@@ -1,0 +1,6 @@
+.zig-cache/
+zig-out/
+*.vhd
+*.img
+*.vhdx
+*.qcow2
