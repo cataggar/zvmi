@@ -155,7 +155,7 @@ pub const Placement = struct {
 pub const WriteError = error{
     TooManyPartitions,
     NotEnoughSpace,
-} || Io.File.ReadPositionalError || Io.File.WritePositionalError;
+} || Image.PreadError || Image.PwriteError;
 
 /// Writes a full protective-MBR + primary GPT (header+array) + backup GPT
 /// (array+header) layout to `img`, placing each of `specs` back-to-back
@@ -237,7 +237,7 @@ pub const ParsedGpt = struct {
 pub const ReadError = error{
     UnsupportedPartitionEntrySize,
     BadPartitionArrayChecksum,
-} || Header.DecodeError || Io.File.ReadPositionalError || std.mem.Allocator.Error;
+} || Header.DecodeError || Image.PreadError || std.mem.Allocator.Error;
 
 /// Reads and validates the primary GPT header + partition array from `img`
 /// (LBA 1 and LBA 2.. respectively). Does not cross-check the backup copy

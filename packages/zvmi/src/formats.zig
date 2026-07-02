@@ -8,11 +8,13 @@ const std = @import("std");
 pub const Format = enum {
     raw,
     vhd,
+    vhdx,
 
     pub fn parseName(name: []const u8) ?Format {
         if (std.ascii.eqlIgnoreCase(name, "raw")) return .raw;
         if (std.ascii.eqlIgnoreCase(name, "vhd")) return .vhd;
         if (std.ascii.eqlIgnoreCase(name, "vpc")) return .vhd;
+        if (std.ascii.eqlIgnoreCase(name, "vhdx")) return .vhdx;
         return null;
     }
 
@@ -20,6 +22,7 @@ pub const Format = enum {
         return switch (self) {
             .raw => "raw",
             .vhd => "vhd",
+            .vhdx => "vhdx",
         };
     }
 };
@@ -28,5 +31,6 @@ test "Format.parseName accepts vhd and vpc aliases" {
     try std.testing.expectEqual(Format.vhd, Format.parseName("vhd").?);
     try std.testing.expectEqual(Format.vhd, Format.parseName("VPC").?);
     try std.testing.expectEqual(Format.raw, Format.parseName("RAW").?);
+    try std.testing.expectEqual(Format.vhdx, Format.parseName("vhdx").?);
     try std.testing.expect(Format.parseName("qcow2") == null);
 }

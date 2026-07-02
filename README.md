@@ -25,6 +25,8 @@ zvmi/
                               #   resize/check/map; raw + fixed/dynamic vhd)
         vhd.zig               # VHD/VPC footer + dynamic header codec
                               #   (spec + QEMU-verified)
+        vhdx.zig              # VHDX **read-only** codec (header, region
+                              #   table, metadata, BAT -- QEMU-verified)
         guid.zig               # mixed-endian GUID encoding + well-known
                               #   partition type GUIDs (ESP, Linux data)
         mbr.zig                # MBR partition table codec (protective +
@@ -61,10 +63,10 @@ zig build test       # run all tests
 zig build run -- <args>   # run the CLI, e.g. `zig build run -- info foo.vhd`
 ```
 
-## Status (Milestone 3)
+## Status (Milestone 4)
 
-Supports `raw`, fixed `vhd`, dynamic `vhd`, plus MBR/GPT partition table
-read/write and an Azure-readiness check:
+Supports `raw`, fixed `vhd`, dynamic `vhd`, MBR/GPT partition tables, an
+Azure-readiness check, and **read-only** `vhdx`:
 
 ```
 zvmi create -f vhd disk.vhd 32M                          # dynamic by default (matches qemu-img)
@@ -72,6 +74,7 @@ zvmi create -f vhd -o subformat=fixed disk.vhd 32M       # required for Azure ma
 zvmi info disk.vhd
 zvmi info --output=json disk.vhd
 zvmi convert -f raw -O vhd -o subformat=dynamic disk.img disk.vhd
+zvmi convert -f vhdx -O vhd -o subformat=fixed disk.vhdx disk.vhd  # import a VHDX (e.g. Hyper-V export)
 zvmi resize disk.vhd +4G
 zvmi check disk.vhd
 zvmi map disk.vhd
@@ -89,8 +92,17 @@ requested Hyper-V generation (Gen1 = plain MBR, Gen2 = protective MBR + GPT).
 There is no interactive partitioning CLI command yet -- that lands with
 `zvmi build-image`.
 
-VHDX, qcow2, and the `zvmi build-image` Azure Linux + container workflow are
-future milestones.
+VHDX support is read-only (`zvmi.vhdx`; usable via `info`/`convert`/`check`/
+`map`, but not `create`), covering non-differencing images with 512-byte
+logical sectors -- the common case. No real Hyper-V/QEMU install was
+available in this environment to generate reference VHDX files, so
+correctness was verified against QEMU's own `block/vhdx.c`/`vhdx.h` (struct
+layout, CRC-32C checksums, and the BAT chunk-ratio interleaving formula) plus
+a hand-built synthetic fixture exercised through the full `Image` API in
+`packages/zvmi/src/image.zig`'s test suite.
+
+qcow2 and the `zvmi build-image` Azure Linux + container workflow are future
+milestones.
 
 ## Notes on Zig 0.16
 

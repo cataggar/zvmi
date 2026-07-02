@@ -19,16 +19,18 @@
 const std = @import("std");
 const Io = std.Io;
 const vhd = @import("vhd.zig");
+const vhdx = @import("vhdx.zig");
 pub const Format = @import("formats.zig").Format;
 
 pub const OpenError = error{
     UnsupportedVhdDiskType,
     InvalidBlockSize,
 } || Io.File.OpenError || Io.File.ReadPositionalError || Io.File.StatError ||
-    vhd.Footer.DecodeError || vhd.DynamicHeader.DecodeError;
+    vhd.Footer.DecodeError || vhd.DynamicHeader.DecodeError || vhdx.OpenError;
 
 pub const CreateError = error{
     SizeNotSectorAligned,
+    UnsupportedFormatForCreate,
 } || Io.File.OpenError || Io.File.WritePositionalError || Io.File.SetLengthError;
 
 pub const VhdSubformat = enum { fixed, dynamic };
@@ -72,6 +74,14 @@ const DynamicState = struct {
     footer_template: [vhd.footer_size]u8,
 };
 
+/// Per-image state needed to navigate a read-only VHDX's BAT, mirroring
+/// `DynamicState`'s "don't cache the BAT, read entries on demand" approach.
+const VhdxState = struct {
+    bat_offset: u64,
+    block_size: u32,
+    chunk_ratio: u64,
+};
+
 pub const Image = struct {
     file: Io.File,
     format: Format,
@@ -81,6 +91,7 @@ pub const Image = struct {
     data_offset: u64,
     virtual_size: u64,
     dynamic: ?DynamicState = null,
+    vhdx: ?VhdxState = null,
 
     pub fn openPath(io: Io, path: []const u8) OpenError!Image {
         const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
@@ -91,6 +102,29 @@ pub const Image = struct {
     /// Takes ownership of `file` (closing the returned `Image` closes it).
     pub fn openFile(io: Io, file: Io.File) OpenError!Image {
         const file_size = (try file.stat(io)).size;
+
+        // VHDX's signature lives at the very start of the file (unlike
+        // VHD's footer, which trails the data); check it first so we never
+        // misdetect a VHDX as raw. Once the signature matches, any further
+        // parse failure is a real error, not a fallback-to-raw case.
+        if (file_size >= 8) {
+            var sig_buf: [8]u8 = undefined;
+            const n = try file.readPositionalAll(io, &sig_buf, 0);
+            if (n == 8 and std.mem.eql(u8, &sig_buf, &vhdx.file_signature)) {
+                const vhdx_info = try vhdx.open(io, file);
+                return .{
+                    .file = file,
+                    .format = .vhdx,
+                    .data_offset = 0,
+                    .virtual_size = vhdx_info.virtual_size,
+                    .vhdx = .{
+                        .bat_offset = vhdx_info.bat_offset,
+                        .block_size = vhdx_info.block_size,
+                        .chunk_ratio = vhdx_info.chunk_ratio,
+                    },
+                };
+            }
+        }
 
         if (file_size >= vhd.footer_size) {
             var footer_buf: [vhd.footer_size]u8 = undefined;
@@ -159,6 +193,9 @@ pub const Image = struct {
     /// `size` must be a multiple of the 512-byte sector size.
     pub fn create(io: Io, path: []const u8, format: Format, size: u64, options: CreateOptions) CreateError!Image {
         if (size % 512 != 0) return error.SizeNotSectorAligned;
+        // VHDX support is read-only (see vhdx.zig) -- reject before creating
+        // any file on disk.
+        if (format == .vhdx) return error.UnsupportedFormatForCreate;
 
         const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
         errdefer file.close(io);
@@ -178,6 +215,7 @@ pub const Image = struct {
                 },
                 .dynamic => return try createDynamic(io, file, size),
             },
+            .vhdx => unreachable, // rejected above
         }
     }
 
@@ -233,7 +271,9 @@ pub const Image = struct {
         return .{ .format = self.format, .virtual_size = self.virtual_size, .file_size = file_size, .subformat = subformat };
     }
 
-    pub fn pread(self: Image, io: Io, buffer: []u8, offset: u64) Io.File.ReadPositionalError!usize {
+    pub const PreadError = error{UnsupportedVhdxBlockState} || Io.File.ReadPositionalError;
+
+    pub fn pread(self: Image, io: Io, buffer: []u8, offset: u64) PreadError!usize {
         if (self.dynamic) |d| {
             var total: usize = 0;
             var off = offset;
@@ -258,10 +298,44 @@ pub const Image = struct {
             }
             return total;
         }
+        if (self.vhdx) |v| {
+            var total: usize = 0;
+            var off = offset;
+            var remaining = buffer.len;
+            while (remaining > 0) {
+                const block_index = off / v.block_size;
+                const in_block_offset: u32 = @intCast(off % v.block_size);
+                const chunk: usize = @min(remaining, v.block_size - in_block_offset);
+
+                const bat_index = vhdx.batIndexForBlock(block_index, v.chunk_ratio);
+                const entry = try readBatEntryU64(self.file, io, v.bat_offset, bat_index);
+                const state: vhdx.BlockState = @enumFromInt(entry & vhdx.bat_state_mask);
+
+                switch (state) {
+                    .fully_present => {
+                        const file_offset = entry & vhdx.bat_file_off_mask;
+                        const got = try self.file.readPositionalAll(io, buffer[total..][0..chunk], file_offset + in_block_offset);
+                        if (got < chunk) @memset(buffer[total + got ..][0 .. chunk - got], 0);
+                    },
+                    .not_present, .undefined_state, .zero, .unmapped, .unmapped_v095 => {
+                        @memset(buffer[total..][0..chunk], 0);
+                    },
+                    else => return error.UnsupportedVhdxBlockState, // partially_present (differencing only)
+                }
+
+                total += chunk;
+                off += chunk;
+                remaining -= chunk;
+            }
+            return total;
+        }
         return self.file.readPositionalAll(io, buffer, self.data_offset + offset);
     }
 
-    pub fn pwrite(self: *Image, io: Io, buffer: []const u8, offset: u64) (Io.File.ReadPositionalError || Io.File.WritePositionalError)!void {
+    pub const PwriteError = error{ReadOnlyFormat} || Io.File.ReadPositionalError || Io.File.WritePositionalError;
+
+    pub fn pwrite(self: *Image, io: Io, buffer: []const u8, offset: u64) PwriteError!void {
+        if (self.format == .vhdx) return error.ReadOnlyFormat;
         if (self.dynamic) |*d| {
             var off = offset;
             var remaining = buffer.len;
@@ -295,6 +369,7 @@ pub const Image = struct {
     pub const ResizeError = error{
         ShrinkNotSupported,
         ExceedsAllocatedBatCapacity,
+        ReadOnlyFormat,
     } || Io.File.SetLengthError || Io.File.WritePositionalError || Io.File.ReadPositionalError;
 
     /// Changes the guest-visible virtual size. Growing is supported for all
@@ -303,8 +378,10 @@ pub const Image = struct {
     /// allocated BAT capacity, i.e. no BAT growth -- otherwise returns
     /// `error.ExceedsAllocatedBatCapacity`). Shrinking is not yet supported
     /// (`error.ShrinkNotSupported`) since it requires format-specific data
-    /// loss handling that qemu-img itself guards behind `--shrink`.
+    /// loss handling that qemu-img itself guards behind `--shrink`. VHDX is
+    /// read-only, so resizing it always fails (`error.ReadOnlyFormat`).
     pub fn resize(self: *Image, io: Io, new_size: u64) ResizeError!void {
+        if (self.format == .vhdx) return error.ReadOnlyFormat;
         if (new_size < self.virtual_size) return error.ShrinkNotSupported;
         if (new_size == self.virtual_size) return;
 
@@ -331,10 +408,11 @@ pub const Image = struct {
                     self.virtual_size = new_size;
                 }
             },
+            .vhdx => unreachable, // rejected above
         }
     }
 
-    pub const CheckError = Io.File.ReadPositionalError || Io.File.StatError;
+    pub const CheckError = vhdx.OpenError || Io.File.StatError;
 
     pub const CheckResult = struct {
         ok: bool,
@@ -347,6 +425,14 @@ pub const Image = struct {
     /// wrong (there are no refcounts/clusters to leak like qcow2).
     pub fn check(self: Image, io: Io) CheckError!CheckResult {
         if (self.format == .raw) return .{ .ok = true, .message = "raw image: nothing to check" };
+
+        if (self.format == .vhdx) {
+            _ = vhdx.open(io, self.file) catch |err| return .{
+                .ok = false,
+                .message = @errorName(err),
+            };
+            return .{ .ok = true, .message = "vhdx header/region/metadata checks passed" };
+        }
 
         const file_size = (try self.file.stat(io)).size;
         if (file_size < vhd.footer_size) return .{ .ok = false, .message = "file too small for a VHD footer" };
@@ -392,7 +478,7 @@ pub const Image = struct {
     /// virtual disk (coalescing adjacent same-state blocks), analogous to
     /// `qemu-img map`. Caller owns the returned slice. `raw` and fixed `vhd`
     /// report a single, fully allocated extent (neither format has a sparse
-    /// concept); dynamic `vhd` walks the BAT.
+    /// concept); dynamic `vhd` and `vhdx` walk their respective BATs.
     pub fn mapExtents(self: Image, io: Io, allocator: std.mem.Allocator) MapError![]Extent {
         if (self.dynamic) |d| {
             var extents = std.array_list.Managed(Extent).init(allocator);
@@ -417,6 +503,29 @@ pub const Image = struct {
             return extents.toOwnedSlice();
         }
 
+        if (self.vhdx) |v| {
+            var extents = std.array_list.Managed(Extent).init(allocator);
+            errdefer extents.deinit();
+
+            const total_blocks = std.math.divCeil(u64, self.virtual_size, v.block_size) catch unreachable;
+
+            var index: u64 = 0;
+            while (index < total_blocks) {
+                const allocated = try vhdxBlockAllocated(self.file, io, v, index);
+                const block_start = index * v.block_size;
+
+                var run_end_index = index + 1;
+                while (run_end_index < total_blocks) : (run_end_index += 1) {
+                    if (try vhdxBlockAllocated(self.file, io, v, run_end_index) != allocated) break;
+                }
+
+                const run_end_offset = @min(run_end_index * v.block_size, self.virtual_size);
+                try extents.append(.{ .offset = block_start, .length = run_end_offset - block_start, .allocated = allocated });
+                index = run_end_index;
+            }
+            return extents.toOwnedSlice();
+        }
+
         const single = try allocator.alloc(Extent, 1);
         single[0] = .{ .offset = 0, .length = self.virtual_size, .allocated = true };
         return single;
@@ -424,6 +533,19 @@ pub const Image = struct {
 };
 
 const unallocated_bat_entry: u32 = 0xFFFF_FFFF;
+
+fn vhdxBlockAllocated(file: Io.File, io: Io, v: VhdxState, block_index: u64) Io.File.ReadPositionalError!bool {
+    const bat_index = vhdx.batIndexForBlock(block_index, v.chunk_ratio);
+    const entry = try readBatEntryU64(file, io, v.bat_offset, bat_index);
+    const state: vhdx.BlockState = @enumFromInt(entry & vhdx.bat_state_mask);
+    return state == .fully_present or state == .partially_present;
+}
+
+fn readBatEntryU64(file: Io.File, io: Io, bat_offset: u64, index: u64) Io.File.ReadPositionalError!u64 {
+    var buf: [8]u8 = undefined;
+    _ = try file.readPositionalAll(io, &buf, bat_offset + index * 8);
+    return std.mem.readInt(u64, &buf, .little);
+}
 
 fn readBatEntry(file: Io.File, io: Io, bat_offset: u64, index: u32) Io.File.ReadPositionalError!u32 {
     var buf: [4]u8 = undefined;
@@ -520,7 +642,7 @@ fn randomUuid(io: Io) [16]u8 {
     return bytes;
 }
 
-pub const CopyError = Io.File.ReadPositionalError || Io.File.WritePositionalError ||
+pub const CopyError = Image.PreadError || Image.PwriteError ||
     std.mem.Allocator.Error || error{UnexpectedEndOfFile};
 
 /// Copies all `src` virtual-disk bytes into `*dst` (which must already have
@@ -794,4 +916,156 @@ test "resize rejects shrinking" {
     var img = try Image.create(io, path, .raw, 4096, .{});
     defer img.close(io);
     try std.testing.expectError(error.ShrinkNotSupported, img.resize(io, 1024));
+}
+
+// ---- VHDX end-to-end integration test ----
+//
+// No real Hyper-V/QEMU install was available to generate a reference VHDX
+// file, so this test builds a minimal-but-spec-correct one by hand (reusing
+// the raw `Image`'s pwrite as a simple "poke bytes at this file offset"
+// tool) and then verifies `Image.openPath`/`pread` read it back correctly.
+// This exercises the full stack (signature/header/region-table/metadata
+// parsing, CRC-32C validation, and BAT-driven reads for both an allocated
+// and an unallocated block) even though, at this small scale, chunk_ratio
+// is far larger than the block count, so the BAT interleaving adjustment
+// itself is covered separately by `vhdx.zig`'s `batIndexForBlock` test.
+test "Image reads a hand-built minimal VHDX file" {
+    const io = std.testing.io;
+    const path = "test-vhdx-fixture.vhdx";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const block_size: u32 = 1 * 1024 * 1024; // VHDX minimum block size
+    const virtual_size: u64 = 2 * @as(u64, block_size); // 2 blocks
+    const region_table_off: u64 = 3 * 64 * 1024;
+    const bat_off: u64 = 1 * 1024 * 1024;
+    const metadata_off: u64 = 2 * 1024 * 1024;
+    const block0_data_off: u64 = 3 * 1024 * 1024;
+    const total_file_size: u64 = block0_data_off + block_size;
+
+    var img = try Image.create(io, path, .raw, total_file_size, .{});
+
+    try img.pwrite(io, "vhdxfile", 0);
+    try writeVhdxTestHeader(&img, io, 64 * 1024);
+    try writeVhdxTestRegionTable(&img, io, region_table_off, bat_off, metadata_off);
+    try writeVhdxTestMetadata(&img, io, metadata_off, block_size, virtual_size);
+
+    // BAT: block 0 fully present at block0_data_off, block 1 not present.
+    var bat_entry0: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bat_entry0, block0_data_off | 6, .little); // state=6 fully_present
+    try img.pwrite(io, &bat_entry0, bat_off);
+    var bat_entry1: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bat_entry1, 0, .little); // state=0 not_present
+    try img.pwrite(io, &bat_entry1, bat_off + 8);
+
+    try img.pwrite(io, "VHDXBLOCK0DATA", block0_data_off);
+    img.close(io);
+
+    var opened = try Image.openPath(io, path);
+    defer opened.close(io);
+    try std.testing.expectEqual(Format.vhdx, opened.format);
+    try std.testing.expectEqual(virtual_size, opened.virtual_size);
+
+    var buf: [14]u8 = undefined;
+    _ = try opened.pread(io, &buf, 0);
+    try std.testing.expectEqualSlices(u8, "VHDXBLOCK0DATA", &buf);
+
+    // Block 1 (not present) reads as zero.
+    var zero_buf: [64]u8 = undefined;
+    _ = try opened.pread(io, &zero_buf, block_size);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 64), &zero_buf);
+
+    // pwrite is rejected -- VHDX support is read-only.
+    var one_byte: [1]u8 = .{1};
+    try std.testing.expectError(error.ReadOnlyFormat, opened.pwrite(io, &one_byte, 0));
+
+    // check() and mapExtents() should also work through the full Image API.
+    const result = try opened.check(io);
+    try std.testing.expect(result.ok);
+
+    const extents = try opened.mapExtents(io, std.testing.allocator);
+    defer std.testing.allocator.free(extents);
+    try std.testing.expectEqual(@as(usize, 2), extents.len);
+    try std.testing.expectEqual(true, extents[0].allocated);
+    try std.testing.expectEqual(false, extents[1].allocated);
+}
+
+fn vhdxTestCrc32c(buf: []const u8) u32 {
+    return std.hash.crc.Crc32Iscsi.hash(buf);
+}
+
+fn writeVhdxTestHeader(img: *Image, io: Io, offset: u64) !void {
+    var buf: [4096]u8 = [_]u8{0} ** 4096;
+    buf[0..4].* = "head".*;
+    // checksum (buf[4..8]) filled below
+    std.mem.writeInt(u64, buf[8..16], 2, .little); // sequence_number
+    std.mem.writeInt(u16, buf[66..68], 1, .little); // version = 1
+
+    const crc = vhdxTestCrc32c(&buf);
+    std.mem.writeInt(u32, buf[4..8], crc, .little);
+    try img.pwrite(io, &buf, offset);
+}
+
+fn writeVhdxTestRegionTable(img: *Image, io: Io, offset: u64, bat_offset: u64, metadata_offset: u64) !void {
+    const guid = @import("guid.zig");
+    const bat_guid = guid.parse("2DC27766-F623-4200-9D64-115E9BFD4A08");
+    const metadata_guid = guid.parse("8B7CA206-4790-4B9A-B8FE-575F050F886E");
+
+    var buf: [64 * 1024]u8 = [_]u8{0} ** (64 * 1024);
+    buf[0..4].* = "regi".*;
+    // checksum (buf[4..8]) filled below
+    std.mem.writeInt(u32, buf[8..12], 2, .little); // entry_count
+
+    buf[16..32].* = bat_guid;
+    std.mem.writeInt(u64, buf[32..40], bat_offset, .little);
+
+    buf[48..64].* = metadata_guid;
+    std.mem.writeInt(u64, buf[64..72], metadata_offset, .little);
+
+    const crc = vhdxTestCrc32c(&buf);
+    std.mem.writeInt(u32, buf[4..8], crc, .little);
+    try img.pwrite(io, &buf, offset);
+}
+
+fn writeVhdxTestMetadata(img: *Image, io: Io, offset: u64, block_size: u32, virtual_size: u64) !void {
+    const guid = @import("guid.zig");
+    const file_params_guid = guid.parse("CAA16737-FA36-4D43-B3B6-33F0AA44E76B");
+    const virtual_size_guid = guid.parse("2FA54224-CD1B-4876-B211-5DBED83BF4B8");
+    const logical_sector_guid = guid.parse("8141BF1D-A96F-4709-BA47-F233A8FAAB5F");
+
+    // Metadata table header (32 bytes) + 3 entries (32 bytes each) = 128 bytes,
+    // then the actual item data placed at 64KB into the region (spec minimum).
+    var table_buf: [128]u8 = [_]u8{0} ** 128;
+    table_buf[0..8].* = "metadata".*;
+    std.mem.writeInt(u16, table_buf[10..12], 3, .little); // entry_count
+
+    const item0_off: u32 = 64 * 1024;
+    const item1_off: u32 = item0_off + 64;
+    const item2_off: u32 = item1_off + 64;
+
+    table_buf[32..48].* = file_params_guid;
+    std.mem.writeInt(u32, table_buf[48..52], item0_off, .little);
+    std.mem.writeInt(u32, table_buf[52..56], 8, .little);
+
+    table_buf[64..80].* = virtual_size_guid;
+    std.mem.writeInt(u32, table_buf[80..84], item1_off, .little);
+    std.mem.writeInt(u32, table_buf[84..88], 8, .little);
+
+    table_buf[96..112].* = logical_sector_guid;
+    std.mem.writeInt(u32, table_buf[112..116], item2_off, .little);
+    std.mem.writeInt(u32, table_buf[116..120], 4, .little);
+
+    try img.pwrite(io, &table_buf, offset);
+
+    var file_params: [8]u8 = undefined;
+    std.mem.writeInt(u32, file_params[0..4], block_size, .little);
+    std.mem.writeInt(u32, file_params[4..8], 0, .little); // data_bits: no HAS_PARENT
+    try img.pwrite(io, &file_params, offset + item0_off);
+
+    var vsize: [8]u8 = undefined;
+    std.mem.writeInt(u64, &vsize, virtual_size, .little);
+    try img.pwrite(io, &vsize, offset + item1_off);
+
+    var lss: [4]u8 = undefined;
+    std.mem.writeInt(u32, &lss, 512, .little);
+    try img.pwrite(io, &lss, offset + item2_off);
 }

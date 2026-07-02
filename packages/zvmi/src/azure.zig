@@ -20,7 +20,7 @@ pub const Generation = enum { gen1, gen2 };
 
 pub const FixupError = error{
     NotAFixedVhd,
-} || Image.ResizeError || Io.File.ReadPositionalError || gpt.ReadError || mbr.Mbr.DecodeError;
+} || Image.ResizeError || Image.PreadError || gpt.ReadError || mbr.Mbr.DecodeError;
 
 pub const FixupResult = struct {
     old_size: u64,
