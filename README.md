@@ -25,6 +25,14 @@ zvmi/
                               #   resize/check/map; raw + fixed/dynamic vhd)
         vhd.zig               # VHD/VPC footer + dynamic header codec
                               #   (spec + QEMU-verified)
+        guid.zig               # mixed-endian GUID encoding + well-known
+                              #   partition type GUIDs (ESP, Linux data)
+        mbr.zig                # MBR partition table codec (protective +
+                              #   plain single-partition)
+        gpt.zig                # GPT header + partition entry array codec
+                              #   (CRC-32, spec-verified layout)
+        azure.zig              # 1 MiB alignment + Gen1/Gen2 partition-style
+                              #   checks (backs `zvmi azure fixup`)
         formats.zig           # Format enum (raw, vhd)
         size.zig              # qemu-img-style size suffix parsing (K/M/G/T)
   cli/
@@ -37,6 +45,7 @@ zvmi/
         resize.zig            # `zvmi resize`
         check.zig             # `zvmi check`
         map.zig               # `zvmi map`
+        azure.zig             # `zvmi azure fixup`
         opts.zig              # shared `-o subformat=...` parsing
 ```
 
@@ -52,9 +61,10 @@ zig build test       # run all tests
 zig build run -- <args>   # run the CLI, e.g. `zig build run -- info foo.vhd`
 ```
 
-## Status (Milestone 2)
+## Status (Milestone 3)
 
-Supports `raw`, fixed `vhd`, and dynamic `vhd` (sparse, block-allocated):
+Supports `raw`, fixed `vhd`, dynamic `vhd`, plus MBR/GPT partition table
+read/write and an Azure-readiness check:
 
 ```
 zvmi create -f vhd disk.vhd 32M                          # dynamic by default (matches qemu-img)
@@ -65,14 +75,22 @@ zvmi convert -f raw -O vhd -o subformat=dynamic disk.img disk.vhd
 zvmi resize disk.vhd +4G
 zvmi check disk.vhd
 zvmi map disk.vhd
+zvmi azure fixup --generation 1|2 disk.vhd  # pads to 1 MiB, checks MBR/GPT
 ```
 
 `convert` skips all-zero chunks (aligned to the destination's block size for
 dynamic vhd), so converting a mostly-empty raw image into a dynamic vhd stays
 sparse instead of eagerly allocating every block it touches.
 
-MBR/GPT partitioning, VHDX, qcow2, and the `zvmi build-image` Azure Linux +
-container workflow are future milestones.
+MBR/GPT partition-table read/write is available as a library API
+(`zvmi.mbr`, `zvmi.gpt`, `zvmi.guid`) with round-trip test coverage, used by
+`zvmi azure fixup` to validate the disk's partition style against the
+requested Hyper-V generation (Gen1 = plain MBR, Gen2 = protective MBR + GPT).
+There is no interactive partitioning CLI command yet -- that lands with
+`zvmi build-image`.
+
+VHDX, qcow2, and the `zvmi build-image` Azure Linux + container workflow are
+future milestones.
 
 ## Notes on Zig 0.16
 

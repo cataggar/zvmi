@@ -11,6 +11,7 @@ const convert_cmd = @import("commands/convert.zig");
 const resize_cmd = @import("commands/resize.zig");
 const check_cmd = @import("commands/check.zig");
 const map_cmd = @import("commands/map.zig");
+const azure_cmd = @import("commands/azure.zig");
 
 const usage =
     \\Usage: zvmi <command> [options]
@@ -22,6 +23,7 @@ const usage =
     \\  resize <file> [+]<size>
     \\  check <file>
     \\  map [--output=human|json] <file>
+    \\  azure fixup --generation 1|2 <file>
     \\
     \\Formats: raw, vhd (alias: vpc)
     \\Sizes accept K/M/G/T binary suffixes (e.g. 20G).
@@ -53,6 +55,7 @@ fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     if (std.mem.eql(u8, command, "resize")) return resize_cmd.run(gpa, io, rest);
     if (std.mem.eql(u8, command, "check")) return check_cmd.run(gpa, io, rest);
     if (std.mem.eql(u8, command, "map")) return map_cmd.run(gpa, io, rest);
+    if (std.mem.eql(u8, command, "azure")) return azure_cmd.run(gpa, io, rest);
     if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h") or std.mem.eql(u8, command, "help")) {
         std.debug.print("{s}", .{usage});
         return 0;
@@ -68,4 +71,5 @@ test {
     _ = resize_cmd;
     _ = check_cmd;
     _ = map_cmd;
+    _ = azure_cmd;
 }

@@ -4,12 +4,16 @@
 //! the Azure Linux + container build-image workflow this library exists to
 //! support.
 //!
-//! Milestone 1 status: `raw` and fixed `vhd` read/write + convert. Dynamic
-//! vhd, MBR/GPT, VHDX, and qcow2 are not implemented yet.
+//! Milestone 3 status: raw + fixed/dynamic vhd read/write, MBR + GPT
+//! partition table read/write. VHDX and qcow2 are not implemented yet.
 
 const std = @import("std");
 
 pub const vhd = @import("vhd.zig");
+pub const guid = @import("guid.zig");
+pub const mbr = @import("mbr.zig");
+pub const gpt = @import("gpt.zig");
+pub const azure = @import("azure.zig");
 const image_mod = @import("image.zig");
 const size_mod = @import("size.zig");
 
