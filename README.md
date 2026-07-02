@@ -21,8 +21,10 @@ zvmi/
     zvmi/                   # the core disk-image library
       src/
         root.zig             # public API surface
-        image.zig            # format-agnostic Image (open/create/read/write)
-        vhd.zig               # VHD/VPC fixed-footer codec (spec + QEMU-verified)
+        image.zig            # format-agnostic Image (open/create/read/write,
+                              #   resize/check/map; raw + fixed/dynamic vhd)
+        vhd.zig               # VHD/VPC footer + dynamic header codec
+                              #   (spec + QEMU-verified)
         formats.zig           # Format enum (raw, vhd)
         size.zig              # qemu-img-style size suffix parsing (K/M/G/T)
   cli/
@@ -32,6 +34,10 @@ zvmi/
         create.zig            # `zvmi create`
         info.zig              # `zvmi info`
         convert.zig           # `zvmi convert`
+        resize.zig            # `zvmi resize`
+        check.zig             # `zvmi check`
+        map.zig               # `zvmi map`
+        opts.zig              # shared `-o subformat=...` parsing
 ```
 
 ## Requirements
@@ -46,19 +52,27 @@ zig build test       # run all tests
 zig build run -- <args>   # run the CLI, e.g. `zig build run -- info foo.vhd`
 ```
 
-## Status (Milestone 1)
+## Status (Milestone 2)
 
-Supports `raw` and fixed `vhd` formats only:
+Supports `raw`, fixed `vhd`, and dynamic `vhd` (sparse, block-allocated):
 
 ```
-zvmi create -f vhd disk.vhd 32M
+zvmi create -f vhd disk.vhd 32M                          # dynamic by default (matches qemu-img)
+zvmi create -f vhd -o subformat=fixed disk.vhd 32M       # required for Azure managed-disk upload
 zvmi info disk.vhd
 zvmi info --output=json disk.vhd
-zvmi convert -f raw -O vhd disk.img disk.vhd
+zvmi convert -f raw -O vhd -o subformat=dynamic disk.img disk.vhd
+zvmi resize disk.vhd +4G
+zvmi check disk.vhd
+zvmi map disk.vhd
 ```
 
-Dynamic VHD, MBR/GPT partitioning, VHDX, qcow2, and the `zvmi build-image`
-Azure Linux + container workflow are future milestones.
+`convert` skips all-zero chunks (aligned to the destination's block size for
+dynamic vhd), so converting a mostly-empty raw image into a dynamic vhd stays
+sparse instead of eagerly allocating every block it touches.
+
+MBR/GPT partitioning, VHDX, qcow2, and the `zvmi build-image` Azure Linux +
+container workflow are future milestones.
 
 ## Notes on Zig 0.16
 

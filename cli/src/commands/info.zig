@@ -36,6 +36,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
                 "image: {s}\nfile format: {s}\nvirtual size: {d} ({d} bytes)\ndisk size: {d} bytes\n",
                 .{ file_path, stat.format.displayName(), stat.virtual_size, stat.virtual_size, stat.file_size },
             );
+            if (stat.subformat) |sf| {
+                std.debug.print("subformat: {s}\n", .{if (sf == .fixed) "fixed" else "dynamic"});
+            }
         },
         .json => {
             var buf: [512]u8 = undefined;
@@ -45,6 +48,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
                 .@"format" = stat.format.displayName(),
                 .@"virtual-size" = stat.virtual_size,
                 .@"actual-size" = stat.file_size,
+                .subformat = if (stat.subformat) |sf| (if (sf == .fixed) "fixed" else "dynamic") else null,
             }, .{}, &writer) catch |err|
                 return fail("info: failed to format JSON: {s}", .{@errorName(err)});
             std.debug.print("{s}\n", .{writer.buffered()});

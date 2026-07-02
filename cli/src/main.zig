@@ -1,5 +1,6 @@
-//! `zvmi`: a qemu-img-like CLI over the `zvmi` library. Milestone 1 supports
-//! `create`, `info`, and `convert` for `raw` and fixed `vhd`.
+//! `zvmi`: a qemu-img-like CLI over the `zvmi` library. Supports `create`,
+//! `info`, `convert`, `resize`, `check`, and `map` for `raw` and both fixed
+//! and dynamic `vhd`.
 
 const std = @import("std");
 const zvmi = @import("zvmi");
@@ -7,14 +8,20 @@ const zvmi = @import("zvmi");
 const create_cmd = @import("commands/create.zig");
 const info_cmd = @import("commands/info.zig");
 const convert_cmd = @import("commands/convert.zig");
+const resize_cmd = @import("commands/resize.zig");
+const check_cmd = @import("commands/check.zig");
+const map_cmd = @import("commands/map.zig");
 
 const usage =
     \\Usage: zvmi <command> [options]
     \\
     \\Commands:
-    \\  create -f <format> [-o key=value,...] <file> <size>
+    \\  create -f <format> [-o subformat=fixed|dynamic] <file> <size>
     \\  info [--output=human|json] <file>
-    \\  convert -f <src_format> -O <dst_format> <src> <dst>
+    \\  convert -f <src_format> -O <dst_format> [-o subformat=fixed|dynamic] <src> <dst>
+    \\  resize <file> [+]<size>
+    \\  check <file>
+    \\  map [--output=human|json] <file>
     \\
     \\Formats: raw, vhd (alias: vpc)
     \\Sizes accept K/M/G/T binary suffixes (e.g. 20G).
@@ -43,6 +50,9 @@ fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     if (std.mem.eql(u8, command, "create")) return create_cmd.run(gpa, io, rest);
     if (std.mem.eql(u8, command, "info")) return info_cmd.run(gpa, io, rest);
     if (std.mem.eql(u8, command, "convert")) return convert_cmd.run(gpa, io, rest);
+    if (std.mem.eql(u8, command, "resize")) return resize_cmd.run(gpa, io, rest);
+    if (std.mem.eql(u8, command, "check")) return check_cmd.run(gpa, io, rest);
+    if (std.mem.eql(u8, command, "map")) return map_cmd.run(gpa, io, rest);
     if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h") or std.mem.eql(u8, command, "help")) {
         std.debug.print("{s}", .{usage});
         return 0;
@@ -55,4 +65,7 @@ test {
     _ = create_cmd;
     _ = info_cmd;
     _ = convert_cmd;
+    _ = resize_cmd;
+    _ = check_cmd;
+    _ = map_cmd;
 }

@@ -1,10 +1,12 @@
-//! `zvmi create -f <format> [-o key=value,...] <file> <size>`
+//! `zvmi create -f <format> [-o subformat=fixed|dynamic] <file> <size>`
 
 const std = @import("std");
 const zvmi = @import("zvmi");
+const opts = @import("opts.zig");
 
 pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     var format: ?zvmi.Format = null;
+    var options: zvmi.CreateOptions = .{};
     var positional: [2][]const u8 = undefined;
     var positional_count: usize = 0;
 
@@ -19,8 +21,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
         } else if (std.mem.eql(u8, a, "-o")) {
             i += 1;
             if (i >= args.len) return fail("create: -o requires an option list", .{});
-            // Options are accepted but not yet used by any format (no
-            // per-format tunables exist until dynamic vhd/qcow2 land).
+            options = opts.parseVhdCreateOptions(args[i]) orelse return 1;
         } else if (positional_count < positional.len) {
             positional[positional_count] = a;
             positional_count += 1;
@@ -30,7 +31,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     }
 
     if (positional_count != 2) {
-        return fail("usage: zvmi create -f <format> <file> <size>", .{});
+        return fail("usage: zvmi create -f <format> [-o subformat=fixed|dynamic] <file> <size>", .{});
     }
     const fmt = format orelse return fail("create: -f <format> is required", .{});
     const path = positional[0];
@@ -38,11 +39,15 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
         return fail("create: invalid size '{s}': {s}", .{ positional[1], @errorName(err) });
 
     _ = gpa;
-    var img = zvmi.Image.create(io, path, fmt, size) catch |err|
+    var img = zvmi.Image.create(io, path, fmt, size, options) catch |err|
         return fail("create: failed to create '{s}': {s}", .{ path, @errorName(err) });
     img.close(io);
 
-    std.debug.print("Formatting '{s}', fmt={s} size={d}\n", .{ path, fmt.displayName(), size });
+    const subformat_suffix: []const u8 = if (fmt == .vhd)
+        (if (options.vhd_subformat == .fixed) " subformat=fixed" else " subformat=dynamic")
+    else
+        "";
+    std.debug.print("Formatting '{s}', fmt={s}{s} size={d}\n", .{ path, fmt.displayName(), subformat_suffix, size });
     return 0;
 }
 

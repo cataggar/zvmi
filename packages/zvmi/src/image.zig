@@ -1,13 +1,20 @@
 //! The `Image` abstraction: a format-agnostic view over a disk image file,
-//! analogous to qemu's `BlockDriver`. Milestone 1 supports `raw` and fixed
-//! `vhd` only; dynamic vhd, vhdx, and qcow2 are later milestones (see the
-//! project plan). Because there are only ever a handful of formats, this
-//! uses a plain tagged union rather than a vtable/`anyopaque` interface --
-//! simpler and fully type-safe for a small, closed set of variants.
+//! analogous to qemu's `BlockDriver`. Supports `raw`, fixed `vhd`, and
+//! dynamic `vhd` (sparse, block-allocated). MBR/GPT, VHDX, and qcow2 are
+//! later milestones (see the project plan). Because there are only ever a
+//! handful of formats, this uses a plain tagged union rather than a
+//! vtable/`anyopaque` interface -- simpler and fully type-safe for a small,
+//! closed set of variants.
 //!
 //! Every operation takes an explicit `std.Io` parameter (Zig 0.16's I/O
 //! interface), matching the pattern used by `std.Io.File`/`std.Io.Dir`
 //! themselves -- there is no implicit global filesystem or event loop.
+//!
+//! Dynamic VHD layout/semantics (BAT sector numbering, sector bitmap size,
+//! and the "footer trailer always sits at the current end of file, and gets
+//! overwritten by the next block's bitmap" allocation strategy) are verified
+//! against QEMU's `block/vpc.c` (`vpc_open`, `alloc_block`, `get_image_offset`,
+//! `create_dynamic_disk`), the de-facto interoperability reference.
 
 const std = @import("std");
 const Io = std.Io;
@@ -16,29 +23,64 @@ pub const Format = @import("formats.zig").Format;
 
 pub const OpenError = error{
     UnsupportedVhdDiskType,
-} || Io.File.OpenError || Io.File.ReadPositionalError || Io.File.StatError || vhd.Footer.DecodeError;
+    InvalidBlockSize,
+} || Io.File.OpenError || Io.File.ReadPositionalError || Io.File.StatError ||
+    vhd.Footer.DecodeError || vhd.DynamicHeader.DecodeError;
 
 pub const CreateError = error{
     SizeNotSectorAligned,
 } || Io.File.OpenError || Io.File.WritePositionalError || Io.File.SetLengthError;
 
+pub const VhdSubformat = enum { fixed, dynamic };
+
+pub const CreateOptions = struct {
+    /// Only consulted when `format == .vhd`. Defaults to `.dynamic` to match
+    /// real qemu-img's default subformat for `-f vpc`. Azure managed-disk
+    /// uploads require *fixed* VHDs -- pass `.fixed` explicitly (the future
+    /// `zvmi build-image`/`azure fixup` commands do this automatically).
+    vhd_subformat: VhdSubformat = .dynamic,
+};
+
 pub const Info = struct {
     format: Format,
     /// Guest-visible disk size, in bytes.
     virtual_size: u64,
-    /// Bytes actually occupied by the file on disk (host-side file size;
-    /// for `raw`/fixed `vhd` this is the same as the file length, since
-    /// neither format is sparse-aware yet).
+    /// Bytes actually occupied by the file on disk. For `raw`/fixed `vhd`
+    /// this equals the virtual size (+ footer for vhd); for dynamic `vhd`
+    /// it reflects only the blocks actually allocated so far.
     file_size: u64,
+    subformat: ?VhdSubformat,
+};
+
+/// Per-image state needed to navigate a dynamic VHD's BAT and data blocks.
+/// Not cached in memory beyond these scalars -- BAT entries themselves are
+/// read/written directly against the file on each access (see `readBatEntry`),
+/// trading a little I/O for a much simpler, allocation-free `Image`.
+const DynamicState = struct {
+    bat_offset: u64,
+    max_table_entries: u32,
+    block_size: u32,
+    bitmap_size: u32,
+    /// Where the *next* allocated block (bitmap + data) will be written.
+    /// Also where a copy of the footer currently sits (matching QEMU: the
+    /// footer trailer always sits at the true end of file, and gets
+    /// overwritten by the next block's bitmap when another block is
+    /// allocated).
+    free_data_block_offset: u64,
+    /// A ready-to-write encoded footer, rewritten to `free_data_block_offset`
+    /// after every new block allocation.
+    footer_template: [vhd.footer_size]u8,
 };
 
 pub const Image = struct {
     file: Io.File,
     format: Format,
-    /// Offset within `file` where guest-visible byte 0 lives (0 for both
-    /// raw and fixed vhd -- fixed vhd's footer is a trailer, not a header).
+    /// Offset within `file` where guest-visible byte 0 lives (0 for raw,
+    /// fixed vhd, and dynamic vhd -- dynamic vhd's "offset 0" is virtual;
+    /// actual block placement is indirected through the BAT).
     data_offset: u64,
     virtual_size: u64,
+    dynamic: ?DynamicState = null,
 
     pub fn openPath(io: Io, path: []const u8) OpenError!Image {
         const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
@@ -55,13 +97,16 @@ pub const Image = struct {
             const n = try file.readPositionalAll(io, &footer_buf, file_size - vhd.footer_size);
             if (n == vhd.footer_size) {
                 if (vhd.Footer.decode(&footer_buf)) |footer| {
-                    if (footer.disk_type != .fixed) return error.UnsupportedVhdDiskType;
-                    return .{
-                        .file = file,
-                        .format = .vhd,
-                        .data_offset = 0,
-                        .virtual_size = footer.current_size,
-                    };
+                    switch (footer.disk_type) {
+                        .fixed => return .{
+                            .file = file,
+                            .format = .vhd,
+                            .data_offset = 0,
+                            .virtual_size = footer.current_size,
+                        },
+                        .dynamic => return try openDynamic(io, file, footer, footer_buf),
+                        else => return error.UnsupportedVhdDiskType,
+                    }
                 } else |_| {
                     // Not a valid VHD footer -- fall through and treat as raw.
                 }
@@ -76,9 +121,43 @@ pub const Image = struct {
         };
     }
 
+    fn openDynamic(io: Io, file: Io.File, footer: vhd.Footer, footer_buf: [vhd.footer_size]u8) OpenError!Image {
+        var header_buf: [vhd.dynamic_header_size]u8 = undefined;
+        _ = try file.readPositionalAll(io, &header_buf, footer.data_offset);
+        const header = try vhd.DynamicHeader.decode(&header_buf);
+
+        if (!std.math.isPowerOfTwo(header.block_size) or header.block_size < 512) {
+            return error.InvalidBlockSize;
+        }
+        const bitmap_size = vhd.bitmapSize(header.block_size);
+        const free_offset = try computeFreeDataBlockOffset(
+            file,
+            io,
+            header.table_offset,
+            header.max_table_entries,
+            bitmap_size,
+            header.block_size,
+        );
+
+        return .{
+            .file = file,
+            .format = .vhd,
+            .data_offset = 0,
+            .virtual_size = footer.current_size,
+            .dynamic = .{
+                .bat_offset = header.table_offset,
+                .max_table_entries = header.max_table_entries,
+                .block_size = header.block_size,
+                .bitmap_size = bitmap_size,
+                .free_data_block_offset = free_offset,
+                .footer_template = footer_buf,
+            },
+        };
+    }
+
     /// Creates a brand-new image file of the given format and virtual size.
     /// `size` must be a multiple of the 512-byte sector size.
-    pub fn create(io: Io, path: []const u8, format: Format, size: u64) CreateError!Image {
+    pub fn create(io: Io, path: []const u8, format: Format, size: u64, options: CreateOptions) CreateError!Image {
         if (size % 512 != 0) return error.SizeNotSectorAligned;
 
         const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
@@ -89,27 +168,122 @@ pub const Image = struct {
                 try file.setLength(io, size);
                 return .{ .file = file, .format = .raw, .data_offset = 0, .virtual_size = size };
             },
-            .vhd => {
-                try file.setLength(io, size + vhd.footer_size);
-                const now_unix: i64 = @intCast(@divTrunc(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
-                const footer = vhd.Footer.forFixedDisk(size, randomUuid(io), now_unix);
-                const encoded = footer.encode();
-                try file.writePositionalAll(io, &encoded, size);
-                return .{ .file = file, .format = .vhd, .data_offset = 0, .virtual_size = size };
+            .vhd => switch (options.vhd_subformat) {
+                .fixed => {
+                    try file.setLength(io, size + vhd.footer_size);
+                    const footer = vhd.Footer.forFixedDisk(size, randomUuid(io), nowUnix(io));
+                    const encoded = footer.encode();
+                    try file.writePositionalAll(io, &encoded, size);
+                    return .{ .file = file, .format = .vhd, .data_offset = 0, .virtual_size = size };
+                },
+                .dynamic => return try createDynamic(io, file, size),
             },
         }
     }
 
+    fn createDynamic(io: Io, file: Io.File, size: u64) CreateError!Image {
+        const block_size: u32 = vhd.default_block_size;
+        const bitmap_size = vhd.bitmapSize(block_size);
+        const total_sectors = size / 512;
+        const sectors_per_block = block_size / 512;
+        const max_table_entries: u32 = @intCast(std.math.divCeil(u64, total_sectors, sectors_per_block) catch unreachable);
+
+        const bat_offset: u64 = vhd.footer_size + vhd.dynamic_header_size;
+        const bat_bytes_len: u64 = @as(u64, max_table_entries) * 4;
+        const free_offset = alignUp(bat_offset + bat_bytes_len, 512);
+
+        const footer = vhd.Footer.forDynamicDisk(size, vhd.footer_size, randomUuid(io), nowUnix(io));
+        const footer_bytes = footer.encode();
+        try file.writePositionalAll(io, &footer_bytes, 0);
+
+        const header = vhd.DynamicHeader{
+            .table_offset = bat_offset,
+            .max_table_entries = max_table_entries,
+            .block_size = block_size,
+        };
+        const header_bytes = header.encode();
+        try file.writePositionalAll(io, &header_bytes, vhd.footer_size);
+
+        try fillBatUnallocated(file, io, bat_offset, max_table_entries);
+
+        try file.setLength(io, free_offset + vhd.footer_size);
+        try file.writePositionalAll(io, &footer_bytes, free_offset);
+
+        return .{
+            .file = file,
+            .format = .vhd,
+            .data_offset = 0,
+            .virtual_size = size,
+            .dynamic = .{
+                .bat_offset = bat_offset,
+                .max_table_entries = max_table_entries,
+                .block_size = block_size,
+                .bitmap_size = bitmap_size,
+                .free_data_block_offset = free_offset,
+                .footer_template = footer_bytes,
+            },
+        };
+    }
+
     pub fn info(self: Image, io: Io) Io.File.StatError!Info {
         const file_size = (try self.file.stat(io)).size;
-        return .{ .format = self.format, .virtual_size = self.virtual_size, .file_size = file_size };
+        const subformat: ?VhdSubformat = if (self.format != .vhd)
+            null
+        else if (self.dynamic != null) .dynamic else .fixed;
+        return .{ .format = self.format, .virtual_size = self.virtual_size, .file_size = file_size, .subformat = subformat };
     }
 
     pub fn pread(self: Image, io: Io, buffer: []u8, offset: u64) Io.File.ReadPositionalError!usize {
+        if (self.dynamic) |d| {
+            var total: usize = 0;
+            var off = offset;
+            var remaining = buffer.len;
+            while (remaining > 0) {
+                const block_index: u32 = @intCast(off / d.block_size);
+                const in_block_offset: u32 = @intCast(off % d.block_size);
+                const chunk: usize = @min(remaining, d.block_size - in_block_offset);
+
+                const bat_value = try readBatEntry(self.file, io, d.bat_offset, block_index);
+                if (bat_value == unallocated_bat_entry) {
+                    @memset(buffer[total..][0..chunk], 0);
+                } else {
+                    const block_data_offset = @as(u64, bat_value) * 512 + d.bitmap_size;
+                    const got = try self.file.readPositionalAll(io, buffer[total..][0..chunk], block_data_offset + in_block_offset);
+                    if (got < chunk) @memset(buffer[total + got ..][0 .. chunk - got], 0);
+                }
+
+                total += chunk;
+                off += chunk;
+                remaining -= chunk;
+            }
+            return total;
+        }
         return self.file.readPositionalAll(io, buffer, self.data_offset + offset);
     }
 
-    pub fn pwrite(self: Image, io: Io, buffer: []const u8, offset: u64) Io.File.WritePositionalError!void {
+    pub fn pwrite(self: *Image, io: Io, buffer: []const u8, offset: u64) (Io.File.ReadPositionalError || Io.File.WritePositionalError)!void {
+        if (self.dynamic) |*d| {
+            var off = offset;
+            var remaining = buffer.len;
+            var src: usize = 0;
+            while (remaining > 0) {
+                const block_index: u32 = @intCast(off / d.block_size);
+                const in_block_offset: u32 = @intCast(off % d.block_size);
+                const chunk: usize = @min(remaining, d.block_size - in_block_offset);
+
+                var bat_value = try readBatEntry(self.file, io, d.bat_offset, block_index);
+                if (bat_value == unallocated_bat_entry) {
+                    bat_value = try allocateBlock(self.file, io, d, block_index);
+                }
+                const block_data_offset = @as(u64, bat_value) * 512 + d.bitmap_size;
+                try self.file.writePositionalAll(io, buffer[src..][0..chunk], block_data_offset + in_block_offset);
+
+                src += chunk;
+                off += chunk;
+                remaining -= chunk;
+            }
+            return;
+        }
         try self.file.writePositionalAll(io, buffer, self.data_offset + offset);
     }
 
@@ -117,7 +291,226 @@ pub const Image = struct {
         self.file.close(io);
         self.* = undefined;
     }
+
+    pub const ResizeError = error{
+        ShrinkNotSupported,
+        ExceedsAllocatedBatCapacity,
+    } || Io.File.SetLengthError || Io.File.WritePositionalError || Io.File.ReadPositionalError;
+
+    /// Changes the guest-visible virtual size. Growing is supported for all
+    /// formats (raw: extend with zeros; fixed vhd: extend + move footer;
+    /// dynamic vhd: only if the new size still fits within the already
+    /// allocated BAT capacity, i.e. no BAT growth -- otherwise returns
+    /// `error.ExceedsAllocatedBatCapacity`). Shrinking is not yet supported
+    /// (`error.ShrinkNotSupported`) since it requires format-specific data
+    /// loss handling that qemu-img itself guards behind `--shrink`.
+    pub fn resize(self: *Image, io: Io, new_size: u64) ResizeError!void {
+        if (new_size < self.virtual_size) return error.ShrinkNotSupported;
+        if (new_size == self.virtual_size) return;
+
+        switch (self.format) {
+            .raw => {
+                try self.file.setLength(io, new_size);
+                self.virtual_size = new_size;
+            },
+            .vhd => {
+                if (self.dynamic) |*d| {
+                    const capacity = @as(u64, d.max_table_entries) * d.block_size;
+                    if (new_size > capacity) return error.ExceedsAllocatedBatCapacity;
+                    const footer = vhd.Footer.forDynamicDisk(new_size, vhd.footer_size, randomUuid(io), nowUnix(io));
+                    d.footer_template = footer.encode();
+                    try self.file.writePositionalAll(io, &d.footer_template, d.free_data_block_offset);
+                    self.virtual_size = new_size;
+                } else {
+                    // Fixed: move the footer to the new end of the raw data
+                    // region and rewrite it with the new size/geometry.
+                    try self.file.setLength(io, new_size + vhd.footer_size);
+                    const footer = vhd.Footer.forFixedDisk(new_size, randomUuid(io), nowUnix(io));
+                    const encoded = footer.encode();
+                    try self.file.writePositionalAll(io, &encoded, new_size);
+                    self.virtual_size = new_size;
+                }
+            },
+        }
+    }
+
+    pub const CheckError = Io.File.ReadPositionalError || Io.File.StatError;
+
+    pub const CheckResult = struct {
+        ok: bool,
+        message: []const u8,
+    };
+
+    /// Validates footer/header checksums and (for dynamic vhd) that every
+    /// allocated BAT entry points within the file. Roughly analogous to
+    /// qemu-img's `check`, scoped to what these simple formats can have
+    /// wrong (there are no refcounts/clusters to leak like qcow2).
+    pub fn check(self: Image, io: Io) CheckError!CheckResult {
+        if (self.format == .raw) return .{ .ok = true, .message = "raw image: nothing to check" };
+
+        const file_size = (try self.file.stat(io)).size;
+        if (file_size < vhd.footer_size) return .{ .ok = false, .message = "file too small for a VHD footer" };
+
+        var footer_buf: [vhd.footer_size]u8 = undefined;
+        _ = try self.file.readPositionalAll(io, &footer_buf, file_size - vhd.footer_size);
+        const footer = vhd.Footer.decode(&footer_buf) catch |err| return .{
+            .ok = false,
+            .message = switch (err) {
+                error.BadCookie => "footer: bad cookie",
+                error.BadChecksum => "footer: bad checksum",
+            },
+        };
+
+        if (self.dynamic) |d| {
+            var header_buf: [vhd.dynamic_header_size]u8 = undefined;
+            _ = try self.file.readPositionalAll(io, &header_buf, footer.data_offset);
+            const header_ok = if (vhd.DynamicHeader.decode(&header_buf)) |_| true else |_| false;
+            if (!header_ok) return .{ .ok = false, .message = "dynamic header: bad cookie or checksum" };
+
+            var index: u32 = 0;
+            while (index < d.max_table_entries) : (index += 1) {
+                const bat_value = try readBatEntry(self.file, io, d.bat_offset, index);
+                if (bat_value == unallocated_bat_entry) continue;
+                const block_end = @as(u64, bat_value) * 512 + d.bitmap_size + d.block_size;
+                if (block_end > file_size) return .{ .ok = false, .message = "BAT entry points past end of file" };
+            }
+        }
+
+        return .{ .ok = true, .message = "no errors found" };
+    }
+
+    pub const Extent = struct {
+        /// Offset within the guest-visible virtual disk.
+        offset: u64,
+        length: u64,
+        allocated: bool,
+    };
+
+    pub const MapError = Io.File.ReadPositionalError || std.mem.Allocator.Error;
+
+    /// Returns the list of allocated/unallocated extents covering the whole
+    /// virtual disk (coalescing adjacent same-state blocks), analogous to
+    /// `qemu-img map`. Caller owns the returned slice. `raw` and fixed `vhd`
+    /// report a single, fully allocated extent (neither format has a sparse
+    /// concept); dynamic `vhd` walks the BAT.
+    pub fn mapExtents(self: Image, io: Io, allocator: std.mem.Allocator) MapError![]Extent {
+        if (self.dynamic) |d| {
+            var extents = std.array_list.Managed(Extent).init(allocator);
+            errdefer extents.deinit();
+
+            var index: u32 = 0;
+            while (index < d.max_table_entries) {
+                const bat_value = try readBatEntry(self.file, io, d.bat_offset, index);
+                const allocated = bat_value != unallocated_bat_entry;
+                const block_start = @as(u64, index) * d.block_size;
+
+                var run_end_index = index + 1;
+                while (run_end_index < d.max_table_entries) : (run_end_index += 1) {
+                    const next = try readBatEntry(self.file, io, d.bat_offset, run_end_index);
+                    if ((next != unallocated_bat_entry) != allocated) break;
+                }
+
+                const run_end_offset = @min(@as(u64, run_end_index) * d.block_size, self.virtual_size);
+                try extents.append(.{ .offset = block_start, .length = run_end_offset - block_start, .allocated = allocated });
+                index = run_end_index;
+            }
+            return extents.toOwnedSlice();
+        }
+
+        const single = try allocator.alloc(Extent, 1);
+        single[0] = .{ .offset = 0, .length = self.virtual_size, .allocated = true };
+        return single;
+    }
 };
+
+const unallocated_bat_entry: u32 = 0xFFFF_FFFF;
+
+fn readBatEntry(file: Io.File, io: Io, bat_offset: u64, index: u32) Io.File.ReadPositionalError!u32 {
+    var buf: [4]u8 = undefined;
+    _ = try file.readPositionalAll(io, &buf, bat_offset + @as(u64, index) * 4);
+    return std.mem.readInt(u32, &buf, .big);
+}
+
+fn writeBatEntry(file: Io.File, io: Io, bat_offset: u64, index: u32, value: u32) Io.File.WritePositionalError!void {
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &buf, value, .big);
+    try file.writePositionalAll(io, &buf, bat_offset + @as(u64, index) * 4);
+}
+
+fn fillBatUnallocated(file: Io.File, io: Io, bat_offset: u64, max_table_entries: u32) Io.File.WritePositionalError!void {
+    const bat_bytes_len: u64 = @as(u64, max_table_entries) * 4;
+    const chunk: [4096]u8 = [_]u8{0xFF} ** 4096;
+    var written: u64 = 0;
+    while (written < bat_bytes_len) {
+        const n: usize = @intCast(@min(bat_bytes_len - written, chunk.len));
+        try file.writePositionalAll(io, chunk[0..n], bat_offset + written);
+        written += n;
+    }
+}
+
+/// Scans the BAT once to determine the current end of allocated data,
+/// mirroring QEMU's `vpc_open`: starts from just past the BAT itself, then
+/// grows to cover every already-allocated block (bitmap + data).
+fn computeFreeDataBlockOffset(
+    file: Io.File,
+    io: Io,
+    bat_offset: u64,
+    max_table_entries: u32,
+    bitmap_size: u32,
+    block_size: u32,
+) Io.File.ReadPositionalError!u64 {
+    var free_offset = alignUp(bat_offset + @as(u64, max_table_entries) * 4, 512);
+
+    var buf: [4096]u8 = undefined; // 1024 BAT entries per chunk
+    var index: u32 = 0;
+    while (index < max_table_entries) {
+        const entries_this_chunk = @min(max_table_entries - index, 1024);
+        const bytes_len = entries_this_chunk * 4;
+        _ = try file.readPositionalAll(io, buf[0..bytes_len], bat_offset + @as(u64, index) * 4);
+
+        var i: u32 = 0;
+        while (i < entries_this_chunk) : (i += 1) {
+            const val = std.mem.readInt(u32, buf[i * 4 ..][0..4], .big);
+            if (val != unallocated_bat_entry) {
+                const candidate = @as(u64, val) * 512 + bitmap_size + block_size;
+                if (candidate > free_offset) free_offset = candidate;
+            }
+        }
+        index += entries_this_chunk;
+    }
+    return free_offset;
+}
+
+/// Allocates a fresh block for `block_index`: writes an all-1s sector
+/// bitmap, advances `d.free_data_block_offset` past it, rewrites the footer
+/// trailer at the new end of file, and records the BAT entry. Returns the
+/// BAT entry value (sector number of the bitmap) to use for this write.
+fn allocateBlock(file: Io.File, io: Io, d: *DynamicState, block_index: u32) (Io.File.WritePositionalError)!u32 {
+    const bitmap_offset = d.free_data_block_offset;
+    const bat_value: u32 = @intCast(bitmap_offset / 512);
+
+    const bitmap_chunk: [512]u8 = [_]u8{0xFF} ** 512;
+    var written: u64 = 0;
+    while (written < d.bitmap_size) {
+        const n: usize = @intCast(@min(@as(u64, d.bitmap_size) - written, bitmap_chunk.len));
+        try file.writePositionalAll(io, bitmap_chunk[0..n], bitmap_offset + written);
+        written += n;
+    }
+
+    d.free_data_block_offset += d.block_size + d.bitmap_size;
+    try file.writePositionalAll(io, &d.footer_template, d.free_data_block_offset);
+    try writeBatEntry(file, io, d.bat_offset, block_index, bat_value);
+
+    return bat_value;
+}
+
+fn alignUp(v: u64, a: u64) u64 {
+    return (v + a - 1) / a * a;
+}
+
+fn nowUnix(io: Io) i64 {
+    return @intCast(@divTrunc(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+}
 
 fn randomUuid(io: Io) [16]u8 {
     var bytes: [16]u8 = undefined;
@@ -130,10 +523,19 @@ fn randomUuid(io: Io) [16]u8 {
 pub const CopyError = Io.File.ReadPositionalError || Io.File.WritePositionalError ||
     std.mem.Allocator.Error || error{UnexpectedEndOfFile};
 
-/// Copies all `src` virtual-disk bytes into `dst` (which must already have
+/// Copies all `src` virtual-disk bytes into `*dst` (which must already have
 /// been created with at least `src`'s virtual size). Used by `zvmi convert`.
-pub fn copyAll(io: Io, src: Image, dst: Image, allocator: std.mem.Allocator) CopyError!void {
-    const chunk_size: usize = 4 * 1024 * 1024;
+/// Takes `dst` by pointer since dynamic-vhd writes mutate BAT/allocation
+/// state that must be visible to the caller after this returns.
+///
+/// All-zero chunks are skipped rather than written, so converting into a
+/// dynamic vhd stays sparse instead of eagerly allocating every block it
+/// touches. When `dst` is a dynamic vhd, the chunk size is aligned to its
+/// block size so each chunk maps to exactly one BAT entry -- otherwise a
+/// single mostly-zero copy chunk spanning multiple blocks would force all of
+/// them to be allocated just because one had non-zero bytes.
+pub fn copyAll(io: Io, src: Image, dst: *Image, allocator: std.mem.Allocator) CopyError!void {
+    const chunk_size: usize = if (dst.dynamic) |d| d.block_size else 4 * 1024 * 1024;
     const buf = try allocator.alloc(u8, chunk_size);
     defer allocator.free(buf);
 
@@ -143,9 +545,18 @@ pub fn copyAll(io: Io, src: Image, dst: Image, allocator: std.mem.Allocator) Cop
         const n: usize = @intCast(@min(remaining, chunk_size));
         const got = try src.pread(io, buf[0..n], offset);
         if (got != n) return error.UnexpectedEndOfFile;
-        try dst.pwrite(io, buf[0..n], offset);
+        if (!isAllZero(buf[0..n])) {
+            try dst.pwrite(io, buf[0..n], offset);
+        }
         offset += n;
     }
+}
+
+fn isAllZero(buf: []const u8) bool {
+    for (buf) |b| {
+        if (b != 0) return false;
+    }
+    return true;
 }
 
 test "create raw image, then open and read back zeros" {
@@ -153,7 +564,7 @@ test "create raw image, then open and read back zeros" {
     const path = "test-create-raw.img";
     defer Io.Dir.cwd().deleteFile(io, path) catch {};
 
-    var img = try Image.create(io, path, .raw, 1024 * 1024);
+    var img = try Image.create(io, path, .raw, 1024 * 1024, .{});
     img.close(io);
 
     var opened = try Image.openPath(io, path);
@@ -172,7 +583,7 @@ test "create fixed vhd image, then open and recover virtual size" {
     defer Io.Dir.cwd().deleteFile(io, path) catch {};
 
     const size: u64 = 8 * 1024 * 1024;
-    var img = try Image.create(io, path, .vhd, size);
+    var img = try Image.create(io, path, .vhd, size, .{ .vhd_subformat = .fixed });
     try img.pwrite(io, "hello", 0);
     img.close(io);
 
@@ -197,11 +608,11 @@ test "convert raw to fixed vhd round-trips data" {
     defer Io.Dir.cwd().deleteFile(io, dst_path) catch {};
 
     const size: u64 = 2 * 1024 * 1024;
-    var src = try Image.create(io, src_path, .raw, size);
+    var src = try Image.create(io, src_path, .raw, size, .{});
     try src.pwrite(io, "some payload bytes", 4096);
 
-    var dst = try Image.create(io, dst_path, .vhd, size);
-    try copyAll(io, src, dst, std.testing.allocator);
+    var dst = try Image.create(io, dst_path, .vhd, size, .{ .vhd_subformat = .fixed });
+    try copyAll(io, src, &dst, std.testing.allocator);
     src.close(io);
     dst.close(io);
 
@@ -210,4 +621,177 @@ test "convert raw to fixed vhd round-trips data" {
     var buf: [18]u8 = undefined;
     _ = try reopened.pread(io, &buf, 4096);
     try std.testing.expectEqualSlices(u8, "some payload bytes", &buf);
+}
+
+test "convert raw to dynamic vhd stays sparse for zero regions" {
+    const io = std.testing.io;
+    const src_path = "test-convert-sparse-src.img";
+    const dst_path = "test-convert-sparse-dst.vhd";
+    defer Io.Dir.cwd().deleteFile(io, src_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, dst_path) catch {};
+
+    // 4 blocks' worth of raw, all zero except a few bytes in block 1.
+    const size: u64 = 4 * @as(u64, vhd.default_block_size);
+    var src = try Image.create(io, src_path, .raw, size, .{});
+    try src.pwrite(io, "only-block-1", vhd.default_block_size + 123);
+
+    var dst = try Image.create(io, dst_path, .vhd, size, .{ .vhd_subformat = .dynamic });
+    try copyAll(io, src, &dst, std.testing.allocator);
+    src.close(io);
+
+    const extents = try dst.mapExtents(io, std.testing.allocator);
+    defer std.testing.allocator.free(extents);
+    dst.close(io);
+
+    // Only the block actually touched should be allocated; the rest of the
+    // 4-block disk should stay sparse.
+    try std.testing.expectEqual(@as(usize, 3), extents.len);
+    try std.testing.expectEqual(false, extents[0].allocated);
+    try std.testing.expectEqual(true, extents[1].allocated);
+    try std.testing.expectEqual(@as(u64, vhd.default_block_size), extents[1].offset);
+    try std.testing.expectEqual(@as(u64, vhd.default_block_size), extents[1].length);
+    try std.testing.expectEqual(false, extents[2].allocated);
+}
+
+test "create dynamic vhd, write across blocks, reopen and read back" {
+    const io = std.testing.io;
+    const path = "test-create-dynamic.vhd";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    // 3 blocks' worth so we exercise multiple BAT entries.
+    const size: u64 = 3 * @as(u64, vhd.default_block_size);
+    var img = try Image.create(io, path, .vhd, size, .{ .vhd_subformat = .dynamic });
+    try std.testing.expect(img.dynamic != null);
+
+    // Write into the 2nd block only -- the 1st and 3rd should stay unallocated.
+    const payload = "dynamic-vhd-payload";
+    try img.pwrite(io, payload, vhd.default_block_size + 4096);
+    img.close(io);
+
+    var opened = try Image.openPath(io, path);
+    defer opened.close(io);
+    try std.testing.expectEqual(Format.vhd, opened.format);
+    try std.testing.expectEqual(size, opened.virtual_size);
+    try std.testing.expect(opened.dynamic != null);
+
+    var buf: [payload.len]u8 = undefined;
+    _ = try opened.pread(io, &buf, vhd.default_block_size + 4096);
+    try std.testing.expectEqualSlices(u8, payload, &buf);
+
+    // Reading from an untouched region returns zeros (sparse).
+    var zero_buf: [64]u8 = undefined;
+    _ = try opened.pread(io, &zero_buf, 0);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 64), &zero_buf);
+
+    // The file on disk should be much smaller than the virtual size, since
+    // only one block was ever allocated.
+    const stat = try opened.info(io);
+    try std.testing.expect(stat.file_size < size);
+}
+
+test "dynamic vhd map reports sparse extents" {
+    const io = std.testing.io;
+    const path = "test-map-dynamic.vhd";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const size: u64 = 3 * @as(u64, vhd.default_block_size);
+    var img = try Image.create(io, path, .vhd, size, .{ .vhd_subformat = .dynamic });
+    try img.pwrite(io, "x", vhd.default_block_size);
+
+    const extents = try img.mapExtents(io, std.testing.allocator);
+    defer std.testing.allocator.free(extents);
+    img.close(io);
+
+    try std.testing.expectEqual(@as(usize, 3), extents.len);
+    try std.testing.expectEqual(false, extents[0].allocated);
+    try std.testing.expectEqual(true, extents[1].allocated);
+    try std.testing.expectEqual(false, extents[2].allocated);
+    try std.testing.expectEqual(@as(u64, vhd.default_block_size), extents[1].offset);
+}
+
+test "raw and fixed vhd map report a single allocated extent" {
+    const io = std.testing.io;
+    const raw_path = "test-map-raw.img";
+    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+
+    var img = try Image.create(io, raw_path, .raw, 4096, .{});
+    const extents = try img.mapExtents(io, std.testing.allocator);
+    defer std.testing.allocator.free(extents);
+    img.close(io);
+
+    try std.testing.expectEqual(@as(usize, 1), extents.len);
+    try std.testing.expectEqual(true, extents[0].allocated);
+    try std.testing.expectEqual(@as(u64, 4096), extents[0].length);
+}
+
+test "check reports ok for freshly created images" {
+    const io = std.testing.io;
+
+    {
+        const path = "test-check-fixed.vhd";
+        defer Io.Dir.cwd().deleteFile(io, path) catch {};
+        var img = try Image.create(io, path, .vhd, 1024 * 1024, .{ .vhd_subformat = .fixed });
+        defer img.close(io);
+        const result = try img.check(io);
+        try std.testing.expect(result.ok);
+    }
+    {
+        const path = "test-check-dynamic.vhd";
+        defer Io.Dir.cwd().deleteFile(io, path) catch {};
+        var img = try Image.create(io, path, .vhd, 4 * 1024 * 1024, .{ .vhd_subformat = .dynamic });
+        try img.pwrite(io, "abc", 0);
+        defer img.close(io);
+        const result = try img.check(io);
+        try std.testing.expect(result.ok);
+    }
+}
+
+test "check detects a corrupted footer" {
+    const io = std.testing.io;
+    const path = "test-check-corrupt.vhd";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var img = try Image.create(io, path, .vhd, 1024 * 1024, .{ .vhd_subformat = .fixed });
+    defer img.close(io);
+
+    // Corrupt a reserved footer byte in place.
+    var one: [1]u8 = .{0xFF};
+    try img.file.writePositionalAll(io, &one, img.virtual_size + 100);
+
+    const result = try img.check(io);
+    try std.testing.expect(!result.ok);
+}
+
+test "resize grows raw and fixed vhd images" {
+    const io = std.testing.io;
+    {
+        const path = "test-resize-raw.img";
+        defer Io.Dir.cwd().deleteFile(io, path) catch {};
+        var img = try Image.create(io, path, .raw, 1024, .{});
+        defer img.close(io);
+        try img.resize(io, 4096);
+        try std.testing.expectEqual(@as(u64, 4096), img.virtual_size);
+        try std.testing.expectEqual(@as(u64, 4096), (try img.info(io)).file_size);
+    }
+    {
+        const path = "test-resize-fixed.vhd";
+        defer Io.Dir.cwd().deleteFile(io, path) catch {};
+        var img = try Image.create(io, path, .vhd, 1024 * 1024, .{ .vhd_subformat = .fixed });
+        defer img.close(io);
+        try img.resize(io, 2 * 1024 * 1024);
+        try std.testing.expectEqual(@as(u64, 2 * 1024 * 1024), img.virtual_size);
+
+        var reopened = try Image.openPath(io, path);
+        defer reopened.close(io);
+        try std.testing.expectEqual(@as(u64, 2 * 1024 * 1024), reopened.virtual_size);
+    }
+}
+
+test "resize rejects shrinking" {
+    const io = std.testing.io;
+    const path = "test-resize-shrink.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var img = try Image.create(io, path, .raw, 4096, .{});
+    defer img.close(io);
+    try std.testing.expectError(error.ShrinkNotSupported, img.resize(io, 1024));
 }

@@ -16,6 +16,8 @@ const size_mod = @import("size.zig");
 pub const Format = image_mod.Format;
 pub const Image = image_mod.Image;
 pub const Info = image_mod.Info;
+pub const CreateOptions = image_mod.CreateOptions;
+pub const VhdSubformat = image_mod.VhdSubformat;
 pub const copyAll = image_mod.copyAll;
 
 pub const parseSize = size_mod.parseSize;

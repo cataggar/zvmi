@@ -120,12 +120,28 @@ pub const Footer = struct {
         };
     }
 
+    /// `header_offset` is where the dynamic disk header (immediately
+    /// followed by the BAT) lives -- always `footer_size` (512) for images
+    /// we create ourselves.
+    pub fn forDynamicDisk(size: u64, header_offset: u64, unique_id: [16]u8, now_unix: i64) Footer {
+        const total_sectors = size / 512;
+        return .{
+            .data_offset = header_offset,
+            .timestamp = @intCast(@max(0, now_unix - timestamp_base)),
+            .original_size = size,
+            .current_size = size,
+            .geometry = calculateGeometry(total_sectors),
+            .disk_type = .dynamic,
+            .unique_id = unique_id,
+        };
+    }
+
     /// Serializes to the on-disk, big-endian, 512-byte footer, with the
     /// checksum field computed and filled in.
     pub fn encode(self: Footer) [footer_size]u8 {
         var buf: [footer_size]u8 = [_]u8{0} ** footer_size;
 
-        var w = FixedWriter{ .buf = &buf };
+        var w = ByteWriter{ .buf = &buf };
         w.bytes(&cookie_conectix);
         w.putU32(self.features);
         w.putU32(self.file_format_version);
@@ -163,7 +179,7 @@ pub const Footer = struct {
         const expected_checksum = std.mem.readInt(u32, buf[64..68], .big);
         if (computeChecksum(&checked) != expected_checksum) return error.BadChecksum;
 
-        var r = FixedReader{ .buf = buf };
+        var r = ByteReader{ .buf = buf };
         r.skip(8); // cookie
         const features = r.getU32();
         const file_format_version = r.getU32();
@@ -200,69 +216,168 @@ pub const Footer = struct {
     }
 };
 
+pub const dynamic_header_size: usize = 1024;
+pub const cookie_cxsparse: [8]u8 = "cxsparse".*;
+
+/// 2 MiB, matching QEMU's `create_dynamic_disk` (the de-facto standard
+/// block size for VHD; must be a power of two).
+pub const default_block_size: u32 = 0x0020_0000;
+
+/// Size in bytes of the per-block sector-allocation bitmap that precedes
+/// each data block: 1 bit per 512-byte sector in the block, rounded up to
+/// a 512-byte boundary. Matches QEMU's `vpc_open`:
+/// `bitmap_size = ((block_size / (8 * 512)) + 511) & ~511`.
+pub fn bitmapSize(block_size: u32) u32 {
+    const raw = block_size / (8 * 512);
+    return (raw + 511) & ~@as(u32, 511);
+}
+
+/// The "cxsparse" Dynamic Disk Header that immediately follows the footer
+/// in a dynamic VHD (at the footer's `data_offset`), followed immediately
+/// by the Block Allocation Table (BAT) at `table_offset`. Only the fields
+/// needed for a non-differencing dynamic disk (no backing/parent file) are
+/// modeled; the parent-locator region is always zero-filled.
+pub const DynamicHeader = struct {
+    /// Per spec this should be 0xFFFFFFFF in the low 32 bits (0xFFFFFFFF____),
+    /// but QEMU's comment notes "the spec is actually wrong here... MS tools
+    /// expect all 64 bits to be set" -- we follow QEMU/MS tools, not the
+    /// literal spec text, since that's what's actually interoperable.
+    data_offset: u64 = 0xFFFF_FFFF_FFFF_FFFF,
+    table_offset: u64,
+    header_version: u32 = 0x0001_0000,
+    max_table_entries: u32,
+    block_size: u32 = default_block_size,
+    parent_unique_id: [16]u8 = [_]u8{0} ** 16,
+    parent_timestamp: u32 = 0,
+    parent_unicode_name: [512]u8 = [_]u8{0} ** 512,
+
+    pub fn encode(self: DynamicHeader) [dynamic_header_size]u8 {
+        var buf: [dynamic_header_size]u8 = [_]u8{0} ** dynamic_header_size;
+
+        var w = ByteWriter{ .buf = &buf };
+        w.bytes(&cookie_cxsparse);
+        w.putU64(self.data_offset);
+        w.putU64(self.table_offset);
+        w.putU32(self.header_version);
+        w.putU32(self.max_table_entries);
+        w.putU32(self.block_size);
+        w.putU32(0); // checksum placeholder, filled below
+        w.bytes(&self.parent_unique_id);
+        w.putU32(self.parent_timestamp);
+        w.putU32(0); // reserved
+        w.bytes(&self.parent_unicode_name);
+        // parent_locator[8] (192 bytes) + reserved2 (256 bytes) stay zero:
+        // this is a non-differencing disk with no backing/parent file.
+
+        const checksum = computeChecksum(&buf);
+        std.mem.writeInt(u32, buf[36..40], checksum, .big);
+        return buf;
+    }
+
+    pub const DecodeError = error{
+        BadCookie,
+        BadChecksum,
+    };
+
+    pub fn decode(buf: *const [dynamic_header_size]u8) DecodeError!DynamicHeader {
+        if (!std.mem.eql(u8, buf[0..8], &cookie_cxsparse)) return error.BadCookie;
+
+        var checked = buf.*;
+        checked[36..40].* = .{ 0, 0, 0, 0 };
+        const expected_checksum = std.mem.readInt(u32, buf[36..40], .big);
+        if (computeChecksum(&checked) != expected_checksum) return error.BadChecksum;
+
+        var r = ByteReader{ .buf = buf };
+        r.skip(8); // cookie
+        const data_offset = r.getU64();
+        const table_offset = r.getU64();
+        const header_version = r.getU32();
+        const max_table_entries = r.getU32();
+        const block_size = r.getU32();
+        r.skip(4); // checksum
+        const parent_unique_id = r.bytes(16).*;
+        const parent_timestamp = r.getU32();
+        r.skip(4); // reserved
+        const parent_unicode_name = r.bytes(512).*;
+
+        return .{
+            .data_offset = data_offset,
+            .table_offset = table_offset,
+            .header_version = header_version,
+            .max_table_entries = max_table_entries,
+            .block_size = block_size,
+            .parent_unique_id = parent_unique_id,
+            .parent_timestamp = parent_timestamp,
+            .parent_unicode_name = parent_unicode_name,
+        };
+    }
+};
+
 /// "One's complement of the sum of all the bytes in the footer without the
 /// checksum field" (spec wording; matches QEMU's `vpc_checksum`). The
-/// checksum field itself must be zeroed in `buf` before calling this.
-fn computeChecksum(buf: *const [footer_size]u8) u32 {
+/// checksum field itself must be zeroed in `buf` before calling this. Used
+/// for both the 512-byte footer and the 1024-byte dynamic disk header (both
+/// use the identical algorithm per spec).
+fn computeChecksum(buf: []const u8) u32 {
     var sum: u32 = 0;
     for (buf) |b| sum +%= b;
     return ~sum;
 }
 
-const FixedWriter = struct {
-    buf: *[footer_size]u8,
+const ByteWriter = struct {
+    buf: []u8,
     pos: usize = 0,
 
-    fn bytes(self: *FixedWriter, b: []const u8) void {
+    fn bytes(self: *ByteWriter, b: []const u8) void {
         @memcpy(self.buf[self.pos..][0..b.len], b);
         self.pos += b.len;
     }
-    fn putU8(self: *FixedWriter, v: u8) void {
+    fn putU8(self: *ByteWriter, v: u8) void {
         self.buf[self.pos] = v;
         self.pos += 1;
     }
-    fn putU16(self: *FixedWriter, v: u16) void {
+    fn putU16(self: *ByteWriter, v: u16) void {
         std.mem.writeInt(u16, self.buf[self.pos..][0..2], v, .big);
         self.pos += 2;
     }
-    fn putU32(self: *FixedWriter, v: u32) void {
+    fn putU32(self: *ByteWriter, v: u32) void {
         std.mem.writeInt(u32, self.buf[self.pos..][0..4], v, .big);
         self.pos += 4;
     }
-    fn putU64(self: *FixedWriter, v: u64) void {
+    fn putU64(self: *ByteWriter, v: u64) void {
         std.mem.writeInt(u64, self.buf[self.pos..][0..8], v, .big);
         self.pos += 8;
     }
 };
 
-const FixedReader = struct {
-    buf: *const [footer_size]u8,
+const ByteReader = struct {
+    buf: []const u8,
     pos: usize = 0,
 
-    fn skip(self: *FixedReader, n: usize) void {
+    fn skip(self: *ByteReader, n: usize) void {
         self.pos += n;
     }
-    fn bytes(self: *FixedReader, comptime n: usize) *const [n]u8 {
+    fn bytes(self: *ByteReader, comptime n: usize) *const [n]u8 {
         const s = self.buf[self.pos..][0..n];
         self.pos += n;
         return s;
     }
-    fn getU8(self: *FixedReader) u8 {
+    fn getU8(self: *ByteReader) u8 {
         const v = self.buf[self.pos];
         self.pos += 1;
         return v;
     }
-    fn getU16(self: *FixedReader) u16 {
+    fn getU16(self: *ByteReader) u16 {
         const v = std.mem.readInt(u16, self.buf[self.pos..][0..2], .big);
         self.pos += 2;
         return v;
     }
-    fn getU32(self: *FixedReader) u32 {
+    fn getU32(self: *ByteReader) u32 {
         const v = std.mem.readInt(u32, self.buf[self.pos..][0..4], .big);
         self.pos += 4;
         return v;
     }
-    fn getU64(self: *FixedReader) u64 {
+    fn getU64(self: *ByteReader) u64 {
         const v = std.mem.readInt(u64, self.buf[self.pos..][0..8], .big);
         self.pos += 8;
         return v;
@@ -303,4 +418,45 @@ test "Footer.decode rejects corrupted checksum" {
     var encoded = footer.encode();
     encoded[100] ^= 0xFF; // corrupt a reserved byte
     try std.testing.expectError(error.BadChecksum, Footer.decode(&encoded));
+}
+
+test "bitmapSize matches known QEMU value for the default 2 MiB block size" {
+    // 2 MiB block / 512-byte sectors = 4096 sectors -> 4096 bits = 512 bytes,
+    // already 512-aligned. Matches QEMU's vpc_open computation exactly.
+    try std.testing.expectEqual(@as(u32, 512), bitmapSize(default_block_size));
+}
+
+test "DynamicHeader encode/decode round-trip" {
+    const header = DynamicHeader{
+        .table_offset = footer_size + dynamic_header_size,
+        .max_table_entries = 1234,
+        .block_size = default_block_size,
+    };
+    const encoded = header.encode();
+
+    try std.testing.expectEqualSlices(u8, &cookie_cxsparse, encoded[0..8]);
+
+    const decoded = try DynamicHeader.decode(&encoded);
+    try std.testing.expectEqual(header.table_offset, decoded.table_offset);
+    try std.testing.expectEqual(header.max_table_entries, decoded.max_table_entries);
+    try std.testing.expectEqual(header.block_size, decoded.block_size);
+    try std.testing.expectEqual(@as(u64, 0xFFFF_FFFF_FFFF_FFFF), decoded.data_offset);
+}
+
+test "DynamicHeader.decode rejects bad cookie" {
+    var buf = [_]u8{0} ** dynamic_header_size;
+    try std.testing.expectError(error.BadCookie, DynamicHeader.decode(&buf));
+}
+
+test "DynamicHeader.decode rejects corrupted checksum" {
+    const header = DynamicHeader{ .table_offset = 1536, .max_table_entries = 4 };
+    var encoded = header.encode();
+    encoded[900] ^= 0xFF; // corrupt a reserved byte
+    try std.testing.expectError(error.BadChecksum, DynamicHeader.decode(&encoded));
+}
+
+test "Footer.forDynamicDisk points data_offset at the dynamic header" {
+    const footer = Footer.forDynamicDisk(4 * 1024 * 1024, footer_size, [_]u8{2} ** 16, timestamp_base);
+    try std.testing.expectEqual(DiskType.dynamic, footer.disk_type);
+    try std.testing.expectEqual(@as(u64, footer_size), footer.data_offset);
 }
