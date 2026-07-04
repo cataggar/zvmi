@@ -11,16 +11,21 @@
 //! Scope / limitations:
 //!  - Backing-file chains are resolved for reads (via `openAtPath()` or
 //!    `Image.openPath()` so relative paths can be resolved against the qcow2
-//!    file's directory), but writes still target only the active image.
-//!  - Deflate-compressed clusters are supported for reads; zstd-compressed
-//!    clusters remain unsupported (`error.UnsupportedCompressionType`).
-//!  - Internal snapshots can be enumerated with `listSnapshots()` and switched
-//!    for reads with `openSnapshot()`. Writes/resizes still reject snapshot
-//!    images instead of attempting copy-on-write.
+//!    file's directory), and writes copy backing-visible cluster contents into
+//!    newly allocated active clusters before applying guest changes.
+//!  - Deflate-compressed clusters are supported for reads, and writes to
+//!    existing compressed clusters transparently inflate them into standard
+//!    data clusters. Emitting new compressed clusters is still deferred;
+//!    zstd-compressed clusters remain unsupported
+//!    (`error.UnsupportedCompressionType`).
+//!  - Internal snapshots can be enumerated with `listSnapshots()`, switched
+//!    for reads with `openSnapshot()`, and created with `createSnapshot()`.
+//!    Active-image writes/resizes honor snapshot refcounts with copy-on-write;
+//!    `openSnapshot()` views remain read-only.
 //!  - Encryption is detected and rejected (`error.EncryptionNotSupported`).
 //!  - Extended L2 entries and external data files are supported for reads.
-//!    Writes/resizes still reject them until qcow2 write support grows the
-//!    corresponding metadata handling.
+//!    Writes/resizes/snapshot creation still reject them until qcow2 write
+//!    support grows the corresponding metadata handling.
 //!  - qcow2 creation always writes a version 3 header with 64 KiB clusters,
 //!    an empty L1 table, and fully provisioned refcount metadata for the
 //!    current virtual size.
@@ -115,6 +120,7 @@ pub const PwriteError = LookupError || error{
     ImageMarkedDirty,
     ImageMarkedCorrupt,
     SnapshotsNotSupported,
+    SnapshotViewNotWritable,
     ExternalDataFileNotSupported,
     ExtendedL2NotSupported,
     SharedL2TableNotSupported,
@@ -123,13 +129,15 @@ pub const PwriteError = LookupError || error{
     WritePastEndOfImage,
     MissingRefcountBlock,
     RefcountTableTooSmall,
-} || Io.File.ReadPositionalError || Io.File.WritePositionalError || Io.File.SetLengthError;
+    InvalidCompressedCluster,
+} || std.mem.Allocator.Error || Io.File.OpenError || Io.File.ReadPositionalError || Io.File.WritePositionalError || Io.File.SetLengthError;
 
 pub const ResizeError = error{
     ShrinkNotSupported,
     ImageMarkedDirty,
     ImageMarkedCorrupt,
     SnapshotsNotSupported,
+    SnapshotViewNotWritable,
     ExternalDataFileNotSupported,
     ExtendedL2NotSupported,
     UnsupportedRefcountOrderForWrite,
@@ -154,6 +162,7 @@ pub const Info = struct {
     cluster_size: u64,
     l1_size: u32,
     l1_table_offset: u64,
+    active_l1_table_offset: u64,
     l2_entries: u64,
     refcount_table_offset: u64,
     refcount_table_clusters: u32,
@@ -167,7 +176,6 @@ pub const Info = struct {
     incompatible_features: u64,
     crypt_method: u32,
     compression_type: u8,
-    /// Internal snapshots remain unsupported for writes/resizes.
     snapshot_count: u32,
     snapshots_offset: u64,
     source_path_len: u16 = 0,
@@ -213,6 +221,32 @@ pub const ListSnapshotsError = std.mem.Allocator.Error || Io.File.ReadPositional
     SnapshotTablePastEndOfFile,
     InvalidSnapshotEntry,
 };
+
+pub const SnapshotCreateOptions = struct {
+    id: []const u8,
+    name: []const u8,
+    timestamp_seconds: u32 = 0,
+    timestamp_nanoseconds: u32 = 0,
+    vm_clock_nanoseconds: u64 = 0,
+    vm_state_size: u64 = 0,
+    icount: i64 = -1,
+};
+
+pub const CreateSnapshotError = LookupError || error{
+    ImageMarkedDirty,
+    ImageMarkedCorrupt,
+    SnapshotsNotSupported,
+    SnapshotViewNotWritable,
+    ExternalDataFileNotSupported,
+    ExtendedL2NotSupported,
+    UnsupportedRefcountOrderForWrite,
+    MissingRefcountBlock,
+    RefcountTableTooSmall,
+    SnapshotIdTooLong,
+    SnapshotNameTooLong,
+    SnapshotTablePastEndOfFile,
+    InvalidSnapshotEntry,
+} || std.mem.Allocator.Error || Io.File.ReadPositionalError || Io.File.WritePositionalError || Io.File.SetLengthError;
 
 const max_backing_chain_depth: u8 = 8;
 
@@ -451,6 +485,7 @@ pub fn create(io: Io, file: Io.File, size: u64) CreateError!Info {
         .cluster_size = layout.cluster_size,
         .l1_size = layout.l1_size,
         .l1_table_offset = l1_table_offset,
+        .active_l1_table_offset = l1_table_offset,
         .l2_entries = layout.l2_entries,
         .refcount_table_offset = refcount_table_offset,
         .refcount_table_clusters = layout.refcount_table_clusters,
@@ -572,9 +607,9 @@ fn readCompressedClusterChunk(
 }
 
 /// Writes guest-visible bytes, allocating qcow2 L2/data clusters on demand.
-/// Snapshots/shared clusters are intentionally not supported: writes fail with
-/// `error.SnapshotsNotSupported`, `error.SharedL2TableNotSupported`, or
-/// `error.SharedClusterNotSupported` instead of attempting copy-on-write.
+/// Writes into backing-file regions, compressed clusters, and snapshot-shared
+/// metadata/data all transparently allocate a private active-image copy before
+/// the caller's bytes are applied.
 pub fn pwrite(file: Io.File, io: Io, info: *Info, buffer: []const u8, offset: u64) PwriteError!void {
     try ensureWritableImage(info.*);
     const write_end = std.math.add(u64, offset, buffer.len) catch return error.WritePastEndOfImage;
@@ -598,7 +633,7 @@ pub fn pwrite(file: Io.File, io: Io, info: *Info, buffer: []const u8, offset: u6
 
         const l2_table_offset = try ensureL2TableWritable(file, io, info, guest_cluster_index);
         const l2_index = guest_cluster_index % info.l2_entries;
-        const host_cluster_offset = try ensureDataClusterWritable(file, io, info, l2_table_offset, l2_index);
+        const host_cluster_offset = try ensureDataClusterWritable(file, io, info, guest_cluster_index, l2_table_offset, l2_index);
         try file.writePositionalAll(io, buffer[src..][0..chunk], host_cluster_offset + in_cluster_offset);
 
         src += chunk;
@@ -983,6 +1018,7 @@ fn infoFromParsed(parsed: ParsedLayer) Info {
         .cluster_size = parsed.info.cluster_size,
         .l1_size = parsed.info.l1_size,
         .l1_table_offset = parsed.info.l1_table_offset,
+        .active_l1_table_offset = parsed.info.l1_table_offset,
         .l2_entries = parsed.info.l2_entries,
         .refcount_table_offset = parsed.info.refcount_table_offset,
         .refcount_table_clusters = parsed.info.refcount_table_clusters,
@@ -1224,20 +1260,137 @@ pub fn listSnapshots(file: Io.File, io: Io, info: Info, allocator: std.mem.Alloc
     return snapshots.toOwnedSlice();
 }
 
+fn snapshotTableByteLen(file: Io.File, io: Io, info: Info) ListSnapshotsError!u64 {
+    if (info.snapshot_count == 0) return 0;
+    if (info.snapshots_offset == 0 or info.snapshots_offset >= info.file_size) return error.SnapshotTablePastEndOfFile;
+
+    var cursor = info.snapshots_offset;
+    var index: u32 = 0;
+    while (index < info.snapshot_count) : (index += 1) {
+        if (cursor + 40 > info.file_size) return error.SnapshotTablePastEndOfFile;
+
+        var entry_header: [40]u8 = undefined;
+        _ = try file.readPositionalAll(io, &entry_header, cursor);
+
+        const id_len = std.mem.readInt(u16, entry_header[12..14], .big);
+        const name_len = std.mem.readInt(u16, entry_header[14..16], .big);
+        const extra_data_size = std.mem.readInt(u32, entry_header[36..40], .big);
+
+        const raw_entry_size = std.math.add(u64, 40, extra_data_size) catch return error.InvalidSnapshotEntry;
+        const with_id = std.math.add(u64, raw_entry_size, id_len) catch return error.InvalidSnapshotEntry;
+        const entry_size = std.math.add(u64, with_id, name_len) catch return error.InvalidSnapshotEntry;
+        const padded_entry_size = std.mem.alignForward(u64, entry_size, 8);
+        const entry_end = std.math.add(u64, cursor, padded_entry_size) catch return error.InvalidSnapshotEntry;
+        if (entry_end > info.file_size) return error.SnapshotTablePastEndOfFile;
+        cursor = entry_end;
+    }
+
+    return cursor - info.snapshots_offset;
+}
+
+fn snapshotTableClusterCount(info: Info, byte_len: u64) u32 {
+    if (byte_len == 0) return 0;
+    return tableClusterCount(byte_len, info.cluster_size);
+}
+
+pub fn createSnapshot(file: Io.File, io: Io, info: *Info, options: SnapshotCreateOptions) CreateSnapshotError!void {
+    try ensureWritableImage(info.*);
+    if (options.id.len > std.math.maxInt(u16)) return error.SnapshotIdTooLong;
+    if (options.name.len > std.math.maxInt(u16)) return error.SnapshotNameTooLong;
+
+    var dirty_marked = false;
+    var ok = false;
+    if (info.version >= 3) {
+        try setDirtyState(file, io, info, true);
+        dirty_marked = true;
+    }
+    defer if (dirty_marked and ok) setDirtyState(file, io, info, false) catch {};
+
+    const l1_clusters = tableClusterCount(@as(u64, info.l1_size) * 8, info.cluster_size);
+    const snapshot_l1_offset = try allocateContiguousMetadataClustersAtEnd(file, io, info, l1_clusters);
+    try copyRange(file, io, info.l1_table_offset, snapshot_l1_offset, @as(u64, info.l1_size) * 8);
+
+    try incrementReferencedClustersForL1(file, io, info.*, snapshot_l1_offset, info.l1_size);
+
+    const old_table_bytes_len = try snapshotTableByteLen(file, io, info.*);
+    const old_table = try std.heap.page_allocator.alloc(u8, @intCast(old_table_bytes_len));
+    defer std.heap.page_allocator.free(old_table);
+    if (old_table_bytes_len != 0) {
+        _ = try file.readPositionalAll(io, old_table, info.snapshots_offset);
+    }
+
+    var snapshot_bytes = std.array_list.Managed(u8).init(std.heap.page_allocator);
+    defer snapshot_bytes.deinit();
+    if (old_table_bytes_len != 0) try snapshot_bytes.appendSlice(old_table);
+    try appendSnapshotEntry(&snapshot_bytes, .{
+        .l1_table_offset = snapshot_l1_offset,
+        .id = options.id,
+        .name = options.name,
+        .timestamp_seconds = options.timestamp_seconds,
+        .timestamp_nanoseconds = options.timestamp_nanoseconds,
+        .vm_clock_nanoseconds = options.vm_clock_nanoseconds,
+        .vm_state_size = options.vm_state_size,
+        .virtual_size = info.virtual_size,
+        .icount = options.icount,
+    });
+
+    const old_snapshot_table_offset = info.snapshots_offset;
+    const old_snapshot_table_clusters = snapshotTableClusterCount(info.*, old_table_bytes_len);
+
+    const new_snapshot_table_clusters = tableClusterCount(snapshot_bytes.items.len, info.cluster_size);
+    const new_snapshot_table_offset = try allocateContiguousMetadataClustersAtEnd(file, io, info, new_snapshot_table_clusters);
+    try file.writePositionalAll(io, snapshot_bytes.items, new_snapshot_table_offset);
+
+    try writeHeaderU32Field(file, io, 60, info.snapshot_count + 1);
+    try writeHeaderU64Field(file, io, 64, new_snapshot_table_offset);
+    info.snapshot_count += 1;
+    info.snapshots_offset = new_snapshot_table_offset;
+
+    if (old_snapshot_table_clusters != 0 and isAligned(old_snapshot_table_offset, info.cluster_size) and old_snapshot_table_offset >= info.cluster_size) {
+        try setClusterRangeRefcount(file, io, info.*, old_snapshot_table_offset / info.cluster_size, old_snapshot_table_clusters, 0);
+    }
+
+    ok = true;
+}
+
 fn ensureWritableImage(info: Info) error{
     ImageMarkedDirty,
     ImageMarkedCorrupt,
     SnapshotsNotSupported,
+    SnapshotViewNotWritable,
     ExternalDataFileNotSupported,
     ExtendedL2NotSupported,
     UnsupportedRefcountOrderForWrite,
 }!void {
     if (info.incompatible_features & incompatible_dirty != 0) return error.ImageMarkedDirty;
     if (info.incompatible_features & incompatible_corrupt != 0) return error.ImageMarkedCorrupt;
-    if (info.snapshot_count != 0) return error.SnapshotsNotSupported;
+    if (info.l1_table_offset != info.active_l1_table_offset) return error.SnapshotViewNotWritable;
     if (info.data_file_len != 0) return error.ExternalDataFileNotSupported;
     if (isExtendedL2(info)) return error.ExtendedL2NotSupported;
     if (info.refcount_order != default_refcount_order) return error.UnsupportedRefcountOrderForWrite;
+}
+
+fn incrementReferencedClustersForL1(file: Io.File, io: Io, info: Info, l1_table_offset: u64, l1_size: u32) CreateSnapshotError!void {
+    const guest_clusters = divCeil(info.virtual_size, info.cluster_size);
+    var l1_index: u64 = 0;
+    while (l1_index < l1_size) : (l1_index += 1) {
+        const l2_table_entry = try readU64(file, io, l1_table_offset + l1_index * 8);
+        const l2_table_offset = l2_table_entry & host_offset_mask;
+        if (l2_table_offset == 0) continue;
+        if (!isAligned(l2_table_offset, info.cluster_size) or l2_table_offset < info.cluster_size or l2_table_offset + info.cluster_size > info.file_size) {
+            return error.InvalidL1Entry;
+        }
+        try adjustRefcountAtOffset(file, io, info, l2_table_offset, 1);
+
+        var l2_index: u64 = 0;
+        while (l2_index < info.l2_entries) : (l2_index += 1) {
+            const guest_cluster_index = l1_index * info.l2_entries + l2_index;
+            if (guest_cluster_index >= guest_clusters) break;
+            const l2_entry_offset = l2_table_offset + l2_index * l2EntrySizeBytes(info.incompatible_features);
+            const l2_entry = try readU64(file, io, l2_entry_offset);
+            try adjustL2EntryRefcounts(file, io, info, guest_cluster_index, l2_entry, 1);
+        }
+    }
 }
 
 fn setDirtyState(file: Io.File, io: Io, info: *Info, dirty: bool) Io.File.WritePositionalError!void {
@@ -1280,30 +1433,46 @@ fn ensureL2TableWritable(file: Io.File, io: Io, info: *Info, guest_cluster_index
     }
 
     const refcount = try readRefcountAtOffset(file, io, info.*, l2_table_offset);
-    if (refcount != 1) return error.SharedL2TableNotSupported;
+    if (refcount != 1) {
+        const new_table_offset = try allocateCluster(file, io, info);
+        try copyRange(file, io, l2_table_offset, new_table_offset, info.cluster_size);
+        try adjustRefcountAtOffset(file, io, info.*, l2_table_offset, -1);
+        try writeU64(file, io, l1_entry_offset, new_table_offset | copied_mask);
+        return new_table_offset;
+    }
     if ((l1_entry & copied_mask) == 0) {
         try writeU64(file, io, l1_entry_offset, l2_table_offset | copied_mask);
     }
     return l2_table_offset;
 }
 
-fn ensureDataClusterWritable(file: Io.File, io: Io, info: *Info, l2_table_offset: u64, l2_index: u64) PwriteError!u64 {
+fn replaceClusterWithCOWCopy(file: Io.File, io: Io, info: *Info, guest_cluster_index: u64, entry_offset: u64, old_l2_entry: u64) PwriteError!u64 {
+    const new_cluster_offset = try allocateCluster(file, io, info);
+    try copyGuestVisibleCluster(file, io, info.*, guest_cluster_index, new_cluster_offset);
+    try writeU64(file, io, entry_offset, new_cluster_offset | copied_mask);
+    try adjustL2EntryRefcounts(file, io, info.*, guest_cluster_index, old_l2_entry, -1);
+    return new_cluster_offset;
+}
+
+fn ensureDataClusterWritable(file: Io.File, io: Io, info: *Info, guest_cluster_index: u64, l2_table_offset: u64, l2_index: u64) PwriteError!u64 {
     const entry_offset = l2_table_offset + l2_index * 8;
     const l2_entry = try readU64(file, io, entry_offset);
-    if (l2_entry & compressed_mask != 0) return error.CompressedClusterNotSupported;
+    if (l2_entry & compressed_mask != 0) {
+        return try replaceClusterWithCOWCopy(file, io, info, guest_cluster_index, entry_offset, l2_entry);
+    }
 
     const host_cluster_offset = l2_entry & host_offset_mask;
-    if (host_cluster_offset == 0) {
-        const new_cluster_offset = try allocateCluster(file, io, info);
-        try writeU64(file, io, entry_offset, new_cluster_offset | copied_mask);
-        return new_cluster_offset;
-    }
-    if (!isAligned(host_cluster_offset, info.cluster_size) or host_cluster_offset < info.cluster_size or host_cluster_offset + info.cluster_size > info.file_size) {
+    if (host_cluster_offset != 0 and (!isAligned(host_cluster_offset, info.cluster_size) or host_cluster_offset < info.cluster_size or host_cluster_offset + info.cluster_size > info.file_size)) {
         return error.InvalidL2Entry;
+    }
+    if (host_cluster_offset == 0) {
+        return try replaceClusterWithCOWCopy(file, io, info, guest_cluster_index, entry_offset, l2_entry);
     }
 
     const refcount = try readRefcountAtOffset(file, io, info.*, host_cluster_offset);
-    if (refcount != 1) return error.SharedClusterNotSupported;
+    if (refcount != 1) {
+        return try replaceClusterWithCOWCopy(file, io, info, guest_cluster_index, entry_offset, l2_entry);
+    }
     if ((l2_entry & zero_mask) != 0) {
         try zeroRange(file, io, host_cluster_offset, info.cluster_size);
     }
@@ -1311,6 +1480,16 @@ fn ensureDataClusterWritable(file: Io.File, io: Io, info: *Info, l2_table_offset
         try writeU64(file, io, entry_offset, host_cluster_offset | copied_mask);
     }
     return host_cluster_offset;
+}
+
+fn copyGuestVisibleCluster(file: Io.File, io: Io, info: Info, guest_cluster_index: u64, dst_cluster_offset: u64) PwriteError!void {
+    const cluster = try std.heap.page_allocator.alloc(u8, @intCast(info.cluster_size));
+    defer std.heap.page_allocator.free(cluster);
+
+    const guest_offset = guest_cluster_index * info.cluster_size;
+    const got = try pread(file, io, info, cluster, guest_offset);
+    if (got < cluster.len) @memset(cluster[got..], 0);
+    try file.writePositionalAll(io, cluster, dst_cluster_offset);
 }
 
 fn ensureRefcountCapacity(file: Io.File, io: Io, info: *Info, layout: Layout) ResizeError!void {
@@ -1321,7 +1500,7 @@ fn ensureRefcountCapacity(file: Io.File, io: Io, info: *Info, layout: Layout) Re
 fn rebuildRefcountStructure(file: Io.File, io: Io, info: *Info, new_table_clusters: u32, new_block_count: u32) (Io.File.ReadPositionalError || Io.File.WritePositionalError || Io.File.SetLengthError || error{MissingRefcountBlock})!void {
     const old_info = info.*;
     const old_cluster_count = divCeil(old_info.file_size, old_info.cluster_size);
-    const new_table_offset = old_info.file_size;
+    const new_table_offset = std.mem.alignForward(u64, old_info.file_size, old_info.cluster_size);
     const new_blocks_offset = new_table_offset + @as(u64, new_table_clusters) * old_info.cluster_size;
     const new_file_size = new_blocks_offset + @as(u64, new_block_count) * old_info.cluster_size;
 
@@ -1385,6 +1564,7 @@ fn ensureL1Capacity(file: Io.File, io: Io, info: *Info, new_l1_size: u32, new_l1
     try writeHeaderU64Field(file, io, 40, new_l1_offset);
     info.l1_size = new_l1_size;
     info.l1_table_offset = new_l1_offset;
+    info.active_l1_table_offset = new_l1_offset;
 
     try setClusterRangeRefcount(file, io, info.*, old_l1_offset / info.cluster_size, old_l1_clusters, 0);
 }
@@ -1404,9 +1584,10 @@ fn allocateCluster(file: Io.File, io: Io, info: *Info) PwriteError!u64 {
         try ensureRefcountBlocksForClusterIndex(file, io, info, existing_clusters);
         existing_clusters = divCeil(info.file_size, info.cluster_size);
     }
-    const cluster_offset = info.file_size;
-    try file.setLength(io, info.file_size + info.cluster_size);
-    info.file_size += info.cluster_size;
+    const cluster_offset = std.mem.alignForward(u64, info.file_size, info.cluster_size);
+    const new_file_size = cluster_offset + info.cluster_size;
+    try file.setLength(io, new_file_size);
+    info.file_size = new_file_size;
     try writeRefcountByClusterIndex(file, io, info.*, existing_clusters, 1);
     try zeroRange(file, io, cluster_offset, info.cluster_size);
     return cluster_offset;
@@ -1424,10 +1605,11 @@ fn allocateContiguousMetadataClustersAtEnd(file: Io.File, io: Io, info: *Info, c
     }
 
     const start_index = divCeil(info.file_size, info.cluster_size);
-    const start_offset = info.file_size;
+    const start_offset = std.mem.alignForward(u64, info.file_size, info.cluster_size);
     const byte_len = @as(u64, cluster_count) * info.cluster_size;
-    try file.setLength(io, info.file_size + byte_len);
-    info.file_size += byte_len;
+    const new_file_size = start_offset + byte_len;
+    try file.setLength(io, new_file_size);
+    info.file_size = new_file_size;
     try zeroRange(file, io, start_offset, byte_len);
 
     var i: u32 = 0;
@@ -1478,6 +1660,14 @@ fn readRefcountAtOffset(file: Io.File, io: Io, info: Info, offset: u64) (Io.File
     return readRefcountByClusterIndex(file, io, info, offset / info.cluster_size);
 }
 
+fn adjustRefcountAtOffset(file: Io.File, io: Io, info: Info, offset: u64, delta: i32) (Io.File.ReadPositionalError || Io.File.WritePositionalError || error{MissingRefcountBlock})!void {
+    const cluster_index = offset / info.cluster_size;
+    const current = try readRefcountByClusterIndex(file, io, info, cluster_index);
+    const next = @as(i32, current) + delta;
+    std.debug.assert(next >= 0 and next <= std.math.maxInt(u16));
+    try writeRefcountByClusterIndex(file, io, info, cluster_index, @intCast(next));
+}
+
 fn readRefcountByClusterIndex(file: Io.File, io: Io, info: Info, cluster_index: u64) (Io.File.ReadPositionalError || error{MissingRefcountBlock})!u16 {
     const table_index = cluster_index / refcountBlockEntries(info);
     if (table_index >= info.refcount_block_count) return 0;
@@ -1503,6 +1693,28 @@ fn writeRefcountByClusterIndex(file: Io.File, io: Io, info: Info, cluster_index:
     var buf: [2]u8 = undefined;
     std.mem.writeInt(u16, &buf, value, .big);
     try file.writePositionalAll(io, &buf, block_offset + block_index * 2);
+}
+
+fn adjustL2EntryRefcounts(file: Io.File, io: Io, info: Info, guest_cluster_index: u64, l2_entry: u64, delta: i32) (LookupError || Io.File.ReadPositionalError || Io.File.WritePositionalError || error{MissingRefcountBlock})!void {
+    if (l2_entry & compressed_mask != 0) {
+        const mapping = try compressedClusterMapping(info, l2_entry);
+        const host_offset = mapping.host_offset.?;
+        const start_cluster_index = hostOffsetClusterIndex(host_offset, info.cluster_size);
+        try adjustRefcountAtOffset(file, io, info, start_cluster_index * info.cluster_size, delta);
+        const end_cluster_index = hostOffsetClusterIndex(host_offset + mapping.compressed_byte_len - 1, info.cluster_size);
+        if (end_cluster_index != start_cluster_index) {
+            try adjustRefcountAtOffset(file, io, info, end_cluster_index * info.cluster_size, delta);
+        }
+        return;
+    }
+
+    if (!hasDataHostCluster(info, guest_cluster_index, l2_entry)) return;
+
+    if (usesExternalDataFile(info)) return;
+
+    const host_cluster_offset = l2_entry & host_offset_mask;
+    if (!validDataHostClusterOffset(info, guest_cluster_index, host_cluster_offset)) return error.InvalidL2Entry;
+    try adjustRefcountAtOffset(file, io, info, host_cluster_offset, delta);
 }
 
 fn writeInitialHeader(file: Io.File, io: Io, info: Info) Io.File.WritePositionalError!void {
@@ -1715,6 +1927,52 @@ test "openAtPath resolves recursive backing files" {
     try std.testing.expectEqualSlices(u8, "ROOT-CLUSTER-2", &root_buf);
 }
 
+test "pwrite copy-on-write preserves backing-file contents" {
+    const io = std.testing.io;
+    const base_path = "test-qcow2-backing-cow-base.qcow2";
+    const overlay_path = "test-qcow2-backing-cow-overlay.qcow2";
+    defer Io.Dir.cwd().deleteFile(io, base_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, overlay_path) catch {};
+
+    const base = try writeTestFixture(io, base_path, .{});
+    _ = try writeSingleClusterFixture(io, overlay_path, .{
+        .backing_file = base_path,
+        .guest_cluster_index = 1,
+        .payload = "OVERLAY-CLUSTER",
+        .payload_offset = 24,
+    });
+
+    const overlay_file = try Io.Dir.cwd().openFile(io, overlay_path, .{ .mode = .read_write });
+    defer overlay_file.close(io);
+
+    var overlay = try openAtPath(io, overlay_file, overlay_path);
+    var inherited_before: [13]u8 = undefined;
+    _ = try pread(overlay_file, io, overlay, &inherited_before, 0);
+    try std.testing.expectEqualSlices(u8, "QCOW2BLOCK000", &inherited_before);
+
+    try pwrite(overlay_file, io, &overlay, "COW", 5);
+
+    var inherited_after: [13]u8 = undefined;
+    _ = try pread(overlay_file, io, overlay, &inherited_after, 0);
+    try std.testing.expectEqualSlices(u8, "QCOW2COWCK000", &inherited_after);
+
+    var overlay_buf: [15]u8 = undefined;
+    _ = try pread(overlay_file, io, overlay, &overlay_buf, base.cluster_size + 24);
+    try std.testing.expectEqualSlices(u8, "OVERLAY-CLUSTER", &overlay_buf);
+
+    var base_cluster2: [13]u8 = undefined;
+    _ = try pread(overlay_file, io, overlay, &base_cluster2, 2 * base.cluster_size + 32);
+    try std.testing.expectEqualSlices(u8, "QCOW2BLOCK222", &base_cluster2);
+
+    const base_file = try Io.Dir.cwd().openFile(io, base_path, .{ .mode = .read_write });
+    defer base_file.close(io);
+    const base_info = try open(io, base_file);
+
+    var base_unchanged: [13]u8 = undefined;
+    _ = try pread(base_file, io, base_info, &base_unchanged, 0);
+    try std.testing.expectEqualSlices(u8, "QCOW2BLOCK000", &base_unchanged);
+}
+
 test "pread inflates deflate-compressed clusters" {
     const io = std.testing.io;
     const path = "test-qcow2-compressed.qcow2";
@@ -1735,6 +1993,28 @@ test "pread inflates deflate-compressed clusters" {
     var tail: [64]u8 = undefined;
     _ = try pread(file, io, info, &tail, cluster_size - tail.len);
     try std.testing.expectEqualSlices(u8, &([_]u8{'A'} ** 64), &tail);
+}
+
+test "pwrite inflates compressed clusters into standard data clusters" {
+    const io = std.testing.io;
+    const path = "test-qcow2-compressed-write.qcow2";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    _ = try writeCompressedFixture(io, path);
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer file.close(io);
+
+    var info = try open(io, file);
+    try pwrite(file, io, &info, "BLOB", 1024);
+
+    const mapping = try lookupGuestCluster(file, io, info, 0);
+    try std.testing.expectEqual(ClusterKind.standard, mapping.kind);
+
+    var buf: [16]u8 = undefined;
+    _ = try pread(file, io, info, &buf, 1016);
+    var expected = [_]u8{'A'} ** 16;
+    @memcpy(expected[8..12], "BLOB");
+    try std.testing.expectEqualSlices(u8, &expected, &buf);
 }
 
 test "listSnapshots enumerates qcow2 snapshot table entries" {
@@ -1800,6 +2080,55 @@ test "openSnapshot switches reads to snapshot L1 tables" {
     var shared_buf: [13]u8 = undefined;
     _ = try pread(file, io, first, &shared_buf, info.cluster_size + 64);
     try std.testing.expectEqualSlices(u8, "SHARED-CLSTR", shared_buf[0..12]);
+}
+
+test "createSnapshot preserves pre-write active state" {
+    const io = std.testing.io;
+    const path = "test-qcow2-create-snapshot.qcow2";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+
+    var info = try create(io, file, 2 * (1 << default_cluster_bits));
+    try pwrite(file, io, &info, "SNAPSHOT-OLD", 0);
+    try pwrite(file, io, &info, "SHARED-CLSTR", info.cluster_size + 64);
+
+    try createSnapshot(file, io, &info, .{
+        .id = "snap-1",
+        .name = "first snapshot",
+        .timestamp_seconds = 1_700_000_000,
+    });
+    try pwrite(file, io, &info, "SNAPSHOT-NEW", 0);
+
+    const reopened = try open(io, file);
+    try std.testing.expectEqual(@as(u32, 1), reopened.snapshot_count);
+
+    const snapshots = try listSnapshots(file, io, reopened, std.testing.allocator);
+    defer {
+        for (snapshots) |*snapshot| snapshot.deinit(std.testing.allocator);
+        std.testing.allocator.free(snapshots);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), snapshots.len);
+    try std.testing.expectEqualStrings("snap-1", snapshots[0].id);
+    try std.testing.expectEqualStrings("first snapshot", snapshots[0].name);
+    try std.testing.expect(snapshots[0].l1_table_offset != reopened.l1_table_offset);
+
+    var active_buf: [12]u8 = undefined;
+    _ = try pread(file, io, reopened, &active_buf, 0);
+    try std.testing.expectEqualSlices(u8, "SNAPSHOT-NEW", &active_buf);
+
+    const snapshot_info = openSnapshot(reopened, snapshots[0]);
+    var snapshot_buf: [12]u8 = undefined;
+    _ = try pread(file, io, snapshot_info, &snapshot_buf, 0);
+    try std.testing.expectEqualSlices(u8, "SNAPSHOT-OLD", &snapshot_buf);
+
+    var shared_snapshot: [12]u8 = undefined;
+    _ = try pread(file, io, snapshot_info, &shared_snapshot, reopened.cluster_size + 64);
+    try std.testing.expectEqualSlices(u8, "SHARED-CLSTR", &shared_snapshot);
+
+    try check(file, io, reopened);
 }
 
 test "openAtPath reads qcow2 external data files" {
