@@ -12,6 +12,7 @@ const std = @import("std");
 
 pub const vhd = @import("vhd.zig");
 pub const vhdx = @import("vhdx.zig");
+pub const fat32 = @import("fat32.zig");
 pub const guid = @import("guid.zig");
 pub const mbr = @import("mbr.zig");
 pub const gpt = @import("gpt.zig");
