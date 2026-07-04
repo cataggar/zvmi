@@ -17,7 +17,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
             i += 1;
             if (i >= args.len) return fail("create: -f requires a format argument", .{});
             format = zvmi.Format.parseName(args[i]) orelse
-                return fail("create: unknown format '{s}' (expected raw, vhd, or vpc)", .{args[i]});
+                return fail("create: unknown format '{s}' (expected raw, vhd/vpc, vhdx, or qcow2)", .{args[i]});
         } else if (std.mem.eql(u8, a, "-o")) {
             i += 1;
             if (i >= args.len) return fail("create: -o requires an option list", .{});
