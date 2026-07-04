@@ -216,12 +216,16 @@ pub const FileSystem = struct {
         if (parent.name.len == 0) return error.InvalidPath;
         const entry = (try self.findEntry(io, parent.cluster, parent.name)) orelse return error.PathNotFound;
 
-        if (entry.kind() == .directory and !(try self.isDirectoryEmpty(io, entry.first_cluster))) {
-            return error.DirectoryNotEmpty;
-        }
+        try self.deleteLocatedEntry(io, parent.cluster, entry, false);
+    }
 
-        if (entry.first_cluster != 0) try self.releaseChain(io, entry.first_cluster);
-        try self.markEntryDeleted(io, parent.cluster, entry.location());
+    /// Deletes an existing file or directory tree recursively.
+    pub fn deleteTree(self: *FileSystem, io: Io, path: []const u8) MutationError!void {
+        const parent = try self.resolveParent(io, path);
+        if (parent.name.len == 0) return error.InvalidPath;
+        const entry = (try self.findEntry(io, parent.cluster, parent.name)) orelse return error.PathNotFound;
+
+        try self.deleteLocatedEntry(io, parent.cluster, entry, true);
     }
 
     /// Shrinks an existing file to `new_size`, freeing no-longer-needed clusters.
@@ -491,6 +495,44 @@ pub const FileSystem = struct {
         for (0..location.slot_count) |slot_index| {
             try self.writeRegion(io, &deleted, try self.directorySlotOffset(io, dir_cluster, location.first_slot + slot_index));
         }
+    }
+
+    fn deleteLocatedEntry(
+        self: *FileSystem,
+        io: Io,
+        parent_cluster: u32,
+        entry: LocatedEntry,
+        recursive: bool,
+    ) MutationError!void {
+        if (entry.kind() == .directory) {
+            if (recursive) {
+                try self.deleteDirectoryChildren(io, entry.first_cluster);
+            } else if (!(try self.isDirectoryEmpty(io, entry.first_cluster))) {
+                return error.DirectoryNotEmpty;
+            }
+        }
+
+        try self.releaseEntry(io, parent_cluster, entry.location(), entry.first_cluster);
+    }
+
+    fn deleteDirectoryChildren(self: *FileSystem, io: Io, dir_cluster: u32) MutationError!void {
+        var iter = try DirectoryIterator.init(self, io, dir_cluster);
+        while (try iter.next(io, null)) |entry| {
+            if (entry.attr & attr_volume_id != 0) continue;
+            if (isDotEntry(entry.short_name)) continue;
+            try self.deleteLocatedEntry(io, dir_cluster, entry, true);
+        }
+    }
+
+    fn releaseEntry(
+        self: *FileSystem,
+        io: Io,
+        parent_cluster: u32,
+        location: DirectoryEntryLocation,
+        first_cluster: u32,
+    ) MutationError!void {
+        if (first_cluster != 0) try self.releaseChain(io, first_cluster);
+        try self.markEntryDeleted(io, parent_cluster, location);
     }
 
     fn isDirectoryEmpty(self: *FileSystem, io: Io, dir_cluster: u32) MutationError!bool {
