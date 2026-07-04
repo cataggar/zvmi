@@ -1,22 +1,22 @@
 //! COSI (Composable OS Image) writer.
 //!
-//! Public COSI references are split across the Azure Linux Image Tools COSI
-//! spec (`docs/imagecustomizer/api/cosi.md`) and its `cosimetadata.go`
-//! implementation. This module follows the documented pieces closely:
-//! - uncompressed outer tarball,
-//! - `metadata.json` at the tar root,
-//! - per-artifact `images/*.raw.zst` members,
-//! - `disk.gptRegions` plus per-filesystem `images[]` records.
+//! The emitted `metadata.json` schema is verified against Azure Linux Image
+//! Tools' real implementation:
+//! - `toolkit/tools/pkg/imagecustomizerlib/cosimetadata.go`
+//! - `toolkit/tools/pkg/imagecustomizerlib/cosicommon.go`
+//! - `toolkit/tools/pkg/imagecustomizerlib/extractgpt.go`
+//! - `toolkit/tools/pkg/imagecustomizerlib/extractpartitions.go`
 //!
-//! The public schema does not currently expose slots for the GPT disk GUID or
-//! per-partition PARTUUID, so `zvmi` adds conservative extra fields
-//! (`disk.guid`, `partUuid`, `partitionNumber`, `partitionName`) to make the
-//! issue's requested metadata available while staying compatible with readers
-//! that ignore unknown JSON members.
+//! Standalone `zvmi cosi` can derive only a subset of that metadata from a raw
+//! disk image, so `writeWithOptions` accepts caller-supplied values for fields
+//! like bootloader details and the OS package list. When no override is
+//! supplied, `osRelease` is best-effort populated by reading `/etc/os-release`
+//! from an ext4 root filesystem inside the image.
 
 const builtin = @import("builtin");
 const std = @import("std");
 const Io = std.Io;
+const ext4 = @import("ext4.zig");
 const guid = @import("guid.zig");
 const gpt = @import("gpt.zig");
 const image_mod = @import("image.zig");
@@ -38,6 +38,51 @@ const metadata_version = "1.2";
 const file_mode = 0o400;
 
 pub fn write(img: Image, io: Io, allocator: std.mem.Allocator, output_path: []const u8) WriteError!void {
+    try writeWithOptions(img, io, allocator, output_path, .{});
+}
+
+pub const SystemdBootEntry = struct {
+    type: []const u8,
+    path: []const u8,
+    cmdline: []const u8,
+    kernel: []const u8,
+};
+
+pub const SystemdBoot = struct {
+    entries: []const SystemdBootEntry,
+};
+
+pub const CosiBootloader = struct {
+    type: []const u8 = "",
+    systemdBoot: ?SystemdBoot = null,
+};
+
+pub const Compression = struct {
+    maxWindowLog: u32 = 0,
+};
+
+pub const OsPackage = struct {
+    name: []const u8,
+    version: []const u8,
+    release: []const u8,
+    arch: []const u8,
+};
+
+pub const WriteOptions = struct {
+    os_arch: ?[]const u8 = null,
+    os_release: ?[]const u8 = null,
+    bootloader: CosiBootloader = .{},
+    os_packages: []const OsPackage = &.{},
+    compression: Compression = .{},
+};
+
+pub fn writeWithOptions(
+    img: Image,
+    io: Io,
+    allocator: std.mem.Allocator,
+    output_path: []const u8,
+    options: WriteOptions,
+) WriteError!void {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -54,8 +99,8 @@ pub fn write(img: Image, io: Io, allocator: std.mem.Allocator, output_path: []co
         partitions[i] = try buildPartitionArtifact(arena, img, io, entry, @intCast(i + 1), image_id);
     }
 
-    const os_release = try detectOsRelease(arena, img, io, partitions);
-    const metadata_json = try buildMetadataJson(arena, img.virtual_size, disk_guid_text, gpt_region, partitions, os_release);
+    const os_release = try detectOsRelease(arena, img, io, partitions, options.os_release);
+    const metadata_json = try buildMetadataJson(arena, img.virtual_size, disk_guid_text, gpt_region, partitions, os_release, options);
 
     const output_file = try Io.Dir.cwd().createFile(io, output_path, .{ .truncate = true });
     defer output_file.close(io);
@@ -109,8 +154,6 @@ const PartitionArtifact = struct {
     fs_type: []const u8,
     fs_uuid: []const u8,
     part_type: []const u8,
-    part_uuid: []const u8,
-    part_name: []const u8,
     part_type_guid: guid.Guid,
 };
 
@@ -141,7 +184,6 @@ fn buildPartitionArtifact(
     const image_path = try std.fmt.allocPrint(arena, "images/image_{d}.raw.zst", .{number});
 
     const part_type = try dupeGuidText(arena, entry.partition_type_guid);
-    const part_uuid = try dupeGuidText(arena, entry.unique_partition_guid);
     const part_name = try decodePartitionNameAlloc(arena, &entry.name_utf16le);
     const fs_probe = try probeFilesystem(arena, img, io, offset_bytes, uncompressed_size);
     const meta = try hashCompressedRegion(arena, img, io, offset_bytes, uncompressed_size, image_id);
@@ -160,8 +202,6 @@ fn buildPartitionArtifact(
         .fs_type = fs_probe.fs_type,
         .fs_uuid = fs_probe.fs_uuid,
         .part_type = part_type,
-        .part_uuid = part_uuid,
-        .part_name = part_name,
         .part_type_guid = entry.partition_type_guid,
     };
 }
@@ -328,15 +368,30 @@ fn dupeGuidText(arena: std.mem.Allocator, value: guid.Guid) std.mem.Allocator.Er
     return arena.dupe(u8, guid.formatLower(&buf, value));
 }
 
-fn detectOsRelease(arena: std.mem.Allocator, img: Image, io: Io, partitions: []const PartitionArtifact) WriteError![]const u8 {
-    // Filesystem traversal is intentionally out of scope for this change, so
-    // we only populate this field when a future caller wires in guest-side
-    // metadata explicitly. Returning the empty string is safer than guessing
-    // from raw filesystem bytes.
-    _ = arena;
-    _ = img;
-    _ = io;
-    _ = partitions;
+fn detectOsRelease(
+    arena: std.mem.Allocator,
+    img: Image,
+    io: Io,
+    partitions: []const PartitionArtifact,
+    os_release_override: ?[]const u8,
+) WriteError![]const u8 {
+    if (os_release_override) |value| return value;
+
+    for (partitions) |part| {
+        if (!std.mem.eql(u8, part.mount_point, "/") or !std.mem.eql(u8, part.fs_type, "ext4")) continue;
+
+        var reader = ext4.Reader.open(io, img.file, arena, .{ .offset = part.offset_bytes }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
+        defer reader.deinit();
+
+        return reader.readFileAlloc(io, arena, "etc/os-release") catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
+    }
+
     return "";
 }
 
@@ -352,15 +407,19 @@ const MetadataImage = struct {
     sha384: []const u8,
 };
 
+const MetadataVerity = struct {
+    image: MetadataImage,
+    roothash: []const u8,
+    hashOffset: ?u64 = null,
+};
+
 const MetadataFs = struct {
     image: MetadataImage,
     mountPoint: []const u8,
     fsType: []const u8,
     fsUuid: []const u8,
     partType: []const u8,
-    partUuid: []const u8,
-    partitionNumber: u32,
-    partitionName: []const u8,
+    verity: ?MetadataVerity = null,
 };
 
 const MetadataDiskRegion = struct {
@@ -373,7 +432,6 @@ const MetadataDisk = struct {
     size: u64,
     type: []const u8,
     lbaSize: u32,
-    guid: []const u8,
     gptRegions: []MetadataDiskRegion,
 };
 
@@ -384,6 +442,9 @@ const MetadataRoot = struct {
     images: []MetadataFs,
     osRelease: []const u8,
     id: []const u8,
+    bootloader: CosiBootloader,
+    osPackages: []const OsPackage,
+    compression: Compression,
 };
 
 fn buildMetadataJson(
@@ -393,6 +454,7 @@ fn buildMetadataJson(
     gpt_region: GptArtifact,
     partitions: []const PartitionArtifact,
     os_release: []const u8,
+    options: WriteOptions,
 ) WriteError![]u8 {
     const fs_entries = try arena.alloc(MetadataFs, partitions.len);
     const gpt_regions = try arena.alloc(MetadataDiskRegion, partitions.len + 1);
@@ -408,9 +470,6 @@ fn buildMetadataJson(
             .fsType = part.fs_type,
             .fsUuid = part.fs_uuid,
             .partType = part.part_type,
-            .partUuid = part.part_uuid,
-            .partitionNumber = part.number,
-            .partitionName = part.part_name,
         };
         gpt_regions[i + 1] = .{
             .image = .{ .path = part.image.path, .compressedSize = part.image.compressedSize, .uncompressedSize = part.image.uncompressedSize, .sha384 = part.image.sha384 },
@@ -421,17 +480,19 @@ fn buildMetadataJson(
 
     const metadata = MetadataRoot{
         .version = metadata_version,
-        .osArch = detectOsArch(partitions),
+        .osArch = options.os_arch orelse detectOsArch(partitions),
         .disk = .{
             .size = disk_size,
             .type = "gpt",
             .lbaSize = gpt.sector_size,
-            .guid = disk_guid_text,
             .gptRegions = gpt_regions,
         },
         .images = fs_entries,
         .osRelease = os_release,
         .id = disk_guid_text,
+        .bootloader = options.bootloader,
+        .osPackages = options.os_packages,
+        .compression = options.compression,
     };
 
     return try std.json.Stringify.valueAlloc(arena, metadata, .{});
@@ -452,6 +513,77 @@ fn detectOsArch(partitions: []const PartitionArtifact) []const u8 {
 const ParsedTarEntry = struct {
     path: []const u8,
     bytes: []const u8,
+};
+
+const InMemoryEntry = struct {
+    path: []const u8,
+    kind: ext4.Kind,
+    mode: u16,
+    uid: u32,
+    gid: u32,
+    size: u64 = 0,
+    bytes: []const u8 = "",
+};
+
+const InMemoryTree = struct {
+    entries: []const InMemoryEntry,
+    index: usize = 0,
+    view: ext4.FileTreeView,
+
+    fn init(entries: []const InMemoryEntry) InMemoryTree {
+        return .{
+            .entries = entries,
+            .view = .{
+                .ctx = undefined,
+                .next_fn = next,
+                .reset_fn = reset,
+            },
+        };
+    }
+
+    fn bind(self: *InMemoryTree) void {
+        self.view = .{
+            .ctx = self,
+            .next_fn = next,
+            .reset_fn = reset,
+        };
+    }
+
+    fn reset(ctx: *anyopaque) void {
+        const self: *InMemoryTree = @ptrCast(@alignCast(ctx));
+        self.index = 0;
+    }
+
+    fn next(ctx: *anyopaque) ext4.FileTreeView.IteratorError!?ext4.FileTreeView.Entry {
+        const self: *InMemoryTree = @ptrCast(@alignCast(ctx));
+        if (self.index >= self.entries.len) return null;
+        const entry = self.entries[self.index];
+        self.index += 1;
+        return .{
+            .path = entry.path,
+            .kind = entry.kind,
+            .mode = entry.mode,
+            .uid = entry.uid,
+            .gid = entry.gid,
+            .size = entry.size,
+            .content = switch (entry.kind) {
+                .directory => null,
+                .file, .symlink => .{
+                    .ctx = &self.entries[self.index - 1],
+                    .read_at_fn = readContent,
+                },
+            },
+        };
+    }
+
+    fn readContent(ctx: *const anyopaque, buffer: []u8, offset: u64) ext4.FileTreeView.ContentError!usize {
+        const entry: *const InMemoryEntry = @ptrCast(@alignCast(ctx));
+        const off = std.math.cast(usize, offset) orelse return error.UnexpectedEndOfStream;
+        if (off > entry.bytes.len) return error.UnexpectedEndOfStream;
+        const n = @min(buffer.len, entry.bytes.len - off);
+        std.mem.copyForwards(u8, buffer[0..n], entry.bytes[off .. off + n]);
+        return n;
+    }
 };
 
 fn parseTarEntries(allocator: std.mem.Allocator, archive: []const u8) ![]ParsedTarEntry {
@@ -492,7 +624,7 @@ test "write builds a COSI tarball with GPT metadata and raw-zst partitions" {
     defer Io.Dir.cwd().deleteFile(io, disk_path) catch {};
     defer Io.Dir.cwd().deleteFile(io, cosi_path) catch {};
 
-    const disk_size: u64 = 16 * 1024 * 1024;
+    const disk_size: u64 = 32 * 1024 * 1024;
     var img = try Image.create(io, disk_path, .raw, disk_size, .{});
     defer img.close(io);
 
@@ -506,7 +638,7 @@ test "write builds a COSI tarball with GPT metadata and raw-zst partitions" {
         .{
             .type_guid = root_partition_x86_64,
             .unique_guid = guid.parse("22222222-2222-2222-2222-222222222222"),
-            .size_sectors = 4096,
+            .size_sectors = 16384,
             .name_utf16le = gpt.asciiName("root"),
         },
     };
@@ -518,8 +650,13 @@ test "write builds a COSI tarball with GPT metadata and raw-zst partitions" {
     const root_size = (placements[1].last_lba - placements[1].first_lba + 1) * gpt.sector_size;
     const esp_bytes = try std.testing.allocator.alloc(u8, esp_size);
     defer std.testing.allocator.free(esp_bytes);
-    const root_bytes = try std.testing.allocator.alloc(u8, root_size);
-    defer std.testing.allocator.free(root_bytes);
+    const os_release = "NAME=zvmi\nID=zvmi\nVERSION_ID=1\n";
+    const root_fs_uuid = [_]u8{ 0x88, 0xD2, 0xFA, 0x9B, 0x7A, 0x32, 0x45, 0x0A, 0xA9, 0xF8, 0xAA, 0x9C, 0x3D, 0xE7, 0x92, 0x98 };
+    var root_tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "etc", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "etc/os-release", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = os_release.len, .bytes = os_release },
+    });
+    root_tree.bind();
 
     @memset(esp_bytes, 0xEE);
     esp_bytes[3] = 0x90;
@@ -528,15 +665,35 @@ test "write builds a COSI tarball with GPT metadata and raw-zst partitions" {
     esp_bytes[511] = 0xAA;
     std.mem.writeInt(u32, esp_bytes[67..71], 0xC3D4250D, .little);
 
-    @memset(root_bytes, 0x44);
-    std.mem.writeInt(u16, root_bytes[1024 + 0x38 .. 1024 + 0x3A], 0xEF53, .little);
-    const root_fs_uuid = [_]u8{ 0x88, 0xD2, 0xFA, 0x9B, 0x7A, 0x32, 0x45, 0x0A, 0xA9, 0xF8, 0xAA, 0x9C, 0x3D, 0xE7, 0x92, 0x98 };
-    @memcpy(root_bytes[1024 + 0x68 .. 1024 + 0x78], &root_fs_uuid);
-
     try img.pwrite(io, esp_bytes, placements[0].first_lba * gpt.sector_size);
-    try img.pwrite(io, root_bytes, placements[1].first_lba * gpt.sector_size);
+    _ = try ext4.populate(io, img.file, std.testing.allocator, &root_tree.view, .{
+        .offset = placements[1].first_lba * gpt.sector_size,
+        .length = root_size,
+        .uuid = root_fs_uuid,
+        .label = "rootfs",
+    });
 
-    try write(img, io, std.testing.allocator, cosi_path);
+    const packages = [_]OsPackage{
+        .{ .name = "bash", .version = "5.1.8", .release = "1", .arch = "x86_64" },
+        .{ .name = "coreutils", .version = "9.5", .release = "2", .arch = "x86_64" },
+    };
+    try writeWithOptions(img, io, std.testing.allocator, cosi_path, .{
+        .bootloader = .{
+            .type = "systemd-boot",
+            .systemdBoot = .{
+                .entries = &.{
+                    .{
+                        .type = "uki-standalone",
+                        .path = "/boot/efi/EFI/Linux/zvmi.efi",
+                        .cmdline = "root=UUID=88d2fa9b-7a32-450a-a9f8-aa9c3de79298 ro",
+                        .kernel = "6.8.0-zvmi",
+                    },
+                },
+            },
+        },
+        .os_packages = &packages,
+        .compression = .{ .maxWindowLog = 23 },
+    });
 
     const cosi_file = try Io.Dir.cwd().openFile(io, cosi_path, .{});
     defer cosi_file.close(io);
@@ -565,46 +722,92 @@ test "write builds a COSI tarball with GPT metadata and raw-zst partitions" {
     defer std.testing.allocator.free(decoded_root.bytes);
 
     try std.testing.expectEqualSlices(u8, esp_bytes, decoded_esp.bytes);
-    try std.testing.expectEqualSlices(u8, root_bytes, decoded_root.bytes);
+    var root_reader = try ext4.open(io, img.file, std.testing.allocator, .{ .offset = placements[1].first_lba * gpt.sector_size });
+    defer root_reader.deinit();
+    const expected_root_os_release = try root_reader.readFileAlloc(io, std.testing.allocator, "etc/os-release");
+    defer std.testing.allocator.free(expected_root_os_release);
+    try std.testing.expectEqualSlices(u8, os_release, expected_root_os_release);
+    const decoded_root_reader_file = try Io.Dir.cwd().createFile(io, "test-cosi-rootfs.img", .{ .read = true, .truncate = true });
+    defer {
+        decoded_root_reader_file.close(io);
+        Io.Dir.cwd().deleteFile(io, "test-cosi-rootfs.img") catch {};
+    }
+    try decoded_root_reader_file.writePositionalAll(io, decoded_root.bytes, 0);
+    var decoded_root_reader = try ext4.open(io, decoded_root_reader_file, std.testing.allocator, .{});
+    defer decoded_root_reader.deinit();
+    const decoded_os_release = try decoded_root_reader.readFileAlloc(io, std.testing.allocator, "etc/os-release");
+    defer std.testing.allocator.free(decoded_os_release);
+    try std.testing.expectEqualSlices(u8, os_release, decoded_os_release);
     const parsed_gpt = try gpt.readGpt(img, io, std.testing.allocator);
     defer std.testing.allocator.free(parsed_gpt.partitions);
     try std.testing.expectEqual(primaryGptSize(parsed_gpt.header), decoded_gpt.bytes.len);
 
+    try std.testing.expect(std.mem.indexOf(u8, metadata_entry.bytes, "\"guid\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, metadata_entry.bytes, "\"partUuid\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, metadata_entry.bytes, "\"partitionNumber\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, metadata_entry.bytes, "\"partitionName\"") == null);
+
     const MetadataForTest = struct {
         version: []const u8,
         osArch: []const u8,
-        osRelease: []const u8,
-        id: []const u8,
         disk: struct {
             size: u64,
             type: []const u8,
             lbaSize: u32,
-            guid: []const u8,
             gptRegions: []struct {
-                type: []const u8,
-                number: ?u32 = null,
                 image: struct {
                     path: []const u8,
                     compressedSize: u64,
                     uncompressedSize: u64,
                     sha384: []const u8,
                 },
+                type: []const u8,
+                number: ?u32 = null,
             },
         },
         images: []struct {
-            mountPoint: []const u8,
-            fsType: []const u8,
-            fsUuid: []const u8,
-            partType: []const u8,
-            partUuid: []const u8,
-            partitionNumber: u32,
-            partitionName: []const u8,
             image: struct {
                 path: []const u8,
                 compressedSize: u64,
                 uncompressedSize: u64,
                 sha384: []const u8,
             },
+            mountPoint: []const u8,
+            fsType: []const u8,
+            fsUuid: []const u8,
+            partType: []const u8,
+            verity: ?struct {
+                image: struct {
+                    path: []const u8,
+                    compressedSize: u64,
+                    uncompressedSize: u64,
+                    sha384: []const u8,
+                },
+                roothash: []const u8,
+                hashOffset: ?u64 = null,
+            } = null,
+        },
+        osRelease: []const u8,
+        id: []const u8,
+        bootloader: struct {
+            type: []const u8,
+            systemdBoot: ?struct {
+                entries: []struct {
+                    type: []const u8,
+                    path: []const u8,
+                    cmdline: []const u8,
+                    kernel: []const u8,
+                },
+            } = null,
+        },
+        osPackages: []struct {
+            name: []const u8,
+            version: []const u8,
+            release: []const u8,
+            arch: []const u8,
+        },
+        compression: struct {
+            maxWindowLog: u32,
         },
     };
 
@@ -613,7 +816,6 @@ test "write builds a COSI tarball with GPT metadata and raw-zst partitions" {
 
     try std.testing.expectEqualStrings(metadata_version, parsed_json.value.version);
     try std.testing.expectEqualStrings("33333333-3333-3333-3333-333333333333", parsed_json.value.id);
-    try std.testing.expectEqualStrings("33333333-3333-3333-3333-333333333333", parsed_json.value.disk.guid);
     try std.testing.expectEqualStrings("gpt", parsed_json.value.disk.type);
     try std.testing.expectEqual(@as(usize, 3), parsed_json.value.disk.gptRegions.len);
     try std.testing.expectEqualStrings(GptImageName, parsed_json.value.disk.gptRegions[0].image.path);
@@ -625,6 +827,15 @@ test "write builds a COSI tarball with GPT metadata and raw-zst partitions" {
     try std.testing.expectEqualStrings("/", parsed_json.value.images[1].mountPoint);
     try std.testing.expectEqualStrings("ext4", parsed_json.value.images[1].fsType);
     try std.testing.expectEqualStrings("88d2fa9b-7a32-450a-a9f8-aa9c3de79298", parsed_json.value.images[1].fsUuid);
-    try std.testing.expectEqualStrings("", parsed_json.value.osRelease);
+    try std.testing.expect(parsed_json.value.images[0].verity == null);
+    try std.testing.expect(parsed_json.value.images[1].verity == null);
+    try std.testing.expectEqualStrings(os_release, parsed_json.value.osRelease);
     try std.testing.expectEqualStrings("x86_64", parsed_json.value.osArch);
+    try std.testing.expectEqualStrings("systemd-boot", parsed_json.value.bootloader.type);
+    try std.testing.expect(parsed_json.value.bootloader.systemdBoot != null);
+    try std.testing.expectEqual(@as(usize, 1), parsed_json.value.bootloader.systemdBoot.?.entries.len);
+    try std.testing.expectEqualStrings("/boot/efi/EFI/Linux/zvmi.efi", parsed_json.value.bootloader.systemdBoot.?.entries[0].path);
+    try std.testing.expectEqual(@as(usize, 2), parsed_json.value.osPackages.len);
+    try std.testing.expectEqualStrings("bash", parsed_json.value.osPackages[0].name);
+    try std.testing.expectEqual(@as(u32, 23), parsed_json.value.compression.maxWindowLog);
 }
