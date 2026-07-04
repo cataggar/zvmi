@@ -206,11 +206,12 @@ with `.linux`, `.initrd`, `.cmdline`, `.osrel`, `.uname`, and optional
 `vhdx` remains a read-only source format for now, so `build-image` VHDX output
 is still deferred pending separate VHDX write/create support. Both Gen2
 (UEFI/protective-MBR+GPT+ESP) and Gen1 (BIOS/plain-MBR with GRUB embedded into
-the post-MBR gap) are now fully wired in `zvmi build-image`, and Gen2 images
-can optionally append a same-partition dm-verity SHA-256 hash tree with
-`--verity`, wiring the resulting `roothash=`/`systemd.verity_root_*`
-parameters into the generated BLS + GRUB entries while exposing the matching
-metadata through `zvmi.cosi.writeWithOptions`.
+the post-MBR gap) are now fully wired in `zvmi build-image`, and both
+generations can optionally append a same-partition dm-verity SHA-256 hash tree
+with `--verity`, wiring the resulting `roothash=`/`systemd.verity_root_*`
+parameters through the shared PARTUUID-based cmdline path. Gen1/MBR builds use
+Linux's synthesized MBR PARTUUID form (`<8-hex-disk-signature>-<2-hex-partition-number>`);
+the matching verity metadata is also exposed through `zvmi.cosi.writeWithOptions`.
 
 ## Notes on Zig 0.16
 
