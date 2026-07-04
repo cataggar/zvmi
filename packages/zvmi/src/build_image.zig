@@ -8,11 +8,13 @@ const fat32 = @import("fat32.zig");
 const Format = @import("formats.zig").Format;
 const gpt = @import("gpt.zig");
 const guid = @import("guid.zig");
-const Image = @import("image.zig").Image;
+const image_mod = @import("image.zig");
+const Image = image_mod.Image;
 const layout = @import("layout.zig");
 const mbr = @import("mbr.zig");
 const oci = @import("oci.zig");
 const iso9660 = @import("iso9660.zig");
+const qcow2 = @import("qcow2.zig");
 const squashfs = @import("squashfs.zig");
 
 const mib: u64 = azure.one_mib;
@@ -181,9 +183,9 @@ pub fn build(
     raw_img.close(io);
     raw_img_open = false;
 
-    if (output_format == .vhd) {
-        logStep(options.verbose, "convert raw build image to fixed VHD");
-        try convertRawToFixedVhd(allocator, io, raw_build_path, options.output_path, disk_size);
+    if (output_format != .raw) {
+        logStep(options.verbose, "convert raw build image to requested output format");
+        try convertRawToOutput(allocator, io, raw_build_path, options.output_path, output_format, disk_size);
     }
 
     var final_img = try Image.openPath(io, options.output_path);
@@ -194,10 +196,12 @@ pub fn build(
         report.vhd_alignment = try azure.alignFixedVhd(&final_img, io);
     }
 
-    logStep(options.verbose, "validate partition style");
-    const partition_style = try azure.checkPartitionStyle(final_img, io, allocator, options.generation);
-    report.partition_style = partition_style;
-    if (!partition_style.ok) return error.PartitionStyleCheckFailed;
+    if (output_format != .qcow2) {
+        logStep(options.verbose, "validate partition style");
+        const partition_style = try azure.checkPartitionStyle(final_img, io, allocator, options.generation);
+        report.partition_style = partition_style;
+        if (!partition_style.ok) return error.PartitionStyleCheckFailed;
+    }
 
     return report;
 }
