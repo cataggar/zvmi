@@ -44,6 +44,9 @@ pub const SyntheticCompression = enum {
 
 pub const SyntheticImageOptions = struct {
     compression: SyntheticCompression = .none,
+    block_size: u32 = 1024,
+    full_data_blocks: u32 = 1,
+    fragment_tail_size: u32 = 476,
 };
 
 pub const EntryKind = enum { file, directory, symlink };
@@ -103,6 +106,55 @@ pub const OpenError = error{
 pub const LookupError = error{ NotFound, NotADirectory, TooManySymlinks, BrokenSymlink } || std.mem.Allocator.Error;
 pub const ReadError = error{ NotAFile, NotASymlink, CompressedDataUnsupported, InvalidDataBlock, InvalidFragmentIndex } || Io.File.ReadPositionalError || std.mem.Allocator.Error;
 
+pub const CacheStats = struct {
+    data_block_decompressions: usize = 0,
+    fragment_block_decompressions: usize = 0,
+};
+
+const DataBlockCache = struct {
+    file_offset: ?u64 = null,
+    expected_size: usize = 0,
+    bytes: []u8 = &.{},
+
+    fn matches(self: DataBlockCache, file_offset: u64, expected_size: usize) bool {
+        return self.file_offset != null and self.file_offset.? == file_offset and self.expected_size == expected_size;
+    }
+
+    fn replace(self: *DataBlockCache, allocator: std.mem.Allocator, file_offset: u64, expected_size: usize, bytes: []u8) void {
+        self.clear(allocator);
+        self.file_offset = file_offset;
+        self.expected_size = expected_size;
+        self.bytes = bytes;
+    }
+
+    fn clear(self: *DataBlockCache, allocator: std.mem.Allocator) void {
+        if (self.bytes.len != 0) allocator.free(self.bytes);
+        self.* = .{};
+    }
+};
+
+const FragmentBlockCache = struct {
+    start_block: ?u64 = null,
+    raw_size: u32 = 0,
+    bytes: []u8 = &.{},
+
+    fn matches(self: FragmentBlockCache, fragment: FragmentEntry) bool {
+        return self.start_block != null and self.start_block.? == fragment.start_block and self.raw_size == fragment.raw_size;
+    }
+
+    fn replace(self: *FragmentBlockCache, allocator: std.mem.Allocator, fragment: FragmentEntry, bytes: []u8) void {
+        self.clear(allocator);
+        self.start_block = fragment.start_block;
+        self.raw_size = fragment.raw_size;
+        self.bytes = bytes;
+    }
+
+    fn clear(self: *FragmentBlockCache, allocator: std.mem.Allocator) void {
+        if (self.bytes.len != 0) allocator.free(self.bytes);
+        self.* = .{};
+    }
+};
+
 pub const Reader = struct {
     allocator: std.mem.Allocator,
     file: Io.File,
@@ -112,6 +164,12 @@ pub const Reader = struct {
     fragments: []FragmentEntry,
     entries: []Entry,
     root_index: usize,
+    // A single-entry cache is enough for the current hot path: ext4.populate()
+    // reads squashfs-backed files sequentially in 4 KiB chunks, so most calls
+    // stay within the same much-larger compressed block.
+    data_block_cache: DataBlockCache = .{},
+    fragment_block_cache: FragmentBlockCache = .{},
+    cache_stats: CacheStats = .{},
 
     pub fn openPath(allocator: std.mem.Allocator, io: Io, path: []const u8) OpenError!Reader {
         const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
@@ -185,6 +243,7 @@ pub const Reader = struct {
     }
 
     pub fn close(self: *Reader, io: Io) void {
+        self.clearBlockCache();
         for (self.entries) |entry| {
             self.allocator.free(entry.name);
             self.allocator.free(entry.block_sizes);
@@ -197,15 +256,26 @@ pub const Reader = struct {
         self.* = undefined;
     }
 
-    pub fn getEntry(self: Reader, index: usize) *const Entry {
+    /// Frees any memoized decompressed data while keeping the reader open.
+    pub fn clearBlockCache(self: *Reader) void {
+        self.data_block_cache.clear(self.allocator);
+        self.fragment_block_cache.clear(self.allocator);
+    }
+
+    /// Returns decompression counters for tests and diagnostics.
+    pub fn cacheStats(self: *const Reader) CacheStats {
+        return self.cache_stats;
+    }
+
+    pub fn getEntry(self: *const Reader, index: usize) *const Entry {
         return &self.entries[index];
     }
 
-    pub fn lookup(self: Reader, path: []const u8) LookupError!usize {
+    pub fn lookup(self: *const Reader, path: []const u8) LookupError!usize {
         return self.lookupFrom(self.root_index, path, false, 0);
     }
 
-    pub fn listDirAlloc(self: Reader, allocator: std.mem.Allocator, index: usize) (std.mem.Allocator.Error || error{NotADirectory})![]DirEntry {
+    pub fn listDirAlloc(self: *const Reader, allocator: std.mem.Allocator, index: usize) (std.mem.Allocator.Error || error{NotADirectory})![]DirEntry {
         if (self.entries[index].kind != .directory) return error.NotADirectory;
         var list = std.array_list.Managed(DirEntry).init(allocator);
         errdefer list.deinit();
@@ -216,7 +286,7 @@ pub const Reader = struct {
         return list.toOwnedSlice();
     }
 
-    pub fn readFileAlloc(self: Reader, allocator: std.mem.Allocator, io: Io, index: usize) ReadError![]u8 {
+    pub fn readFileAlloc(self: *Reader, allocator: std.mem.Allocator, io: Io, index: usize) ReadError![]u8 {
         const entry = self.entries[index];
         if (entry.kind != .file) return error.NotAFile;
 
@@ -226,7 +296,7 @@ pub const Reader = struct {
         return out;
     }
 
-    pub fn readFileAt(self: Reader, allocator: std.mem.Allocator, io: Io, index: usize, buffer: []u8, offset: u64) ReadError!usize {
+    pub fn readFileAt(self: *Reader, allocator: std.mem.Allocator, io: Io, index: usize, buffer: []u8, offset: u64) ReadError!usize {
         const entry = self.entries[index];
         if (entry.kind != .file) return error.NotAFile;
         if (offset >= entry.size or buffer.len == 0) return 0;
@@ -256,8 +326,7 @@ pub const Reader = struct {
                 stored_file_offset += stored_size;
             } else {
                 const stored_size = raw_size & ~data_uncompressed_bit;
-                const block_bytes = try self.readDataBlockAlloc(allocator, io, stored_file_offset, stored_size, @intCast(@min(@as(u64, block_size), entry.size - @as(u64, block_index) * block_size)));
-                defer allocator.free(block_bytes);
+                const block_bytes = try self.readCachedDataBlock(allocator, io, stored_file_offset, stored_size, @intCast(@min(@as(u64, block_size), entry.size - @as(u64, block_index) * block_size)));
                 const block_offset: usize = block_inner_offset;
                 if (block_offset + block_take > block_bytes.len) return error.InvalidDataBlock;
                 @memcpy(buffer[produced .. produced + block_take], block_bytes[block_offset .. block_offset + block_take]);
@@ -273,8 +342,7 @@ pub const Reader = struct {
                 return total;
             };
             if (fragment_index >= self.fragments.len) return error.InvalidFragmentIndex;
-            const fragment_bytes = try self.readFragmentBlockAlloc(allocator, io, self.fragments[fragment_index]);
-            defer allocator.free(fragment_bytes);
+            const fragment_bytes = try self.readCachedFragmentBlock(allocator, io, self.fragments[fragment_index]);
 
             const data_region_bytes = @as(u64, entry.block_sizes.len) * block_size;
             const fragment_skip = (offset + produced) - data_region_bytes;
@@ -289,21 +357,30 @@ pub const Reader = struct {
         return produced;
     }
 
-    pub fn readLink(self: Reader, index: usize) ReadError![]const u8 {
+    pub fn readLink(self: *const Reader, index: usize) ReadError![]const u8 {
         if (self.entries[index].kind != .symlink) return error.NotASymlink;
         return self.entries[index].symlink_target.?;
     }
 
-    pub fn resolveSymlink(self: Reader, index: usize) LookupError!usize {
+    pub fn resolveSymlink(self: *const Reader, index: usize) LookupError!usize {
         if (self.entries[index].kind != .symlink) return error.BrokenSymlink;
         return self.lookupFrom(self.entries[index].parent orelse self.root_index, self.entries[index].symlink_target.?, true, 1);
     }
 
-    fn readDataBlockAlloc(self: Reader, allocator: std.mem.Allocator, io: Io, file_offset: u64, stored_size: u32, expected_size: usize) ReadError![]u8 {
+    fn readCachedDataBlock(self: *Reader, allocator: std.mem.Allocator, io: Io, file_offset: u64, stored_size: u32, expected_size: usize) ReadError![]const u8 {
+        if (!self.data_block_cache.matches(file_offset, expected_size)) {
+            const block = try self.readDataBlockAlloc(allocator, io, file_offset, stored_size, expected_size);
+            self.data_block_cache.replace(allocator, file_offset, expected_size, block);
+        }
+        return self.data_block_cache.bytes;
+    }
+
+    fn readDataBlockAlloc(self: *Reader, allocator: std.mem.Allocator, io: Io, file_offset: u64, stored_size: u32, expected_size: usize) ReadError![]u8 {
         const stored = try allocator.alloc(u8, stored_size);
         defer allocator.free(stored);
         _ = try self.file.readPositionalAll(io, stored, file_offset);
 
+        self.cache_stats.data_block_decompressions += 1;
         const block = try decompressDataBlockAlloc(allocator, @enumFromInt(self.superblock.compression), stored, expected_size);
         if (block.len != expected_size) {
             allocator.free(block);
@@ -312,17 +389,26 @@ pub const Reader = struct {
         return block;
     }
 
-    fn readFragmentBlockAlloc(self: Reader, allocator: std.mem.Allocator, io: Io, fragment: FragmentEntry) ReadError![]u8 {
+    fn readCachedFragmentBlock(self: *Reader, allocator: std.mem.Allocator, io: Io, fragment: FragmentEntry) ReadError![]const u8 {
+        if (!self.fragment_block_cache.matches(fragment)) {
+            const block = try self.readFragmentBlockAlloc(allocator, io, fragment);
+            self.fragment_block_cache.replace(allocator, fragment, block);
+        }
+        return self.fragment_block_cache.bytes;
+    }
+
+    fn readFragmentBlockAlloc(self: *Reader, allocator: std.mem.Allocator, io: Io, fragment: FragmentEntry) ReadError![]u8 {
         const stored_size = fragment.raw_size & ~data_uncompressed_bit;
         const stored = try allocator.alloc(u8, stored_size);
         defer allocator.free(stored);
         _ = try self.file.readPositionalAll(io, stored, fragment.start_block);
 
         if ((fragment.raw_size & data_uncompressed_bit) != 0) return allocator.dupe(u8, stored);
+        self.cache_stats.fragment_block_decompressions += 1;
         return decompressDataBlockAlloc(allocator, @enumFromInt(self.superblock.compression), stored, self.superblock.block_size);
     }
 
-    fn lookupFrom(self: Reader, start_index: usize, path: []const u8, follow_final_symlink: bool, depth: u8) LookupError!usize {
+    fn lookupFrom(self: *const Reader, start_index: usize, path: []const u8, follow_final_symlink: bool, depth: u8) LookupError!usize {
         if (depth > 16) return error.TooManySymlinks;
         var current = if (std.mem.startsWith(u8, path, "/")) self.root_index else start_index;
         var it = std.mem.tokenizeScalar(u8, path, '/');
@@ -347,7 +433,7 @@ pub const Reader = struct {
         return current;
     }
 
-    fn findChild(self: Reader, parent: usize, name: []const u8) ?usize {
+    fn findChild(self: *const Reader, parent: usize, name: []const u8) ?usize {
         for (self.entries, 0..) |entry, i| {
             if (entry.parent == parent and std.mem.eql(u8, entry.name, name)) return i;
         }
@@ -1203,10 +1289,14 @@ fn compressSyntheticZstd(allocator: std.mem.Allocator, payload: []const u8) ![]u
 }
 
 pub fn buildSyntheticSquashfsImage(allocator: std.mem.Allocator, options: SyntheticImageOptions) ![]u8 {
-    const block_size: u32 = 1024;
-    const block_log: u16 = 10;
-    const full_data = [_]u8{'A'} ** block_size;
-    const fragment_tail = [_]u8{'B'} ** 476;
+    std.debug.assert(options.block_size != 0);
+    std.debug.assert(std.math.isPowerOfTwo(options.block_size));
+
+    const block_size = options.block_size;
+    const block_size_usize: usize = @intCast(block_size);
+    const block_log: u16 = @intCast(std.math.log2_int(u32, block_size));
+    const full_data_block_count: usize = @intCast(options.full_data_blocks);
+    const fragment_tail_size: usize = @intCast(options.fragment_tail_size);
     const compression_id: u16 = switch (options.compression) {
         .none => @intFromEnum(Compression.gzip),
         .xz => @intFromEnum(Compression.xz),
@@ -1215,11 +1305,38 @@ pub fn buildSyntheticSquashfsImage(allocator: std.mem.Allocator, options: Synthe
     const compressor_options_len: usize = if (options.compression == .xz) 8 else 0;
     const data_block_start: u64 = 96 + compressor_options_len;
 
-    const stored_full_data = try compressSyntheticBytes(allocator, options.compression, &full_data);
-    defer allocator.free(stored_full_data);
-    const stored_fragment_tail = try compressSyntheticBytes(allocator, options.compression, &fragment_tail);
-    defer allocator.free(stored_fragment_tail);
-    const fragment_data_start: u64 = data_block_start + stored_full_data.len;
+    const full_block_bytes = try allocator.alloc(u8, block_size_usize);
+    defer allocator.free(full_block_bytes);
+    const stored_full_blocks = try allocator.alloc(?[]u8, full_data_block_count);
+    @memset(stored_full_blocks, null);
+    defer {
+        for (stored_full_blocks) |stored_full_block| {
+            if (stored_full_block) |bytes| allocator.free(bytes);
+        }
+        allocator.free(stored_full_blocks);
+    }
+    for (stored_full_blocks, 0..) |*stored_full_block, block_index| {
+        @memset(full_block_bytes, syntheticFullBlockByte(block_index));
+        stored_full_block.* = try compressSyntheticBytes(allocator, options.compression, full_block_bytes);
+    }
+    const fragment_data_start: u64 = blk: {
+        var stored_len: u64 = data_block_start;
+        for (stored_full_blocks) |stored_full_block| stored_len += stored_full_block.?.len;
+        break :blk stored_len;
+    };
+
+    const stored_fragment_tail: ?[]u8 = if (fragment_tail_size == 0)
+        null
+    else blk: {
+        const fragment_tail = try allocator.alloc(u8, fragment_tail_size);
+        defer allocator.free(fragment_tail);
+        @memset(fragment_tail, syntheticFragmentByte(full_data_block_count));
+        break :blk try compressSyntheticBytes(allocator, options.compression, fragment_tail);
+    };
+    defer if (stored_fragment_tail) |bytes| allocator.free(bytes);
+
+    const file_size = @as(u64, options.full_data_blocks) * @as(u64, block_size) + @as(u64, options.fragment_tail_size);
+    const fragment_index: u32 = if (fragment_tail_size == 0) invalid_fragment else 0;
 
     var inode_payload = std.array_list.Managed(u8).init(allocator);
     defer inode_payload.deinit();
@@ -1259,10 +1376,15 @@ pub fn buildSyntheticSquashfsImage(allocator: std.mem.Allocator, options: Synthe
     try appendU32Le(&inode_payload, 0);
     try appendU32Le(&inode_payload, 3);
     try appendU32Le(&inode_payload, @intCast(data_block_start));
+    try appendU32Le(&inode_payload, fragment_index);
     try appendU32Le(&inode_payload, 0);
-    try appendU32Le(&inode_payload, 0);
-    try appendU32Le(&inode_payload, 1500);
-    try appendU32Le(&inode_payload, if (options.compression == .none) block_size | data_uncompressed_bit else @as(u32, @intCast(stored_full_data.len)));
+    try appendU32Le(&inode_payload, @intCast(file_size));
+    for (stored_full_blocks) |stored_full_block| {
+        try appendU32Le(&inode_payload, if (options.compression == .none)
+            block_size | data_uncompressed_bit
+        else
+            @as(u32, @intCast(stored_full_block.?.len)));
+    }
 
     var dir_payload = std.array_list.Managed(u8).init(allocator);
     defer dir_payload.deinit();
@@ -1286,9 +1408,14 @@ pub fn buildSyntheticSquashfsImage(allocator: std.mem.Allocator, options: Synthe
 
     var fragment_payload = std.array_list.Managed(u8).init(allocator);
     defer fragment_payload.deinit();
-    try appendU64Le(&fragment_payload, fragment_data_start);
-    try appendU32Le(&fragment_payload, if (options.compression == .none) fragment_tail.len | data_uncompressed_bit else @as(u32, @intCast(stored_fragment_tail.len)));
-    try appendU32Le(&fragment_payload, 0);
+    if (stored_fragment_tail) |bytes| {
+        try appendU64Le(&fragment_payload, fragment_data_start);
+        try appendU32Le(&fragment_payload, if (options.compression == .none)
+            options.fragment_tail_size | data_uncompressed_bit
+        else
+            @as(u32, @intCast(bytes.len)));
+        try appendU32Le(&fragment_payload, 0);
+    }
 
     var id_payload = std.array_list.Managed(u8).init(allocator);
     defer id_payload.deinit();
@@ -1302,17 +1429,23 @@ pub fn buildSyntheticSquashfsImage(allocator: std.mem.Allocator, options: Synthe
         try appendU32Le(&image, block_size);
         try appendU32Le(&image, 0);
     }
-    try image.appendSlice(stored_full_data);
-    try image.appendSlice(stored_fragment_tail);
+    for (stored_full_blocks) |stored_full_block| try image.appendSlice(stored_full_block.?);
+    if (stored_fragment_tail) |bytes| try image.appendSlice(bytes);
 
     const inode_table_start: u64 = image.items.len;
     try appendMetadataBlock(allocator, &image, options.compression, inode_payload.items);
     const directory_table_start: u64 = image.items.len;
     try appendMetadataBlock(allocator, &image, options.compression, dir_payload.items);
-    const fragment_meta_start: u64 = image.items.len;
-    try appendMetadataBlock(allocator, &image, options.compression, fragment_payload.items);
-    const fragment_table_start: u64 = image.items.len;
-    try appendU64Le(&image, fragment_meta_start);
+    const fragment_meta_start: u64 = if (stored_fragment_tail != null) blk: {
+        const start = image.items.len;
+        try appendMetadataBlock(allocator, &image, options.compression, fragment_payload.items);
+        break :blk start;
+    } else invalid_table;
+    const fragment_table_start: u64 = if (stored_fragment_tail != null) blk: {
+        const start = image.items.len;
+        try appendU64Le(&image, fragment_meta_start);
+        break :blk start;
+    } else invalid_table;
     const id_meta_start: u64 = image.items.len;
     try appendMetadataBlock(allocator, &image, options.compression, id_payload.items);
     const id_table_start: u64 = image.items.len;
@@ -1323,7 +1456,7 @@ pub fn buildSyntheticSquashfsImage(allocator: std.mem.Allocator, options: Synthe
     std.mem.writeInt(u32, image.items[4..8], 3, .little);
     std.mem.writeInt(u32, image.items[8..12], 0, .little);
     std.mem.writeInt(u32, image.items[12..16], block_size, .little);
-    std.mem.writeInt(u32, image.items[16..20], 1, .little);
+    std.mem.writeInt(u32, image.items[16..20], if (stored_fragment_tail == null) 0 else 1, .little);
     std.mem.writeInt(u16, image.items[20..22], compression_id, .little);
     std.mem.writeInt(u16, image.items[22..24], block_log, .little);
     std.mem.writeInt(u16, image.items[24..26], if (options.compression == .xz) 0b1011 | compressor_options_flag else 0b1011, .little);
@@ -1342,6 +1475,34 @@ pub fn buildSyntheticSquashfsImage(allocator: std.mem.Allocator, options: Synthe
     return image.toOwnedSlice();
 }
 
+fn syntheticFullBlockByte(block_index: usize) u8 {
+    return @as(u8, 'A') + @as(u8, @intCast(block_index % 26));
+}
+
+fn syntheticFragmentByte(full_data_block_count: usize) u8 {
+    return @as(u8, 'A') + @as(u8, @intCast(full_data_block_count % 26));
+}
+
+fn buildExpectedSyntheticFileBytesAlloc(allocator: std.mem.Allocator, options: SyntheticImageOptions) ![]u8 {
+    const block_size: usize = @intCast(options.block_size);
+    const full_data_block_count: usize = @intCast(options.full_data_blocks);
+    const fragment_tail_size: usize = @intCast(options.fragment_tail_size);
+
+    const total_len = full_data_block_count * block_size + fragment_tail_size;
+    const bytes = try allocator.alloc(u8, total_len);
+    var offset: usize = 0;
+
+    for (0..full_data_block_count) |block_index| {
+        @memset(bytes[offset..][0..block_size], syntheticFullBlockByte(block_index));
+        offset += block_size;
+    }
+
+    if (fragment_tail_size > 0) {
+        @memset(bytes[offset..][0..fragment_tail_size], syntheticFragmentByte(full_data_block_count));
+    }
+    return bytes;
+}
+
 fn writeFixture(path: []const u8, bytes: []const u8) !void {
     const io = std.testing.io;
     const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
@@ -1354,7 +1515,8 @@ fn expectSyntheticReaderRoundTrip(compression: SyntheticCompression, path: []con
     const io = std.testing.io;
     defer Io.Dir.cwd().deleteFile(io, path) catch {};
 
-    const image = try buildSyntheticSquashfsImage(allocator, .{ .compression = compression });
+    const options = SyntheticImageOptions{ .compression = compression };
+    const image = try buildSyntheticSquashfsImage(allocator, options);
     defer allocator.free(image);
     try writeFixture(path, image);
 
@@ -1364,7 +1526,7 @@ fn expectSyntheticReaderRoundTrip(compression: SyntheticCompression, path: []con
     try std.testing.expectEqual(@as(u32, 1024), reader.superblock.block_size);
     try std.testing.expectEqual(@as(usize, 1), reader.fragments.len);
     try std.testing.expectEqual(compression == .xz, reader.compressor_options != null);
-    if (reader.compressor_options) |options| switch (options) {
+    if (reader.compressor_options) |compressor_options| switch (compressor_options) {
         .xz => |xz_options| {
             try std.testing.expectEqual(@as(u32, 1024), xz_options.dictionary_size);
             try std.testing.expectEqual(@as(u32, 0), xz_options.flags);
@@ -1377,14 +1539,55 @@ fn expectSyntheticReaderRoundTrip(compression: SyntheticCompression, path: []con
     const file_index = try reader.lookup("/etc/message.txt");
     const contents = try reader.readFileAlloc(allocator, io, file_index);
     defer allocator.free(contents);
-    try std.testing.expectEqual(@as(usize, 1500), contents.len);
-    for (contents[0..1024]) |byte| try std.testing.expectEqual(@as(u8, 'A'), byte);
-    for (contents[1024..]) |byte| try std.testing.expectEqual(@as(u8, 'B'), byte);
+    const expected = try buildExpectedSyntheticFileBytesAlloc(allocator, options);
+    defer allocator.free(expected);
+    try std.testing.expectEqualSlices(u8, expected, contents);
 
     const root_entries = try reader.listDirAlloc(allocator, reader.root_index);
     defer allocator.free(root_entries);
     try std.testing.expectEqual(@as(usize, 1), root_entries.len);
     try std.testing.expectEqualStrings("etc", root_entries[0].name);
+}
+
+fn expectSequentialReadCaching(compression: SyntheticCompression, path: []const u8) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const options = SyntheticImageOptions{
+        .compression = compression,
+        .block_size = 64 * 1024,
+        .full_data_blocks = 48,
+        .fragment_tail_size = 8192,
+    };
+    const image = try buildSyntheticSquashfsImage(allocator, options);
+    defer allocator.free(image);
+    try writeFixture(path, image);
+
+    const expected = try buildExpectedSyntheticFileBytesAlloc(allocator, options);
+    defer allocator.free(expected);
+
+    var reader = try Reader.openPath(allocator, io, path);
+    defer reader.close(io);
+
+    const file_index = try reader.lookup("/etc/message.txt");
+    const actual = try allocator.alloc(u8, expected.len);
+    defer allocator.free(actual);
+
+    const chunk_size = 4096;
+    var offset: usize = 0;
+    while (offset < expected.len) {
+        const want = @min(chunk_size, expected.len - offset);
+        const got = try reader.readFileAt(allocator, io, file_index, actual[offset..][0..want], offset);
+        try std.testing.expectEqual(want, got);
+        offset += got;
+    }
+
+    try std.testing.expectEqualSlices(u8, expected, actual);
+
+    const stats = reader.cacheStats();
+    try std.testing.expectEqual(@as(usize, @intCast(options.full_data_blocks)), stats.data_block_decompressions);
+    try std.testing.expectEqual(@as(usize, 1), stats.fragment_block_decompressions);
 }
 
 test "squashfs reader enumerates nested directories and extracts fragment-backed file" {
@@ -1397,6 +1600,10 @@ test "squashfs reader decodes xz-compressed metadata data and fragments" {
 
 test "squashfs reader decodes zstd-compressed metadata data and fragments" {
     try expectSyntheticReaderRoundTrip(.zstd, "test-squashfs-zstd.sqsh");
+}
+
+test "squashfs reader caches repeated sequential reads within compressed data and fragment blocks" {
+    try expectSequentialReadCaching(.xz, "test-squashfs-read-cache.sqsh");
 }
 
 test "xz decompressor supports x86 BCJ + LZMA2 filter chains" {
