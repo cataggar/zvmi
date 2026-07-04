@@ -1071,6 +1071,32 @@ fn expectGen2BuiltImageContents(
     try std.testing.expectEqualStrings("kernel-from-oci", boot_kernel);
 }
 
+fn syntheticSquashfsBlockByte(block_index: usize) u8 {
+    return @as(u8, 'A') + @as(u8, @intCast(block_index % 26));
+}
+
+fn syntheticSquashfsFragmentByte(full_data_block_count: usize) u8 {
+    return @as(u8, 'A') + @as(u8, @intCast(full_data_block_count % 26));
+}
+
+fn buildExpectedSyntheticSquashfsFileAlloc(allocator: std.mem.Allocator, options: squashfs.SyntheticImageOptions) ![]u8 {
+    const block_size: usize = @intCast(options.block_size);
+    const full_data_block_count: usize = @intCast(options.full_data_blocks);
+    const fragment_tail_size: usize = @intCast(options.fragment_tail_size);
+    const total_len = full_data_block_count * block_size + fragment_tail_size;
+    const bytes = try allocator.alloc(u8, total_len);
+
+    var offset: usize = 0;
+    for (0..full_data_block_count) |block_index| {
+        @memset(bytes[offset..][0..block_size], syntheticSquashfsBlockByte(block_index));
+        offset += block_size;
+    }
+    if (fragment_tail_size > 0) {
+        @memset(bytes[offset..][0..fragment_tail_size], syntheticSquashfsFragmentByte(full_data_block_count));
+    }
+    return bytes;
+}
+
 fn extractImageRegionToPath(
     allocator: std.mem.Allocator,
     io: Io,
@@ -1156,6 +1182,61 @@ test "build-image builds Gen2 VHD and qcow2 outputs from XZ squashfs + OCI layou
     defer qcow2_img.close(io);
     try std.testing.expectEqual(Format.qcow2, qcow2_img.format);
     try expectGen2BuiltImageContents(allocator, io, &qcow2_img, qcow2_report, qcow2_output_path);
+}
+
+test "build-image populates multi-block squashfs files into ext4 for small sequential reads" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const iso_path = "test-build-image-large-squashfs.iso";
+    const oci_root = "test-build-image-large-squashfs-oci";
+    const output_path = "test-build-image-large-squashfs.raw";
+    defer Io.Dir.cwd().deleteFile(io, iso_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, oci_root) catch {};
+    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
+
+    const squashfs_options = squashfs.SyntheticImageOptions{
+        .compression = .xz,
+        .block_size = 64 * 1024,
+        .full_data_blocks = 48,
+        .fragment_tail_size = 8192,
+    };
+    const squashfs_bytes = try squashfs.buildSyntheticSquashfsImage(allocator, squashfs_options);
+    defer allocator.free(squashfs_bytes);
+    try writeMinimalIsoWithFile(allocator, io, iso_path, "ROOT.SQUASHFS;1", squashfs_bytes);
+
+    var fixture = try createBuildImageOciFixture(allocator, io, oci_root);
+    defer fixture.deinit(allocator);
+
+    var report = try build(allocator, io, .{
+        .iso_path = iso_path,
+        .container_path = oci_root,
+        .output_path = output_path,
+        .output_format = .raw,
+        .generation = .gen2,
+        .size = 256 * mib,
+    });
+    defer report.deinit(allocator);
+
+    var img = try Image.openPath(io, output_path);
+    defer img.close(io);
+
+    const root_partition = report.planned_partitions[1].planned;
+    const rootfs_scratch_path = try std.fmt.allocPrint(allocator, "{s}.test-rootfs.raw", .{output_path});
+    defer allocator.free(rootfs_scratch_path);
+    defer Io.Dir.cwd().deleteFile(io, rootfs_scratch_path) catch {};
+    try extractImageRegionToPath(allocator, io, &img, root_partition.offset_bytes, root_partition.length_bytes, rootfs_scratch_path);
+
+    const rootfs_scratch = try Io.Dir.cwd().openFile(io, rootfs_scratch_path, .{});
+    defer rootfs_scratch.close(io);
+    var root_reader = try ext4.open(io, rootfs_scratch, allocator, .{});
+    defer root_reader.deinit();
+
+    const contents = try root_reader.readFileAlloc(io, allocator, "etc/message.txt");
+    defer allocator.free(contents);
+    const expected = try buildExpectedSyntheticSquashfsFileAlloc(allocator, squashfs_options);
+    defer allocator.free(expected);
+    try std.testing.expectEqualSlices(u8, expected, contents);
 }
 
 test "build-image installs a Gen1 BIOS GRUB chain into the post-MBR gap" {
