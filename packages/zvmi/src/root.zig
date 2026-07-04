@@ -5,8 +5,8 @@
 //! support.
 //!
 //! Milestone 4 status: raw + fixed/dynamic vhd read/write, MBR + GPT
-//! partition table read/write, VHDX **read-only**. qcow2 is not implemented
-//! yet.
+//! partition table read/write, FAT32 filesystem read/write, VHDX
+//! **read-only**. qcow2 is not implemented yet.
 
 const std = @import("std");
 
