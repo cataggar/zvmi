@@ -595,11 +595,47 @@ test "loadLayout merges gzip layers, whiteouts, and opaque directories" {
     try std.testing.expect(seen >= 7);
 }
 
+test "loadLayout rejects zstd layer media types" {
+    const io = std.testing.io;
+    const fixture_root = "test-oci-layout-zstd-fixture";
+    defer Io.Dir.cwd().deleteTree(io, fixture_root) catch {};
+
+    var fixture = try createFixtureLayout(std.testing.allocator, io, fixture_root);
+    defer fixture.deinit(std.testing.allocator);
+
+    var dir = try Io.Dir.cwd().openDir(io, fixture_root, .{});
+    defer dir.close(io);
+
+    const zstd_manifest_json = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"schemaVersion\":2,\"config\":{{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\"{s}\",\"size\":{d}}},\"layers\":[{{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+zstd\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
+        .{ fixture.config_digest, fixture.config_json.len, fixture.layer1_digest, fixture.layer1_gzip.len },
+    );
+    defer std.testing.allocator.free(zstd_manifest_json);
+
+    const zstd_manifest_digest = try writeBlobAndDigest(std.testing.allocator, io, dir, zstd_manifest_json);
+    defer std.testing.allocator.free(zstd_manifest_digest);
+
+    const zstd_index_json = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
+        .{ zstd_manifest_digest, zstd_manifest_json.len },
+    );
+    defer std.testing.allocator.free(zstd_index_json);
+    try dir.writeFile(io, .{ .sub_path = "index.json", .data = zstd_index_json });
+
+    try std.testing.expectError(error.UnsupportedLayerCompression, loadLayout(io, std.testing.allocator, fixture_root, .{}));
+}
+
 const FixtureLayout = struct {
     layer1_tar: []u8,
     layer2_tar: []u8,
     layer1_gzip: []u8,
     layer2_gzip: []u8,
+    config_digest: []u8,
+    layer1_digest: []u8,
+    layer2_digest: []u8,
+    manifest_digest: []u8,
     config_json: []u8,
     manifest_json: []u8,
     index_json: []u8,
@@ -609,6 +645,10 @@ const FixtureLayout = struct {
         allocator.free(self.layer2_tar);
         allocator.free(self.layer1_gzip);
         allocator.free(self.layer2_gzip);
+        allocator.free(self.config_digest);
+        allocator.free(self.layer1_digest);
+        allocator.free(self.layer2_digest);
+        allocator.free(self.manifest_digest);
         allocator.free(self.config_json);
         allocator.free(self.manifest_json);
         allocator.free(self.index_json);
@@ -648,11 +688,8 @@ fn createFixtureLayout(allocator: Allocator, io: Io, root: []const u8) !FixtureL
     );
 
     const config_digest = try writeBlobAndDigest(allocator, io, dir, config_json);
-    defer allocator.free(config_digest);
     const layer1_digest = try writeBlobAndDigest(allocator, io, dir, layer1_gzip);
-    defer allocator.free(layer1_digest);
     const layer2_digest = try writeBlobAndDigest(allocator, io, dir, layer2_gzip);
-    defer allocator.free(layer2_digest);
 
     const manifest_json = try std.fmt.allocPrint(
         allocator,
@@ -660,7 +697,6 @@ fn createFixtureLayout(allocator: Allocator, io: Io, root: []const u8) !FixtureL
         .{ config_digest, config_json.len, layer1_digest, layer1_gzip.len, layer2_digest, layer2_gzip.len },
     );
     const manifest_digest = try writeBlobAndDigest(allocator, io, dir, manifest_json);
-    defer allocator.free(manifest_digest);
 
     const index_json = try std.fmt.allocPrint(
         allocator,
@@ -676,6 +712,10 @@ fn createFixtureLayout(allocator: Allocator, io: Io, root: []const u8) !FixtureL
         .layer2_tar = layer2_tar,
         .layer1_gzip = layer1_gzip,
         .layer2_gzip = layer2_gzip,
+        .config_digest = config_digest,
+        .layer1_digest = layer1_digest,
+        .layer2_digest = layer2_digest,
+        .manifest_digest = manifest_digest,
         .config_json = config_json,
         .manifest_json = manifest_json,
         .index_json = index_json,
