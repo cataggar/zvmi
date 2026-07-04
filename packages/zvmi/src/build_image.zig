@@ -62,6 +62,7 @@ pub fn build(
 ) !BuildImageReport {
     const output_format = try resolveOutputFormat(options.output_format, options.output_path);
     const disk_size = if (output_format == .vhd) azure.alignSizeToMib(options.size) else options.size;
+    if (options.verity and options.generation == .gen1) return error.UnsupportedGenerationForVerity;
 
     if (options.verbose and output_format == .vhd and disk_size != options.size) {
         std.debug.print("build-image: aligned requested VHD size from {d} to {d} bytes for Azure compatibility\n", .{ options.size, disk_size });
@@ -1149,6 +1150,18 @@ test "build-image installs a Gen1 BIOS GRUB chain into the post-MBR gap" {
     std.mem.writeInt(u16, expected_core[508..][0..2], @intCast(core_sector_count - 1), .little);
     std.mem.writeInt(u16, expected_core[510..][0..2], 0x820, .little);
     try std.testing.expectEqualSlices(u8, expected_core, embedded_core);
+}
+
+test "build-image rejects dm-verity for Gen1 builds" {
+    try std.testing.expectError(error.UnsupportedGenerationForVerity, build(std.testing.allocator, std.testing.io, .{
+        .iso_path = "unused.iso",
+        .container_path = "unused-oci",
+        .output_path = "unused.raw",
+        .output_format = .raw,
+        .generation = .gen1,
+        .size = 256 * mib,
+        .verity = true,
+    }));
 }
 
 test "build-image can append a dm-verity tree and pass metadata through COSI output" {
