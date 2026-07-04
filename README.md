@@ -37,8 +37,8 @@ zvmi/
         squashfs.zig           # squashfs **read-only** codec (superblock,
                               #   inode/directory/fragment tables, XZ/zstd
                               #   compressed blocks)
-        oci.zig                # local OCI image-layout ingestion (layer
-                              #   extraction + whiteout-aware merge)
+        oci.zig                # local OCI/docker-save image ingestion
+                              #   (layer extraction + whiteout-aware merge)
         ext4.zig              # minimal native ext4 writer + readback helper
                               #   (no journal, linear dirs, inline extents)
         bootconfig.zig         # ESP bootloader population (copy EFI binaries

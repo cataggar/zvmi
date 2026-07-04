@@ -63,8 +63,8 @@ pub fn build(
         std.debug.print("build-image: aligned requested VHD size from {d} to {d} bytes for Azure compatibility\n", .{ options.size, disk_size });
     }
 
-    logStep(options.verbose, "load OCI layout");
-    var container_image = try oci.loadLayout(io, allocator, options.container_path, .{});
+    logStep(options.verbose, "load container image");
+    var container_image = try oci.load(io, allocator, options.container_path, .{});
     defer container_image.deinit();
 
     const architecture = inferArchitecture(container_image.config.architecture);
