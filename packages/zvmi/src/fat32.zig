@@ -59,11 +59,13 @@ pub const Error = error{
     PathNotFound,
     NotDirectory,
     IsDirectory,
+    DirectoryNotEmpty,
     AlreadyExists,
     NoSpaceLeft,
     BadClusterChain,
     UnexpectedEndOfFile,
     FileTooLarge,
+    InvalidTruncateSize,
 };
 
 pub const FormatError = Error || Image.PreadError || Image.PwriteError;
@@ -208,6 +210,63 @@ pub const FileSystem = struct {
         first_cluster: u32,
         size: u32,
     ) MutationError!void {
+    /// Deletes an existing file or empty directory.
+    pub fn deletePath(self: *FileSystem, io: Io, path: []const u8) MutationError!void {
+        const parent = try self.resolveParent(io, path);
+        if (parent.name.len == 0) return error.InvalidPath;
+        const entry = (try self.findEntry(io, parent.cluster, parent.name)) orelse return error.PathNotFound;
+
+        if (entry.kind() == .directory and !(try self.isDirectoryEmpty(io, entry.first_cluster))) {
+            return error.DirectoryNotEmpty;
+        }
+
+        if (entry.first_cluster != 0) try self.releaseChain(io, entry.first_cluster);
+        try self.markEntryDeleted(io, parent.cluster, entry.location());
+    }
+
+    /// Shrinks an existing file to `new_size`, freeing no-longer-needed clusters.
+    pub fn truncateFile(self: *FileSystem, io: Io, path: []const u8, new_size: u32) MutationError!void {
+        const parent = try self.resolveParent(io, path);
+        if (parent.name.len == 0) return error.InvalidPath;
+        const entry = (try self.findEntry(io, parent.cluster, parent.name)) orelse return error.PathNotFound;
+        if (entry.kind() != .file) return error.IsDirectory;
+        if (new_size > entry.size) return error.InvalidTruncateSize;
+        if (new_size == entry.size) return;
+
+        if (new_size == 0) {
+            if (entry.first_cluster != 0) try self.releaseChain(io, entry.first_cluster);
+            try self.updateDirectoryEntry(io, parent.cluster, entry.location(), 0, 0);
+            return;
+        }
+        if (entry.first_cluster == 0) return error.BadClusterChain;
+
+        const cluster_size = self.info.clusterSize();
+        const needed_clusters: u32 = @intCast(std.math.divCeil(u64, new_size, cluster_size) catch unreachable);
+        var keep_cluster = entry.first_cluster;
+        var cluster_index: u32 = 1;
+        while (cluster_index < needed_clusters) : (cluster_index += 1) {
+            keep_cluster = (try self.nextCluster(io, keep_cluster)) orelse return error.BadClusterChain;
+        }
+
+        const tail_cluster = try self.nextCluster(io, keep_cluster);
+        if (tail_cluster) |cluster| {
+            try self.writeFatEntry(io, keep_cluster, fat_entry_eoc);
+            try self.releaseChain(io, cluster);
+        }
+
+        const tail_bytes = new_size % cluster_size;
+        if (tail_bytes != 0) {
+            var zeros: [max_cluster_size]u8 = [_]u8{0} ** max_cluster_size;
+            try self.writeRegion(
+                io,
+                zeros[0 .. cluster_size - tail_bytes],
+                self.clusterOffset(keep_cluster) + tail_bytes,
+            );
+        }
+
+        try self.updateDirectoryEntry(io, parent.cluster, entry.location(), entry.first_cluster, new_size);
+    }
+
         var utf16_units: [max_long_name_units]u16 = undefined;
         const utf16_name = try encodeLongName(name, &utf16_units);
 
