@@ -216,12 +216,16 @@ pub const FileSystem = struct {
         if (parent.name.len == 0) return error.InvalidPath;
         const entry = (try self.findEntry(io, parent.cluster, parent.name)) orelse return error.PathNotFound;
 
-        if (entry.kind() == .directory and !(try self.isDirectoryEmpty(io, entry.first_cluster))) {
-            return error.DirectoryNotEmpty;
-        }
+        try self.deleteLocatedEntry(io, parent.cluster, entry, false);
+    }
 
-        if (entry.first_cluster != 0) try self.releaseChain(io, entry.first_cluster);
-        try self.markEntryDeleted(io, parent.cluster, entry.location());
+    /// Deletes an existing file or directory tree recursively.
+    pub fn deleteTree(self: *FileSystem, io: Io, path: []const u8) MutationError!void {
+        const parent = try self.resolveParent(io, path);
+        if (parent.name.len == 0) return error.InvalidPath;
+        const entry = (try self.findEntry(io, parent.cluster, parent.name)) orelse return error.PathNotFound;
+
+        try self.deleteLocatedEntry(io, parent.cluster, entry, true);
     }
 
     /// Shrinks an existing file to `new_size`, freeing no-longer-needed clusters.
@@ -491,6 +495,44 @@ pub const FileSystem = struct {
         for (0..location.slot_count) |slot_index| {
             try self.writeRegion(io, &deleted, try self.directorySlotOffset(io, dir_cluster, location.first_slot + slot_index));
         }
+    }
+
+    fn deleteLocatedEntry(
+        self: *FileSystem,
+        io: Io,
+        parent_cluster: u32,
+        entry: LocatedEntry,
+        recursive: bool,
+    ) MutationError!void {
+        if (entry.kind() == .directory) {
+            if (recursive) {
+                try self.deleteDirectoryChildren(io, entry.first_cluster);
+            } else if (!(try self.isDirectoryEmpty(io, entry.first_cluster))) {
+                return error.DirectoryNotEmpty;
+            }
+        }
+
+        try self.releaseEntry(io, parent_cluster, entry.location(), entry.first_cluster);
+    }
+
+    fn deleteDirectoryChildren(self: *FileSystem, io: Io, dir_cluster: u32) MutationError!void {
+        var iter = try DirectoryIterator.init(self, io, dir_cluster);
+        while (try iter.next(io, null)) |entry| {
+            if (entry.attr & attr_volume_id != 0) continue;
+            if (isDotEntry(entry.short_name)) continue;
+            try self.deleteLocatedEntry(io, dir_cluster, entry, true);
+        }
+    }
+
+    fn releaseEntry(
+        self: *FileSystem,
+        io: Io,
+        parent_cluster: u32,
+        location: DirectoryEntryLocation,
+        first_cluster: u32,
+    ) MutationError!void {
+        if (first_cluster != 0) try self.releaseChain(io, first_cluster);
+        try self.markEntryDeleted(io, parent_cluster, location);
     }
 
     fn isDirectoryEmpty(self: *FileSystem, io: Io, dir_cluster: u32) MutationError!bool {
@@ -1634,6 +1676,88 @@ test "delete frees directory entries and FAT chains for reuse" {
 
     try fs.deletePath(io, "EFI/EMPTY");
     try std.testing.expectError(error.PathNotFound, fs.listDirAlloc(io, std.testing.allocator, "EFI/EMPTY"));
+}
+
+test "deleteTree removes nested directories and reuses freed clusters" {
+    const io = std.testing.io;
+    const path = "test-fat32-delete-tree.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const partition_len: u64 = 64 * 1024 * 1024;
+    var img = try Image.create(io, path, .raw, partition_len, .{});
+    defer img.close(io);
+
+    try format(&img, io, .{ .partition_offset = 0, .partition_len = partition_len });
+
+    var fs = try open(&img, io, .{ .offset = 0, .length = partition_len });
+    const cluster_size = fs.info.clusterSize();
+
+    const survivor_contents = try allocPattern(std.testing.allocator, cluster_size + 23, 0x14);
+    defer std.testing.allocator.free(survivor_contents);
+    const alpha_contents = try allocPattern(std.testing.allocator, cluster_size * 2 + 13, 0x31);
+    defer std.testing.allocator.free(alpha_contents);
+    const beta_contents = try allocPattern(std.testing.allocator, cluster_size + 19, 0x42);
+    defer std.testing.allocator.free(beta_contents);
+    const gamma_contents = try allocPattern(std.testing.allocator, cluster_size * 2 + 5, 0x53);
+    defer std.testing.allocator.free(gamma_contents);
+    const replacement_contents = try allocPattern(std.testing.allocator, cluster_size * 3 + 41, 0x64);
+    defer std.testing.allocator.free(replacement_contents);
+
+    try fs.writeFile(io, "survivor.bin", survivor_contents);
+    try fs.createDir(io, "trash/dir1/dir2");
+    try fs.writeFile(io, "trash/alpha.bin", alpha_contents);
+    try fs.writeFile(io, "trash/dir1/beta.bin", beta_contents);
+    try fs.writeFile(io, "trash/dir1/dir2/gamma.bin", gamma_contents);
+
+    const trash_entry = (try fs.lookup(io, "trash")).?;
+    const dir1_entry = (try fs.lookup(io, "trash/dir1")).?;
+    const dir2_entry = (try fs.lookup(io, "trash/dir1/dir2")).?;
+    const alpha_entry = (try fs.lookup(io, "trash/alpha.bin")).?;
+    const beta_entry = (try fs.lookup(io, "trash/dir1/beta.bin")).?;
+    const gamma_entry = (try fs.lookup(io, "trash/dir1/dir2/gamma.bin")).?;
+
+    const trash_chain = try collectClusterChain(&fs, io, std.testing.allocator, trash_entry.first_cluster);
+    defer std.testing.allocator.free(trash_chain);
+    const dir1_chain = try collectClusterChain(&fs, io, std.testing.allocator, dir1_entry.first_cluster);
+    defer std.testing.allocator.free(dir1_chain);
+    const dir2_chain = try collectClusterChain(&fs, io, std.testing.allocator, dir2_entry.first_cluster);
+    defer std.testing.allocator.free(dir2_chain);
+    const alpha_chain = try collectClusterChain(&fs, io, std.testing.allocator, alpha_entry.first_cluster);
+    defer std.testing.allocator.free(alpha_chain);
+    const beta_chain = try collectClusterChain(&fs, io, std.testing.allocator, beta_entry.first_cluster);
+    defer std.testing.allocator.free(beta_chain);
+    const gamma_chain = try collectClusterChain(&fs, io, std.testing.allocator, gamma_entry.first_cluster);
+    defer std.testing.allocator.free(gamma_chain);
+
+    const deleted_cluster_count = trash_chain.len + dir1_chain.len + dir2_chain.len + alpha_chain.len + beta_chain.len + gamma_chain.len;
+    const free_before = fs.free_cluster_count;
+
+    try fs.deleteTree(io, "trash");
+
+    try std.testing.expectEqual(
+        free_before + @as(u32, @intCast(deleted_cluster_count)),
+        fs.free_cluster_count,
+    );
+    try std.testing.expect((try fs.lookup(io, "trash")) == null);
+    try std.testing.expect((try fs.lookup(io, "trash/dir1")) == null);
+    try std.testing.expectError(error.PathNotFound, fs.readFileAlloc(io, std.testing.allocator, "trash/alpha.bin"));
+
+    const root_entries_after_delete = try fs.listDirAlloc(io, std.testing.allocator, "");
+    defer freeDirEntries(std.testing.allocator, root_entries_after_delete);
+    try std.testing.expectEqual(@as(usize, 1), root_entries_after_delete.len);
+    try std.testing.expectEqualStrings("survivor.bin", root_entries_after_delete[0].name);
+
+    try fs.writeFile(io, "replacement.bin", replacement_contents);
+    const replacement_entry = (try fs.lookup(io, "replacement.bin")).?;
+    try std.testing.expectEqual(trash_entry.first_cluster, replacement_entry.first_cluster);
+
+    const survivor = try fs.readFileAlloc(io, std.testing.allocator, "survivor.bin");
+    defer std.testing.allocator.free(survivor);
+    try std.testing.expectEqualSlices(u8, survivor_contents, survivor);
+
+    const replacement = try fs.readFileAlloc(io, std.testing.allocator, "replacement.bin");
+    defer std.testing.allocator.free(replacement);
+    try std.testing.expectEqualSlices(u8, replacement_contents, replacement);
 }
 
 test "truncate shrinks files and frees unused clusters" {
