@@ -961,61 +961,10 @@ fn readSquashfsFileAt(io: Io, reader: *squashfs.Reader, index: usize, buffer: []
     const entry = reader.getEntry(index);
     if (entry.kind != .file) return error.NotAFile;
     if (offset > entry.size) return error.UnexpectedEndOfStream;
-    if (offset == entry.size or buffer.len == 0) return 0;
-
-    const total: usize = @intCast(@min(@as(u64, buffer.len), entry.size - offset));
-    var produced: usize = 0;
-    const block_size = reader.superblock.block_size;
-    const full_blocks_to_skip: usize = @intCast(offset / block_size);
-    var block_inner_offset: u32 = @intCast(offset % block_size);
-    var stored_file_offset = entry.data_start;
-
-    var block_index: usize = 0;
-    while (block_index < full_blocks_to_skip and block_index < entry.block_sizes.len) : (block_index += 1) {
-        const raw_size = entry.block_sizes[block_index];
-        if (raw_size != 0) {
-            if ((raw_size & squashfs.data_uncompressed_bit) == 0) return error.CompressedDataUnsupported;
-            stored_file_offset += raw_size & ~squashfs.data_uncompressed_bit;
-        }
-    }
-
-    while (block_index < entry.block_sizes.len and produced < total) : (block_index += 1) {
-        const raw_size = entry.block_sizes[block_index];
-        const block_take: usize = @intCast(@min(@as(u64, total - produced), block_size - block_inner_offset));
-        if (raw_size == 0) {
-            @memset(buffer[produced .. produced + block_take], 0);
-        } else {
-            if ((raw_size & squashfs.data_uncompressed_bit) == 0) return error.CompressedDataUnsupported;
-            const stored_size = raw_size & ~squashfs.data_uncompressed_bit;
-            const got = try reader.file.readPositionalAll(io, buffer[produced .. produced + block_take], stored_file_offset + block_inner_offset);
-            if (got < block_take) @memset(buffer[produced + got .. produced + block_take], 0);
-            stored_file_offset += stored_size;
-        }
-        produced += block_take;
-        block_inner_offset = 0;
-    }
-
-    if (produced < total) {
-        const fragment_index = entry.fragment_index orelse {
-            @memset(buffer[produced..total], 0);
-            return total;
-        };
-        if (fragment_index >= reader.fragments.len) return error.InvalidFragmentIndex;
-        const fragment = reader.fragments[fragment_index];
-        if ((fragment.raw_size & squashfs.data_uncompressed_bit) == 0) return error.CompressedDataUnsupported;
-        const data_region_bytes = @as(u64, entry.block_sizes.len) * block_size;
-        const fragment_skip = (offset + produced) - data_region_bytes;
-        const fragment_inner_offset = entry.fragment_offset + @as(u32, @intCast(fragment_skip));
-        const take = total - produced;
-        const got = try reader.file.readPositionalAll(io, buffer[produced .. produced + take], fragment.start_block + fragment_inner_offset);
-        if (got < take) @memset(buffer[produced + got .. produced + take], 0);
-        produced += take;
-    }
-
-    return produced;
+    return reader.readFileAt(reader.allocator, io, index, buffer, offset);
 }
 
-test "build-image builds a Gen2 Azure-ready VHD from ISO squashfs + OCI layout" {
+test "build-image builds a Gen2 Azure-ready VHD from XZ squashfs + OCI layout" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1026,7 +975,7 @@ test "build-image builds a Gen2 Azure-ready VHD from ISO squashfs + OCI layout" 
     defer Io.Dir.cwd().deleteTree(io, oci_root) catch {};
     defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
 
-    const squashfs_bytes = try buildSyntheticSquashfsImage(allocator);
+    const squashfs_bytes = try squashfs.buildSyntheticSquashfsImage(allocator, .{ .compression = .xz });
     defer allocator.free(squashfs_bytes);
     try writeMinimalIsoWithFile(allocator, io, iso_path, "ROOT.SQUASHFS;1", squashfs_bytes);
 
@@ -1101,13 +1050,13 @@ test "build-image builds a Gen2 Azure-ready VHD from ISO squashfs + OCI layout" 
 test "build-image reports errors cleanly (no double-free) when squashfs open fails after partition planning" {
     // Regression test for a bug found via real-world testing against the real
     // Azure Linux 4.0 ISO (https://aka.ms/azurelinux-4.0-x86_64.iso), whose
-    // embedded /LiveOS/squashfs.img uses XZ-compressed metadata blocks (not yet
-    // supported -- see the "squashfs: zstd/xz compressed block support" issue).
+    // embedded /LiveOS/squashfs.img uses XZ-compressed metadata blocks.
     // `build()` used to register an `errdefer allocator.free(planned_partitions)`
     // / `errdefer allocator.free(rootfs_path_in_iso)` *and* a later
     // `errdefer report.deinit(allocator)` that also frees the same two slices;
-    // any error past that point (like squashfs.Reader.openFile's
-    // CompressedMetadataUnsupported) triggered all of them during unwinding and
+    // any error past that point (like squashfs.Reader.openFile returning
+    // InvalidMetadataBlock for malformed compressed metadata) triggered all of
+    // them during unwinding and
     // double-freed both allocations. `std.testing.allocator` below will fail
     // this test if that regresses.
     const allocator = std.testing.allocator;
@@ -1120,12 +1069,13 @@ test "build-image reports errors cleanly (no double-free) when squashfs open fai
     defer Io.Dir.cwd().deleteTree(io, oci_root) catch {};
     defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
 
-    const squashfs_bytes = try buildSyntheticSquashfsImage(allocator);
+    const squashfs_bytes = try squashfs.buildSyntheticSquashfsImage(allocator, .{ .compression = .none });
     defer allocator.free(squashfs_bytes);
 
-    // Clear the inode table's metadata-block "uncompressed" bit so it looks
-    // like a real, compressed squashfs image to zvmi.squashfs.Reader --
-    // exactly what tripped the real Azure Linux ISO's XZ-compressed metadata.
+    // Clear the inode table's metadata-block "uncompressed" bit and relabel
+    // the filesystem as XZ-compressed so squashfs.Reader attempts to
+    // decompress raw metadata bytes and fails after partition planning.
+    std.mem.writeInt(u16, squashfs_bytes[20..22], @intFromEnum(squashfs.Compression.xz), .little);
     const inode_table_start = std.mem.readInt(u64, squashfs_bytes[64..72], .little);
     const header_offset: usize = @intCast(inode_table_start);
     var header = std.mem.readInt(u16, squashfs_bytes[header_offset..][0..2], .little);
@@ -1137,7 +1087,7 @@ test "build-image reports errors cleanly (no double-free) when squashfs open fai
     var fixture = try createBuildImageOciFixture(allocator, io, oci_root);
     defer fixture.deinit(allocator);
 
-    try std.testing.expectError(error.CompressedMetadataUnsupported, build(allocator, io, .{
+    try std.testing.expectError(error.InvalidMetadataBlock, build(allocator, io, .{
         .iso_path = iso_path,
         .container_path = oci_root,
         .output_path = output_path,
@@ -1338,139 +1288,6 @@ fn writeChecksumField(field: []u8, value: u32) !void {
     field[field.len - 1] = ' ';
 }
 
-fn buildSyntheticSquashfsImage(allocator: std.mem.Allocator) ![]u8 {
-    const block_size: u32 = 1024;
-    const block_log: u16 = 10;
-    const full_data = [_]u8{'A'} ** block_size;
-    const fragment_tail = [_]u8{'B'} ** 476;
-
-    const data_block_start: u64 = 96;
-    const fragment_data_start: u64 = data_block_start + full_data.len;
-
-    var inode_payload = std.array_list.Managed(u8).init(allocator);
-    defer inode_payload.deinit();
-
-    const root_inode_offset: u16 = @intCast(inode_payload.items.len);
-    _ = root_inode_offset;
-    try appendU16Le(&inode_payload, 1);
-    try appendU16Le(&inode_payload, 0o755);
-    try appendU16Le(&inode_payload, 0);
-    try appendU16Le(&inode_payload, 0);
-    try appendU32Le(&inode_payload, 0);
-    try appendU32Le(&inode_payload, 1);
-    try appendU32Le(&inode_payload, 0);
-    try appendU32Le(&inode_payload, 2);
-    try appendU16Le(&inode_payload, 23);
-    try appendU16Le(&inode_payload, 0);
-    try appendU32Le(&inode_payload, 1);
-
-    const nested_inode_offset: u16 = @intCast(inode_payload.items.len);
-    try appendU16Le(&inode_payload, 1);
-    try appendU16Le(&inode_payload, 0o755);
-    try appendU16Le(&inode_payload, 0);
-    try appendU16Le(&inode_payload, 0);
-    try appendU32Le(&inode_payload, 0);
-    try appendU32Le(&inode_payload, 2);
-    try appendU32Le(&inode_payload, 0);
-    try appendU32Le(&inode_payload, 2);
-    try appendU16Le(&inode_payload, 31);
-    try appendU16Le(&inode_payload, 23);
-    try appendU32Le(&inode_payload, 1);
-
-    const file_inode_offset: u16 = @intCast(inode_payload.items.len);
-    try appendU16Le(&inode_payload, 2);
-    try appendU16Le(&inode_payload, 0o644);
-    try appendU16Le(&inode_payload, 0);
-    try appendU16Le(&inode_payload, 0);
-    try appendU32Le(&inode_payload, 0);
-    try appendU32Le(&inode_payload, 3);
-    try appendU32Le(&inode_payload, @intCast(data_block_start));
-    try appendU32Le(&inode_payload, 0);
-    try appendU32Le(&inode_payload, 0);
-    try appendU32Le(&inode_payload, 1500);
-    try appendU32Le(&inode_payload, block_size | squashfs.data_uncompressed_bit);
-
-    var dir_payload = std.array_list.Managed(u8).init(allocator);
-    defer dir_payload.deinit();
-    try appendU32Le(&dir_payload, 0);
-    try appendU32Le(&dir_payload, 0);
-    try appendU32Le(&dir_payload, 2);
-    try appendU16Le(&dir_payload, nested_inode_offset);
-    try appendU16Le(&dir_payload, 0);
-    try appendU16Le(&dir_payload, 1);
-    try appendU16Le(&dir_payload, 2);
-    try dir_payload.appendSlice("etc");
-
-    try appendU32Le(&dir_payload, 0);
-    try appendU32Le(&dir_payload, 0);
-    try appendU32Le(&dir_payload, 3);
-    try appendU16Le(&dir_payload, file_inode_offset);
-    try appendU16Le(&dir_payload, 0);
-    try appendU16Le(&dir_payload, 2);
-    try appendU16Le(&dir_payload, 10);
-    try dir_payload.appendSlice("message.txt");
-
-    var fragment_payload = std.array_list.Managed(u8).init(allocator);
-    defer fragment_payload.deinit();
-    try appendU64Le(&fragment_payload, fragment_data_start);
-    try appendU32Le(&fragment_payload, fragment_tail.len | squashfs.data_uncompressed_bit);
-    try appendU32Le(&fragment_payload, 0);
-
-    var id_payload = std.array_list.Managed(u8).init(allocator);
-    defer id_payload.deinit();
-    try appendU32Le(&id_payload, 0);
-
-    var image = std.array_list.Managed(u8).init(allocator);
-    errdefer image.deinit();
-    try image.resize(96);
-    @memset(image.items, 0);
-    try image.appendSlice(&full_data);
-    try image.appendSlice(&fragment_tail);
-
-    const inode_table_start: u64 = image.items.len;
-    try appendMetadataBlock(&image, inode_payload.items);
-    const directory_table_start: u64 = image.items.len;
-    try appendMetadataBlock(&image, dir_payload.items);
-    const fragment_meta_start: u64 = image.items.len;
-    try appendMetadataBlock(&image, fragment_payload.items);
-    const fragment_table_start: u64 = image.items.len;
-    try appendU64LeImage(&image, fragment_meta_start);
-    const id_meta_start: u64 = image.items.len;
-    try appendMetadataBlock(&image, id_payload.items);
-    const id_table_start: u64 = image.items.len;
-    try appendU64LeImage(&image, id_meta_start);
-    const bytes_used: u64 = image.items.len;
-
-    std.mem.writeInt(u32, image.items[0..4], squashfs.magic, .little);
-    std.mem.writeInt(u32, image.items[4..8], 3, .little);
-    std.mem.writeInt(u32, image.items[8..12], 0, .little);
-    std.mem.writeInt(u32, image.items[12..16], block_size, .little);
-    std.mem.writeInt(u32, image.items[16..20], 1, .little);
-    std.mem.writeInt(u16, image.items[20..22], 1, .little);
-    std.mem.writeInt(u16, image.items[22..24], block_log, .little);
-    std.mem.writeInt(u16, image.items[24..26], 0b1011, .little);
-    std.mem.writeInt(u16, image.items[26..28], 1, .little);
-    std.mem.writeInt(u16, image.items[28..30], squashfs.major_version, .little);
-    std.mem.writeInt(u16, image.items[30..32], 0, .little);
-    std.mem.writeInt(u64, image.items[32..40], 0, .little);
-    std.mem.writeInt(u64, image.items[40..48], bytes_used, .little);
-    std.mem.writeInt(u64, image.items[48..56], id_table_start, .little);
-    std.mem.writeInt(u64, image.items[56..64], squashfs.invalid_table, .little);
-    std.mem.writeInt(u64, image.items[64..72], inode_table_start, .little);
-    std.mem.writeInt(u64, image.items[72..80], directory_table_start, .little);
-    std.mem.writeInt(u64, image.items[80..88], fragment_table_start, .little);
-    std.mem.writeInt(u64, image.items[88..96], squashfs.invalid_table, .little);
-
-    return image.toOwnedSlice();
-}
-
-fn appendMetadataBlock(image: *std.array_list.Managed(u8), payload: []const u8) !void {
-    var header: [2]u8 = undefined;
-    std.mem.writeInt(u16, &header, @as(u16, @intCast(payload.len)) | squashfs.metadata_uncompressed_bit, .little);
-    try image.appendSlice(&header);
-    try image.appendSlice(payload);
-}
-
 fn appendU16Le(list: *std.array_list.Managed(u8), value: u16) !void {
     var buf: [2]u8 = undefined;
     std.mem.writeInt(u16, &buf, value, .little);
@@ -1487,10 +1304,6 @@ fn appendU64Le(list: *std.array_list.Managed(u8), value: u64) !void {
     var buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &buf, value, .little);
     try list.appendSlice(&buf);
-}
-
-fn appendU64LeImage(list: *std.array_list.Managed(u8), value: u64) !void {
-    try appendU64Le(list, value);
 }
 
 fn writeMinimalIsoWithFile(

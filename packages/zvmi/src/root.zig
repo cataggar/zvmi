@@ -8,7 +8,7 @@
 //! partition table read/write, FAT32 filesystem read/write, native ESP
 //! bootloader population (copy EFI binaries + generate grub.cfg/BLS),
 //! VHDX **read-only**, qcow2 **read-only**, ISO9660/squashfs
-//! **read-only**, local OCI image ingestion, a minimal native ext4
+//! **read-only** (including squashfs XZ/zstd-compressed blocks), local OCI image ingestion, a minimal native ext4
 //! writer/readback helper, COSI output packaging, and the initial
 //! `build-image` orchestration pipeline for ISO + OCI -> raw/fixed-VHD.
 

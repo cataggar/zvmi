@@ -35,7 +35,8 @@ zvmi/
         iso9660.zig            # ISO9660 **read-only** codec (PVD, Rock
                               #   Ridge, Joliet)
         squashfs.zig           # squashfs **read-only** codec (superblock,
-                              #   inode/directory/fragment tables)
+                              #   inode/directory/fragment tables, XZ/zstd
+                              #   compressed blocks)
         oci.zig                # local OCI image-layout ingestion (layer
                               #   extraction + whiteout-aware merge)
         ext4.zig              # minimal native ext4 writer + readback helper
@@ -93,10 +94,11 @@ Supports `raw`, fixed `vhd`, dynamic `vhd`, MBR/GPT partition tables, native
 FAT32 filesystem read/write for ESP-style partitions, native ESP bootloader
 population (copy prebuilt EFI binaries + generate `grub.cfg`/BLS text), an
 Azure-readiness check, **read-only** `vhdx`, **read-only** `qcow2`,
-**read-only** ISO9660 (+Rock Ridge/Joliet) and squashfs readers, local OCI
-container image ingestion, a minimal native ext4 writer/readback library API,
-COSI output packaging, and a first `zvmi build-image` orchestration path that
-builds `raw` and fixed-`vhd` disk images from an ISO + local OCI layout:
+**read-only** ISO9660 (+Rock Ridge/Joliet) and squashfs readers (including
+XZ/zstd-compressed squashfs blocks), local OCI container image ingestion, a
+minimal native ext4 writer/readback library API, COSI output packaging, and a
+first `zvmi build-image` orchestration path that builds `raw` and fixed-`vhd`
+disk images from an ISO + local OCI layout:
 
 ```
 zvmi create -f vhd disk.vhd 32M                          # dynamic by default (matches qemu-img)
