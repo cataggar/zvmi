@@ -1,9 +1,13 @@
-//! Local OCI image-layout ingestion and layer flattening.
+//! Local container image ingestion and layer flattening.
 //!
 //! Scope / limitations:
-//!  - Supports OCI image-layout directories on local disk.
+//!  - `load()` auto-detects OCI image-layout directories and docker/podman
+//!    save tarballs on local disk.
 //!  - Supports uncompressed and gzip-compressed tar layers.
-//!  - Docker/podman save tarballs are not parsed yet.
+//!  - `loadLayout()` remains available for callers that explicitly require
+//!    an OCI image-layout directory.
+//!  - Docker save tarballs with multiple manifest entries currently load the
+//!    first entry; manifest selection is only supported for OCI layouts.
 //!  - zstd-compressed layers are not supported yet.
 //!  - Registry/network access, signatures, and manifest-list/platform
 //!    resolution are out of scope; callers may optionally pick a specific
@@ -102,14 +106,19 @@ pub const Image = struct {
 };
 
 pub const LoadOptions = struct {
+    /// Applies to OCI image-layout directories only.
     manifest_digest: ?[]const u8 = null,
     max_blob_size: usize = 64 * 1024 * 1024,
     max_layer_size: usize = 128 * 1024 * 1024,
+    max_archive_size: usize = 512 * 1024 * 1024,
 };
 
 pub const LoadError = error{
     MissingOciLayout,
     MissingImageManifest,
+    MissingDockerManifest,
+    MissingDockerConfig,
+    MissingDockerLayer,
     UnsupportedManifestList,
     UnsupportedDigestAlgorithm,
     UnsupportedLayerCompression,
@@ -122,10 +131,35 @@ pub const LoadError = error{
     Io.File.StatError || Io.Dir.OpenError || std.json.ParseError(std.json.Scanner) ||
     tar.Error || error{StreamTooLong};
 
+/// Auto-detects an OCI image-layout directory or docker/podman save tarball.
+pub fn load(io: Io, allocator: Allocator, image_path: []const u8, options: LoadOptions) LoadError!Image {
+    var image_dir = Io.Dir.cwd().openDir(io, image_path, .{}) catch |err| switch (err) {
+        error.NotDir => return loadDockerSaveTarball(io, allocator, image_path, options),
+        else => return err,
+    };
+    defer image_dir.close(io);
+    return loadLayoutDir(io, allocator, image_dir, options);
+}
+
+/// Loads an OCI image-layout directory from local disk.
 pub fn loadLayout(io: Io, allocator: Allocator, layout_path: []const u8, options: LoadOptions) LoadError!Image {
     var layout_dir = try Io.Dir.cwd().openDir(io, layout_path, .{});
     defer layout_dir.close(io);
+    return loadLayoutDir(io, allocator, layout_dir, options);
+}
 
+/// Loads a docker/podman save tarball from local disk.
+pub fn loadDockerSaveTarball(io: Io, allocator: Allocator, tarball_path: []const u8, options: LoadOptions) LoadError!Image {
+    var tarball = try Io.Dir.cwd().openFile(io, tarball_path, .{});
+    defer tarball.close(io);
+
+    var archive = try tar.readFile(io, allocator, tarball, options.max_archive_size);
+    defer archive.deinit(allocator);
+
+    return loadDockerSaveArchive(allocator, archive.bytes, options);
+}
+
+fn loadLayoutDir(io: Io, allocator: Allocator, layout_dir: Io.Dir, options: LoadOptions) LoadError!Image {
     const layout_bytes = try readFileAtMost(io, allocator, layout_dir, "oci-layout", options.max_blob_size);
     defer allocator.free(layout_bytes);
     const layout = try std.json.parseFromSlice(LayoutFile, allocator, layout_bytes, .{ .ignore_unknown_fields = true });
@@ -151,32 +185,15 @@ pub fn loadLayout(io: Io, allocator: Allocator, layout_path: []const u8, options
     defer config_doc.deinit();
 
     var entry_map = StringHashMap(FileTree.Entry).init(allocator);
-    errdefer deinitEntryMap(&entry_map, allocator);
+    var entry_map_owned = true;
+    errdefer if (entry_map_owned) deinitEntryMap(&entry_map, allocator);
 
     for (manifest.value.layers) |layer_desc| {
         try applyLayer(io, allocator, layout_dir, &entry_map, layer_desc, options);
     }
-
-    const entries = try allocator.alloc(FileTree.Entry, entry_map.count());
-    errdefer allocator.free(entries);
-
-    var iter = entry_map.iterator();
-    var index_out: usize = 0;
-    while (iter.next()) |kv| {
-        entries[index_out] = kv.value_ptr.*;
-        index_out += 1;
-    }
-    entry_map.deinit();
-    errdefer {
-        var tree = FileTree{ .allocator = allocator, .entries = entries };
-        tree.deinit();
-    }
-
-    std.mem.sort(FileTree.Entry, entries, {}, struct {
-        fn lessThan(_: void, a: FileTree.Entry, b: FileTree.Entry) bool {
-            return std.mem.lessThan(u8, a.path, b.path);
-        }
-    }.lessThan);
+    var tree = try finalizeTree(allocator, &entry_map);
+    entry_map_owned = false;
+    errdefer tree.deinit();
 
     return .{
         .allocator = allocator,
@@ -185,7 +202,7 @@ pub fn loadLayout(io: Io, allocator: Allocator, layout_path: []const u8, options
             .os = if (config_doc.value.os) |value| try allocator.dupe(u8, value) else null,
             .manifest_digest = try allocator.dupe(u8, manifest_desc.digest),
         },
-        .tree = .{ .allocator = allocator, .entries = entries },
+        .tree = tree,
     };
 }
 
@@ -210,10 +227,110 @@ const ManifestDocument = struct {
     layers: []const Descriptor,
 };
 
+const DockerSaveManifestItem = struct {
+    @"Config": []const u8,
+    @"RepoTags": ?[]const []const u8 = null,
+    @"Layers": []const []const u8,
+};
+
 const ConfigDocument = struct {
     architecture: ?[]const u8 = null,
     os: ?[]const u8 = null,
 };
+
+const ArchiveEntry = struct {
+    kind: tar.Kind,
+    content: []const u8,
+};
+
+const ArchiveIndex = struct {
+    entries: StringHashMap(ArchiveEntry),
+
+    fn init(allocator: Allocator, archive_bytes: []const u8) LoadError!ArchiveIndex {
+        var entries = StringHashMap(ArchiveEntry).init(allocator);
+        errdefer deinitArchiveEntries(&entries, allocator);
+
+        var reader = tar.Reader.init(archive_bytes);
+        while (try reader.next()) |entry| {
+            const normalized_path = try normalizeArchivePath(allocator, entry.path);
+            var path_owned = true;
+            errdefer if (path_owned) allocator.free(normalized_path);
+
+            if (entries.fetchRemove(normalized_path)) |removed| allocator.free(removed.key);
+            try entries.put(normalized_path, .{
+                .kind = entry.kind,
+                .content = entry.content,
+            });
+            path_owned = false;
+        }
+
+        return .{ .entries = entries };
+    }
+
+    fn deinit(self: *ArchiveIndex, allocator: Allocator) void {
+        deinitArchiveEntries(&self.entries, allocator);
+        self.* = undefined;
+    }
+
+    fn getFile(self: ArchiveIndex, path: []const u8) ?ArchiveEntry {
+        const entry = self.entries.get(path) orelse return null;
+        return if (entry.kind == .file) entry else null;
+    }
+};
+
+fn loadDockerSaveArchive(allocator: Allocator, archive_bytes: []const u8, options: LoadOptions) LoadError!Image {
+    var archive = try ArchiveIndex.init(allocator, archive_bytes);
+    defer archive.deinit(allocator);
+
+    const manifest_file = archive.getFile("manifest.json") orelse return error.MissingDockerManifest;
+    const manifest_doc = try std.json.parseFromSlice([]DockerSaveManifestItem, allocator, manifest_file.content, .{
+        .ignore_unknown_fields = true,
+    });
+    defer manifest_doc.deinit();
+
+    const manifest_entry = selectDockerSaveManifest(manifest_doc.value) orelse return error.MissingImageManifest;
+
+    const config_path = try normalizeArchivePath(allocator, manifest_entry.@"Config");
+    defer allocator.free(config_path);
+    const config_file = archive.getFile(config_path) orelse return error.MissingDockerConfig;
+    const config_doc = try std.json.parseFromSlice(ConfigDocument, allocator, config_file.content, .{
+        .ignore_unknown_fields = true,
+    });
+    defer config_doc.deinit();
+
+    var entry_map = StringHashMap(FileTree.Entry).init(allocator);
+    var entry_map_owned = true;
+    errdefer if (entry_map_owned) deinitEntryMap(&entry_map, allocator);
+
+    for (manifest_entry.@"Layers") |layer_path_raw| {
+        const layer_path = try normalizeArchivePath(allocator, layer_path_raw);
+        defer allocator.free(layer_path);
+
+        const layer_file = archive.getFile(layer_path) orelse return error.MissingDockerLayer;
+        try applyLayerBytes(allocator, &entry_map, null, layer_file.content, options);
+    }
+
+    var tree = try finalizeTree(allocator, &entry_map);
+    entry_map_owned = false;
+    errdefer tree.deinit();
+
+    const manifest_digest = try sha256DigestString(allocator, manifest_file.content);
+    errdefer allocator.free(manifest_digest);
+
+    return .{
+        .allocator = allocator,
+        .config = .{
+            .architecture = if (config_doc.value.architecture) |value| try allocator.dupe(u8, value) else null,
+            .os = if (config_doc.value.os) |value| try allocator.dupe(u8, value) else null,
+            .manifest_digest = manifest_digest,
+        },
+        .tree = tree,
+    };
+}
+
+fn selectDockerSaveManifest(manifests: []const DockerSaveManifestItem) ?DockerSaveManifestItem {
+    return if (manifests.len == 0) null else manifests[0];
+}
 
 fn selectManifest(index: IndexDocument, requested_digest: ?[]const u8) ?Descriptor {
     if (requested_digest) |digest| {
@@ -245,7 +362,17 @@ fn applyLayer(
     const layer_blob = try readBlob(io, allocator, layout_dir, layer_desc.digest, options.max_blob_size);
     defer allocator.free(layer_blob);
 
-    const layer_bytes = switch (detectCompression(layer_desc.mediaType, layer_blob)) {
+    try applyLayerBytes(allocator, entry_map, layer_desc.mediaType, layer_blob, options);
+}
+
+fn applyLayerBytes(
+    allocator: Allocator,
+    entry_map: *StringHashMap(FileTree.Entry),
+    media_type: ?[]const u8,
+    layer_blob: []const u8,
+    options: LoadOptions,
+) LoadError!void {
+    const layer_bytes = switch (detectCompression(media_type, layer_blob)) {
         .none => if (layer_blob.len > options.max_layer_size) return error.LayerTooLarge else try allocator.dupe(u8, layer_blob),
         .gzip => try decompressGzip(allocator, layer_blob, options.max_layer_size),
         .zstd => return error.UnsupportedLayerCompression,
@@ -287,6 +414,7 @@ fn detectCompression(media_type: ?[]const u8, bytes: []const u8) Compression {
         if (std.mem.indexOf(u8, mt, "+zstd") != null or std.mem.endsWith(u8, mt, ".zstd")) return .zstd;
         if (std.mem.indexOf(u8, mt, "+gzip") != null or std.mem.endsWith(u8, mt, ".gzip")) return .gzip;
     }
+    if (bytes.len >= 4 and bytes[0] == 0x28 and bytes[1] == 0xb5 and bytes[2] == 0x2f and bytes[3] == 0xfd) return .zstd;
     if (bytes.len >= 2 and bytes[0] == 0x1f and bytes[1] == 0x8b) return .gzip;
     return .none;
 }
@@ -530,12 +658,47 @@ fn freeEntry(allocator: Allocator, entry: FileTree.Entry) void {
     if (entry.kind == .file) allocator.free(entry.content);
 }
 
+fn deinitArchiveEntries(entries: *StringHashMap(ArchiveEntry), allocator: Allocator) void {
+    var it = entries.iterator();
+    while (it.next()) |kv| allocator.free(kv.key_ptr.*);
+    entries.deinit();
+}
+
 fn deinitEntryMap(entry_map: *StringHashMap(FileTree.Entry), allocator: Allocator) void {
     var it = entry_map.iterator();
     while (it.next()) |kv| {
         freeEntry(allocator, kv.value_ptr.*);
     }
     entry_map.deinit();
+}
+
+fn finalizeTree(allocator: Allocator, entry_map: *StringHashMap(FileTree.Entry)) LoadError!FileTree {
+    const entries = try allocator.alloc(FileTree.Entry, entry_map.count());
+    errdefer allocator.free(entries);
+
+    var iter = entry_map.iterator();
+    var index_out: usize = 0;
+    while (iter.next()) |kv| {
+        entries[index_out] = kv.value_ptr.*;
+        index_out += 1;
+    }
+    entry_map.deinit();
+    errdefer {
+        var tree = FileTree{ .allocator = allocator, .entries = entries };
+        tree.deinit();
+    }
+
+    std.mem.sort(FileTree.Entry, entries, {}, struct {
+        fn lessThan(_: void, a: FileTree.Entry, b: FileTree.Entry) bool {
+            return std.mem.lessThan(u8, a.path, b.path);
+        }
+    }.lessThan);
+
+    return .{ .allocator = allocator, .entries = entries };
+}
+
+fn normalizeArchivePath(allocator: Allocator, raw_path: []const u8) LoadError![]u8 {
+    return normalizeLayerPath(allocator, raw_path);
 }
 
 fn readBlob(io: Io, allocator: Allocator, layout_dir: Io.Dir, digest: []const u8, max_size: usize) LoadError![]u8 {
@@ -557,7 +720,14 @@ fn readFileAtMost(io: Io, allocator: Allocator, dir: Io.Dir, sub_path: []const u
     return bytes;
 }
 
-test "loadLayout merges gzip layers, whiteouts, and opaque directories" {
+fn sha256DigestString(allocator: Allocator, data: []const u8) ![]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return std.fmt.allocPrint(allocator, "sha256:{s}", .{hex});
+}
+
+test "load auto-detects OCI layouts and merges gzip layers, whiteouts, and opaque directories" {
     const io = std.testing.io;
     const fixture_root = "test-oci-layout-fixture";
     defer Io.Dir.cwd().deleteTree(io, fixture_root) catch {};
@@ -565,7 +735,7 @@ test "loadLayout merges gzip layers, whiteouts, and opaque directories" {
     var fixture = try createFixtureLayout(std.testing.allocator, io, fixture_root);
     defer fixture.deinit(std.testing.allocator);
 
-    var image = try loadLayout(io, std.testing.allocator, fixture_root, .{});
+    var image = try load(io, std.testing.allocator, fixture_root, .{});
     defer image.deinit();
 
     try std.testing.expectEqualStrings("amd64", image.config.architecture.?);
@@ -593,6 +763,39 @@ test "loadLayout merges gzip layers, whiteouts, and opaque directories" {
     var seen: usize = 0;
     while (iter.next()) |_| seen += 1;
     try std.testing.expect(seen >= 7);
+}
+
+test "load auto-detects docker save tarballs and merges whiteouts" {
+    const io = std.testing.io;
+    const fixture_path = "test-docker-save-fixture.tar";
+    defer Io.Dir.cwd().deleteFile(io, fixture_path) catch {};
+
+    try createDockerSaveFixture(std.testing.allocator, io, fixture_path);
+
+    var image = try load(io, std.testing.allocator, fixture_path, .{});
+    defer image.deinit();
+
+    try std.testing.expectEqualStrings("amd64", image.config.architecture.?);
+    try std.testing.expectEqualStrings("linux", image.config.os.?);
+    try std.testing.expect(std.mem.startsWith(u8, image.config.manifest_digest, "sha256:"));
+
+    const hello = image.get("hello.txt").?;
+    try std.testing.expectEqual(EntryKind.file, hello.kind);
+    try std.testing.expectEqualStrings("hello from top\n", hello.content);
+
+    const keep = image.get("etc/keep.txt").?;
+    try std.testing.expectEqualStrings("keep from base\n", keep.content);
+    try std.testing.expect(image.get("etc/remove.txt") == null);
+
+    const opaque_dir = image.get("etc/opaque").?;
+    try std.testing.expectEqual(EntryKind.directory, opaque_dir.kind);
+    try std.testing.expect(image.get("etc/opaque/from-base.txt") == null);
+    const opaque_top = image.get("etc/opaque/from-top.txt").?;
+    try std.testing.expectEqualStrings("top survives\n", opaque_top.content);
+
+    const symlink = image.get("links/config").?;
+    try std.testing.expectEqual(EntryKind.symlink, symlink.kind);
+    try std.testing.expectEqualStrings("../etc/keep.txt", symlink.link_name.?);
 }
 
 test "loadLayout rejects zstd layer media types" {
@@ -722,12 +925,59 @@ fn createFixtureLayout(allocator: Allocator, io: Io, root: []const u8) !FixtureL
     };
 }
 
+fn createDockerSaveFixture(allocator: Allocator, io: Io, tarball_path: []const u8) !void {
+    const layer1_tar = try buildTarArchive(allocator, &.{
+        .{ .path = "etc/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
+        .{ .path = "etc/keep.txt", .mode = 0o644, .typeflag = '0', .content = "keep from base\n", .link_name = null },
+        .{ .path = "etc/remove.txt", .mode = 0o644, .typeflag = '0', .content = "remove me\n", .link_name = null },
+        .{ .path = "etc/opaque/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
+        .{ .path = "etc/opaque/from-base.txt", .mode = 0o644, .typeflag = '0', .content = "base hidden\n", .link_name = null },
+        .{ .path = "hello.txt", .mode = 0o644, .typeflag = '0', .content = "hello from base\n", .link_name = null },
+        .{ .path = "links/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
+        .{ .path = "links/config", .mode = 0o777, .typeflag = '2', .content = "", .link_name = "../etc/keep.txt" },
+    });
+    defer allocator.free(layer1_tar);
+
+    const layer2_tar = try buildTarArchive(allocator, &.{
+        .{ .path = "etc/.wh.remove.txt", .mode = 0o000, .typeflag = '0', .content = "", .link_name = null },
+        .{ .path = "etc/opaque/.wh..wh..opq", .mode = 0o000, .typeflag = '0', .content = "", .link_name = null },
+        .{ .path = "etc/opaque/from-top.txt", .mode = 0o644, .typeflag = '0', .content = "top survives\n", .link_name = null },
+        .{ .path = "hello.txt", .mode = 0o644, .typeflag = '0', .content = "hello from top\n", .link_name = null },
+    });
+    defer allocator.free(layer2_tar);
+
+    const config_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"architecture\":\"amd64\",\"os\":\"linux\",\"rootfs\":{{\"type\":\"layers\",\"diff_ids\":[]}}}}",
+        .{},
+    );
+    defer allocator.free(config_json);
+
+    const repositories_json =
+        "{\"example.com/test\":{\"latest\":\"2222222222222222222222222222222222222222222222222222222222222222\"}}";
+
+    const outer_tar = try buildTarArchive(allocator, &.{
+        .{ .path = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json", .mode = 0o644, .typeflag = '0', .content = config_json, .link_name = null },
+        .{ .path = "1111111111111111111111111111111111111111111111111111111111111111/layer.tar", .mode = 0o644, .typeflag = '0', .content = layer1_tar, .link_name = null },
+        .{ .path = "2222222222222222222222222222222222222222222222222222222222222222/layer.tar", .mode = 0o644, .typeflag = '0', .content = layer2_tar, .link_name = null },
+        .{
+            .path = "manifest.json",
+            .mode = 0o644,
+            .typeflag = '0',
+            .content =
+            "[{\"Config\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json\",\"RepoTags\":[\"example.com/test:latest\"],\"Layers\":[\"1111111111111111111111111111111111111111111111111111111111111111/layer.tar\",\"2222222222222222222222222222222222222222222222222222222222222222/layer.tar\"]}]",
+            .link_name = null,
+        },
+        .{ .path = "repositories", .mode = 0o644, .typeflag = '0', .content = repositories_json, .link_name = null },
+    });
+    defer allocator.free(outer_tar);
+
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = tarball_path, .data = outer_tar });
+}
+
 fn writeBlobAndDigest(allocator: Allocator, io: Io, dir: Io.Dir, data: []const u8) ![]u8 {
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
-    const hex = std.fmt.bytesToHex(digest, .lower);
-    const digest_string = try std.fmt.allocPrint(allocator, "sha256:{s}", .{hex});
-    const blob_path = try std.fmt.allocPrint(allocator, "blobs/sha256/{s}", .{hex});
+    const digest_string = try sha256DigestString(allocator, data);
+    const blob_path = try std.fmt.allocPrint(allocator, "blobs/sha256/{s}", .{digest_string[7..]});
     defer allocator.free(blob_path);
     try dir.writeFile(io, .{ .sub_path = blob_path, .data = data });
     return digest_string;
