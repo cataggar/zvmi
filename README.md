@@ -1,7 +1,7 @@
 # zvmi
 
 A Zig 0.16 library and CLI for reading and writing VM disk image formats
-(raw, VHD/VPC, qcow2, plus read-only VHDX) plus filesystem/image-build
+(raw, VHD/VPC, VHDX, and qcow2) plus filesystem/image-build
 orchestration, analogous to `qemu-img`.
 
 ## Goal
@@ -24,13 +24,13 @@ zvmi/
         root.zig             # public API surface
         image.zig            # format-agnostic Image (open/create/read/write,
                               #   resize/check/map; raw + fixed/dynamic vhd +
-                              #   qcow2)
+                              #   vhdx + qcow2)
         fat32.zig             # FAT32 formatter + directory/file read/write
                               #   for partition-sized regions inside an Image
         vhd.zig               # VHD/VPC footer + dynamic header codec
                               #   (spec + QEMU-verified)
-        vhdx.zig              # VHDX **read-only** codec (header, region
-                              #   table, metadata, BAT -- QEMU-verified)
+        vhdx.zig              # VHDX codec (header, region table, metadata,
+                              #   BAT, create/pwrite/resize -- QEMU-verified)
         qcow2.zig              # qcow2 codec (header, L1/L2 cluster mapping,
                               #   create/pwrite/resize)
         iso9660.zig            # ISO9660 **read-only** codec (PVD, Rock
@@ -95,17 +95,17 @@ zig build run -- <args>   # run the CLI, e.g. `zig build run -- info foo.vhd`
 
 ## Status (Milestone 7)
 
-Supports `raw`, fixed `vhd`, dynamic `vhd`, `qcow2`, MBR/GPT partition tables,
+Supports `raw`, fixed `vhd`, dynamic `vhd`, `vhdx`, `qcow2`, MBR/GPT partition tables,
 native FAT32 filesystem read/write for ESP-style partitions, native ESP
 bootloader population (copy prebuilt EFI binaries + generate `grub.cfg`/BLS
-text), an Azure-readiness check, **read-only** `vhdx`, **read-only** ISO9660
+text), an Azure-readiness check, **read-only** ISO9660
 (+Rock Ridge/Joliet) and squashfs readers (including
 XZ/zstd-compressed squashfs blocks), automatic unwrapping of nested ext4 or
 squashfs rootfs images discovered inside squashfs payloads (matching LiveOS
 media such as Azure Linux 4.0), local OCI container image ingestion, a minimal
 native ext4 writer/readback library API, COSI output packaging, and a first
-`zvmi build-image` orchestration path that builds `raw`, fixed-`vhd`, and
-`qcow2` disk images from an ISO + local OCI layout:
+`zvmi build-image` orchestration path that builds `raw`, fixed-`vhd`, `vhdx`,
+and `qcow2` disk images from an ISO + local OCI layout:
 
 ```
 zvmi create -f vhd disk.vhd 32M                          # dynamic by default (matches qemu-img)
@@ -113,7 +113,9 @@ zvmi create -f vhd -o subformat=fixed disk.vhd 32M       # required for Azure ma
 zvmi info disk.vhd
 zvmi info --output=json disk.vhd
 zvmi convert -f raw -O vhd -o subformat=dynamic disk.img disk.vhd
+zvmi convert -f raw -O vhdx disk.img disk.vhdx
 zvmi convert -f vhdx -O vhd -o subformat=fixed disk.vhdx disk.vhd  # import a VHDX (e.g. Hyper-V export)
+zvmi resize disk.vhdx +4G
 zvmi resize disk.vhd +4G
 zvmi check disk.vhd
 zvmi map disk.vhd
@@ -121,13 +123,15 @@ zvmi azure fixup --generation 1|2 disk.vhd  # pads to 1 MiB, checks MBR/GPT
 zvmi cosi disk.img -o disk.cosi              # tar + metadata.json + per-partition raw.zst
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G -o output.vhd
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G -o output.raw -O raw
+zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G -o output.vhdx -O vhdx
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G -o output.qcow2 -O qcow2
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G --verity -o output.vhd
 ```
 
 `convert` skips all-zero chunks (aligned to the destination's block size for
-dynamic vhd), so converting a mostly-empty raw image into a dynamic vhd stays
-sparse instead of eagerly allocating every block it touches.
+sparse block formats such as dynamic vhd and vhdx), so converting a
+mostly-empty raw image into a sparse image stays sparse instead of eagerly
+allocating every block it touches.
 
 MBR/GPT partition-table read/write is available as a library API
 (`zvmi.mbr`, `zvmi.gpt`, `zvmi.guid`) with round-trip test coverage, used by
@@ -142,14 +146,15 @@ returned/opened filesystem handle to create directories, write full file
 contents, list directory entries, and read files back -- including VFAT long
 file names such as typical `EFI/...` ESP paths.
 
-VHDX support is read-only (`zvmi.vhdx`; usable via `info`/`convert`/`check`/
-`map`, but not `create`), covering non-differencing images with 512-byte
-logical sectors -- the common case. No real Hyper-V/QEMU install was
+VHDX support (`zvmi.vhdx`) covers create/read/write/resize/check for
+non-differencing images with 512-byte logical sectors -- the common case.
+`zvmi build-image` can emit VHDX output directly, and `convert`/`resize`
+operate on VHDX images the same way they already do for raw/VHD/qcow2. No real Hyper-V/QEMU install was
 available in this environment to generate reference VHDX files, so
 correctness was verified against QEMU's own `block/vhdx.c`/`vhdx.h` (struct
-layout, CRC-32C checksums, and the BAT chunk-ratio interleaving formula) plus
-a hand-built synthetic fixture exercised through the full `Image` API in
-`packages/zvmi/src/image.zig`'s test suite.
+layout, CRC-32C checksums, the BAT chunk-ratio interleaving formula, and the
+create-path metadata layout) plus writable round-trip tests exercised through
+both `zvmi.vhdx` and the full `Image` API in the test suite.
 
 Phase-1 ext4 lives at `zvmi.ext4`. The writer entry point is:
 
@@ -202,9 +207,8 @@ stub plus kernel/initrd/cmdline payloads and emits a structurally valid UKI
 with `.linux`, `.initrd`, `.cmdline`, `.osrel`, `.uname`, and optional
 `.splash` sections.
 
-`zvmi build-image` currently writes `raw`, fixed `vhd`, and `qcow2` outputs.
-`vhdx` remains a read-only source format for now, so `build-image` VHDX output
-is still deferred pending separate VHDX write/create support. Both Gen2
+`zvmi build-image` currently writes `raw`, fixed `vhd`, `vhdx`, and `qcow2`
+outputs. Both Gen2
 (UEFI/protective-MBR+GPT+ESP) and Gen1 (BIOS/plain-MBR with GRUB embedded into
 the post-MBR gap) are now fully wired in `zvmi build-image`, and Gen2 images
 can optionally append a same-partition dm-verity SHA-256 hash tree with
