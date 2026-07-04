@@ -3,6 +3,7 @@ const Io = std.Io;
 
 const azure = @import("azure.zig");
 const bootconfig = @import("bootconfig.zig");
+const cosi = @import("cosi.zig");
 const ext4 = @import("ext4.zig");
 const fat32 = @import("fat32.zig");
 const Format = @import("formats.zig").Format;
@@ -14,6 +15,7 @@ const mbr = @import("mbr.zig");
 const oci = @import("oci.zig");
 const iso9660 = @import("iso9660.zig");
 const squashfs = @import("squashfs.zig");
+const verity = @import("verity.zig");
 
 const mib: u64 = azure.one_mib;
 pub const default_esp_size: u64 = 96 * mib;
@@ -29,6 +31,7 @@ pub const BuildImageOptions = struct {
     rootfs_path_in_iso: ?[]const u8 = null,
     esp_size: u64 = default_esp_size,
     ext4_label: []const u8 = "rootfs",
+    verity: bool = false,
     dry_run: bool = false,
     verbose: bool = false,
 };
@@ -41,6 +44,7 @@ pub const BuildImageReport = struct {
     dry_run: bool,
     rootfs_path_in_iso: []u8,
     planned_partitions: []bootconfig.PlannedPartitionIdentity,
+    verity: ?verity.Info = null,
     vhd_alignment: ?azure.FixupResult = null,
     partition_style: ?azure.PartitionStyleReport = null,
 
@@ -150,13 +154,32 @@ pub fn build(
     }
 
     const root_partition = findRootPartition(planned_partitions, architecture) orelse return error.MissingRootPartition;
+    const verity_layout = if (options.verity)
+        try verity.splitPartition(root_partition.planned.length_bytes, ext4.default_block_size, ext4.default_block_size)
+    else
+        null;
+    const rootfs_length = if (verity_layout) |layout_for_verity| layout_for_verity.data_size else root_partition.planned.length_bytes;
 
     logStep(options.verbose, "populate root ext4 filesystem");
     _ = try ext4.populate(io, raw_img.file, allocator, &source_tree.view, .{
         .offset = root_partition.planned.offset_bytes,
-        .length = root_partition.planned.length_bytes,
+        .length = rootfs_length,
         .label = options.ext4_label,
     });
+
+    if (verity_layout) |layout_for_verity| {
+        logStep(options.verbose, "generate dm-verity hash tree");
+        var salt: [verity.salt_size]u8 = undefined;
+        Io.random(io, &salt);
+        report.verity = try verity.generateAndWrite(io, raw_img.file, allocator, .{
+            .device_offset = root_partition.planned.offset_bytes,
+            .data_size = layout_for_verity.data_size,
+            .hash_offset = layout_for_verity.hash_offset,
+            .data_block_size = ext4.default_block_size,
+            .hash_block_size = ext4.default_block_size,
+            .salt = salt,
+        });
+    }
 
     if (options.generation == .gen1) {
         logStep(options.verbose, "install BIOS GRUB boot chain");
@@ -175,6 +198,7 @@ pub fn build(
         _ = try bootconfig.populateEsp(allocator, io, &esp_fs, &source_tree.view, .{
             .planned_partitions = planned_partitions,
             .architecture = architecture,
+            .verity = report.verity,
         });
     }
 
@@ -1125,6 +1149,71 @@ test "build-image installs a Gen1 BIOS GRUB chain into the post-MBR gap" {
     std.mem.writeInt(u16, expected_core[508..][0..2], @intCast(core_sector_count - 1), .little);
     std.mem.writeInt(u16, expected_core[510..][0..2], 0x820, .little);
     try std.testing.expectEqualSlices(u8, expected_core, embedded_core);
+}
+
+test "build-image can append a dm-verity tree and pass metadata through COSI output" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const iso_path = "test-build-image-verity.iso";
+    const oci_root = "test-build-image-verity-oci";
+    const output_path = "test-build-image-verity.raw";
+    const cosi_path = "test-build-image-verity.cosi";
+    defer Io.Dir.cwd().deleteFile(io, iso_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, oci_root) catch {};
+    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, cosi_path) catch {};
+
+    const squashfs_bytes = try squashfs.buildSyntheticSquashfsImage(allocator, .{ .compression = .xz });
+    defer allocator.free(squashfs_bytes);
+    try writeMinimalIsoWithFile(allocator, io, iso_path, "ROOT.SQUASHFS;1", squashfs_bytes);
+
+    var fixture = try createBuildImageOciFixture(allocator, io, oci_root);
+    defer fixture.deinit(allocator);
+
+    var report = try build(allocator, io, .{
+        .iso_path = iso_path,
+        .container_path = oci_root,
+        .output_path = output_path,
+        .output_format = .raw,
+        .generation = .gen2,
+        .size = 256 * mib,
+        .verity = true,
+    });
+    defer report.deinit(allocator);
+
+    try std.testing.expect(report.verity != null);
+
+    var img = try Image.openPath(io, output_path);
+    defer img.close(io);
+
+    const esp_partition = report.planned_partitions[0].planned;
+    var esp = try fat32.open(&img, io, .{ .offset = esp_partition.offset_bytes, .length = esp_partition.length_bytes });
+
+    const bls_entry = try esp.readFileAlloc(io, allocator, "loader/entries/vmlinuz-test.conf");
+    defer allocator.free(bls_entry);
+
+    var root_hash_buf: [verity.digest_size * 2]u8 = undefined;
+    const root_hash_text = report.verity.?.formatRootHash(&root_hash_buf);
+    try std.testing.expect(std.mem.indexOf(u8, bls_entry, "root=/dev/mapper/root") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bls_entry, root_hash_text) != null);
+    try std.testing.expect(std.mem.indexOf(u8, bls_entry, "systemd.verity_root_options=superblock=0,format=1") != null);
+
+    try cosi.writeWithOptions(img, io, allocator, cosi_path, .{
+        .root_verity = report.verity,
+    });
+
+    const cosi_file = try Io.Dir.cwd().openFile(io, cosi_path, .{});
+    defer cosi_file.close(io);
+    const cosi_size = (try cosi_file.stat(io)).size;
+    const cosi_bytes = try allocator.alloc(u8, cosi_size);
+    defer allocator.free(cosi_bytes);
+    _ = try cosi_file.readPositionalAll(io, cosi_bytes, 0);
+
+    try std.testing.expect(std.mem.indexOf(u8, cosi_bytes, "\"roothash\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cosi_bytes, root_hash_text) != null);
+    try std.testing.expect(std.mem.indexOf(u8, cosi_bytes, "\"hashAlgorithm\":\"sha256\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cosi_bytes, "\"hashOffset\":") != null);
 }
 
 test "build-image reports errors cleanly (no double-free) when squashfs open fails after partition planning" {
