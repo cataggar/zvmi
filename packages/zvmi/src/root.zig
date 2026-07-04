@@ -4,12 +4,13 @@
 //! the Azure Linux + container build-image workflow this library exists to
 //! support.
 //!
-//! Milestone 6 status: raw + fixed/dynamic vhd read/write, MBR + GPT
+//! Milestone 7 status: raw + fixed/dynamic vhd read/write, MBR + GPT
 //! partition table read/write, FAT32 filesystem read/write, native ESP
 //! bootloader population (copy EFI binaries + generate grub.cfg/BLS),
 //! VHDX **read-only**, qcow2 **read-only**, ISO9660/squashfs
 //! **read-only**, local OCI image ingestion, a minimal native ext4
-//! writer/readback helper, and COSI output packaging.
+//! writer/readback helper, COSI output packaging, and the initial
+//! `build-image` orchestration pipeline for ISO + OCI -> raw/fixed-VHD.
 
 const std = @import("std");
 
@@ -28,6 +29,7 @@ pub const azure = @import("azure.zig");
 pub const layout = @import("layout.zig");
 pub const oci = @import("oci.zig");
 pub const cosi = @import("cosi.zig");
+pub const build_image = @import("build_image.zig");
 const image_mod = @import("image.zig");
 const size_mod = @import("size.zig");
 
