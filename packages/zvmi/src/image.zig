@@ -98,11 +98,15 @@ pub const Image = struct {
     pub fn openPath(io: Io, path: []const u8) OpenError!Image {
         const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
         errdefer file.close(io);
-        return openFile(io, file);
+        return openFileWithPath(io, file, path);
     }
 
     /// Takes ownership of `file` (closing the returned `Image` closes it).
     pub fn openFile(io: Io, file: Io.File) OpenError!Image {
+        return openFileWithPath(io, file, null);
+    }
+
+    fn openFileWithPath(io: Io, file: Io.File, path: ?[]const u8) OpenError!Image {
         const file_size = (try file.stat(io)).size;
 
         // qcow2 and VHDX signatures both live at the very start of the file
@@ -114,7 +118,7 @@ pub const Image = struct {
             var sig_buf: [8]u8 = undefined;
             const n = try file.readPositionalAll(io, &sig_buf, 0);
             if (n >= 4 and std.mem.eql(u8, sig_buf[0..4], &qcow2.file_signature)) {
-                const qcow2_info = try qcow2.open(io, file);
+                const qcow2_info = if (path) |p| try qcow2.openAtPath(io, file, p) else try qcow2.open(io, file);
                 return .{
                     .file = file,
                     .format = .qcow2,
