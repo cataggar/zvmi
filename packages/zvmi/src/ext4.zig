@@ -395,6 +395,9 @@ pub fn populate(
     };
 }
 
+/// Grow an ext4 filesystem in place by extending the final block group or
+/// appending new groups; this deliberately does not emulate online
+/// `resize_inode` journaling/reservation machinery.
 pub fn resize(io: Io, file: Io.File, allocator: std.mem.Allocator, options: ResizeOptions) ResizeError!FilesystemInfo {
     if (options.length == 0 or options.length % default_block_size != 0) return error.InvalidRange;
 
