@@ -7,8 +7,8 @@
 //! Milestone 5 status: raw + fixed/dynamic vhd read/write, MBR + GPT
 //! partition table read/write, FAT32 filesystem read/write, VHDX
 //! **read-only**, qcow2 **read-only**, ISO9660/squashfs **read-only**,
-//! local OCI image ingestion, and a minimal native ext4 writer/readback
-//! helper.
+//! local OCI image ingestion, a minimal native ext4 writer/readback
+//! helper, and COSI output packaging.
 
 const std = @import("std");
 
@@ -25,6 +25,7 @@ pub const gpt = @import("gpt.zig");
 pub const azure = @import("azure.zig");
 pub const layout = @import("layout.zig");
 pub const oci = @import("oci.zig");
+pub const cosi = @import("cosi.zig");
 const image_mod = @import("image.zig");
 const size_mod = @import("size.zig");
 

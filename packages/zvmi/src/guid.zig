@@ -15,6 +15,32 @@ const std = @import("std");
 
 pub const Guid = [16]u8;
 
+/// Formats a mixed-endian binary GUID as a lowercase canonical string
+/// (`aabbccdd-eeff-gghh-iijj-kkllmmnnoopp`).
+pub fn formatLower(buf: *[36]u8, value: Guid) []const u8 {
+    const data1 = std.mem.readInt(u32, value[0..4], .little);
+    const data2 = std.mem.readInt(u16, value[4..6], .little);
+    const data3 = std.mem.readInt(u16, value[6..8], .little);
+    _ = std.fmt.bufPrint(
+        buf,
+        "{x:0>8}-{x:0>4}-{x:0>4}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}",
+        .{
+            data1,
+            data2,
+            data3,
+            value[8],
+            value[9],
+            value[10],
+            value[11],
+            value[12],
+            value[13],
+            value[14],
+            value[15],
+        },
+    ) catch unreachable;
+    return buf;
+}
+
 /// Parses a canonical `AABBCCDD-EEFF-GGHH-IIJJ-KKLLMMNNOOPP` string (case
 /// insensitive) into its mixed-endian binary form. Intended primarily for
 /// `comptime`-evaluating the well-known constants below, but works at
@@ -83,6 +109,14 @@ pub const microsoft_basic_data: Guid = parse("EBD0A0A2-B9E5-4433-87C0-68B6B72699
 
 /// A GUID with all bytes zero, used for "no partition" / unused entries.
 pub const nil: Guid = [_]u8{0} ** 16;
+
+test "formatLower reverses parse" {
+    var buf: [36]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "c12a7328-f81f-11d2-ba4b-00a0c93ec93b",
+        formatLower(&buf, esp),
+    );
+}
 
 test "parse produces the well-known ESP GUID bytes" {
     // Cross-checked against the UEFI spec / Wikipedia's GPT article: the

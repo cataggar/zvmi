@@ -30,8 +30,18 @@ zvmi/
                               #   (spec + QEMU-verified)
         vhdx.zig              # VHDX **read-only** codec (header, region
                               #   table, metadata, BAT -- QEMU-verified)
+        qcow2.zig              # qcow2 **read-only** codec (header, L1/L2
+                              #   cluster mapping)
+        iso9660.zig            # ISO9660 **read-only** codec (PVD, Rock
+                              #   Ridge, Joliet)
+        squashfs.zig           # squashfs **read-only** codec (superblock,
+                              #   inode/directory/fragment tables)
+        oci.zig                # local OCI image-layout ingestion (layer
+                              #   extraction + whiteout-aware merge)
         ext4.zig              # minimal native ext4 writer + readback helper
                               #   (no journal, linear dirs, inline extents)
+        layout.zig             # partition-layout planner (sizing math,
+                              #   alignment, DPS type GUIDs)
         guid.zig               # mixed-endian GUID encoding + well-known
                               #   partition type GUIDs (ESP, Linux data)
         mbr.zig                # MBR partition table codec (protective +
@@ -40,7 +50,11 @@ zvmi/
                               #   (CRC-32, spec-verified layout)
         azure.zig              # 1 MiB alignment + Gen1/Gen2 partition-style
                               #   checks (backs `zvmi azure fixup`)
-        formats.zig           # Format enum (raw, vhd)
+        tar.zig                # minimal private USTAR reader for OCI layers
+        tar_writer.zig         # minimal private USTAR writer for COSI packaging
+        zstd.zig               # minimal private raw-block zstd codec for COSI
+        cosi.zig               # COSI writer (tar + metadata.json + raw.zst parts)
+        formats.zig           # Format enum (raw, vhd, vhdx, qcow2)
         size.zig              # qemu-img-style size suffix parsing (K/M/G/T)
   cli/
     src/
@@ -53,6 +67,7 @@ zvmi/
         check.zig             # `zvmi check`
         map.zig               # `zvmi map`
         azure.zig             # `zvmi azure fixup`
+        cosi.zig              # `zvmi cosi`
         opts.zig              # shared `-o subformat=...` parsing
 ```
 
@@ -74,7 +89,8 @@ Supports `raw`, fixed `vhd`, dynamic `vhd`, MBR/GPT partition tables, native
 FAT32 filesystem read/write for ESP-style partitions, an Azure-readiness
 check, **read-only** `vhdx`, **read-only** `qcow2`, **read-only** ISO9660
 (+Rock Ridge/Joliet) and squashfs readers, local OCI container image
-ingestion, and a minimal native ext4 writer/readback library API:
+ingestion, a minimal native ext4 writer/readback library API, and COSI
+output packaging:
 
 ```
 zvmi create -f vhd disk.vhd 32M                          # dynamic by default (matches qemu-img)
@@ -87,6 +103,7 @@ zvmi resize disk.vhd +4G
 zvmi check disk.vhd
 zvmi map disk.vhd
 zvmi azure fixup --generation 1|2 disk.vhd  # pads to 1 MiB, checks MBR/GPT
+zvmi cosi disk.img -o disk.cosi              # tar + metadata.json + per-partition raw.zst
 ```
 
 `convert` skips all-zero chunks (aligned to the destination's block size for
