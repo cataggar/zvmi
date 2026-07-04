@@ -40,6 +40,8 @@ zvmi/
                               #   extraction + whiteout-aware merge)
         ext4.zig              # minimal native ext4 writer + readback helper
                               #   (no journal, linear dirs, inline extents)
+        bootconfig.zig         # ESP bootloader population (copy EFI binaries
+                              #   + generate grub.cfg/BLS text)
         layout.zig             # partition-layout planner (sizing math,
                               #   alignment, DPS type GUIDs)
         guid.zig               # mixed-endian GUID encoding + well-known
@@ -83,14 +85,15 @@ zig build test       # run all tests
 zig build run -- <args>   # run the CLI, e.g. `zig build run -- info foo.vhd`
 ```
 
-## Status (Milestone 5)
+## Status (Milestone 6)
 
 Supports `raw`, fixed `vhd`, dynamic `vhd`, MBR/GPT partition tables, native
-FAT32 filesystem read/write for ESP-style partitions, an Azure-readiness
-check, **read-only** `vhdx`, **read-only** `qcow2`, **read-only** ISO9660
-(+Rock Ridge/Joliet) and squashfs readers, local OCI container image
-ingestion, a minimal native ext4 writer/readback library API, and COSI
-output packaging:
+FAT32 filesystem read/write for ESP-style partitions, native ESP bootloader
+population (copy prebuilt EFI binaries + generate `grub.cfg`/BLS text), an
+Azure-readiness check, **read-only** `vhdx`, **read-only** `qcow2`,
+**read-only** ISO9660 (+Rock Ridge/Joliet) and squashfs readers, local OCI
+container image ingestion, a minimal native ext4 writer/readback library API,
+and COSI output packaging:
 
 ```
 zvmi create -f vhd disk.vhd 32M                          # dynamic by default (matches qemu-img)
@@ -151,6 +154,23 @@ implicit. The phase-1 writer emits no journal, no dir_index/htree, and no
 metadata checksums; it writes linear directory blocks plus inline extents in
 each inode. The paired reader API can `statPath`, `listDir`, `preadPath`,
 `readExtents`, and `readLinkAlloc` for round-trip verification.
+
+ESP bootloader population lives at `zvmi.bootconfig`. It reuses the exact same
+`FileTreeView` shape as `zvmi.ext4`, so future orchestration can drive both
+rootfs population and ESP population from one merged source-tree interface.
+Callers pass the planned GPT partitions plus their unique GUIDs, then
+`populateEsp()` copies discovered `EFI/.../*.efi` binaries into a FAT32 ESP
+and generates `EFI/.../grub.cfg`, `loader/loader.conf`, and
+`loader/entries/*.conf` files that reference the resolved root partition by
+`PARTUUID`.
+
+```zig
+try zvmi.bootconfig.populateEsp(allocator, io, &esp_fs, &tree, .{
+    .planned_partitions = planned_partitions,
+    .path_strip_prefix = "",
+    .extra_kernel_options = "console=ttyS0",
+});
+```
 
 qcow2 and the `zvmi build-image` Azure Linux + container workflow are future
 milestones.
