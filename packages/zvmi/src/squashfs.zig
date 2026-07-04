@@ -47,6 +47,7 @@ pub const SyntheticImageOptions = struct {
     block_size: u32 = 1024,
     full_data_blocks: u32 = 1,
     fragment_tail_size: u32 = 476,
+    file_bytes: ?[]const u8 = null,
 };
 
 pub const EntryKind = enum { file, directory, symlink };
@@ -1295,8 +1296,14 @@ pub fn buildSyntheticSquashfsImage(allocator: std.mem.Allocator, options: Synthe
     const block_size = options.block_size;
     const block_size_usize: usize = @intCast(block_size);
     const block_log: u16 = @intCast(std.math.log2_int(u32, block_size));
-    const full_data_block_count: usize = @intCast(options.full_data_blocks);
-    const fragment_tail_size: usize = @intCast(options.fragment_tail_size);
+    const full_data_block_count: usize = if (options.file_bytes) |bytes|
+        bytes.len / block_size_usize
+    else
+        @intCast(options.full_data_blocks);
+    const fragment_tail_size: usize = if (options.file_bytes) |bytes|
+        bytes.len % block_size_usize
+    else
+        @intCast(options.fragment_tail_size);
     const compression_id: u16 = switch (options.compression) {
         .none => @intFromEnum(Compression.gzip),
         .xz => @intFromEnum(Compression.xz),
@@ -1316,8 +1323,13 @@ pub fn buildSyntheticSquashfsImage(allocator: std.mem.Allocator, options: Synthe
         allocator.free(stored_full_blocks);
     }
     for (stored_full_blocks, 0..) |*stored_full_block, block_index| {
-        @memset(full_block_bytes, syntheticFullBlockByte(block_index));
-        stored_full_block.* = try compressSyntheticBytes(allocator, options.compression, full_block_bytes);
+        const block_payload = if (options.file_bytes) |bytes|
+            bytes[block_index * block_size_usize ..][0..block_size_usize]
+        else blk: {
+            @memset(full_block_bytes, syntheticFullBlockByte(block_index));
+            break :blk full_block_bytes[0..];
+        };
+        stored_full_block.* = try compressSyntheticBytes(allocator, options.compression, block_payload);
     }
     const fragment_data_start: u64 = blk: {
         var stored_len: u64 = data_block_start;
@@ -1330,12 +1342,19 @@ pub fn buildSyntheticSquashfsImage(allocator: std.mem.Allocator, options: Synthe
     else blk: {
         const fragment_tail = try allocator.alloc(u8, fragment_tail_size);
         defer allocator.free(fragment_tail);
-        @memset(fragment_tail, syntheticFragmentByte(full_data_block_count));
+        if (options.file_bytes) |bytes| {
+            @memcpy(fragment_tail, bytes[full_data_block_count * block_size_usize ..][0..fragment_tail_size]);
+        } else {
+            @memset(fragment_tail, syntheticFragmentByte(full_data_block_count));
+        }
         break :blk try compressSyntheticBytes(allocator, options.compression, fragment_tail);
     };
     defer if (stored_fragment_tail) |bytes| allocator.free(bytes);
 
-    const file_size = @as(u64, options.full_data_blocks) * @as(u64, block_size) + @as(u64, options.fragment_tail_size);
+    const file_size: u64 = if (options.file_bytes) |bytes|
+        bytes.len
+    else
+        @as(u64, options.full_data_blocks) * @as(u64, block_size) + @as(u64, options.fragment_tail_size);
     const fragment_index: u32 = if (fragment_tail_size == 0) invalid_fragment else 0;
 
     var inode_payload = std.array_list.Managed(u8).init(allocator);
@@ -1484,6 +1503,8 @@ fn syntheticFragmentByte(full_data_block_count: usize) u8 {
 }
 
 fn buildExpectedSyntheticFileBytesAlloc(allocator: std.mem.Allocator, options: SyntheticImageOptions) ![]u8 {
+    if (options.file_bytes) |bytes| return allocator.dupe(u8, bytes);
+
     const block_size: usize = @intCast(options.block_size);
     const full_data_block_count: usize = @intCast(options.full_data_blocks);
     const fragment_tail_size: usize = @intCast(options.fragment_tail_size);
