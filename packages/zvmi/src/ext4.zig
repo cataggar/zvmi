@@ -4,8 +4,9 @@
 //! subset:
 //!   - `feature_compat = EXT_ATTR | DIR_INDEX`: external xattr blocks are
 //!     supported, and directories that outgrow a single leaf block are written
-//!     with one-level htree indexes. `HAS_JOURNAL`, `RESIZE_INODE`, and quota
-//!     bits remain unset; this writer deliberately ships a permanently
+//!     with ext4 htree indexes, including interior index nodes when a single
+//!     root index block is no longer enough. `HAS_JOURNAL`, `RESIZE_INODE`,
+//!     and quota bits remain unset; this writer deliberately ships a permanently
 //!     journal-less filesystem for now because the target image-build flow
 //!     creates filesystems offline and writes them atomically.
 //!   - `feature_incompat = FILETYPE | EXTENTS`: directory entries carry the
@@ -310,6 +311,7 @@ const Node = struct {
     link_count: u16 = 1,
     uses_fast_symlink: bool = false,
     uses_hashed_directory: bool = false,
+    hashed_directory_index_block_count: u32 = 0,
 };
 
 const ExtentHeader = struct {
@@ -764,6 +766,9 @@ pub const Reader = struct {
         const inode = try self.readInode(io, dir_inode_number);
         if (inode.kind != .directory) return error.NotDirectory;
 
+        // ext4 htree index blocks deliberately masquerade as unused directory
+        // entries, so a linear scan remains correct for both indexed and
+        // non-indexed directories.
         const data = try self.readInodeDataAlloc(io, self.allocator, inode);
         defer self.allocator.free(data);
 
@@ -1304,10 +1309,11 @@ fn writeNodeData(io: Io, file: Io.File, nodes: []Node, options: PopulateOptions)
                 var block_index: usize = 0;
                 while (block_index < dir_bytes.len / options.block_size) : (block_index += 1) {
                     const block = dir_bytes[block_index * options.block_size .. (block_index + 1) * options.block_size];
-                    if (node.uses_hashed_directory and block_index == 0) {
-                        const root_limit = readInt(u16, block[32..34]);
-                        const root_count = readInt(u16, block[34..36]);
-                        setDxChecksum(block, 32, root_count, root_limit, uuid, node.inode, 0);
+                    if (node.uses_hashed_directory and block_index < node.hashed_directory_index_block_count) {
+                        const count_offset: usize = if (block_index == 0) 32 else 8;
+                        const limit = readInt(u16, block[count_offset .. count_offset + 2]);
+                        const count = readInt(u16, block[count_offset + 2 .. count_offset + 4]);
+                        setDxChecksum(block, count_offset, count, limit, uuid, node.inode, 0);
                     } else {
                         setDirectoryLeafChecksum(block, uuid, node.inode, 0);
                     }
@@ -1566,7 +1572,9 @@ fn buildDirectoryPayloads(allocator: std.mem.Allocator, nodes: []Node, block_siz
 
         allocator.free(linear_bytes);
         node.uses_hashed_directory = true;
-        node.dir_bytes = try buildIndexedDirectoryBytes(allocator, node.inode, parent_inode, child_specs.items, block_size);
+        const indexed = try buildIndexedDirectoryBytes(allocator, node.inode, parent_inode, child_specs.items, block_size);
+        node.dir_bytes = indexed.bytes;
+        node.hashed_directory_index_block_count = indexed.index_block_count;
     }
 }
 
@@ -1579,6 +1587,28 @@ const DirEntrySpec = struct {
 const HashedDirEntry = struct {
     spec: DirEntrySpec,
     hash: u32,
+};
+
+const IndexedDirectoryBytes = struct {
+    bytes: []u8,
+    index_block_count: u32,
+};
+
+const HtreeChild = struct {
+    start_hash: u32,
+    target: union(enum) {
+        leaf: usize,
+        node: struct {
+            level: usize,
+            index: usize,
+        },
+    },
+};
+
+const HtreeInteriorNode = struct {
+    start_hash: u32,
+    children: []HtreeChild,
+    logical_block: u32 = 0,
 };
 
 fn dirEntryMinRecLen(name_len: usize) u16 {
@@ -1638,7 +1668,7 @@ fn buildIndexedDirectoryBytes(
     parent_inode: u32,
     children: []const DirEntrySpec,
     block_size: u32,
-) PopulateError![]u8 {
+) PopulateError!IndexedDirectoryBytes {
     const hashed = try allocator.alloc(HashedDirEntry, children.len);
     defer allocator.free(hashed);
     for (children, 0..) |child, index| {
@@ -1646,55 +1676,233 @@ fn buildIndexedDirectoryBytes(
     }
     sortHashedDirEntries(hashed);
 
-    var leaf_starts = std.array_list.Managed(usize).init(allocator);
-    defer leaf_starts.deinit();
-    try leaf_starts.append(0);
+    const leaves = try buildIndexedDirectoryLeaves(allocator, hashed, block_size);
+    defer allocator.free(leaves.start_hashes);
+    errdefer allocator.free(leaves.bytes);
+
+    const root_limit = dxRootLimit(block_size);
+    const node_limit = dxNodeLimit(block_size);
+
+    var level_nodes = std.array_list.Managed([]HtreeInteriorNode).init(allocator);
+    defer {
+        for (level_nodes.items) |nodes| {
+            for (nodes) |node| allocator.free(node.children);
+            allocator.free(nodes);
+        }
+        level_nodes.deinit();
+    }
+
+    var root_children = try allocator.alloc(HtreeChild, leaves.start_hashes.len);
+    defer allocator.free(root_children);
+    for (leaves.start_hashes, 0..) |start_hash, index| {
+        root_children[index] = .{
+            .start_hash = start_hash,
+            .target = .{ .leaf = index },
+        };
+    }
+
+    while (root_children.len > root_limit) {
+        const level_index = level_nodes.items.len;
+        const node_count = divCeil(root_children.len, node_limit);
+        const nodes = try allocator.alloc(HtreeInteriorNode, node_count);
+        errdefer allocator.free(nodes);
+
+        const next_children = try allocator.alloc(HtreeChild, node_count);
+        errdefer allocator.free(next_children);
+
+        var built: usize = 0;
+        errdefer {
+            while (built > 0) : (built -= 1) allocator.free(nodes[built - 1].children);
+        }
+
+        for (0..node_count) |node_index| {
+            const start = node_index * node_limit;
+            const end = @min(start + node_limit, root_children.len);
+            const node_children = try allocator.dupe(HtreeChild, root_children[start..end]);
+            nodes[node_index] = .{
+                .start_hash = root_children[start].start_hash,
+                .children = node_children,
+            };
+            next_children[node_index] = .{
+                .start_hash = root_children[start].start_hash,
+                .target = .{ .node = .{ .level = level_index, .index = node_index } },
+            };
+            built += 1;
+        }
+
+        try level_nodes.append(nodes);
+        allocator.free(root_children);
+        root_children = next_children;
+    }
+
+    var next_logical_block: u32 = 1;
+    var reverse_level = level_nodes.items.len;
+    while (reverse_level > 0) {
+        reverse_level -= 1;
+        for (level_nodes.items[reverse_level]) |*node| {
+            node.logical_block = next_logical_block;
+            next_logical_block += 1;
+        }
+    }
+
+    const index_block_count = next_logical_block;
+    const leaf_block_base = index_block_count;
+    const total_blocks = index_block_count + @as(u32, @intCast(leaves.start_hashes.len));
+    const total_bytes = @as(usize, total_blocks) * block_size;
+    const bytes = try allocator.alloc(u8, total_bytes);
+    @memset(bytes, 0);
+
+    encodeDxRootBlock(
+        bytes[0..block_size],
+        inode_number,
+        parent_inode,
+        @intCast(level_nodes.items.len),
+        root_limit,
+        root_children,
+        level_nodes.items,
+        leaf_block_base,
+    );
+
+    reverse_level = level_nodes.items.len;
+    while (reverse_level > 0) {
+        reverse_level -= 1;
+        for (level_nodes.items[reverse_level]) |node| {
+            const block_start = @as(usize, node.logical_block) * block_size;
+            encodeDxNodeBlock(
+                bytes[block_start .. block_start + block_size],
+                node_limit,
+                node.children,
+                level_nodes.items,
+                leaf_block_base,
+            );
+        }
+    }
+
+    const leaf_bytes_start = @as(usize, leaf_block_base) * block_size;
+    @memcpy(bytes[leaf_bytes_start .. leaf_bytes_start + leaves.bytes.len], leaves.bytes);
+    allocator.free(leaves.bytes);
+
+    return .{
+        .bytes = bytes,
+        .index_block_count = index_block_count,
+    };
+}
+
+fn buildIndexedDirectoryLeaves(
+    allocator: std.mem.Allocator,
+    hashed: []const HashedDirEntry,
+    block_size: u32,
+) PopulateError!struct { bytes: []u8, start_hashes: []u32 } {
+    var bytes = std.array_list.Managed(u8).init(allocator);
+    errdefer bytes.deinit();
+
+    var start_hashes = std.array_list.Managed(u32).init(allocator);
+    errdefer start_hashes.deinit();
 
     const usable = block_size - 12;
     var cursor: usize = 0;
     while (cursor < hashed.len) {
+        try start_hashes.append(hashed[cursor].hash);
+        const block_start = bytes.items.len;
+        try bytes.appendNTimes(0, block_size);
         var pos: usize = 0;
-        const leaf_start = cursor;
         while (cursor < hashed.len) {
-            const min_rec_len = dirEntryMinRecLen(hashed[cursor].spec.name.len);
+            const entry = hashed[cursor].spec;
+            const min_rec_len = dirEntryMinRecLen(entry.name.len);
             const next_min = if (cursor + 1 < hashed.len) dirEntryMinRecLen(hashed[cursor + 1].spec.name.len) else 0;
             if (pos + min_rec_len > usable) return error.InvalidDirectorySize;
-            if (cursor > leaf_start and pos + min_rec_len + next_min > usable) break;
-            pos += if (cursor + 1 == hashed.len or pos + min_rec_len + next_min > usable) usable - pos else min_rec_len;
+            const rec_len: u16 = if (cursor + 1 == hashed.len or pos + min_rec_len + next_min > usable)
+                @intCast(usable - pos)
+            else
+                min_rec_len;
+            encodeDirEntry(bytes.items[block_start + pos .. block_start + pos + rec_len], entry, rec_len);
+            pos += rec_len;
             cursor += 1;
             if (pos == usable) break;
         }
-        if (cursor < hashed.len) try leaf_starts.append(cursor);
+        putDirectoryLeafTail(bytes.items[block_start .. block_start + block_size]);
     }
 
-    const root_limit: usize = (block_size - 32 - 8) / 8;
-    if (leaf_starts.items.len > root_limit) return error.InvalidDirectorySize;
+    return .{
+        .bytes = try bytes.toOwnedSlice(),
+        .start_hashes = try start_hashes.toOwnedSlice(),
+    };
+}
 
-    var bytes = std.array_list.Managed(u8).init(allocator);
-    errdefer bytes.deinit();
-    try bytes.appendNTimes(0, block_size);
-    encodeDirEntry(bytes.items[0..12], .{ .inode = inode_number, .kind = .directory, .name = "." }, 12);
-    encodeDirEntry(bytes.items[12..block_size], .{ .inode = parent_inode, .kind = .directory, .name = ".." }, @intCast(block_size - 12));
-    writeInt(u32, bytes.items[24..28], 0);
-    bytes.items[28] = dx_hash_half_md4;
-    bytes.items[29] = 8;
-    bytes.items[30] = 0;
-    bytes.items[31] = 0;
-    writeInt(u16, bytes.items[32..34], @intCast(root_limit));
-    writeInt(u16, bytes.items[34..36], @intCast(leaf_starts.items.len));
-    writeInt(u32, bytes.items[36..40], 1);
-    for (leaf_starts.items[1..], 1..) |leaf_start, leaf_index| {
-        const base = 32 + leaf_index * 8;
-        writeInt(u32, bytes.items[base .. base + 4], hashed[leaf_start].hash);
-        writeInt(u32, bytes.items[base + 4 .. base + 8], @intCast(leaf_index + 1));
+fn dxRootLimit(block_size: u32) usize {
+    return (block_size - 32 - 8) / 8;
+}
+
+fn dxNodeLimit(block_size: u32) usize {
+    return (block_size - 8 - 8) / 8;
+}
+
+fn dxBoundaryHash(previous_start_hash: u32, current_start_hash: u32) u32 {
+    return if (current_start_hash == previous_start_hash) current_start_hash | 1 else current_start_hash;
+}
+
+fn resolveHtreeChildBlock(
+    child: HtreeChild,
+    levels: []const []const HtreeInteriorNode,
+    leaf_block_base: u32,
+) u32 {
+    return switch (child.target) {
+        .leaf => |index| leaf_block_base + @as(u32, @intCast(index)),
+        .node => |node_ref| levels[node_ref.level][node_ref.index].logical_block,
+    };
+}
+
+fn writeDxEntries(
+    buf: []u8,
+    count_offset: usize,
+    limit: usize,
+    children: []const HtreeChild,
+    levels: []const []const HtreeInteriorNode,
+    leaf_block_base: u32,
+) void {
+    std.debug.assert(children.len > 0);
+    writeInt(u16, buf[count_offset .. count_offset + 2], @intCast(limit));
+    writeInt(u16, buf[count_offset + 2 .. count_offset + 4], @intCast(children.len));
+    writeInt(u32, buf[count_offset + 4 .. count_offset + 8], resolveHtreeChildBlock(children[0], levels, leaf_block_base));
+
+    var previous_start_hash = children[0].start_hash;
+    for (children[1..], 1..) |child, child_index| {
+        const base = count_offset + child_index * 8;
+        writeInt(u32, buf[base .. base + 4], dxBoundaryHash(previous_start_hash, child.start_hash));
+        writeInt(u32, buf[base + 4 .. base + 8], resolveHtreeChildBlock(child, levels, leaf_block_base));
+        previous_start_hash = child.start_hash;
     }
-    setDxChecksum(bytes.items[0..block_size], 32, leaf_starts.items.len, root_limit, [_]u8{0} ** 16, inode_number, 0);
+}
 
-    var leaf_specs = try allocator.alloc(DirEntrySpec, hashed.len);
-    defer allocator.free(leaf_specs);
-    for (hashed, 0..) |entry, index| leaf_specs[index] = entry.spec;
-    try appendDirectoryLeafBlocks(&bytes, leaf_specs, block_size);
-    return bytes.toOwnedSlice();
+fn encodeDxRootBlock(
+    buf: []u8,
+    inode_number: u32,
+    parent_inode: u32,
+    indirect_levels: u8,
+    limit: usize,
+    children: []const HtreeChild,
+    levels: []const []const HtreeInteriorNode,
+    leaf_block_base: u32,
+) void {
+    @memset(buf, 0);
+    encodeDirEntry(buf[0..12], .{ .inode = inode_number, .kind = .directory, .name = "." }, 12);
+    encodeDirEntry(buf[12..buf.len], .{ .inode = parent_inode, .kind = .directory, .name = ".." }, @intCast(buf.len - 12));
+    buf[28] = dx_hash_half_md4;
+    buf[29] = 8;
+    buf[30] = indirect_levels;
+    writeDxEntries(buf, 32, limit, children, levels, leaf_block_base);
+}
+
+fn encodeDxNodeBlock(
+    buf: []u8,
+    limit: usize,
+    children: []const HtreeChild,
+    levels: []const []const HtreeInteriorNode,
+    leaf_block_base: u32,
+) void {
+    @memset(buf, 0);
+    writeInt(u16, buf[4..6], @intCast(buf.len));
+    writeDxEntries(buf, 8, limit, children, levels, leaf_block_base);
 }
 
 fn validateTreeEntry(entry: FileTreeView.Entry) PopulateError!void {
@@ -2855,6 +3063,93 @@ test "large directories use htree indexing" {
     try std.testing.expect(readInt(u16, root_block[34..36]) > 1);
 }
 
+test "very large directories use multi-level htree indexing" {
+    const io = std.testing.io;
+    const path = "test-ext4-multilevel-htree.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const entry_count = 8_200;
+    var entries = std.array_list.Managed(InMemoryEntry).init(std.testing.allocator);
+    defer entries.deinit();
+
+    var owned_paths = std.array_list.Managed([]u8).init(std.testing.allocator);
+    defer {
+        for (owned_paths.items) |owned_path| std.testing.allocator.free(owned_path);
+        owned_paths.deinit();
+    }
+
+    try entries.append(.{ .path = "huge", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 });
+    for (0..entry_count) |index| {
+        const path_bytes = try std.testing.allocator.alloc(u8, "huge/".len + 255);
+        try owned_paths.append(path_bytes);
+        std.mem.copyForwards(u8, path_bytes[0.."huge/".len], "huge/");
+        @memset(path_bytes["huge/".len..], 'a');
+        _ = try std.fmt.bufPrint(path_bytes["huge/".len .. "huge/".len + 7], "{d:0>6}-", .{index});
+        try entries.append(.{
+            .path = path_bytes,
+            .kind = .file,
+            .mode = 0o644,
+            .uid = 0,
+            .gid = 0,
+            .size = 0,
+        });
+    }
+
+    var tree = InMemoryTree.init(entries.items);
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{
+        .length = 128 * 1024 * 1024,
+        .uuid = [_]u8{0x66} ** 16,
+        .timestamp = 1_717_171_717,
+    });
+
+    var reader = try open(io, file, std.testing.allocator, .{});
+    defer reader.deinit();
+
+    const dir_entries = try reader.listDir(io, std.testing.allocator, "huge");
+    defer freeDirEntries(std.testing.allocator, dir_entries);
+    try std.testing.expectEqual(@as(usize, entry_count), dir_entries.len);
+
+    _ = try reader.statPath(io, owned_paths.items[0]);
+    _ = try reader.statPath(io, owned_paths.items[entry_count / 2]);
+    _ = try reader.statPath(io, owned_paths.items[entry_count - 1]);
+
+    const dir_inode = try reader.readInode(io, try reader.lookupPath(io, "huge"));
+    try std.testing.expect(dir_inode.flags & inode_flag_index != 0);
+    const extents = try reader.readInodeExtentsAlloc(io, std.testing.allocator, dir_inode);
+    defer std.testing.allocator.free(extents);
+
+    var root_block: [default_block_size]u8 = undefined;
+    try readDirectoryLogicalBlock(io, file, extents, 0, &root_block);
+    try std.testing.expectEqual(dx_hash_half_md4, root_block[28]);
+    try std.testing.expectEqual(@as(u8, 1), root_block[30]);
+
+    const root_limit = readInt(u16, root_block[32..34]);
+    const root_count = readInt(u16, root_block[34..36]);
+    try std.testing.expect(root_count > 1);
+
+    var total_leaf_blocks: usize = 0;
+    for (0..root_count) |entry_index| {
+        const block_field_offset = if (entry_index == 0) 36 else 32 + entry_index * 8 + 4;
+        const child_logical_block = readInt(u32, root_block[block_field_offset .. block_field_offset + 4]);
+        try std.testing.expect(child_logical_block >= 1);
+        try std.testing.expect(child_logical_block <= @as(u32, root_count));
+
+        var node_block: [default_block_size]u8 = undefined;
+        try readDirectoryLogicalBlock(io, file, extents, child_logical_block, &node_block);
+        try std.testing.expectEqual(@as(u32, 0), readInt(u32, node_block[0..4]));
+        try std.testing.expectEqual(@as(u16, @intCast(default_block_size)), readInt(u16, node_block[4..6]));
+        try std.testing.expectEqual(@as(u16, @intCast(dxNodeLimit(default_block_size))), readInt(u16, node_block[8..10]));
+        const node_count = readInt(u16, node_block[10..12]);
+        total_leaf_blocks += node_count;
+        try std.testing.expect(readInt(u32, node_block[12..16]) > @as(u32, root_count));
+    }
+    try std.testing.expect(total_leaf_blocks > root_limit);
+}
+
 test "resize grows ext4 filesystems in place" {
     const io = std.testing.io;
     const path = "test-ext4-resize.img";
@@ -3026,6 +3321,11 @@ fn findSyntheticExtentTreeBlock(blocks: []const ExtentTreeBlock, block_number: u
         if (block.block_number == block_number) return block.bytes[0..];
     }
     return null;
+}
+
+fn readDirectoryLogicalBlock(io: Io, file: Io.File, extents: []const Extent, logical_block: u32, block: []u8) !void {
+    const physical_block = findPhysicalBlock(extents, logical_block) orelse return error.TestUnexpectedResult;
+    _ = try file.readPositionalAll(io, block, physical_block * default_block_size);
 }
 
 fn expectXattrValue(xattrs: []const OwnedXattr, name: []const u8, value: []const u8) !void {
