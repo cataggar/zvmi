@@ -1,23 +1,22 @@
-//! VHDX (Hyper-V's successor format to VHD) **read-only** support.
+//! VHDX (Hyper-V's successor format to VHD) support for standalone,
+//! non-differencing images.
 //!
 //! Every struct layout, offset, well-known GUID, the CRC-32C checksum
 //! algorithm, and -- critically -- the BAT chunk-ratio interleaving math are
 //! transcribed directly from QEMU's `block/vhdx.h`/`block/vhdx.c` (based on
 //! Microsoft's "VHDX Format Specification v1.00"), the de-facto
-//! interoperability reference for this format, since no real Hyper-V/QEMU
-//! install was available in this environment to generate reference files
-//! for round-trip testing. All multi-byte fields are little-endian.
+//! interoperability reference for this format. All multi-byte fields are
+//! little-endian.
 //!
-//! Scope / limitations (read-only, non-differencing only):
+//! Scope / limitations:
 //!  - Differencing (parent/backing-file) VHDX images are not supported
 //!    (`error.DifferencingNotSupported`).
 //!  - Only 512-byte logical sectors are supported (matches QEMU's own
 //!    restriction; virtually all real-world VHDX files use 512).
-//!  - The journal/log is *not* replayed. A VHDX file left with unflushed log
-//!    entries (e.g. after an unclean shutdown) may read stale data. Files
-//!    written by a tool that flushed and cleanly closed the image (the
-//!    common case for images meant to be shared/converted) are unaffected.
-//!  - Writing/creating VHDX is not implemented.
+//!  - The optional journal/log region is created for new images but is not
+//!    replayed on open and is not used to journal metadata updates during
+//!    writes/resizes. Files written by tools that flush and cleanly close the
+//!    image remain readable; crash recovery semantics remain out of scope.
 
 const std = @import("std");
 const Io = std.Io;
@@ -28,12 +27,31 @@ pub const file_id_offset: u64 = 0;
 pub const header1_offset: u64 = header_block_size * 1;
 pub const header2_offset: u64 = header_block_size * 2;
 pub const region_table_offset: u64 = header_block_size * 3;
+pub const region_table2_offset: u64 = header_block_size * 4;
+pub const header_section_end: u64 = 1 * 1024 * 1024;
 
 pub const header_size: usize = 4 * 1024;
 pub const header_signature: [4]u8 = "head".*;
 pub const region_signature: [4]u8 = "regi".*;
 pub const metadata_signature: [8]u8 = "metadata".*;
 pub const file_signature: [8]u8 = "vhdxfile".*;
+
+pub const default_log_size: u32 = 1 * 1024 * 1024;
+pub const metadata_region_length: u64 = 1 * 1024 * 1024;
+pub const metadata_item_base_offset: u32 = 64 * 1024;
+pub const default_block_size: u32 = 1 * 1024 * 1024;
+pub const min_block_size: u32 = 1 * 1024 * 1024;
+pub const max_block_size: u32 = 256 * 1024 * 1024;
+pub const max_image_size: u64 = 64 * 1024 * 1024 * 1024 * 1024;
+pub const default_logical_sector_size: u32 = 512;
+pub const default_physical_sector_size: u32 = 512;
+
+pub const metadata_flag_is_user: u32 = 0x01;
+pub const metadata_flag_is_virtual_disk: u32 = 0x02;
+pub const metadata_flag_is_required: u32 = 0x04;
+pub const region_entry_required: u32 = 0x01;
+pub const file_params_leave_blocks_allocated: u32 = 0x01;
+pub const file_params_has_parent: u32 = 0x02;
 
 /// Sector-bitmap-block interleaving granularity: for every `chunk_ratio`
 /// payload block entries in the BAT, there is one extra (here, ignored)
@@ -69,8 +87,6 @@ pub const logical_sector_size_guid: guid.Guid = guid.parse("8141BF1D-A96F-4709-B
 pub const physical_sector_size_guid: guid.Guid = guid.parse("CDA348C7-445D-4471-9CC9-E9885251C556");
 pub const parent_locator_guid: guid.Guid = guid.parse("A8D35F2D-B30B-454D-ABF7-D3D84834AB0C");
 
-pub const file_params_has_parent: u32 = 0x02;
-
 const Crc32c = std.hash.crc.Crc32Iscsi;
 
 pub const OpenError = error{
@@ -88,20 +104,46 @@ pub const OpenError = error{
     InvalidBlockSize,
 } || Io.File.ReadPositionalError;
 
-/// Everything `Image` needs to translate guest-visible byte offsets into
-/// file offsets. Not cached beyond these scalars -- BAT entries are read
-/// on demand (see `readBatEntry` in `image.zig`), matching the on-demand
-/// approach already used for dynamic VHD.
+pub const CreateError = error{
+    SizeNotSectorAligned,
+    ImageTooLarge,
+} || Io.File.WritePositionalError || Io.File.SetLengthError;
+
+pub const PreadError = error{
+    UnsupportedBlockState,
+    InvalidBatEntry,
+} || Io.File.ReadPositionalError;
+
+pub const PwriteError = error{
+    WritePastEndOfImage,
+    UnsupportedBlockState,
+    InvalidBatEntry,
+} || Io.File.ReadPositionalError || Io.File.WritePositionalError || Io.File.SetLengthError || Io.File.StatError;
+
+pub const ResizeError = error{
+    ShrinkNotSupported,
+    ImageTooLarge,
+    MissingVirtualDiskSize,
+} || OpenError || Io.File.ReadPositionalError || Io.File.WritePositionalError || Io.File.SetLengthError || Io.File.StatError;
+
+/// Everything `Image` and the direct VHDX read/write helpers need to translate
+/// guest-visible byte offsets into file offsets and to update the redundant
+/// header / region-table metadata on write.
 pub const Info = struct {
     virtual_size: u64,
     block_size: u32,
     /// `(2^23 * logical_sector_size) / block_size`, always a power of two.
     chunk_ratio: u64,
     bat_offset: u64,
+    bat_length: u64,
+    metadata_offset: u64,
+    log_offset: u64,
+    log_length: u32,
+    header_sequence_number: u64,
 };
 
-/// Parses the file signature, header, region table, and metadata table,
-/// returning enough information to read guest data. `file` must be
+/// Parses the file signature, active header, region table, and metadata table,
+/// returning enough information to read and write guest data. `file` must be
 /// positioned/seekable via positional reads (no seek state is assumed).
 pub fn open(io: Io, file: Io.File) OpenError!Info {
     var sig: [8]u8 = undefined;
@@ -109,17 +151,17 @@ pub fn open(io: Io, file: Io.File) OpenError!Info {
     if (!std.mem.eql(u8, &sig, &file_signature)) return error.BadFileSignature;
 
     const header = try readValidHeader(io, file);
-    _ = header; // only sequence-number selection matters for us; fields unused beyond that.
-
     const region = try readRegionTable(io, file);
 
     const params = try readFileParameters(io, file, region.metadata_offset);
     if (params.data_bits & file_params_has_parent != 0) return error.DifferencingNotSupported;
-    if (!std.math.isPowerOfTwo(params.block_size) or params.block_size == 0) return error.InvalidBlockSize;
+    if (!std.math.isPowerOfTwo(params.block_size) or params.block_size < min_block_size or params.block_size > max_block_size) {
+        return error.InvalidBlockSize;
+    }
 
     const virtual_size = try readVirtualDiskSize(io, file, region.metadata_offset);
     const logical_sector_size = try readLogicalSectorSize(io, file, region.metadata_offset);
-    if (logical_sector_size != 512) return error.UnsupportedLogicalSectorSize;
+    if (logical_sector_size != default_logical_sector_size) return error.UnsupportedLogicalSectorSize;
 
     const chunk_ratio = max_sectors_per_block * logical_sector_size / params.block_size;
 
@@ -128,7 +170,151 @@ pub fn open(io: Io, file: Io.File) OpenError!Info {
         .block_size = params.block_size,
         .chunk_ratio = chunk_ratio,
         .bat_offset = region.bat_offset,
+        .bat_length = region.bat_length,
+        .metadata_offset = region.metadata_offset,
+        .log_offset = header.log_offset,
+        .log_length = header.log_length,
+        .header_sequence_number = header.sequence_number,
     };
+}
+
+/// Creates a new sparse, standalone VHDX image with a 1 MiB log region,
+/// redundant headers/region tables, a metadata region, and an all-not-present
+/// BAT sized for `size`.
+pub fn create(io: Io, file: Io.File, size: u64) CreateError!Info {
+    if (size % default_logical_sector_size != 0) return error.SizeNotSectorAligned;
+    if (size > max_image_size) return error.ImageTooLarge;
+
+    const block_size = default_block_size;
+    const chunk_ratio = max_sectors_per_block * default_logical_sector_size / block_size;
+    const bat_entries = batEntryCount(size, block_size, chunk_ratio);
+    const bat_length = batRegionLengthForEntries(bat_entries);
+    const bat_offset = alignUp(header_section_end + default_log_size, header_section_end);
+    const metadata_offset = alignUp(bat_offset + bat_length, header_section_end);
+    const initial_file_size = metadata_offset + metadata_region_length;
+
+    try file.setLength(io, initial_file_size);
+    try writeFileIdentifier(file, io);
+
+    const header_sequence_base = randomU64(io);
+    try writeHeaders(file, io, .{
+        .sequence_base = header_sequence_base,
+        .log_offset = header_section_end,
+        .log_length = default_log_size,
+        .file_write_guid = randomGuid(io),
+        .data_write_guid = randomGuid(io),
+        .log_guid = guid.nil,
+    });
+    try writeRegionTables(file, io, bat_offset, bat_length, metadata_offset);
+    try writeMetadataRegion(file, io, size, block_size, metadata_offset);
+
+    return .{
+        .virtual_size = size,
+        .block_size = block_size,
+        .chunk_ratio = chunk_ratio,
+        .bat_offset = bat_offset,
+        .bat_length = bat_length,
+        .metadata_offset = metadata_offset,
+        .log_offset = header_section_end,
+        .log_length = default_log_size,
+        .header_sequence_number = header_sequence_base + 1,
+    };
+}
+
+pub fn pread(file: Io.File, io: Io, info: Info, buffer: []u8, offset: u64) PreadError!usize {
+    if (offset >= info.virtual_size) return 0;
+
+    var total: usize = 0;
+    var off = offset;
+    var remaining = @min(buffer.len, info.virtual_size - offset);
+    while (remaining > 0) {
+        const block_index = off / info.block_size;
+        const in_block_offset: u32 = @intCast(off % info.block_size);
+        const chunk: usize = @intCast(@min(@as(u64, remaining), info.block_size - in_block_offset));
+
+        const entry = try readBatEntry(file, io, info.bat_offset, batIndexForBlock(block_index, info.chunk_ratio));
+        const state: BlockState = @enumFromInt(entry & bat_state_mask);
+
+        switch (state) {
+            .fully_present => {
+                const file_offset = entry & bat_file_off_mask;
+                if (!isValidBlockFileOffset(file_offset)) return error.InvalidBatEntry;
+                const got = try file.readPositionalAll(io, buffer[total..][0..chunk], file_offset + in_block_offset);
+                if (got < chunk) @memset(buffer[total + got ..][0 .. chunk - got], 0);
+            },
+            .not_present, .undefined_state, .zero, .unmapped, .unmapped_v095 => {
+                @memset(buffer[total..][0..chunk], 0);
+            },
+            else => return error.UnsupportedBlockState,
+        }
+
+        total += chunk;
+        off += chunk;
+        remaining -= chunk;
+    }
+    return total;
+}
+
+/// Writes guest-visible bytes, allocating payload blocks on demand and marking
+/// their BAT entries `fully_present`. The optional VHDX log is not used;
+/// headers and BAT updates are written in place.
+pub fn pwrite(file: Io.File, io: Io, info: *Info, buffer: []const u8, offset: u64) PwriteError!void {
+    const write_end = std.math.add(u64, offset, buffer.len) catch return error.WritePastEndOfImage;
+    if (write_end > info.virtual_size) return error.WritePastEndOfImage;
+    if (buffer.len == 0) return;
+
+    try ensureBatCapacityForSize(file, io, info, info.virtual_size);
+
+    var off = offset;
+    var remaining = buffer.len;
+    var src: usize = 0;
+    while (remaining > 0) {
+        const block_index = off / info.block_size;
+        const in_block_offset: u32 = @intCast(off % info.block_size);
+        const chunk: usize = @intCast(@min(@as(u64, remaining), info.block_size - in_block_offset));
+        const bat_index = batIndexForBlock(block_index, info.chunk_ratio);
+
+        var entry = try readBatEntry(file, io, info.bat_offset, bat_index);
+        const state: BlockState = @enumFromInt(entry & bat_state_mask);
+        var file_offset = entry & bat_file_off_mask;
+
+        switch (state) {
+            .fully_present => {
+                if (!isValidBlockFileOffset(file_offset)) return error.InvalidBatEntry;
+            },
+            .not_present, .undefined_state, .zero, .unmapped, .unmapped_v095 => {
+                file_offset = try allocatePayloadBlock(file, io, info.*);
+                entry = file_offset | @intFromEnum(BlockState.fully_present);
+                try writeBatEntry(file, io, info.bat_offset, bat_index, entry);
+            },
+            else => return error.UnsupportedBlockState,
+        }
+
+        try file.writePositionalAll(io, buffer[src..][0..chunk], file_offset + in_block_offset);
+
+        src += chunk;
+        off += chunk;
+        remaining -= chunk;
+    }
+
+    try updateHeaders(file, io, info, true);
+}
+
+/// Grows the guest-visible virtual size, relocating/expanding the BAT region
+/// if necessary and updating the virtual-size metadata item in place.
+pub fn resize(file: Io.File, io: Io, info: *Info, new_size: u64) ResizeError!void {
+    if (new_size < info.virtual_size) return error.ShrinkNotSupported;
+    if (new_size == info.virtual_size) return;
+    if (new_size > max_image_size) return error.ImageTooLarge;
+
+    try ensureBatCapacityForSize(file, io, info, new_size);
+
+    const item = (try findMetadataItem(io, file, info.metadata_offset, virtual_disk_size_guid)) orelse
+        return error.MissingVirtualDiskSize;
+    try writeU64(file, io, item.file_offset, new_size);
+
+    info.virtual_size = new_size;
+    try updateHeaders(file, io, info, true);
 }
 
 /// Index into the BAT array for payload block `block_index`, accounting for
@@ -152,7 +338,11 @@ fn readValidHeader(io: Io, file: Io.File) OpenError!HeaderInfo {
     return h2.?;
 }
 
-const HeaderInfo = struct { sequence_number: u64 };
+const HeaderInfo = struct {
+    sequence_number: u64,
+    log_offset: u64,
+    log_length: u32,
+};
 
 fn readOneHeader(io: Io, file: Io.File, offset: u64) ?HeaderInfo {
     var buf: [header_size]u8 = undefined;
@@ -168,11 +358,16 @@ fn readOneHeader(io: Io, file: Io.File, offset: u64) ?HeaderInfo {
     const version = std.mem.readInt(u16, buf[66..68], .little);
     if (version != 1) return null;
 
-    return .{ .sequence_number = std.mem.readInt(u64, buf[8..16], .little) };
+    return .{
+        .sequence_number = std.mem.readInt(u64, buf[8..16], .little),
+        .log_length = std.mem.readInt(u32, buf[68..72], .little),
+        .log_offset = std.mem.readInt(u64, buf[72..80], .little),
+    };
 }
 
 const RegionInfo = struct {
     bat_offset: u64,
+    bat_length: u64,
     metadata_offset: u64,
 };
 
@@ -189,6 +384,7 @@ fn readRegionTable(io: Io, file: Io.File) OpenError!RegionInfo {
     const entry_count = std.mem.readInt(u32, buf[8..12], .little);
 
     var bat_offset: ?u64 = null;
+    var bat_length: ?u64 = null;
     var metadata_offset: ?u64 = null;
 
     var i: u32 = 0;
@@ -196,9 +392,11 @@ fn readRegionTable(io: Io, file: Io.File) OpenError!RegionInfo {
         const off = 16 + i * 32;
         const entry_guid: guid.Guid = buf[off..][0..16].*;
         const file_offset = std.mem.readInt(u64, buf[off + 16 ..][0..8], .little);
+        const length = std.mem.readInt(u32, buf[off + 24 ..][0..4], .little);
 
         if (std.mem.eql(u8, &entry_guid, &bat_region_guid)) {
             bat_offset = file_offset;
+            bat_length = length;
         } else if (std.mem.eql(u8, &entry_guid, &metadata_region_guid)) {
             metadata_offset = file_offset;
         }
@@ -206,6 +404,7 @@ fn readRegionTable(io: Io, file: Io.File) OpenError!RegionInfo {
 
     return .{
         .bat_offset = bat_offset orelse return error.MissingBatRegion,
+        .bat_length = bat_length orelse return error.MissingBatRegion,
         .metadata_offset = metadata_offset orelse return error.MissingMetadataRegion,
     };
 }
@@ -262,6 +461,206 @@ fn readLogicalSectorSize(io: Io, file: Io.File, metadata_region_offset: u64) Ope
     return std.mem.readInt(u32, &buf, .little);
 }
 
+const HeaderWriteInfo = struct {
+    sequence_base: u64,
+    log_offset: u64,
+    log_length: u32,
+    file_write_guid: guid.Guid,
+    data_write_guid: guid.Guid,
+    log_guid: guid.Guid,
+};
+
+fn writeFileIdentifier(file: Io.File, io: Io) Io.File.WritePositionalError!void {
+    var buf: [header_block_size]u8 = [_]u8{0} ** header_block_size;
+    buf[0..8].* = file_signature;
+    try file.writePositionalAll(io, &buf, file_id_offset);
+}
+
+fn writeHeaders(file: Io.File, io: Io, info: HeaderWriteInfo) Io.File.WritePositionalError!void {
+    try writeOneHeader(file, io, header1_offset, info.sequence_base, info.log_offset, info.log_length, info.file_write_guid, info.data_write_guid, info.log_guid);
+    try writeOneHeader(file, io, header2_offset, info.sequence_base + 1, info.log_offset, info.log_length, info.file_write_guid, info.data_write_guid, info.log_guid);
+}
+
+fn writeOneHeader(
+    file: Io.File,
+    io: Io,
+    offset: u64,
+    sequence_number: u64,
+    log_offset: u64,
+    log_length: u32,
+    file_write_guid: guid.Guid,
+    data_write_guid: guid.Guid,
+    log_guid: guid.Guid,
+) Io.File.WritePositionalError!void {
+    var buf: [header_size]u8 = [_]u8{0} ** header_size;
+    buf[0..4].* = header_signature;
+    std.mem.writeInt(u64, buf[8..16], sequence_number, .little);
+    buf[16..32].* = file_write_guid;
+    buf[32..48].* = data_write_guid;
+    buf[48..64].* = log_guid;
+    std.mem.writeInt(u16, buf[64..66], 0, .little); // log_version
+    std.mem.writeInt(u16, buf[66..68], 1, .little); // version
+    std.mem.writeInt(u32, buf[68..72], log_length, .little);
+    std.mem.writeInt(u64, buf[72..80], log_offset, .little);
+    std.mem.writeInt(u32, buf[4..8], Crc32c.hash(&buf), .little);
+    try file.writePositionalAll(io, &buf, offset);
+}
+
+fn updateHeaders(file: Io.File, io: Io, info: *Info, generate_data_write_guid: bool) Io.File.WritePositionalError!void {
+    const file_write_guid = randomGuid(io);
+    const data_write_guid = if (generate_data_write_guid) randomGuid(io) else guid.nil;
+    try writeHeaders(file, io, .{
+        .sequence_base = info.header_sequence_number + 1,
+        .log_offset = info.log_offset,
+        .log_length = info.log_length,
+        .file_write_guid = file_write_guid,
+        .data_write_guid = data_write_guid,
+        .log_guid = guid.nil,
+    });
+    info.header_sequence_number += 2;
+}
+
+fn writeRegionTables(file: Io.File, io: Io, bat_offset: u64, bat_length: u64, metadata_offset: u64) Io.File.WritePositionalError!void {
+    var buf: [header_block_size]u8 = [_]u8{0} ** header_block_size;
+    buf[0..4].* = region_signature;
+    std.mem.writeInt(u32, buf[8..12], 2, .little);
+
+    buf[16..32].* = bat_region_guid;
+    std.mem.writeInt(u64, buf[32..40], bat_offset, .little);
+    std.mem.writeInt(u32, buf[40..44], @intCast(bat_length), .little);
+    std.mem.writeInt(u32, buf[44..48], region_entry_required, .little);
+
+    buf[48..64].* = metadata_region_guid;
+    std.mem.writeInt(u64, buf[64..72], metadata_offset, .little);
+    std.mem.writeInt(u32, buf[72..76], @intCast(metadata_region_length), .little);
+    std.mem.writeInt(u32, buf[76..80], region_entry_required, .little);
+
+    std.mem.writeInt(u32, buf[4..8], Crc32c.hash(&buf), .little);
+    try file.writePositionalAll(io, &buf, region_table_offset);
+    try file.writePositionalAll(io, &buf, region_table2_offset);
+}
+
+fn writeMetadataRegion(file: Io.File, io: Io, virtual_size: u64, block_size: u32, metadata_offset: u64) Io.File.WritePositionalError!void {
+    var table: [header_block_size]u8 = [_]u8{0} ** header_block_size;
+    table[0..8].* = metadata_signature;
+    std.mem.writeInt(u16, table[10..12], 5, .little);
+
+    writeMetadataTableEntry(table[32..64], file_parameters_guid, metadata_item_base_offset, 8, metadata_flag_is_required);
+    writeMetadataTableEntry(table[64..96], virtual_disk_size_guid, metadata_item_base_offset + 8, 8, metadata_flag_is_required | metadata_flag_is_virtual_disk);
+    writeMetadataTableEntry(table[96..128], page83_data_guid, metadata_item_base_offset + 16, 16, metadata_flag_is_required | metadata_flag_is_virtual_disk);
+    writeMetadataTableEntry(table[128..160], logical_sector_size_guid, metadata_item_base_offset + 32, 4, metadata_flag_is_required | metadata_flag_is_virtual_disk);
+    writeMetadataTableEntry(table[160..192], physical_sector_size_guid, metadata_item_base_offset + 36, 4, metadata_flag_is_required | metadata_flag_is_virtual_disk);
+    try file.writePositionalAll(io, &table, metadata_offset);
+
+    var items: [40]u8 = [_]u8{0} ** 40;
+    std.mem.writeInt(u32, items[0..4], block_size, .little);
+    std.mem.writeInt(u32, items[4..8], 0, .little);
+    std.mem.writeInt(u64, items[8..16], virtual_size, .little);
+    items[16..32].* = randomGuid(io);
+    std.mem.writeInt(u32, items[32..36], default_logical_sector_size, .little);
+    std.mem.writeInt(u32, items[36..40], default_physical_sector_size, .little);
+    try file.writePositionalAll(io, &items, metadata_offset + metadata_item_base_offset);
+}
+
+fn writeMetadataTableEntry(entry_buf: []u8, item_guid: guid.Guid, offset: u32, length: u32, flags: u32) void {
+    entry_buf[0..16].* = item_guid;
+    std.mem.writeInt(u32, entry_buf[16..20], offset, .little);
+    std.mem.writeInt(u32, entry_buf[20..24], length, .little);
+    std.mem.writeInt(u32, entry_buf[24..28], flags, .little);
+    std.mem.writeInt(u32, entry_buf[28..32], 0, .little);
+}
+
+fn batEntryCount(virtual_size: u64, block_size: u32, chunk_ratio: u64) u64 {
+    const data_blocks = divCeil(virtual_size, block_size);
+    if (data_blocks == 0) return 0;
+    return data_blocks + ((data_blocks - 1) / chunk_ratio);
+}
+
+fn batRegionLengthForEntries(entry_count: u64) u64 {
+    const entry_bytes = std.math.mul(u64, entry_count, 8) catch unreachable;
+    return @max(header_section_end, alignUp(entry_bytes, header_section_end));
+}
+
+fn ensureBatCapacityForSize(file: Io.File, io: Io, info: *Info, virtual_size: u64) (Io.File.ReadPositionalError || Io.File.WritePositionalError || Io.File.SetLengthError || Io.File.StatError)!void {
+    const needed_entries = batEntryCount(virtual_size, info.block_size, info.chunk_ratio);
+    const needed_length = batRegionLengthForEntries(needed_entries);
+    if (needed_length <= info.bat_length) return;
+
+    const file_size = (try file.stat(io)).size;
+    const new_bat_offset = alignUp(file_size, header_section_end);
+    const new_end = new_bat_offset + needed_length;
+    try file.setLength(io, new_end);
+    try copyRange(file, io, info.bat_offset, new_bat_offset, info.bat_length);
+    try writeRegionTables(file, io, new_bat_offset, needed_length, info.metadata_offset);
+
+    info.bat_offset = new_bat_offset;
+    info.bat_length = needed_length;
+}
+
+fn allocatePayloadBlock(file: Io.File, io: Io, info: Info) (Io.File.SetLengthError || Io.File.StatError)!u64 {
+    const file_size = (try file.stat(io)).size;
+    const block_offset = alignUp(file_size, header_section_end);
+    try file.setLength(io, block_offset + info.block_size);
+    return block_offset;
+}
+
+fn isValidBlockFileOffset(file_offset: u64) bool {
+    return file_offset >= header_section_end and file_offset % header_section_end == 0;
+}
+
+fn readBatEntry(file: Io.File, io: Io, bat_offset: u64, index: u64) Io.File.ReadPositionalError!u64 {
+    var buf: [8]u8 = undefined;
+    _ = try file.readPositionalAll(io, &buf, bat_offset + index * 8);
+    return std.mem.readInt(u64, &buf, .little);
+}
+
+fn writeBatEntry(file: Io.File, io: Io, bat_offset: u64, index: u64, value: u64) Io.File.WritePositionalError!void {
+    var buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &buf, value, .little);
+    try file.writePositionalAll(io, &buf, bat_offset + index * 8);
+}
+
+fn copyRange(file: Io.File, io: Io, src_offset: u64, dst_offset: u64, byte_length: u64) (Io.File.ReadPositionalError || Io.File.WritePositionalError)!void {
+    var buf: [4096]u8 = undefined;
+    var copied: u64 = 0;
+    while (copied < byte_length) {
+        const n: usize = @intCast(@min(byte_length - copied, buf.len));
+        _ = try file.readPositionalAll(io, buf[0..n], src_offset + copied);
+        try file.writePositionalAll(io, buf[0..n], dst_offset + copied);
+        copied += n;
+    }
+}
+
+fn writeU64(file: Io.File, io: Io, offset: u64, value: u64) Io.File.WritePositionalError!void {
+    var buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &buf, value, .little);
+    try file.writePositionalAll(io, &buf, offset);
+}
+
+fn alignUp(value: u64, alignment: u64) u64 {
+    if (alignment == 0) return value;
+    return std.mem.alignForward(u64, value, alignment);
+}
+
+fn divCeil(numerator: u64, denominator: u64) u64 {
+    if (numerator == 0) return 0;
+    return std.math.divCeil(u64, numerator, denominator) catch unreachable;
+}
+
+fn randomU64(io: Io) u64 {
+    var buf: [8]u8 = undefined;
+    Io.random(io, &buf);
+    return std.mem.readInt(u64, &buf, .little);
+}
+
+fn randomGuid(io: Io) guid.Guid {
+    var bytes: guid.Guid = undefined;
+    Io.random(io, &bytes);
+    bytes[7] = (bytes[7] & 0x0F) | 0x40; // version 4 in mixed-endian GUID layout
+    bytes[8] = (bytes[8] & 0x3F) | 0x80; // variant 10
+    return bytes;
+}
+
 test "batIndexForBlock matches QEMU's vhdx_block_translate interleaving" {
     // chunk_ratio=4: blocks 0-3 map directly, block 4 gets +1 (one sector
     // bitmap slot inserted after every 4 payload entries), block 8 gets +2.
@@ -280,4 +679,54 @@ test "guid constants match known VHDX region/metadata GUIDs" {
         0x9d, 0x64, 0x11, 0x5e, 0x9b, 0xfd, 0x4a, 0x08,
     };
     try std.testing.expectEqualSlices(u8, &expected_bat, &bat_region_guid);
+}
+
+test "create, write, resize, and reopen vhdx images" {
+    const io = std.testing.io;
+    const path = "test-vhdx-write.vhdx";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const gib: u64 = 1024 * 1024 * 1024;
+    const initial_size: u64 = 120 * gib;
+    const grown_size: u64 = 132 * gib;
+    const sparse_offset: u64 = 3 * @as(u64, default_block_size) + 41;
+    const cross_boundary_offset: u64 = 4 * @as(u64, default_block_size) - 96;
+    const distant_offset: u64 = 130 * gib + 123;
+    const payload0 = "vhdx-direct-0";
+    const payload1 = "vhdx-direct-1";
+    const payload2 = [_]u8{0x3C} ** 256;
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+
+    var info = try create(io, file, initial_size);
+    const initial_bat_length = info.bat_length;
+    try std.testing.expectEqual(initial_size, info.virtual_size);
+    try std.testing.expectEqual(default_block_size, info.block_size);
+
+    try pwrite(file, io, &info, payload0, sparse_offset);
+    try pwrite(file, io, &info, &payload2, cross_boundary_offset);
+    try resize(file, io, &info, grown_size);
+    try std.testing.expect(info.bat_length > initial_bat_length);
+    try pwrite(file, io, &info, payload1, distant_offset);
+
+    const reopened = try open(io, file);
+    try std.testing.expectEqual(grown_size, reopened.virtual_size);
+    try std.testing.expect(reopened.bat_length >= info.bat_length);
+
+    var buf0: [payload0.len]u8 = undefined;
+    _ = try pread(file, io, reopened, &buf0, sparse_offset);
+    try std.testing.expectEqualSlices(u8, payload0, &buf0);
+
+    var buf1: [payload1.len]u8 = undefined;
+    _ = try pread(file, io, reopened, &buf1, distant_offset);
+    try std.testing.expectEqualSlices(u8, payload1, &buf1);
+
+    var buf2: [payload2.len]u8 = undefined;
+    _ = try pread(file, io, reopened, &buf2, cross_boundary_offset);
+    try std.testing.expectEqualSlices(u8, &payload2, &buf2);
+
+    var zero_buf: [64]u8 = undefined;
+    _ = try pread(file, io, reopened, &zero_buf, @as(u64, default_block_size));
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 64), &zero_buf);
 }
