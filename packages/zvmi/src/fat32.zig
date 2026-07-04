@@ -1089,7 +1089,8 @@ fn chooseShortName(fs: *FileSystem, io: Io, dir_cluster: u32, name: []const u8) 
         const suffix = try std.fmt.bufPrint(&suffix_buf, "~{d}", .{suffix_num});
         var stem_with_suffix: [8]u8 = [_]u8{' '} ** 8;
         const prefix_len = 8 - suffix.len;
-        @memcpy(stem_with_suffix[0..prefix_len], base_buf[0..@min(prefix_len, stem_len)]);
+        const copy_len = @min(prefix_len, stem_len);
+        @memcpy(stem_with_suffix[0..copy_len], base_buf[0..copy_len]);
         @memcpy(stem_with_suffix[prefix_len .. prefix_len + suffix.len], suffix);
         const candidate = buildShortName(trimSpaces(&stem_with_suffix), ext_buf[0..ext_len]);
         if (!(try shortNameExists(fs, io, dir_cluster, candidate))) return candidate;
@@ -1277,4 +1278,28 @@ test "format, write nested tree with VFAT long names, list, and read back" {
     const fallback = try reopened_fs.readFileAlloc(io, std.testing.allocator, "EFI/tools and utilities/fallback bootloader path.txt");
     defer std.testing.allocator.free(fallback);
     try std.testing.expectEqualStrings("EFI/BOOT/BOOTX64.EFI\n", fallback);
+}
+
+test "FAT32 path lookup is case-insensitive for mixed-case names" {
+    const io = std.testing.io;
+    const path = "test-fat32-casefold.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const partition_len: u64 = 64 * 1024 * 1024;
+    var img = try Image.create(io, path, .raw, partition_len, .{});
+    defer img.close(io);
+
+    try format(&img, io, .{ .partition_offset = 0, .partition_len = partition_len });
+
+    var fs = try open(&img, io, .{ .offset = 0, .length = partition_len });
+    try fs.createDir(io, "EFI/Boot");
+    try fs.writeFile(io, "EFI/Boot/BootX64.Efi", "hello");
+
+    const lower = try fs.readFileAlloc(io, std.testing.allocator, "efi/boot/bootx64.efi");
+    defer std.testing.allocator.free(lower);
+    try std.testing.expectEqualStrings("hello", lower);
+
+    const upper = try fs.readFileAlloc(io, std.testing.allocator, "EFI/BOOT/BOOTX64.EFI");
+    defer std.testing.allocator.free(upper);
+    try std.testing.expectEqualStrings("hello", upper);
 }
