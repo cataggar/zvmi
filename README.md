@@ -42,7 +42,9 @@ zvmi/
         ext4.zig              # minimal native ext4 writer + readback helper
                               #   (no journal, linear dirs, inline extents)
         bootconfig.zig         # ESP bootloader population (copy EFI binaries
-                              #   + generate grub.cfg/BLS text)
+                              #   + Secure Boot MOK/UKI orchestration)
+        uki.zig                # low-level UKI/systemd-stub PE section
+                              #   assembly helpers
         layout.zig             # partition-layout planner (sizing math,
                               #   alignment, DPS type GUIDs)
         guid.zig               # mixed-endian GUID encoding + well-known
@@ -167,17 +169,27 @@ ESP bootloader population lives at `zvmi.bootconfig`. It reuses the exact same
 rootfs population and ESP population from one merged source-tree interface.
 Callers pass the planned GPT partitions plus their unique GUIDs, then
 `populateEsp()` copies discovered `EFI/.../*.efi` binaries into a FAT32 ESP
-and generates `EFI/.../grub.cfg`, `loader/loader.conf`, and
-`loader/entries/*.conf` files that reference the resolved root partition by
-`PARTUUID`.
+and, depending on `boot_mode`, generates the existing shim/GRUB/BLS text files,
+named `EFI/Linux/*.efi` UKIs, or both. The same pass also copies shim/MOK
+auxiliary assets such as `mm*.efi`, `MokManager`, and enrollment/config files
+that already exist in the source tree.
 
 ```zig
 try zvmi.bootconfig.populateEsp(allocator, io, &esp_fs, &tree, .{
     .planned_partitions = planned_partitions,
+    .boot_mode = .bls_and_uki,
     .path_strip_prefix = "",
     .extra_kernel_options = "console=ttyS0",
+    .uki = .{
+        .output_directory = "EFI/Linux",
+    },
 });
 ```
+
+The low-level PE/COFF rewriting lives in `zvmi.uki`, which takes a prebuilt
+stub plus kernel/initrd/cmdline payloads and emits a structurally valid UKI
+with `.linux`, `.initrd`, `.cmdline`, `.osrel`, `.uname`, and optional
+`.splash` sections.
 
 `zvmi build-image` currently writes `raw` and fixed `vhd` outputs. `vhdx` and
 `qcow2` remain read-only source formats for now, so build-image output support

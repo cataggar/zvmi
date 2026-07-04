@@ -7,6 +7,7 @@
 //! Milestone 7 status: raw + fixed/dynamic vhd read/write, MBR + GPT
 //! partition table read/write, FAT32 filesystem read/write, native ESP
 //! bootloader population (copy EFI binaries + generate grub.cfg/BLS),
+//! Secure Boot MOK asset plumbing, UKI generation,
 //! VHDX **read-only**, qcow2 **read-only**, ISO9660/squashfs
 //! **read-only** (including squashfs XZ/zstd-compressed blocks), local OCI image ingestion, a minimal native ext4
 //! writer/readback helper, COSI output packaging, and the initial
@@ -22,6 +23,7 @@ pub const iso9660 = @import("iso9660.zig");
 pub const squashfs = @import("squashfs.zig");
 pub const ext4 = @import("ext4.zig");
 pub const bootconfig = @import("bootconfig.zig");
+pub const uki = @import("uki.zig");
 pub const guid = @import("guid.zig");
 pub const mbr = @import("mbr.zig");
 pub const gpt = @import("gpt.zig");
