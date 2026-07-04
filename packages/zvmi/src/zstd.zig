@@ -6,7 +6,9 @@
 //! - raw (uncompressed) data blocks only.
 //!
 //! The result is spec-compliant and decodable by the real `zstd` CLI, trading
-//! compression ratio for implementation simplicity and correctness.
+//! compression ratio for implementation simplicity and correctness. Zig 0.16's
+//! stdlib exposes `std.compress.zstd.Decompress` but no corresponding zstd
+//! encoder API, so this raw-block writer remains necessary for `cosi.zig`.
 
 const std = @import("std");
 
