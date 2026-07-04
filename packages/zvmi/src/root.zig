@@ -12,6 +12,8 @@ const std = @import("std");
 
 pub const vhd = @import("vhd.zig");
 pub const vhdx = @import("vhdx.zig");
+pub const iso9660 = @import("iso9660.zig");
+pub const squashfs = @import("squashfs.zig");
 pub const guid = @import("guid.zig");
 pub const mbr = @import("mbr.zig");
 pub const gpt = @import("gpt.zig");
