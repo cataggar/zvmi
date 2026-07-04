@@ -69,14 +69,16 @@ pub fn build(
 
     const architecture = inferArchitecture(container_image.config.architecture);
     const planned_partitions = try planPartitionIdentities(allocator, io, disk_size, options.generation, architecture, options.esp_size);
-    errdefer allocator.free(planned_partitions);
+    var planned_partitions_owned = false;
+    errdefer if (!planned_partitions_owned) allocator.free(planned_partitions);
 
     logStep(options.verbose, "open ISO");
     var iso_reader = try iso9660.Reader.openPath(allocator, io, options.iso_path);
     defer iso_reader.close(io);
 
     const rootfs_path_in_iso = try discoverRootfsPathInIso(allocator, &iso_reader, options.rootfs_path_in_iso);
-    errdefer allocator.free(rootfs_path_in_iso);
+    var rootfs_path_in_iso_owned = false;
+    errdefer if (!rootfs_path_in_iso_owned) allocator.free(rootfs_path_in_iso);
 
     var report = BuildImageReport{
         .output_format = output_format,
@@ -87,6 +89,10 @@ pub fn build(
         .rootfs_path_in_iso = rootfs_path_in_iso,
         .planned_partitions = planned_partitions,
     };
+    // `report` now owns both allocations; disarm the standalone errdefers above
+    // so `report.deinit` below is the single owner responsible for freeing them.
+    planned_partitions_owned = true;
+    rootfs_path_in_iso_owned = true;
     errdefer report.deinit(allocator);
 
     if (options.dry_run) return report;
@@ -1090,6 +1096,55 @@ test "build-image builds a Gen2 Azure-ready VHD from ISO squashfs + OCI layout" 
     const boot_kernel = try root_reader.readFileAlloc(io, allocator, "boot/vmlinuz-test");
     defer allocator.free(boot_kernel);
     try std.testing.expectEqualStrings("kernel-from-oci", boot_kernel);
+}
+
+test "build-image reports errors cleanly (no double-free) when squashfs open fails after partition planning" {
+    // Regression test for a bug found via real-world testing against the real
+    // Azure Linux 4.0 ISO (https://aka.ms/azurelinux-4.0-x86_64.iso), whose
+    // embedded /LiveOS/squashfs.img uses XZ-compressed metadata blocks (not yet
+    // supported -- see the "squashfs: zstd/xz compressed block support" issue).
+    // `build()` used to register an `errdefer allocator.free(planned_partitions)`
+    // / `errdefer allocator.free(rootfs_path_in_iso)` *and* a later
+    // `errdefer report.deinit(allocator)` that also frees the same two slices;
+    // any error past that point (like squashfs.Reader.openFile's
+    // CompressedMetadataUnsupported) triggered all of them during unwinding and
+    // double-freed both allocations. `std.testing.allocator` below will fail
+    // this test if that regresses.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const iso_path = "test-build-image-compressed.iso";
+    const oci_root = "test-build-image-compressed-oci";
+    const output_path = "test-build-image-compressed.vhd";
+    defer Io.Dir.cwd().deleteFile(io, iso_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, oci_root) catch {};
+    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
+
+    const squashfs_bytes = try buildSyntheticSquashfsImage(allocator);
+    defer allocator.free(squashfs_bytes);
+
+    // Clear the inode table's metadata-block "uncompressed" bit so it looks
+    // like a real, compressed squashfs image to zvmi.squashfs.Reader --
+    // exactly what tripped the real Azure Linux ISO's XZ-compressed metadata.
+    const inode_table_start = std.mem.readInt(u64, squashfs_bytes[64..72], .little);
+    const header_offset: usize = @intCast(inode_table_start);
+    var header = std.mem.readInt(u16, squashfs_bytes[header_offset..][0..2], .little);
+    header &= ~squashfs.metadata_uncompressed_bit;
+    std.mem.writeInt(u16, squashfs_bytes[header_offset..][0..2], header, .little);
+
+    try writeMinimalIsoWithFile(allocator, io, iso_path, "ROOT.SQUASHFS;1", squashfs_bytes);
+
+    var fixture = try createBuildImageOciFixture(allocator, io, oci_root);
+    defer fixture.deinit(allocator);
+
+    try std.testing.expectError(error.CompressedMetadataUnsupported, build(allocator, io, .{
+        .iso_path = iso_path,
+        .container_path = oci_root,
+        .output_path = output_path,
+        .output_format = .vhd,
+        .generation = .gen2,
+        .size = 256 * mib,
+    }));
 }
 
 const BuildImageOciFixture = struct {
