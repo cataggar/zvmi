@@ -35,6 +35,9 @@ zvmi/
                               #   (CRC-32, spec-verified layout)
         azure.zig              # 1 MiB alignment + Gen1/Gen2 partition-style
                               #   checks (backs `zvmi azure fixup`)
+        tar.zig                # minimal private USTAR writer for COSI packaging
+        zstd.zig               # minimal private raw-block zstd codec for COSI
+        cosi.zig               # COSI writer (tar + metadata.json + raw.zst parts)
         formats.zig           # Format enum (raw, vhd)
         size.zig              # qemu-img-style size suffix parsing (K/M/G/T)
   cli/
@@ -48,6 +51,7 @@ zvmi/
         check.zig             # `zvmi check`
         map.zig               # `zvmi map`
         azure.zig             # `zvmi azure fixup`
+        cosi.zig              # `zvmi cosi`
         opts.zig              # shared `-o subformat=...` parsing
 ```
 
@@ -65,7 +69,7 @@ zig build run -- <args>   # run the CLI, e.g. `zig build run -- info foo.vhd`
 
 ## Status (Milestone 4)
 
-Supports `raw`, fixed `vhd`, dynamic `vhd`, MBR/GPT partition tables, an
+Supports `raw`, fixed `vhd`, dynamic `vhd`, MBR/GPT partition tables, COSI output, an
 Azure-readiness check, and **read-only** `vhdx`:
 
 ```
@@ -79,6 +83,7 @@ zvmi resize disk.vhd +4G
 zvmi check disk.vhd
 zvmi map disk.vhd
 zvmi azure fixup --generation 1|2 disk.vhd  # pads to 1 MiB, checks MBR/GPT
+zvmi cosi disk.img -o disk.cosi              # tar + metadata.json + per-partition raw.zst
 ```
 
 `convert` skips all-zero chunks (aligned to the destination's block size for
