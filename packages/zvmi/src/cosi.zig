@@ -1,5 +1,10 @@
 //! COSI (Composable OS Image) writer.
 //!
+//! Partition payloads are emitted as real `.raw.zst` members using
+//! `zstd.zig`'s small built-in encoder, so repetitive GPT/filesystem regions
+//! shrink while
+//! remaining decodable by standard zstd tooling.
+//!
 //! The emitted `metadata.json` schema is verified against Azure Linux Image
 //! Tools' real implementation:
 //! - `toolkit/tools/pkg/imagecustomizerlib/cosimetadata.go`
@@ -227,6 +232,7 @@ fn hashCompressedRegion(
     var hashed = discard.writer.hashed(std.crypto.hash.sha2.Sha384.init(.{}), &hash_buffer);
 
     try streamCompressedRegionWriter(&hashed.writer, img, io, offset_bytes, length, image_id);
+    try hashed.writer.flush();
 
     var digest: [std.crypto.hash.sha2.Sha384.digest_length]u8 = undefined;
     hashed.hasher.final(&digest);
@@ -259,7 +265,7 @@ fn streamCompressedRegionWriter(writer: *std.Io.Writer, img: Image, io: Io, offs
         const got = try img.pread(io, buffer[0..chunk_len], offset_bytes + done);
         if (got != chunk_len) return error.ShortRead;
         done += chunk_len;
-        try zstd.writeRawBlock(writer, buffer[0..chunk_len], done == length);
+        try zstd.writeBlocksForSlice(writer, buffer[0..chunk_len], done == length);
     }
 }
 
@@ -657,7 +663,7 @@ fn findTarEntry(entries: []const ParsedTarEntry, path: []const u8) ?ParsedTarEnt
     return null;
 }
 
-test "write builds a COSI tarball with GPT metadata and raw-zst partitions" {
+test "write builds a COSI tarball with GPT metadata and compressed zstd partitions" {
     const io = std.testing.io;
     const disk_path = "test-cosi.img";
     const cosi_path = "test-cosi.cosi";
