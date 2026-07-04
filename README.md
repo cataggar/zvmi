@@ -1,7 +1,8 @@
 # zvmi
 
 A Zig 0.16 library and CLI for reading and writing VM disk image formats
-(raw, VHD/VPC, and eventually VHDX/qcow2), analogous to `qemu-img`.
+(raw, VHD/VPC, and eventually VHDX/qcow2) plus FAT32 filesystem contents,
+analogous to `qemu-img`.
 
 ## Goal
 
@@ -23,6 +24,8 @@ zvmi/
         root.zig             # public API surface
         image.zig            # format-agnostic Image (open/create/read/write,
                               #   resize/check/map; raw + fixed/dynamic vhd)
+        fat32.zig             # FAT32 formatter + directory/file read/write
+                              #   for partition-sized regions inside an Image
         vhd.zig               # VHD/VPC footer + dynamic header codec
                               #   (spec + QEMU-verified)
         vhdx.zig              # VHDX **read-only** codec (header, region
@@ -65,8 +68,9 @@ zig build run -- <args>   # run the CLI, e.g. `zig build run -- info foo.vhd`
 
 ## Status (Milestone 4)
 
-Supports `raw`, fixed `vhd`, dynamic `vhd`, MBR/GPT partition tables, an
-Azure-readiness check, and **read-only** `vhdx`:
+Supports `raw`, fixed `vhd`, dynamic `vhd`, MBR/GPT partition tables, native
+FAT32 filesystem read/write for ESP-style partitions, an Azure-readiness
+check, and **read-only** `vhdx`:
 
 ```
 zvmi create -f vhd disk.vhd 32M                          # dynamic by default (matches qemu-img)
@@ -91,6 +95,12 @@ MBR/GPT partition-table read/write is available as a library API
 requested Hyper-V generation (Gen1 = plain MBR, Gen2 = protective MBR + GPT).
 There is no interactive partitioning CLI command yet -- that lands with
 `zvmi build-image`.
+
+FAT32 filesystem support is currently library-only (`zvmi.fat32`). Callers
+format a partition-sized region inside an existing `zvmi.Image`, then use the
+returned/opened filesystem handle to create directories, write full file
+contents, list directory entries, and read files back -- including VFAT long
+file names such as typical `EFI/...` ESP paths.
 
 VHDX support is read-only (`zvmi.vhdx`; usable via `info`/`convert`/`check`/
 `map`, but not `create`), covering non-differencing images with 512-byte
