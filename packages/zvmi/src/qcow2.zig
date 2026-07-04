@@ -136,11 +136,15 @@ pub const Info = struct {
     l2_entries: u64,
     refcount_table_offset: u64,
     refcount_table_clusters: u32,
+    /// Number of refcount-table slots reserved by the current contiguous
+    /// refcount-table allocation, including zero (currently unused) entries.
     refcount_table_capacity_blocks: u64,
+    /// Number of refcount blocks currently referenced by the active table.
     refcount_block_count: u32,
     refcount_order: u32,
     header_length: u32,
     incompatible_features: u64,
+    /// Internal snapshots remain unsupported for writes/resizes.
     snapshot_count: u32,
 };
 
