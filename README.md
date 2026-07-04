@@ -1,7 +1,7 @@
 # zvmi
 
 A Zig 0.16 library and CLI for reading and writing VM disk image formats
-(raw, VHD/VPC, plus read-only VHDX/qcow2) plus filesystem/image-build
+(raw, VHD/VPC, qcow2, plus read-only VHDX) plus filesystem/image-build
 orchestration, analogous to `qemu-img`.
 
 ## Goal
@@ -23,15 +23,16 @@ zvmi/
       src/
         root.zig             # public API surface
         image.zig            # format-agnostic Image (open/create/read/write,
-                              #   resize/check/map; raw + fixed/dynamic vhd)
+                              #   resize/check/map; raw + fixed/dynamic vhd +
+                              #   qcow2)
         fat32.zig             # FAT32 formatter + directory/file read/write
                               #   for partition-sized regions inside an Image
         vhd.zig               # VHD/VPC footer + dynamic header codec
                               #   (spec + QEMU-verified)
         vhdx.zig              # VHDX **read-only** codec (header, region
                               #   table, metadata, BAT -- QEMU-verified)
-        qcow2.zig              # qcow2 **read-only** codec (header, L1/L2
-                              #   cluster mapping)
+        qcow2.zig              # qcow2 codec (header, L1/L2 cluster mapping,
+                              #   create/pwrite/resize)
         iso9660.zig            # ISO9660 **read-only** codec (PVD, Rock
                               #   Ridge, Joliet)
         squashfs.zig           # squashfs **read-only** codec (superblock,
@@ -92,15 +93,15 @@ zig build run -- <args>   # run the CLI, e.g. `zig build run -- info foo.vhd`
 
 ## Status (Milestone 7)
 
-Supports `raw`, fixed `vhd`, dynamic `vhd`, MBR/GPT partition tables, native
-FAT32 filesystem read/write for ESP-style partitions, native ESP bootloader
-population (copy prebuilt EFI binaries + generate `grub.cfg`/BLS text), an
-Azure-readiness check, **read-only** `vhdx`, **read-only** `qcow2`,
-**read-only** ISO9660 (+Rock Ridge/Joliet) and squashfs readers (including
+Supports `raw`, fixed `vhd`, dynamic `vhd`, `qcow2`, MBR/GPT partition tables,
+native FAT32 filesystem read/write for ESP-style partitions, native ESP
+bootloader population (copy prebuilt EFI binaries + generate `grub.cfg`/BLS
+text), an Azure-readiness check, **read-only** `vhdx`, **read-only** ISO9660
+(+Rock Ridge/Joliet) and squashfs readers (including
 XZ/zstd-compressed squashfs blocks), local OCI container image ingestion, a
 minimal native ext4 writer/readback library API, COSI output packaging, and a
-first `zvmi build-image` orchestration path that builds `raw` and fixed-`vhd`
-disk images from an ISO + local OCI layout:
+first `zvmi build-image` orchestration path that builds `raw`, fixed-`vhd`,
+and `qcow2` disk images from an ISO + local OCI layout:
 
 ```
 zvmi create -f vhd disk.vhd 32M                          # dynamic by default (matches qemu-img)
@@ -116,6 +117,7 @@ zvmi azure fixup --generation 1|2 disk.vhd  # pads to 1 MiB, checks MBR/GPT
 zvmi cosi disk.img -o disk.cosi              # tar + metadata.json + per-partition raw.zst
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G -o output.vhd
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G -o output.raw -O raw
+zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G -o output.qcow2 -O qcow2
 ```
 
 `convert` skips all-zero chunks (aligned to the destination's block size for
@@ -195,9 +197,9 @@ stub plus kernel/initrd/cmdline payloads and emits a structurally valid UKI
 with `.linux`, `.initrd`, `.cmdline`, `.osrel`, `.uname`, and optional
 `.splash` sections.
 
-`zvmi build-image` currently writes `raw` and fixed `vhd` outputs. `vhdx` and
-`qcow2` remain read-only source formats for now, so build-image output support
-for them is deferred until write/create support lands separately. Both Gen2
+`zvmi build-image` currently writes `raw`, fixed `vhd`, and `qcow2` outputs.
+`vhdx` remains a read-only source format for now, so `build-image` VHDX output
+is still deferred pending separate VHDX write/create support. Both Gen2
 (UEFI/protective-MBR+GPT+ESP) and Gen1 (BIOS/plain-MBR with GRUB embedded into
 the post-MBR gap) are now fully wired in `zvmi build-image`.
 

@@ -8,11 +8,13 @@ const fat32 = @import("fat32.zig");
 const Format = @import("formats.zig").Format;
 const gpt = @import("gpt.zig");
 const guid = @import("guid.zig");
-const Image = @import("image.zig").Image;
+const image_mod = @import("image.zig");
+const Image = image_mod.Image;
 const layout = @import("layout.zig");
 const mbr = @import("mbr.zig");
 const oci = @import("oci.zig");
 const iso9660 = @import("iso9660.zig");
+const qcow2 = @import("qcow2.zig");
 const squashfs = @import("squashfs.zig");
 
 const mib: u64 = azure.one_mib;
@@ -181,9 +183,9 @@ pub fn build(
     raw_img.close(io);
     raw_img_open = false;
 
-    if (output_format == .vhd) {
-        logStep(options.verbose, "convert raw build image to fixed VHD");
-        try convertRawToFixedVhd(allocator, io, raw_build_path, options.output_path, disk_size);
+    if (output_format != .raw) {
+        logStep(options.verbose, "convert raw build image to requested output format");
+        try convertRawToOutput(allocator, io, raw_build_path, options.output_path, output_format, disk_size);
     }
 
     var final_img = try Image.openPath(io, options.output_path);
@@ -194,10 +196,12 @@ pub fn build(
         report.vhd_alignment = try azure.alignFixedVhd(&final_img, io);
     }
 
-    logStep(options.verbose, "validate partition style");
-    const partition_style = try azure.checkPartitionStyle(final_img, io, allocator, options.generation);
-    report.partition_style = partition_style;
-    if (!partition_style.ok) return error.PartitionStyleCheckFailed;
+    if (output_format != .qcow2) {
+        logStep(options.verbose, "validate partition style");
+        const partition_style = try azure.checkPartitionStyle(final_img, io, allocator, options.generation);
+        report.partition_style = partition_style;
+        if (!partition_style.ok) return error.PartitionStyleCheckFailed;
+    }
 
     return report;
 }
@@ -215,8 +219,8 @@ fn resolveOutputFormat(explicit: ?Format, output_path: []const u8) !Format {
     };
 
     return switch (resolved) {
-        .raw, .vhd => resolved,
-        .vhdx, .qcow2 => error.UnsupportedOutputFormat,
+        .raw, .vhd, .qcow2 => resolved,
+        .vhdx => error.UnsupportedOutputFormat,
     };
 }
 
@@ -343,20 +347,26 @@ fn writeMbrLayout(
     try img.pwrite(io, &table, 0);
 }
 
-fn convertRawToFixedVhd(
+fn convertRawToOutput(
     allocator: std.mem.Allocator,
     io: Io,
     raw_path: []const u8,
     output_path: []const u8,
+    output_format: Format,
     disk_size: u64,
 ) !void {
     var src = try Image.openPath(io, raw_path);
     defer src.close(io);
 
-    var dst = try Image.create(io, output_path, .vhd, disk_size, .{ .vhd_subformat = .fixed });
+    var create_options: image_mod.CreateOptions = .{};
+    if (output_format == .vhd) {
+        create_options.vhd_subformat = .fixed;
+    }
+
+    var dst = try Image.create(io, output_path, output_format, disk_size, create_options);
     defer dst.close(io);
 
-    try @import("image.zig").copyAll(io, src, &dst, allocator);
+    try image_mod.copyAll(io, src, &dst, allocator);
 }
 
 fn logStep(verbose: bool, message: []const u8) void {
@@ -974,49 +984,21 @@ fn readSquashfsFileAt(io: Io, reader: *squashfs.Reader, index: usize, buffer: []
     return reader.readFileAt(reader.allocator, io, index, buffer, offset);
 }
 
-test "build-image builds a Gen2 Azure-ready VHD from XZ squashfs + OCI layout" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-
-    const iso_path = "test-build-image.iso";
-    const oci_root = "test-build-image-oci";
-    const output_path = "test-build-image.vhd";
-    defer Io.Dir.cwd().deleteFile(io, iso_path) catch {};
-    defer Io.Dir.cwd().deleteTree(io, oci_root) catch {};
-    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
-
-    const squashfs_bytes = try squashfs.buildSyntheticSquashfsImage(allocator, .{ .compression = .xz });
-    defer allocator.free(squashfs_bytes);
-    try writeMinimalIsoWithFile(allocator, io, iso_path, "ROOT.SQUASHFS;1", squashfs_bytes);
-
-    var fixture = try createBuildImageOciFixture(allocator, io, oci_root);
-    defer fixture.deinit(allocator);
-
-    var report = try build(allocator, io, .{
-        .iso_path = iso_path,
-        .container_path = oci_root,
-        .output_path = output_path,
-        .output_format = .vhd,
-        .generation = .gen2,
-        .size = 256 * mib,
-    });
-    defer report.deinit(allocator);
-
-    try std.testing.expectEqual(Format.vhd, report.output_format);
-    try std.testing.expect(report.partition_style.?.ok);
-    try std.testing.expectEqual(@as(usize, 2), report.planned_partitions.len);
-
-    var img = try Image.openPath(io, output_path);
-    defer img.close(io);
-
-    const parsed = try gpt.readGpt(img, io, allocator);
+fn expectGen2BuiltImageContents(
+    allocator: std.mem.Allocator,
+    io: Io,
+    img: *Image,
+    report: BuildImageReport,
+    image_path: []const u8,
+) !void {
+    const parsed = try gpt.readGpt(img.*, io, allocator);
     defer allocator.free(parsed.partitions);
     try std.testing.expectEqual(@as(usize, 2), parsed.partitions.len);
     try std.testing.expectEqualSlices(u8, &guid.esp, &parsed.partitions[0].partition_type_guid);
     try std.testing.expectEqualSlices(u8, &report.planned_partitions[1].unique_guid, &parsed.partitions[1].unique_partition_guid);
 
     const esp_partition = report.planned_partitions[0].planned;
-    var esp = try fat32.open(&img, io, .{ .offset = esp_partition.offset_bytes, .length = esp_partition.length_bytes });
+    var esp = try fat32.open(img, io, .{ .offset = esp_partition.offset_bytes, .length = esp_partition.length_bytes });
 
     const bootx64 = try esp.readFileAlloc(io, allocator, "EFI/BOOT/BOOTX64.EFI");
     defer allocator.free(bootx64);
@@ -1032,7 +1014,14 @@ test "build-image builds a Gen2 Azure-ready VHD from XZ squashfs + OCI layout" {
     try std.testing.expect(std.mem.indexOf(u8, bls_entry, "/boot/vmlinuz-test") != null);
 
     const root_partition = report.planned_partitions[1].planned;
-    var root_reader = try ext4.open(io, img.file, allocator, .{ .offset = root_partition.offset_bytes });
+    const rootfs_scratch_path = try std.fmt.allocPrint(allocator, "{s}.test-rootfs.raw", .{image_path});
+    defer allocator.free(rootfs_scratch_path);
+    defer Io.Dir.cwd().deleteFile(io, rootfs_scratch_path) catch {};
+    try extractImageRegionToPath(allocator, io, img, root_partition.offset_bytes, root_partition.length_bytes, rootfs_scratch_path);
+
+    const rootfs_scratch = try Io.Dir.cwd().openFile(io, rootfs_scratch_path, .{});
+    defer rootfs_scratch.close(io);
+    var root_reader = try ext4.open(io, rootfs_scratch, allocator, .{});
     defer root_reader.deinit();
 
     const root_entries = try root_reader.listDir(io, allocator, "");
@@ -1055,6 +1044,93 @@ test "build-image builds a Gen2 Azure-ready VHD from XZ squashfs + OCI layout" {
     const boot_kernel = try root_reader.readFileAlloc(io, allocator, "boot/vmlinuz-test");
     defer allocator.free(boot_kernel);
     try std.testing.expectEqualStrings("kernel-from-oci", boot_kernel);
+}
+
+fn extractImageRegionToPath(
+    allocator: std.mem.Allocator,
+    io: Io,
+    img: *Image,
+    offset: u64,
+    length: u64,
+    output_path: []const u8,
+) !void {
+    const file = try Io.Dir.cwd().createFile(io, output_path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+
+    const buffer = try allocator.alloc(u8, scratch_copy_chunk_size);
+    defer allocator.free(buffer);
+
+    var copied: u64 = 0;
+    while (copied < length) {
+        const want: usize = @intCast(@min(@as(u64, buffer.len), length - copied));
+        const got = try img.pread(io, buffer[0..want], offset + copied);
+        if (got != want) return error.UnexpectedEndOfStream;
+        try file.writePositionalAll(io, buffer[0..want], copied);
+        copied += got;
+    }
+}
+
+test "build-image builds Gen2 VHD and qcow2 outputs from XZ squashfs + OCI layout" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const iso_path = "test-build-image.iso";
+    const oci_root = "test-build-image-oci";
+    const vhd_output_path = "test-build-image.vhd";
+    const qcow2_output_path = "test-build-image.qcow2";
+    defer Io.Dir.cwd().deleteFile(io, iso_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, oci_root) catch {};
+    defer Io.Dir.cwd().deleteFile(io, vhd_output_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, qcow2_output_path) catch {};
+
+    const squashfs_bytes = try squashfs.buildSyntheticSquashfsImage(allocator, .{ .compression = .xz });
+    defer allocator.free(squashfs_bytes);
+    try writeMinimalIsoWithFile(allocator, io, iso_path, "ROOT.SQUASHFS;1", squashfs_bytes);
+
+    var fixture = try createBuildImageOciFixture(allocator, io, oci_root);
+    defer fixture.deinit(allocator);
+
+    var vhd_report = try build(allocator, io, .{
+        .iso_path = iso_path,
+        .container_path = oci_root,
+        .output_path = vhd_output_path,
+        .output_format = .vhd,
+        .generation = .gen2,
+        .size = 256 * mib,
+    });
+    defer vhd_report.deinit(allocator);
+
+    try std.testing.expectEqual(Format.vhd, vhd_report.output_format);
+    try std.testing.expect(vhd_report.partition_style.?.ok);
+    try std.testing.expectEqual(@as(usize, 2), vhd_report.planned_partitions.len);
+
+    var vhd_img = try Image.openPath(io, vhd_output_path);
+    defer vhd_img.close(io);
+    try expectGen2BuiltImageContents(allocator, io, &vhd_img, vhd_report, vhd_output_path);
+
+    var qcow2_report = try build(allocator, io, .{
+        .iso_path = iso_path,
+        .container_path = oci_root,
+        .output_path = qcow2_output_path,
+        .output_format = .qcow2,
+        .generation = .gen2,
+        .size = 256 * mib,
+    });
+    defer qcow2_report.deinit(allocator);
+
+    try std.testing.expectEqual(Format.qcow2, qcow2_report.output_format);
+    try std.testing.expect(qcow2_report.partition_style == null);
+    try std.testing.expectEqual(@as(usize, 2), qcow2_report.planned_partitions.len);
+
+    const qcow2_file = try Io.Dir.cwd().openFile(io, qcow2_output_path, .{});
+    defer qcow2_file.close(io);
+    const qcow2_info = try qcow2.open(io, qcow2_file);
+    try std.testing.expectEqual(qcow2_report.disk_size, qcow2_info.virtual_size);
+
+    var qcow2_img = try Image.openPath(io, qcow2_output_path);
+    defer qcow2_img.close(io);
+    try std.testing.expectEqual(Format.qcow2, qcow2_img.format);
+    try expectGen2BuiltImageContents(allocator, io, &qcow2_img, qcow2_report, qcow2_output_path);
 }
 
 test "build-image installs a Gen1 BIOS GRUB chain into the post-MBR gap" {
