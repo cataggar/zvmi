@@ -22,6 +22,10 @@ const verity = @import("verity.zig");
 const mib: u64 = azure.one_mib;
 pub const default_esp_size: u64 = 96 * mib;
 const scratch_copy_chunk_size: usize = 1024 * 1024;
+const nested_filesystem_probe_len: usize = 2048;
+const ext4_magic_offset: usize = 1024 + 56;
+const ext4_magic: u16 = 0xEF53;
+const max_nested_filesystem_depth: u8 = 3;
 
 pub const BuildImageOptions = struct {
     iso_path: []const u8,
@@ -117,8 +121,11 @@ pub fn build(
     var squash_reader = try squashfs.Reader.openPath(allocator, io, rootfs_scratch_path);
     defer squash_reader.close(io);
 
+    const nested_scratch_prefix = try std.fmt.allocPrint(allocator, "{s}.build-image-nested", .{options.output_path});
+    defer allocator.free(nested_scratch_prefix);
+
     logStep(options.verbose, "merge ISO, squashfs, and OCI trees");
-    var source_tree = try MergedSourceTree.init(allocator, io, &iso_reader, rootfs_path_in_iso, &squash_reader, &container_image);
+    var source_tree = try MergedSourceTree.init(allocator, io, &iso_reader, rootfs_path_in_iso, &squash_reader, &container_image, nested_scratch_prefix);
     source_tree.bind();
     defer source_tree.deinit(allocator);
 
@@ -536,8 +543,22 @@ fn findAnyRootPartition(planned: []const bootconfig.PlannedPartitionIdentity) ?b
     return null;
 }
 
+const NestedSource = union(enum) {
+    ext4: struct {
+        scratch_path: []u8,
+        file: Io.File,
+        reader: ext4.Reader,
+    },
+    squashfs: struct {
+        scratch_path: []u8,
+        reader: squashfs.Reader,
+    },
+};
+
 const MergedSourceTree = struct {
+    io: Io,
     entries: []MergedEntry,
+    nested_sources: []*NestedSource,
     index: usize = 0,
     view: ext4.FileTreeView,
 
@@ -549,6 +570,7 @@ const MergedSourceTree = struct {
         gid: u32,
         size: u64,
         content: ContentSource = .none,
+        xattrs: ?[]ext4.OwnedXattr = null,
     };
 
     const PendingEntry = struct {
@@ -559,14 +581,17 @@ const MergedSourceTree = struct {
         gid: u32,
         size: u64,
         content: ContentSource = .none,
+        xattrs: ?[]ext4.OwnedXattr = null,
         alive: bool = true,
     };
 
     const ContentSource = union(enum) {
         none,
         bytes: []const u8,
+        owned_bytes: []u8,
         iso_file: struct { io: Io, reader: *iso9660.Reader, index: usize },
         squashfs_file: struct { io: Io, reader: *squashfs.Reader, index: usize },
+        nested_ext4_file: struct { io: Io, reader: *ext4.Reader, path: []const u8 },
     };
 
     fn init(
@@ -576,6 +601,7 @@ const MergedSourceTree = struct {
         rootfs_path_in_iso: []const u8,
         squash_reader: *squashfs.Reader,
         container_image: *oci.Image,
+        nested_scratch_prefix: []const u8,
     ) !MergedSourceTree {
         var pending = std.array_list.Managed(PendingEntry).init(allocator);
         defer pending.deinit();
@@ -583,21 +609,45 @@ const MergedSourceTree = struct {
         var path_index = std.StringHashMap(usize).init(allocator);
         defer path_index.deinit();
 
-        try collectSquashfsEntries(allocator, io, &pending, &path_index, squash_reader, squash_reader.root_index, "");
+        var nested_sources = std.array_list.Managed(*NestedSource).init(allocator);
+        errdefer {
+            deinitNestedSourcePointers(io, allocator, nested_sources.items);
+            nested_sources.deinit();
+        }
+        var next_nested_scratch_id: usize = 0;
+
+        try collectSquashfsEntries(
+            allocator,
+            io,
+            &pending,
+            &path_index,
+            &nested_sources,
+            nested_scratch_prefix,
+            &next_nested_scratch_id,
+            squash_reader,
+            squash_reader.root_index,
+            "",
+            0,
+        );
         try collectIsoEntries(allocator, io, &pending, &path_index, iso_reader, iso_reader.root_index, "", rootfs_path_in_iso);
+        pruneEmptyAncestorDirectories(&pending, &path_index, rootfs_path_in_iso);
         try collectOciEntries(allocator, &pending, &path_index, container_image);
         try synthesizeMissingParents(allocator, &pending, &path_index);
 
         var live_count: usize = 0;
-        for (pending.items) |entry| {
-            if (entry.alive) live_count += 1 else allocator.free(entry.path);
+        for (pending.items) |*entry| {
+            if (entry.alive) {
+                live_count += 1;
+            } else {
+                deinitPendingEntry(allocator, entry);
+            }
         }
 
         const entries = try allocator.alloc(MergedEntry, live_count);
         errdefer allocator.free(entries);
 
         var out_index: usize = 0;
-        for (pending.items) |entry| {
+        for (pending.items) |*entry| {
             if (!entry.alive) continue;
             entries[out_index] = .{
                 .path = entry.path,
@@ -607,6 +657,7 @@ const MergedSourceTree = struct {
                 .gid = entry.gid,
                 .size = entry.size,
                 .content = entry.content,
+                .xattrs = entry.xattrs,
             };
             out_index += 1;
         }
@@ -618,14 +669,18 @@ const MergedSourceTree = struct {
         }.lessThan);
 
         return .{
+            .io = io,
             .entries = entries,
+            .nested_sources = try nested_sources.toOwnedSlice(),
             .view = .{ .ctx = undefined, .next_fn = next, .reset_fn = reset },
         };
     }
 
     fn deinit(self: *MergedSourceTree, allocator: std.mem.Allocator) void {
-        for (self.entries) |entry| allocator.free(entry.path);
+        for (self.entries) |*entry| deinitMergedEntry(allocator, entry);
         allocator.free(self.entries);
+        deinitNestedSourcePointers(self.io, allocator, self.nested_sources);
+        allocator.free(self.nested_sources);
         self.* = undefined;
     }
 
@@ -658,6 +713,7 @@ const MergedSourceTree = struct {
                 null
             else
                 .{ .ctx = &entry.content, .read_at_fn = readContent },
+            .xattrs = ownedXattrsAsView(entry.xattrs),
         };
     }
 
@@ -670,21 +726,134 @@ const MergedSourceTree = struct {
         return switch (source.*) {
             .none => 0,
             .bytes => |bytes| readBytes(bytes, buffer, offset),
+            .owned_bytes => |bytes| readBytes(bytes, buffer, offset),
             .iso_file => |file| readIsoFileAt(file.io, file.reader, file.index, buffer, offset) catch error.ReadFailed,
             .squashfs_file => |file| readSquashfsFileAt(file.io, file.reader, file.index, buffer, offset) catch error.ReadFailed,
+            .nested_ext4_file => |file| file.reader.preadPath(file.io, file.path, buffer, offset) catch error.ReadFailed,
         };
     }
 };
+
+const NestedFilesystemKind = enum {
+    ext4,
+    squashfs,
+};
+
+fn deinitPendingEntry(allocator: std.mem.Allocator, entry: *MergedSourceTree.PendingEntry) void {
+    deinitContentSource(allocator, &entry.content);
+    if (entry.xattrs) |xattrs| ext4.freeXattrs(allocator, xattrs);
+    allocator.free(entry.path);
+    entry.* = undefined;
+}
+
+fn deinitMergedEntry(allocator: std.mem.Allocator, entry: *MergedSourceTree.MergedEntry) void {
+    deinitContentSource(allocator, &entry.content);
+    if (entry.xattrs) |xattrs| ext4.freeXattrs(allocator, xattrs);
+    allocator.free(entry.path);
+    entry.* = undefined;
+}
+
+fn deinitContentSource(allocator: std.mem.Allocator, source: *MergedSourceTree.ContentSource) void {
+    switch (source.*) {
+        .owned_bytes => |bytes| allocator.free(bytes),
+        else => {},
+    }
+    source.* = .none;
+}
+
+fn ownedXattrsAsView(xattrs: ?[]ext4.OwnedXattr) []const ext4.Xattr {
+    const owned = xattrs orelse return &.{};
+    return @as([*]const ext4.Xattr, @ptrCast(owned.ptr))[0..owned.len];
+}
+
+fn isValidOwnedXattrName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 255) return false;
+    inline for (.{
+        "user.",
+        "trusted.",
+        "security.",
+        "system.",
+    }) |prefix| {
+        if (std.mem.startsWith(u8, name, prefix)) {
+            const short_name = name[prefix.len..];
+            return short_name.len > 0 and short_name.len <= 255;
+        }
+    }
+    return true;
+}
+
+fn dedupeOwnedXattrs(allocator: std.mem.Allocator, xattrs: []ext4.OwnedXattr) ![]ext4.OwnedXattr {
+    if (xattrs.len == 0) return xattrs;
+
+    const keep = try allocator.alloc(bool, xattrs.len);
+    defer allocator.free(keep);
+    @memset(keep, true);
+
+    var unique_count = xattrs.len;
+    for (xattrs, 0..) |xattr, index| {
+        if (!isValidOwnedXattrName(xattr.name)) {
+            keep[index] = false;
+            unique_count -= 1;
+            continue;
+        }
+        var other: usize = 0;
+        while (other < index) : (other += 1) {
+            if (keep[other] and std.mem.eql(u8, xattrs[other].name, xattr.name)) {
+                keep[index] = false;
+                unique_count -= 1;
+                break;
+            }
+        }
+    }
+    if (unique_count == xattrs.len) return xattrs;
+
+    const deduped = try allocator.alloc(ext4.OwnedXattr, unique_count);
+    var out_index: usize = 0;
+    for (xattrs, keep) |xattr, should_keep| {
+        if (should_keep) {
+            deduped[out_index] = xattr;
+            out_index += 1;
+        } else {
+            allocator.free(xattr.name);
+            allocator.free(xattr.value);
+        }
+    }
+    allocator.free(xattrs);
+    return deduped;
+}
+
+fn deinitNestedSourcePointers(io: Io, allocator: std.mem.Allocator, nested_sources: []const *NestedSource) void {
+    for (nested_sources) |source| {
+        switch (source.*) {
+            .ext4 => |*nested| {
+                nested.reader.deinit();
+                nested.file.close(io);
+                Io.Dir.cwd().deleteFile(io, nested.scratch_path) catch {};
+                allocator.free(nested.scratch_path);
+            },
+            .squashfs => |*nested| {
+                nested.reader.close(io);
+                Io.Dir.cwd().deleteFile(io, nested.scratch_path) catch {};
+                allocator.free(nested.scratch_path);
+            },
+        }
+        allocator.destroy(source);
+    }
+}
 
 fn collectSquashfsEntries(
     allocator: std.mem.Allocator,
     io: Io,
     pending: *std.array_list.Managed(MergedSourceTree.PendingEntry),
     path_index: *std.StringHashMap(usize),
+    nested_sources: *std.array_list.Managed(*NestedSource),
+    nested_scratch_prefix: []const u8,
+    next_nested_scratch_id: *usize,
     reader: *squashfs.Reader,
     parent_index: usize,
     prefix: []const u8,
-) !void {
+    nesting_depth: u8,
+) anyerror!void {
     const children = try reader.listDirAlloc(allocator, parent_index);
     defer allocator.free(children);
 
@@ -711,9 +880,37 @@ fn collectSquashfsEntries(
                     .gid = entry.gid,
                     .size = 0,
                 });
-                try collectSquashfsEntries(allocator, io, pending, path_index, reader, child.index, full_path);
+                try collectSquashfsEntries(
+                    allocator,
+                    io,
+                    pending,
+                    path_index,
+                    nested_sources,
+                    nested_scratch_prefix,
+                    next_nested_scratch_id,
+                    reader,
+                    child.index,
+                    full_path,
+                    nesting_depth,
+                );
             },
             .file => {
+                if (try collectNestedFilesystemFromSquashfsFile(
+                    allocator,
+                    io,
+                    pending,
+                    path_index,
+                    nested_sources,
+                    nested_scratch_prefix,
+                    next_nested_scratch_id,
+                    reader,
+                    child.index,
+                    full_path,
+                    nesting_depth,
+                )) {
+                    allocator.free(full_path);
+                    continue;
+                }
                 try overlayEntry(allocator, pending, path_index, .{
                     .path = full_path,
                     .kind = .file,
@@ -737,6 +934,278 @@ fn collectSquashfsEntries(
                 });
             },
         }
+    }
+}
+
+fn collectNestedFilesystemFromSquashfsFile(
+    allocator: std.mem.Allocator,
+    io: Io,
+    pending: *std.array_list.Managed(MergedSourceTree.PendingEntry),
+    path_index: *std.StringHashMap(usize),
+    nested_sources: *std.array_list.Managed(*NestedSource),
+    nested_scratch_prefix: []const u8,
+    next_nested_scratch_id: *usize,
+    reader: *squashfs.Reader,
+    index: usize,
+    path: []const u8,
+    nesting_depth: u8,
+) anyerror!bool {
+    if (nesting_depth >= max_nested_filesystem_depth) return false;
+
+    var probe: [nested_filesystem_probe_len]u8 = undefined;
+    const got = try readSquashfsFileAt(io, reader, index, &probe, 0);
+    const nested_kind = detectNestedFilesystem(probe[0..got]) orelse return false;
+
+    switch (nested_kind) {
+        .ext4 => {
+            const nested_source = try openNestedExt4FromSquashfsFile(
+                allocator,
+                io,
+                nested_sources,
+                nested_scratch_prefix,
+                next_nested_scratch_id,
+                reader,
+                index,
+            );
+            // LiveOS-style media use nested filesystem image files as a
+            // transport wrapper. Flatten the nested image's own root into the
+            // merged tree root instead of preserving the wrapper file path.
+            try collectExt4Entries(allocator, io, pending, path_index, &nested_source.ext4.reader, "");
+            pruneEmptyAncestorDirectories(pending, path_index, path);
+        },
+        .squashfs => {
+            const nested_source = try openNestedSquashfsFromSquashfsFile(
+                allocator,
+                io,
+                nested_sources,
+                nested_scratch_prefix,
+                next_nested_scratch_id,
+                reader,
+                index,
+            );
+            // Flatten nested squashfs roots for the same reason as ext4
+            // wrappers above: callers want the effective rootfs contents.
+            try collectSquashfsEntries(
+                allocator,
+                io,
+                pending,
+                path_index,
+                nested_sources,
+                nested_scratch_prefix,
+                next_nested_scratch_id,
+                &nested_source.squashfs.reader,
+                nested_source.squashfs.reader.root_index,
+                "",
+                nesting_depth + 1,
+            );
+            pruneEmptyAncestorDirectories(pending, path_index, path);
+        },
+    }
+    return true;
+}
+
+fn pruneEmptyAncestorDirectories(
+    pending: *std.array_list.Managed(MergedSourceTree.PendingEntry),
+    path_index: *std.StringHashMap(usize),
+    path: []const u8,
+) void {
+    var end_opt = std.mem.lastIndexOfScalar(u8, path, '/');
+    while (end_opt) |end| {
+        const parent = path[0..end];
+        if (path_index.get(parent)) |existing_index| {
+            if (pending.items[existing_index].kind == .directory and !hasLiveDescendants(pending.items, parent)) {
+                deactivateEntry(pending, path_index, existing_index);
+            }
+        }
+        end_opt = std.mem.lastIndexOfScalar(u8, parent, '/');
+    }
+}
+
+fn hasLiveDescendants(entries: []const MergedSourceTree.PendingEntry, prefix: []const u8) bool {
+    for (entries) |entry| {
+        if (!entry.alive) continue;
+        if (isDescendantPath(entry.path, prefix)) return true;
+    }
+    return false;
+}
+
+fn detectNestedFilesystem(bytes: []const u8) ?NestedFilesystemKind {
+    if (bytes.len >= 4 and std.mem.readInt(u32, bytes[0..4], .little) == squashfs.magic) {
+        return .squashfs;
+    }
+    if (bytes.len >= ext4_magic_offset + 2 and std.mem.readInt(u16, bytes[ext4_magic_offset..][0..2], .little) == ext4_magic) {
+        return .ext4;
+    }
+    return null;
+}
+
+fn openNestedExt4FromSquashfsFile(
+    allocator: std.mem.Allocator,
+    io: Io,
+    nested_sources: *std.array_list.Managed(*NestedSource),
+    nested_scratch_prefix: []const u8,
+    next_nested_scratch_id: *usize,
+    reader: *squashfs.Reader,
+    index: usize,
+) !*NestedSource {
+    const scratch_path = try nextNestedScratchPath(allocator, nested_scratch_prefix, next_nested_scratch_id, "ext4");
+    errdefer allocator.free(scratch_path);
+    errdefer Io.Dir.cwd().deleteFile(io, scratch_path) catch {};
+
+    try extractSquashfsEntryToPath(allocator, io, reader, index, scratch_path);
+
+    const file = try Io.Dir.cwd().openFile(io, scratch_path, .{});
+    errdefer file.close(io);
+
+    var nested_reader = try ext4.Reader.open(io, file, allocator, .{});
+    errdefer nested_reader.deinit();
+
+    const source = try allocator.create(NestedSource);
+    errdefer allocator.destroy(source);
+    source.* = .{
+        .ext4 = .{
+            .scratch_path = scratch_path,
+            .file = file,
+            .reader = nested_reader,
+        },
+    };
+    try nested_sources.append(source);
+    return source;
+}
+
+fn openNestedSquashfsFromSquashfsFile(
+    allocator: std.mem.Allocator,
+    io: Io,
+    nested_sources: *std.array_list.Managed(*NestedSource),
+    nested_scratch_prefix: []const u8,
+    next_nested_scratch_id: *usize,
+    reader: *squashfs.Reader,
+    index: usize,
+) !*NestedSource {
+    const scratch_path = try nextNestedScratchPath(allocator, nested_scratch_prefix, next_nested_scratch_id, "sqsh");
+    errdefer allocator.free(scratch_path);
+    errdefer Io.Dir.cwd().deleteFile(io, scratch_path) catch {};
+
+    try extractSquashfsEntryToPath(allocator, io, reader, index, scratch_path);
+
+    var nested_reader = try squashfs.Reader.openPath(allocator, io, scratch_path);
+    errdefer nested_reader.close(io);
+
+    const source = try allocator.create(NestedSource);
+    errdefer allocator.destroy(source);
+    source.* = .{
+        .squashfs = .{
+            .scratch_path = scratch_path,
+            .reader = nested_reader,
+        },
+    };
+    try nested_sources.append(source);
+    return source;
+}
+
+fn nextNestedScratchPath(
+    allocator: std.mem.Allocator,
+    nested_scratch_prefix: []const u8,
+    next_nested_scratch_id: *usize,
+    extension: []const u8,
+) ![]u8 {
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "{s}-{d}.{s}",
+        .{ nested_scratch_prefix, next_nested_scratch_id.*, extension },
+    );
+    next_nested_scratch_id.* += 1;
+    return path;
+}
+
+fn collectExt4Entries(
+    allocator: std.mem.Allocator,
+    io: Io,
+    pending: *std.array_list.Managed(MergedSourceTree.PendingEntry),
+    path_index: *std.StringHashMap(usize),
+    reader: *ext4.Reader,
+    prefix: []const u8,
+) !void {
+    const children = try reader.listDir(io, allocator, prefix);
+    defer ext4.freeDirEntries(allocator, children);
+
+    for (children) |child| {
+        const full_path = if (prefix.len == 0)
+            try allocator.dupe(u8, child.name)
+        else
+            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, child.name });
+        errdefer allocator.free(full_path);
+
+        const stat = try reader.statPath(io, full_path);
+        const xattrs = try dedupeOwnedXattrs(allocator, try reader.readXattrsAlloc(io, allocator, full_path));
+        errdefer ext4.freeXattrs(allocator, xattrs);
+
+        switch (child.kind) {
+            .directory => {
+                try overlayEntry(allocator, pending, path_index, .{
+                    .path = full_path,
+                    .kind = .directory,
+                    .mode = normalizeMode(.directory, stat.mode),
+                    .uid = stat.uid,
+                    .gid = stat.gid,
+                    .size = 0,
+                    .xattrs = xattrs,
+                });
+                try collectExt4Entries(allocator, io, pending, path_index, reader, full_path);
+            },
+            .file => {
+                try overlayEntry(allocator, pending, path_index, .{
+                    .path = full_path,
+                    .kind = .file,
+                    .mode = normalizeMode(.file, stat.mode),
+                    .uid = stat.uid,
+                    .gid = stat.gid,
+                    .size = stat.size,
+                    .content = .{ .nested_ext4_file = .{ .io = io, .reader = reader, .path = full_path } },
+                    .xattrs = xattrs,
+                });
+            },
+            .symlink => {
+                const target = try reader.readLinkAlloc(io, allocator, full_path);
+                errdefer allocator.free(target);
+                try overlayEntry(allocator, pending, path_index, .{
+                    .path = full_path,
+                    .kind = .symlink,
+                    .mode = normalizeMode(.symlink, stat.mode),
+                    .uid = stat.uid,
+                    .gid = stat.gid,
+                    .size = target.len,
+                    .content = .{ .owned_bytes = target },
+                    .xattrs = xattrs,
+                });
+            },
+        }
+    }
+}
+
+fn extractSquashfsEntryToPath(
+    allocator: std.mem.Allocator,
+    io: Io,
+    reader: *squashfs.Reader,
+    index: usize,
+    output_path: []const u8,
+) !void {
+    const entry = reader.getEntry(index);
+    if (entry.kind != .file) return error.NotAFile;
+
+    const file = try Io.Dir.cwd().createFile(io, output_path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+
+    const buffer = try allocator.alloc(u8, scratch_copy_chunk_size);
+    defer allocator.free(buffer);
+
+    var offset: u64 = 0;
+    while (offset < entry.size) {
+        const want: usize = @intCast(@min(@as(u64, buffer.len), entry.size - offset));
+        const got = try readSquashfsFileAt(io, reader, index, buffer[0..want], offset);
+        if (got == 0) return error.UnexpectedEndOfStream;
+        try file.writePositionalAll(io, buffer[0..got], offset);
+        offset += got;
     }
 }
 
@@ -1080,6 +1549,8 @@ fn syntheticSquashfsFragmentByte(full_data_block_count: usize) u8 {
 }
 
 fn buildExpectedSyntheticSquashfsFileAlloc(allocator: std.mem.Allocator, options: squashfs.SyntheticImageOptions) ![]u8 {
+    if (options.file_bytes) |bytes| return allocator.dupe(u8, bytes);
+
     const block_size: usize = @intCast(options.block_size);
     const full_data_block_count: usize = @intCast(options.full_data_blocks);
     const fragment_tail_size: usize = @intCast(options.fragment_tail_size);
@@ -1094,6 +1565,99 @@ fn buildExpectedSyntheticSquashfsFileAlloc(allocator: std.mem.Allocator, options
     if (fragment_tail_size > 0) {
         @memset(bytes[offset..][0..fragment_tail_size], syntheticSquashfsFragmentByte(full_data_block_count));
     }
+    return bytes;
+}
+
+const SyntheticNestedExt4Entry = struct {
+    path: []const u8,
+    kind: ext4.Kind,
+    mode: u16,
+    uid: u32,
+    gid: u32,
+    size: u64 = 0,
+    bytes: []const u8 = "",
+};
+
+const SyntheticNestedExt4Tree = struct {
+    entries: []const SyntheticNestedExt4Entry,
+    index: usize = 0,
+    view: ext4.FileTreeView,
+
+    fn init(entries: []const SyntheticNestedExt4Entry) SyntheticNestedExt4Tree {
+        return .{
+            .entries = entries,
+            .view = .{
+                .ctx = undefined,
+                .next_fn = next,
+                .reset_fn = reset,
+            },
+        };
+    }
+
+    fn bind(self: *SyntheticNestedExt4Tree) void {
+        self.view = .{
+            .ctx = self,
+            .next_fn = next,
+            .reset_fn = reset,
+        };
+    }
+
+    fn reset(ctx: *anyopaque) void {
+        const self: *SyntheticNestedExt4Tree = @ptrCast(@alignCast(ctx));
+        self.index = 0;
+    }
+
+    fn next(ctx: *anyopaque) ext4.FileTreeView.IteratorError!?ext4.FileTreeView.Entry {
+        const self: *SyntheticNestedExt4Tree = @ptrCast(@alignCast(ctx));
+        if (self.index >= self.entries.len) return null;
+        const entry = self.entries[self.index];
+        self.index += 1;
+        return .{
+            .path = entry.path,
+            .kind = entry.kind,
+            .mode = entry.mode,
+            .uid = entry.uid,
+            .gid = entry.gid,
+            .size = entry.size,
+            .content = if (entry.kind == .directory)
+                null
+            else
+                .{ .ctx = &self.entries[self.index - 1], .read_at_fn = readContent },
+        };
+    }
+
+    fn readContent(ctx: *const anyopaque, buffer: []u8, offset: u64) ext4.FileTreeView.ContentError!usize {
+        const entry: *const SyntheticNestedExt4Entry = @ptrCast(@alignCast(ctx));
+        return readBytes(entry.bytes, buffer, offset);
+    }
+};
+
+fn buildSyntheticNestedExt4ImageAlloc(
+    allocator: std.mem.Allocator,
+    io: Io,
+    path: []const u8,
+) ![]u8 {
+    var tree = SyntheticNestedExt4Tree.init(&[_]SyntheticNestedExt4Entry{
+        .{ .path = "bin", .kind = .symlink, .mode = 0o777, .uid = 0, .gid = 0, .size = 7, .bytes = "usr/bin" },
+        .{ .path = "etc", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "etc/hostname", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 12, .bytes = "nested-host\n" },
+        .{ .path = "usr", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "usr/bin", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "usr/bin/true", .kind = .file, .mode = 0o755, .uid = 0, .gid = 0, .size = 17, .bytes = "#!/bin/sh\nexit 0\n" },
+    });
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+
+    _ = try ext4.populate(io, file, allocator, &tree.view, .{
+        .length = 8 * 1024 * 1024,
+        .label = "nested-root",
+    });
+
+    const image_size = (try file.stat(io)).size;
+    const bytes = try allocator.alloc(u8, image_size);
+    _ = try file.readPositionalAll(io, bytes, 0);
     return bytes;
 }
 
@@ -1237,6 +1801,76 @@ test "build-image populates multi-block squashfs files into ext4 for small seque
     const expected = try buildExpectedSyntheticSquashfsFileAlloc(allocator, squashfs_options);
     defer allocator.free(expected);
     try std.testing.expectEqualSlices(u8, expected, contents);
+}
+
+test "build-image unwraps nested ext4 filesystem images inside squashfs files" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const iso_path = "test-build-image-nested-ext4.iso";
+    const oci_root = "test-build-image-nested-ext4-oci";
+    const output_path = "test-build-image-nested-ext4.raw";
+    const nested_ext4_path = "test-build-image-nested-rootfs.img";
+    defer Io.Dir.cwd().deleteFile(io, iso_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, oci_root) catch {};
+    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, nested_ext4_path) catch {};
+
+    const nested_ext4_bytes = try buildSyntheticNestedExt4ImageAlloc(allocator, io, nested_ext4_path);
+    defer allocator.free(nested_ext4_bytes);
+
+    const squashfs_bytes = try squashfs.buildSyntheticSquashfsImage(allocator, .{
+        .compression = .none,
+        .block_size = 1024 * 1024,
+        .file_bytes = nested_ext4_bytes,
+    });
+    defer allocator.free(squashfs_bytes);
+    try writeMinimalIsoWithFile(allocator, io, iso_path, "ROOT.SQUASHFS;1", squashfs_bytes);
+
+    var fixture = try createBuildImageOciFixture(allocator, io, oci_root);
+    defer fixture.deinit(allocator);
+
+    var report = try build(allocator, io, .{
+        .iso_path = iso_path,
+        .container_path = oci_root,
+        .output_path = output_path,
+        .output_format = .raw,
+        .generation = .gen2,
+        .size = 256 * mib,
+    });
+    defer report.deinit(allocator);
+
+    var img = try Image.openPath(io, output_path);
+    defer img.close(io);
+
+    const root_partition = report.planned_partitions[1].planned;
+    const rootfs_scratch_path = try std.fmt.allocPrint(allocator, "{s}.test-rootfs.raw", .{output_path});
+    defer allocator.free(rootfs_scratch_path);
+    defer Io.Dir.cwd().deleteFile(io, rootfs_scratch_path) catch {};
+    try extractImageRegionToPath(allocator, io, &img, root_partition.offset_bytes, root_partition.length_bytes, rootfs_scratch_path);
+
+    const rootfs_scratch = try Io.Dir.cwd().openFile(io, rootfs_scratch_path, .{});
+    defer rootfs_scratch.close(io);
+    var root_reader = try ext4.open(io, rootfs_scratch, allocator, .{});
+    defer root_reader.deinit();
+
+    const hostname = try root_reader.readFileAlloc(io, allocator, "etc/hostname");
+    defer allocator.free(hostname);
+    try std.testing.expectEqualStrings("nested-host\n", hostname);
+
+    const true_payload = try root_reader.readFileAlloc(io, allocator, "usr/bin/true");
+    defer allocator.free(true_payload);
+    try std.testing.expectEqualStrings("#!/bin/sh\nexit 0\n", true_payload);
+
+    const bin_link = try root_reader.readLinkAlloc(io, allocator, "bin");
+    defer allocator.free(bin_link);
+    try std.testing.expectEqualStrings("usr/bin", bin_link);
+
+    try std.testing.expectError(error.NotFound, root_reader.statPath(io, "etc/message.txt"));
+
+    const overlay_file = try root_reader.readFileAlloc(io, allocator, "app/hello.txt");
+    defer allocator.free(overlay_file);
+    try std.testing.expectEqualStrings("hello from layer2\n", overlay_file);
 }
 
 test "build-image installs a Gen1 BIOS GRUB chain into the post-MBR gap" {

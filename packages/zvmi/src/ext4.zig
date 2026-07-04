@@ -35,6 +35,7 @@ pub const root_inode: u32 = 2;
 pub const first_non_reserved_inode: u32 = 11;
 
 const inode_size: u16 = 128;
+const max_supported_reader_inode_size: u16 = 256;
 const group_desc_size: u16 = 32;
 const max_inline_extents: usize = 4;
 const max_supported_extent_depth: u16 = 4;
@@ -55,14 +56,24 @@ const feature_compat_has_journal: u32 = 0x0004;
 const feature_compat_ext_attr: u32 = 0x0008;
 const feature_compat_resize_inode: u32 = 0x0010;
 const feature_compat_dir_index: u32 = 0x0020;
+const feature_compat_orphan_file: u32 = 0x1000;
 const feature_incompat_filetype: u32 = 0x0002;
 const feature_incompat_extents: u32 = 0x0040;
+const feature_incompat_64bit: u32 = 0x0080;
+const feature_incompat_flex_bg: u32 = 0x0200;
+const feature_incompat_csum_seed: u32 = 0x2000;
 const feature_ro_compat_sparse_super: u32 = 0x0001;
 const feature_ro_compat_large_file: u32 = 0x0002;
+const feature_ro_compat_huge_file: u32 = 0x0008;
+const feature_ro_compat_dir_nlink: u32 = 0x0020;
+const feature_ro_compat_extra_isize: u32 = 0x0040;
 const feature_ro_compat_metadata_csum: u32 = 0x0400;
 const writer_feature_compat: u32 = feature_compat_ext_attr | feature_compat_dir_index;
 const writer_feature_incompat: u32 = feature_incompat_filetype | feature_incompat_extents;
 const writer_feature_ro_compat_base: u32 = feature_ro_compat_sparse_super | feature_ro_compat_metadata_csum;
+const reader_feature_compat: u32 = writer_feature_compat | feature_compat_has_journal | feature_compat_resize_inode | feature_compat_orphan_file;
+const reader_feature_incompat: u32 = writer_feature_incompat | feature_incompat_64bit | feature_incompat_flex_bg | feature_incompat_csum_seed;
+const reader_feature_ro_compat: u32 = writer_feature_ro_compat_base | feature_ro_compat_large_file | feature_ro_compat_huge_file | feature_ro_compat_dir_nlink | feature_ro_compat_extra_isize;
 
 const inode_flag_index: u32 = 0x0000_1000;
 const inode_flag_extents: u32 = 0x0008_0000;
@@ -177,7 +188,7 @@ pub const FileTreeView = struct {
     reset_fn: *const fn (ctx: *anyopaque) void,
 
     pub const IteratorError = error{EnumerationFailed};
-    pub const ContentError = error{ReadFailed, UnexpectedEndOfStream};
+    pub const ContentError = error{ ReadFailed, UnexpectedEndOfStream };
 
     pub const ContentReader = struct {
         ctx: *const anyopaque,
@@ -582,9 +593,9 @@ pub const Reader = struct {
         const incompat = readInt(u32, sb[0x60..0x64]);
         const ro_compat = readInt(u32, sb[0x64..0x68]);
         const compat = readInt(u32, sb[0x5C..0x60]);
-        if (compat & ~(writer_feature_compat | feature_compat_has_journal | feature_compat_resize_inode) != 0) return error.UnsupportedFeatures;
-        if (incompat & ~writer_feature_incompat != 0) return error.UnsupportedFeatures;
-        if (ro_compat & ~(writer_feature_ro_compat_base | feature_ro_compat_large_file) != 0) return error.UnsupportedFeatures;
+        if (compat & ~reader_feature_compat != 0) return error.UnsupportedFeatures;
+        if (incompat & ~reader_feature_incompat != 0) return error.UnsupportedFeatures;
+        if (ro_compat & ~reader_feature_ro_compat != 0) return error.UnsupportedFeatures;
 
         var uuid: [16]u8 = undefined;
         @memcpy(&uuid, sb[0x68..0x78]);
@@ -593,14 +604,14 @@ pub const Reader = struct {
             const raw = readInt(u16, sb[0xFE..0x100]);
             break :blk if (raw == 0) @as(u16, 32) else raw;
         };
-        if (desc_size != group_desc_size) return error.UnsupportedDescriptorSize;
+        if (desc_size != group_desc_size and desc_size != 64) return error.UnsupportedDescriptorSize;
 
         const total_blocks = readInt(u32, sb[0x04..0x08]);
         const total_inodes = readInt(u32, sb[0x00..0x04]);
         const blocks_per_group = readInt(u32, sb[0x20..0x24]);
         const inodes_per_group = readInt(u32, sb[0x28..0x2C]);
         const inode_size_on_disk = readInt(u16, sb[0x58..0x5A]);
-        if (inode_size_on_disk != inode_size) return error.UnsupportedInodeSize;
+        if (inode_size_on_disk < inode_size or inode_size_on_disk > max_supported_reader_inode_size) return error.UnsupportedInodeSize;
         const group_count = blocksToGroups(total_blocks, blocks_per_group);
 
         const groups = try allocator.alloc(ReaderGroup, group_count);
@@ -864,9 +875,9 @@ pub const Reader = struct {
         const group = self.groups[group_index];
         const inode_offset = self.blockOffset(group.inode_table_block) + @as(u64, index_in_group) * self.inode_size;
 
-        var buf: [inode_size]u8 = [_]u8{0} ** inode_size;
-        _ = try self.file.readPositionalAll(io, &buf, inode_offset);
-        return ParsedInode.fromBytes(inode_number, &buf);
+        var buf: [max_supported_reader_inode_size]u8 = [_]u8{0} ** max_supported_reader_inode_size;
+        _ = try self.file.readPositionalAll(io, buf[0..self.inode_size], inode_offset);
+        return ParsedInode.fromBytes(inode_number, buf[0..self.inode_size]);
     }
 
     fn blockOffset(self: Reader, block_number: u64) u64 {
@@ -1005,7 +1016,6 @@ const ParsedInode = struct {
     fn isFastSymlink(self: ParsedInode) bool {
         return self.kind == .symlink and self.size <= 60 and (self.flags & inode_flag_extents) == 0;
     }
-
 };
 
 fn buildPlan(allocator: std.mem.Allocator, tree: *FileTreeView, options: PopulateOptions) PopulateError!WriterPlan {
@@ -2324,9 +2334,9 @@ fn halfMd4Transform(buf: *[4]u32, input: [8]u32) u32 {
     var d = buf[3];
 
     inline for (.{
-        .{ .f = md4F, .x = 0, .s = @as(u5, 3) }, .{ .f = md4F, .x = 1, .s = @as(u5, 7) },
+        .{ .f = md4F, .x = 0, .s = @as(u5, 3) },  .{ .f = md4F, .x = 1, .s = @as(u5, 7) },
         .{ .f = md4F, .x = 2, .s = @as(u5, 11) }, .{ .f = md4F, .x = 3, .s = @as(u5, 19) },
-        .{ .f = md4F, .x = 4, .s = @as(u5, 3) }, .{ .f = md4F, .x = 5, .s = @as(u5, 7) },
+        .{ .f = md4F, .x = 4, .s = @as(u5, 3) },  .{ .f = md4F, .x = 5, .s = @as(u5, 7) },
         .{ .f = md4F, .x = 6, .s = @as(u5, 11) }, .{ .f = md4F, .x = 7, .s = @as(u5, 19) },
     }, 0..) |step, index| {
         switch (index % 4) {
@@ -2353,9 +2363,9 @@ fn halfMd4Transform(buf: *[4]u32, input: [8]u32) u32 {
     }
 
     inline for (.{
-        .{ .x = 3, .s = @as(u5, 3) }, .{ .x = 7, .s = @as(u5, 9) },
+        .{ .x = 3, .s = @as(u5, 3) },  .{ .x = 7, .s = @as(u5, 9) },
         .{ .x = 2, .s = @as(u5, 11) }, .{ .x = 6, .s = @as(u5, 15) },
-        .{ .x = 1, .s = @as(u5, 3) }, .{ .x = 5, .s = @as(u5, 9) },
+        .{ .x = 1, .s = @as(u5, 3) },  .{ .x = 5, .s = @as(u5, 9) },
         .{ .x = 0, .s = @as(u5, 11) }, .{ .x = 4, .s = @as(u5, 15) },
     }, 0..) |step, index| {
         const value = input[step.x] +% 0x6ED9_EBA1;
@@ -2639,6 +2649,37 @@ test "reader rejects missing paths and wrong node kinds" {
     try std.testing.expectError(error.NotFile, reader.readFileAlloc(io, std.testing.allocator, "dir"));
 }
 
+test "reader opens read-only-safe 64-byte group descriptor ext4 images" {
+    const io = std.testing.io;
+    const path = "test-ext4-reader-64byte-gdt.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "etc", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "etc/os-release", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 9, .bytes = "NAME=zvmi" },
+    });
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = 8 * 1024 * 1024 });
+
+    var sb: [superblock_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &sb, superblock_offset);
+    writeInt(u32, sb[0x5C..0x60], readInt(u32, sb[0x5C..0x60]) | feature_compat_orphan_file);
+    writeInt(u32, sb[0x60..0x64], readInt(u32, sb[0x60..0x64]) | feature_incompat_64bit | feature_incompat_flex_bg | feature_incompat_csum_seed);
+    writeInt(u32, sb[0x64..0x68], readInt(u32, sb[0x64..0x68]) | feature_ro_compat_huge_file | feature_ro_compat_dir_nlink | feature_ro_compat_extra_isize);
+    writeInt(u16, sb[0xFE..0x100], 64);
+    try file.writePositionalAll(io, &sb, superblock_offset);
+
+    var reader = try open(io, file, std.testing.allocator, .{});
+    defer reader.deinit();
+
+    const contents = try reader.readFileAlloc(io, std.testing.allocator, "etc/os-release");
+    defer std.testing.allocator.free(contents);
+    try std.testing.expectEqualSlices(u8, "NAME=zvmi", contents);
+}
+
 test "populate respects non-zero partition-relative offsets" {
     const io = std.testing.io;
     const path = "test-ext4-offset.img";
@@ -2749,7 +2790,7 @@ test "populate round-trips xattrs and metadata checksums" {
 
     const dir_entries = try reader.listDir(io, std.testing.allocator, "etc");
     defer freeDirEntries(std.testing.allocator, dir_entries);
-    try expectDirNames(dir_entries, &.{ "hostname" });
+    try expectDirNames(dir_entries, &.{"hostname"});
 
     const dir_attrs = try reader.readXattrsAlloc(io, std.testing.allocator, "etc");
     defer freeXattrs(std.testing.allocator, dir_attrs);
