@@ -65,8 +65,8 @@ pub const Error = error{
     BadClusterChain,
     UnexpectedEndOfFile,
     FileTooLarge,
-    StreamClosed,
     InvalidTruncateSize,
+    StreamClosed,
 };
 
 pub const FormatError = Error || Image.PreadError || Image.PwriteError;
@@ -210,6 +210,63 @@ pub const FileSystem = struct {
         try self.appendDirectoryEntry(io, parent.cluster, parent.name, .file, first_cluster, @intCast(contents.len));
     }
 
+    /// Deletes an existing file or empty directory.
+    pub fn deletePath(self: *FileSystem, io: Io, path: []const u8) MutationError!void {
+        const parent = try self.resolveParent(io, path);
+        if (parent.name.len == 0) return error.InvalidPath;
+        const entry = (try self.findEntry(io, parent.cluster, parent.name)) orelse return error.PathNotFound;
+
+        if (entry.kind() == .directory and !(try self.isDirectoryEmpty(io, entry.first_cluster))) {
+            return error.DirectoryNotEmpty;
+        }
+
+        if (entry.first_cluster != 0) try self.releaseChain(io, entry.first_cluster);
+        try self.markEntryDeleted(io, parent.cluster, entry.location());
+    }
+
+    /// Shrinks an existing file to `new_size`, freeing no-longer-needed clusters.
+    pub fn truncateFile(self: *FileSystem, io: Io, path: []const u8, new_size: u32) MutationError!void {
+        const parent = try self.resolveParent(io, path);
+        if (parent.name.len == 0) return error.InvalidPath;
+        const entry = (try self.findEntry(io, parent.cluster, parent.name)) orelse return error.PathNotFound;
+        if (entry.kind() != .file) return error.IsDirectory;
+        if (new_size > entry.size) return error.InvalidTruncateSize;
+        if (new_size == entry.size) return;
+
+        if (new_size == 0) {
+            if (entry.first_cluster != 0) try self.releaseChain(io, entry.first_cluster);
+            try self.updateDirectoryEntry(io, parent.cluster, entry.location(), 0, 0);
+            return;
+        }
+        if (entry.first_cluster == 0) return error.BadClusterChain;
+
+        const cluster_size = self.info.clusterSize();
+        const needed_clusters: u32 = @intCast(std.math.divCeil(u64, new_size, cluster_size) catch unreachable);
+        var keep_cluster = entry.first_cluster;
+        var cluster_index: u32 = 1;
+        while (cluster_index < needed_clusters) : (cluster_index += 1) {
+            keep_cluster = (try self.nextCluster(io, keep_cluster)) orelse return error.BadClusterChain;
+        }
+
+        const tail_cluster = try self.nextCluster(io, keep_cluster);
+        if (tail_cluster) |cluster| {
+            try self.writeFatEntry(io, keep_cluster, fat_entry_eoc);
+            try self.releaseChain(io, cluster);
+        }
+
+        const tail_bytes = new_size % cluster_size;
+        if (tail_bytes != 0) {
+            var zeros: [max_cluster_size]u8 = [_]u8{0} ** max_cluster_size;
+            try self.writeRegion(
+                io,
+                zeros[0 .. cluster_size - tail_bytes],
+                self.clusterOffset(keep_cluster) + tail_bytes,
+            );
+        }
+
+        try self.updateDirectoryEntry(io, parent.cluster, entry.location(), entry.first_cluster, new_size);
+    }
+
     /// Returns the immediate children of `path` (`/` or empty for the root).
     pub fn listDirAlloc(self: *FileSystem, io: Io, allocator: std.mem.Allocator, path: []const u8) ListError![]DirEntry {
         const cluster = if (isRootPath(path)) self.info.root_cluster else blk: {
@@ -299,63 +356,18 @@ pub const FileSystem = struct {
         first_cluster: u32,
         size: u32,
     ) MutationError!void {
-    /// Deletes an existing file or empty directory.
-    pub fn deletePath(self: *FileSystem, io: Io, path: []const u8) MutationError!void {
-        const parent = try self.resolveParent(io, path);
-        if (parent.name.len == 0) return error.InvalidPath;
-        const entry = (try self.findEntry(io, parent.cluster, parent.name)) orelse return error.PathNotFound;
-
-        if (entry.kind() == .directory and !(try self.isDirectoryEmpty(io, entry.first_cluster))) {
-            return error.DirectoryNotEmpty;
-        }
-
-        if (entry.first_cluster != 0) try self.releaseChain(io, entry.first_cluster);
-        try self.markEntryDeleted(io, parent.cluster, entry.location());
+        _ = try self.appendDirectoryEntryTracked(io, dir_cluster, name, kind, first_cluster, size);
     }
 
-    /// Shrinks an existing file to `new_size`, freeing no-longer-needed clusters.
-    pub fn truncateFile(self: *FileSystem, io: Io, path: []const u8, new_size: u32) MutationError!void {
-        const parent = try self.resolveParent(io, path);
-        if (parent.name.len == 0) return error.InvalidPath;
-        const entry = (try self.findEntry(io, parent.cluster, parent.name)) orelse return error.PathNotFound;
-        if (entry.kind() != .file) return error.IsDirectory;
-        if (new_size > entry.size) return error.InvalidTruncateSize;
-        if (new_size == entry.size) return;
-
-        if (new_size == 0) {
-            if (entry.first_cluster != 0) try self.releaseChain(io, entry.first_cluster);
-            try self.updateDirectoryEntry(io, parent.cluster, entry.location(), 0, 0);
-            return;
-        }
-        if (entry.first_cluster == 0) return error.BadClusterChain;
-
-        const cluster_size = self.info.clusterSize();
-        const needed_clusters: u32 = @intCast(std.math.divCeil(u64, new_size, cluster_size) catch unreachable);
-        var keep_cluster = entry.first_cluster;
-        var cluster_index: u32 = 1;
-        while (cluster_index < needed_clusters) : (cluster_index += 1) {
-            keep_cluster = (try self.nextCluster(io, keep_cluster)) orelse return error.BadClusterChain;
-        }
-
-        const tail_cluster = try self.nextCluster(io, keep_cluster);
-        if (tail_cluster) |cluster| {
-            try self.writeFatEntry(io, keep_cluster, fat_entry_eoc);
-            try self.releaseChain(io, cluster);
-        }
-
-        const tail_bytes = new_size % cluster_size;
-        if (tail_bytes != 0) {
-            var zeros: [max_cluster_size]u8 = [_]u8{0} ** max_cluster_size;
-            try self.writeRegion(
-                io,
-                zeros[0 .. cluster_size - tail_bytes],
-                self.clusterOffset(keep_cluster) + tail_bytes,
-            );
-        }
-
-        try self.updateDirectoryEntry(io, parent.cluster, entry.location(), entry.first_cluster, new_size);
-    }
-
+    fn appendDirectoryEntryTracked(
+        self: *FileSystem,
+        io: Io,
+        dir_cluster: u32,
+        name: []const u8,
+        kind: DirEntryKind,
+        first_cluster: u32,
+        size: u32,
+    ) MutationError!DirectoryEntryLocation {
         var utf16_units: [max_long_name_units]u16 = undefined;
         const utf16_name = try encodeLongName(name, &utf16_units);
 
@@ -371,6 +383,7 @@ pub const FileSystem = struct {
         const start_slot = try self.findDirectoryEnd(io, dir_cluster);
         try self.ensureDirectorySlots(io, dir_cluster, start_slot + total_slots + 1);
         try self.writeDirectorySlots(io, dir_cluster, start_slot, slots[0..total_slots]);
+        return .{ .first_slot = start_slot, .slot_count = total_slots };
     }
 
     fn findEntry(self: *FileSystem, io: Io, dir_cluster: u32, wanted: []const u8) MutationError!?LocatedEntry {
@@ -443,6 +456,53 @@ pub const FileSystem = struct {
         }
     }
 
+    fn directorySlotOffset(self: *FileSystem, io: Io, dir_cluster: u32, slot_index: usize) MutationError!u64 {
+        const slots_per_cluster = self.info.clusterSize() / directory_entry_size;
+        var cluster = dir_cluster;
+        var remaining = slot_index;
+        while (remaining >= slots_per_cluster) : (remaining -= slots_per_cluster) {
+            cluster = (try self.nextCluster(io, cluster)) orelse return error.BadClusterChain;
+        }
+        return self.clusterOffset(cluster) + remaining * directory_entry_size;
+    }
+
+    fn readDirectorySlot(self: *FileSystem, io: Io, dir_cluster: u32, slot_index: usize, slot: *[directory_entry_size]u8) MutationError!void {
+        try self.readRegion(io, slot, try self.directorySlotOffset(io, dir_cluster, slot_index));
+    }
+
+    fn updateDirectoryEntry(
+        self: *FileSystem,
+        io: Io,
+        dir_cluster: u32,
+        location: DirectoryEntryLocation,
+        first_cluster: u32,
+        size: u32,
+    ) MutationError!void {
+        var slot: [directory_entry_size]u8 = undefined;
+        try self.readDirectorySlot(io, dir_cluster, location.shortSlot(), &slot);
+        std.mem.writeInt(u16, slot[20..22], @intCast(first_cluster >> 16), .little);
+        std.mem.writeInt(u16, slot[26..28], @intCast(first_cluster & 0xFFFF), .little);
+        std.mem.writeInt(u32, slot[28..32], size, .little);
+        try self.writeRegion(io, &slot, try self.directorySlotOffset(io, dir_cluster, location.shortSlot()));
+    }
+
+    fn markEntryDeleted(self: *FileSystem, io: Io, dir_cluster: u32, location: DirectoryEntryLocation) MutationError!void {
+        var deleted = [_]u8{0xE5};
+        for (0..location.slot_count) |slot_index| {
+            try self.writeRegion(io, &deleted, try self.directorySlotOffset(io, dir_cluster, location.first_slot + slot_index));
+        }
+    }
+
+    fn isDirectoryEmpty(self: *FileSystem, io: Io, dir_cluster: u32) MutationError!bool {
+        var iter = try DirectoryIterator.init(self, io, dir_cluster);
+        while (try iter.next(io, null)) |entry| {
+            if (entry.attr & attr_volume_id != 0) continue;
+            if (isDotEntry(entry.short_name)) continue;
+            return false;
+        }
+        return true;
+    }
+
     fn initDirectoryCluster(self: *FileSystem, io: Io, cluster: u32, parent_cluster: u32) MutationError!void {
         try self.zeroCluster(io, cluster);
         const dot = buildDotEntry(false, cluster);
@@ -504,18 +564,6 @@ pub const FileSystem = struct {
         var zero_buf: [max_cluster_size]u8 = [_]u8{0} ** max_cluster_size;
         while (true) {
             const take = @min(data.len - offset, cluster_size);
-        _ = try self.appendDirectoryEntryTracked(io, dir_cluster, name, kind, first_cluster, size);
-    }
-
-    fn appendDirectoryEntryTracked(
-        self: *FileSystem,
-        io: Io,
-        dir_cluster: u32,
-        name: []const u8,
-        kind: DirEntryKind,
-        first_cluster: u32,
-        size: u32,
-    ) MutationError!DirectoryEntryLocation {
             const cluster_rel = self.clusterOffset(cluster);
             try self.writeRegion(io, data[offset .. offset + take], cluster_rel);
             if (take < cluster_size) {
@@ -531,7 +579,6 @@ pub const FileSystem = struct {
         if (buffer.len == 0) return;
         var cluster = first_cluster;
         const cluster_size = self.info.clusterSize();
-        return .{ .first_slot = start_slot, .slot_count = total_slots };
         var offset: usize = 0;
         while (offset < buffer.len) {
             const take = @min(buffer.len - offset, cluster_size);
@@ -604,53 +651,6 @@ pub const FileSystem = struct {
 
     fn zeroCluster(self: *FileSystem, io: Io, cluster: u32) MutationError!void {
         var zeros: [max_cluster_size]u8 = [_]u8{0} ** max_cluster_size;
-    fn directorySlotOffset(self: *FileSystem, io: Io, dir_cluster: u32, slot_index: usize) MutationError!u64 {
-        const slots_per_cluster = self.info.clusterSize() / directory_entry_size;
-        var cluster = dir_cluster;
-        var remaining = slot_index;
-        while (remaining >= slots_per_cluster) : (remaining -= slots_per_cluster) {
-            cluster = (try self.nextCluster(io, cluster)) orelse return error.BadClusterChain;
-        }
-        return self.clusterOffset(cluster) + remaining * directory_entry_size;
-    }
-
-    fn readDirectorySlot(self: *FileSystem, io: Io, dir_cluster: u32, slot_index: usize, slot: *[directory_entry_size]u8) MutationError!void {
-        try self.readRegion(io, slot, try self.directorySlotOffset(io, dir_cluster, slot_index));
-    }
-
-    fn updateDirectoryEntry(
-        self: *FileSystem,
-        io: Io,
-        dir_cluster: u32,
-        location: DirectoryEntryLocation,
-        first_cluster: u32,
-        size: u32,
-    ) MutationError!void {
-        var slot: [directory_entry_size]u8 = undefined;
-        try self.readDirectorySlot(io, dir_cluster, location.shortSlot(), &slot);
-        std.mem.writeInt(u16, slot[20..22], @intCast(first_cluster >> 16), .little);
-        std.mem.writeInt(u16, slot[26..28], @intCast(first_cluster & 0xFFFF), .little);
-        std.mem.writeInt(u32, slot[28..32], size, .little);
-        try self.writeRegion(io, &slot, try self.directorySlotOffset(io, dir_cluster, location.shortSlot()));
-    }
-
-    fn markEntryDeleted(self: *FileSystem, io: Io, dir_cluster: u32, location: DirectoryEntryLocation) MutationError!void {
-        var deleted = [_]u8{0xE5};
-        for (0..location.slot_count) |slot_index| {
-            try self.writeRegion(io, &deleted, try self.directorySlotOffset(io, dir_cluster, location.first_slot + slot_index));
-        }
-    }
-
-    fn isDirectoryEmpty(self: *FileSystem, io: Io, dir_cluster: u32) MutationError!bool {
-        var iter = try DirectoryIterator.init(self, io, dir_cluster);
-        while (try iter.next(io, null)) |entry| {
-            if (entry.attr & attr_volume_id != 0) continue;
-            if (isDotEntry(entry.short_name)) continue;
-            return false;
-        }
-        return true;
-    }
-
         try self.writeRegion(io, zeros[0..self.info.clusterSize()], self.clusterOffset(cluster));
     }
 
@@ -851,6 +851,15 @@ const VolumeInfo = struct {
     }
 };
 
+const DirectoryEntryLocation = struct {
+    first_slot: usize,
+    slot_count: usize,
+
+    fn shortSlot(self: DirectoryEntryLocation) usize {
+        return self.first_slot + self.slot_count - 1;
+    }
+};
+
 const LocatedEntry = struct {
     short_name: [11]u8,
     utf16_name: [max_long_name_units]u16,
@@ -858,9 +867,15 @@ const LocatedEntry = struct {
     attr: u8,
     first_cluster: u32,
     size: u32,
+    first_slot: usize,
+    slot_count: usize,
 
     fn kind(self: LocatedEntry) DirEntryKind {
         return if (self.attr & attr_directory != 0) .directory else .file;
+    }
+
+    fn location(self: LocatedEntry) DirectoryEntryLocation {
+        return .{ .first_slot = self.first_slot, .slot_count = self.slot_count };
     }
 
     fn matches(self: LocatedEntry, wanted: []const u8) bool {
@@ -899,6 +914,7 @@ const DirectoryIterator = struct {
     cluster: u32,
     cluster_buf: [max_cluster_size]u8 = undefined,
     offset_in_cluster: usize = 0,
+    slot_index: usize = 0,
     eof: bool = false,
     lfn: LongNameState = .{},
 
@@ -924,6 +940,8 @@ const DirectoryIterator = struct {
                 try self.fs.readCluster(io, self.cluster, self.cluster_buf[0..cluster_size]);
             }
 
+            const slot_index = self.slot_index;
+            self.slot_index += 1;
             const entry = self.cluster_buf[self.offset_in_cluster .. self.offset_in_cluster + directory_entry_size];
             self.offset_in_cluster += directory_entry_size;
 
@@ -952,6 +970,7 @@ const LongNameState = struct {
     len: usize = 0,
     checksum: u8 = 0,
     expected_sequence: u8 = 0,
+    slot_count: usize = 0,
     active: bool = false,
 
     fn reset(self: *LongNameState) void {
@@ -974,6 +993,7 @@ const LongNameState = struct {
             return error.InvalidBootSector;
         }
         self.expected_sequence = sequence;
+        self.slot_count += 1;
         const index = (@as(usize, sequence) - 1) * 13;
         copyLfnUnits(self.units[index .. index + 13], entry);
         if (sequence == 1) {
@@ -999,15 +1019,6 @@ fn computeLayout(options: FormatOptions) Error!VolumeInfo {
         if (@as(u32, spc) * options.bytes_per_sector > max_cluster_size) return error.InvalidSectorsPerCluster;
         break :blk spc;
     } else try chooseSectorsPerCluster(total_sectors, options.bytes_per_sector, options.reserved_sector_count, options.fat_count);
-const DirectoryEntryLocation = struct {
-    first_slot: usize,
-    slot_count: usize,
-
-    fn shortSlot(self: DirectoryEntryLocation) usize {
-        return self.first_slot + self.slot_count - 1;
-    }
-};
-
 
     const layout = try layoutFor(total_sectors, options.bytes_per_sector, options.reserved_sector_count, options.fat_count, sectors_per_cluster);
     if (layout.data_cluster_count < min_fat32_clusters) return error.VolumeTooSmall;
@@ -1015,17 +1026,11 @@ const DirectoryEntryLocation = struct {
     return .{
         .bytes_per_sector = options.bytes_per_sector,
         .sectors_per_cluster = sectors_per_cluster,
-    first_slot: usize,
-    slot_count: usize,
         .reserved_sector_count = options.reserved_sector_count,
         .fat_count = options.fat_count,
         .fat_size_sectors = layout.fat_size_sectors,
         .total_sectors = total_sectors,
         .root_cluster = 2,
-    fn location(self: LocatedEntry) DirectoryEntryLocation {
-        return .{ .first_slot = self.first_slot, .slot_count = self.slot_count };
-    }
-
         .fsinfo_sector = 1,
         .backup_boot_sector = 6,
         .hidden_sectors = options.hidden_sectors,
@@ -1062,7 +1067,6 @@ fn layoutFor(total_sectors: u32, bytes_per_sector: u16, reserved_sector_count: u
             return .{
                 .fat_size_sectors = fat_size,
                 .data_start_sector = metadata_sectors,
-    slot_index: usize = 0,
                 .data_cluster_count = cluster_count,
             };
         }
@@ -1088,8 +1092,6 @@ fn buildBootSector(info: VolumeInfo) [default_bytes_per_sector]u8 {
     std.mem.writeInt(u16, sector[26..28], info.head_count, .little);
     std.mem.writeInt(u32, sector[28..32], info.hidden_sectors, .little);
     std.mem.writeInt(u32, sector[32..36], info.total_sectors, .little);
-            const slot_index = self.slot_index;
-            self.slot_index += 1;
     std.mem.writeInt(u32, sector[36..40], info.fat_size_sectors, .little);
     std.mem.writeInt(u16, sector[40..42], 0, .little);
     std.mem.writeInt(u16, sector[42..44], 0, .little);
@@ -1118,7 +1120,6 @@ fn zeroRange(fs: *const FileSystem, io: Io, start: u64, length: u64) MutationErr
 
 fn isSupportedBytesPerSector(value: u16) bool {
     return value == 512 or value == 1024 or value == 2048 or value == 4096;
-    slot_count: usize = 0,
 }
 
 fn isValidSectorsPerCluster(value: u8) bool {
@@ -1141,7 +1142,6 @@ fn validateComponent(component: []const u8) Error!void {
 
 fn encodeLongName(name: []const u8, out: *[max_long_name_units]u16) Error![]const u16 {
     var in_i: usize = 0;
-        self.slot_count += 1;
     var out_i: usize = 0;
     while (in_i < name.len) {
         const cp_len = std.unicode.utf8ByteSequenceLength(name[in_i]) catch return error.UnsupportedName;
@@ -1194,6 +1194,8 @@ fn makeLocatedEntry(entry: []const u8, lfn: *LongNameState, short_slot: usize) M
         .attr = entry[11],
         .first_cluster = (@as(u32, std.mem.readInt(u16, entry[20..22], .little)) << 16) | std.mem.readInt(u16, entry[26..28], .little),
         .size = std.mem.readInt(u32, entry[28..32], .little),
+        .first_slot = short_slot,
+        .slot_count = 1,
     };
     @memcpy(&result.short_name, entry[0..11]);
 
@@ -1201,6 +1203,8 @@ fn makeLocatedEntry(entry: []const u8, lfn: *LongNameState, short_slot: usize) M
     if (has_lfn) {
         result.utf16_len = lfn.len;
         @memcpy(result.utf16_name[0..lfn.len], lfn.units[0..lfn.len]);
+        result.first_slot = short_slot - lfn.slot_count;
+        result.slot_count = lfn.slot_count + 1;
     } else {
         result.utf16_len = try decodeShortNameUtf16(result.short_name, &result.utf16_name);
     }
@@ -1343,16 +1347,12 @@ fn shortNameExists(fs: *FileSystem, io: Io, dir_cluster: u32, short_name: [11]u8
 
 fn shortNameChecksum(short_name: [11]u8) u8 {
     var sum: u8 = 0;
-        .first_slot = short_slot,
-        .slot_count = 1,
     for (short_name) |ch| {
         sum = (((sum & 1) << 7) +% (sum >> 1)) +% ch;
     }
     return sum;
 }
 
-        result.first_slot = short_slot - lfn.slot_count;
-        result.slot_count = lfn.slot_count + 1;
 fn buildShortEntry(short_name: [11]u8, kind: DirEntryKind, first_cluster: u32, size: u32) [directory_entry_size]u8 {
     var entry: [directory_entry_size]u8 = [_]u8{0} ** directory_entry_size;
     entry[0..11].* = short_name;
@@ -1373,6 +1373,10 @@ fn buildDotEntry(parent: bool, cluster: u32) [directory_entry_size]u8 {
     name[0] = '.';
     if (parent) name[1] = '.';
     return buildShortEntry(name, .directory, cluster, 0);
+}
+
+fn isDotEntry(short_name: [11]u8) bool {
+    return short_name[0] == '.' and (short_name[1] == ' ' or short_name[1] == '.');
 }
 
 fn buildLfnEntries(entries: [][directory_entry_size]u8, utf16_name: []const u16, short_name: [11]u8) void {
@@ -1423,6 +1427,31 @@ fn readLfnUnitSlice(out: []u16, bytes: []const u8) void {
     while (i < out.len) : (i += 1) {
         out[i] = std.mem.readInt(u16, bytes[i * 2 ..][0..2], .little);
     }
+}
+
+fn allocPattern(allocator: std.mem.Allocator, len: usize, seed: u32) std.mem.Allocator.Error![]u8 {
+    const buffer = try allocator.alloc(u8, len);
+    for (buffer, 0..) |*byte, index| {
+        byte.* = @truncate((seed +% @as(u32, @intCast(index)) *% 31) & 0xFF);
+    }
+    return buffer;
+}
+
+fn collectClusterChain(fs: *FileSystem, io: Io, allocator: std.mem.Allocator, first_cluster: u32) (MutationError || std.mem.Allocator.Error)![]u32 {
+    if (first_cluster == 0) return allocator.alloc(u32, 0);
+
+    var clusters = std.array_list.Managed(u32).init(allocator);
+    errdefer clusters.deinit();
+
+    var cluster = first_cluster;
+    while (true) {
+        try clusters.append(cluster);
+        const next = try fs.nextCluster(io, cluster);
+        if (next == null) break;
+        cluster = next.?;
+    }
+
+    return clusters.toOwnedSlice();
 }
 
 test "format writes FAT32 boot sector, FSInfo, backup boot sector, and root FAT anchor" {
@@ -1523,10 +1552,6 @@ test "FAT32 path lookup is case-insensitive for mixed-case names" {
     defer img.close(io);
 
     try format(&img, io, .{ .partition_offset = 0, .partition_len = partition_len });
-fn isDotEntry(short_name: [11]u8) bool {
-    return short_name[0] == '.' and (short_name[1] == ' ' or short_name[1] == '.');
-}
-
 
     var fs = try open(&img, io, .{ .offset = 0, .length = partition_len });
     try fs.createDir(io, "EFI/Boot");
@@ -1539,4 +1564,179 @@ fn isDotEntry(short_name: [11]u8) bool {
     const upper = try fs.readFileAlloc(io, std.testing.allocator, "EFI/BOOT/BOOTX64.EFI");
     defer std.testing.allocator.free(upper);
     try std.testing.expectEqualStrings("hello", upper);
+}
+
+test "delete frees directory entries and FAT chains for reuse" {
+    const io = std.testing.io;
+    const path = "test-fat32-delete.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const partition_len: u64 = 64 * 1024 * 1024;
+    var img = try Image.create(io, path, .raw, partition_len, .{});
+    defer img.close(io);
+
+    try format(&img, io, .{ .partition_offset = 0, .partition_len = partition_len });
+
+    var fs = try open(&img, io, .{ .offset = 0, .length = partition_len });
+    const cluster_size = fs.info.clusterSize();
+
+    try fs.createDir(io, "EFI/BOOT");
+    try fs.createDir(io, "EFI/EMPTY");
+
+    const keep_contents = try allocPattern(std.testing.allocator, cluster_size + 37, 0x11);
+    defer std.testing.allocator.free(keep_contents);
+    const deleted_contents = try allocPattern(std.testing.allocator, cluster_size * 3 + 29, 0x37);
+    defer std.testing.allocator.free(deleted_contents);
+    const reused_contents = try allocPattern(std.testing.allocator, cluster_size * 3 + 97, 0x59);
+    defer std.testing.allocator.free(reused_contents);
+
+    try fs.writeFile(io, "EFI/BOOT/keep.bin", keep_contents);
+    try fs.writeFile(io, "EFI/BOOT/delete me.bin", deleted_contents);
+
+    const parent = try fs.resolveParent(io, "EFI/BOOT/delete me.bin");
+    const deleted_entry = (try fs.findEntry(io, parent.cluster, parent.name)).?;
+    const deleted_chain = try collectClusterChain(&fs, io, std.testing.allocator, deleted_entry.first_cluster);
+    defer std.testing.allocator.free(deleted_chain);
+    const free_before = fs.free_cluster_count;
+
+    try std.testing.expectError(error.DirectoryNotEmpty, fs.deletePath(io, "EFI"));
+    try fs.deletePath(io, "EFI/BOOT/delete me.bin");
+
+    try std.testing.expectEqual(free_before + @as(u32, @intCast(deleted_chain.len)), fs.free_cluster_count);
+    try std.testing.expectError(error.PathNotFound, fs.readFileAlloc(io, std.testing.allocator, "EFI/BOOT/delete me.bin"));
+
+    for (deleted_chain) |cluster| {
+        try std.testing.expectEqual(@as(u32, 0), try fs.readFatEntry(io, cluster));
+    }
+    for (0..deleted_entry.slot_count) |slot_index| {
+        var slot: [directory_entry_size]u8 = undefined;
+        try fs.readDirectorySlot(io, parent.cluster, deleted_entry.first_slot + slot_index, &slot);
+        try std.testing.expectEqual(@as(u8, 0xE5), slot[0]);
+    }
+
+    const boot_entries_after_delete = try fs.listDirAlloc(io, std.testing.allocator, "EFI/BOOT");
+    defer freeDirEntries(std.testing.allocator, boot_entries_after_delete);
+    try std.testing.expectEqual(@as(usize, 1), boot_entries_after_delete.len);
+    try std.testing.expectEqualStrings("keep.bin", boot_entries_after_delete[0].name);
+
+    try fs.writeFile(io, "EFI/BOOT/reused.bin", reused_contents);
+    const reused_parent = try fs.resolveParent(io, "EFI/BOOT/reused.bin");
+    const reused_entry = (try fs.findEntry(io, reused_parent.cluster, reused_parent.name)).?;
+    try std.testing.expectEqual(deleted_chain[0], reused_entry.first_cluster);
+
+    const kept = try fs.readFileAlloc(io, std.testing.allocator, "EFI/BOOT/keep.bin");
+    defer std.testing.allocator.free(kept);
+    try std.testing.expectEqualSlices(u8, keep_contents, kept);
+
+    const reused = try fs.readFileAlloc(io, std.testing.allocator, "EFI/BOOT/reused.bin");
+    defer std.testing.allocator.free(reused);
+    try std.testing.expectEqualSlices(u8, reused_contents, reused);
+
+    try fs.deletePath(io, "EFI/EMPTY");
+    try std.testing.expectError(error.PathNotFound, fs.listDirAlloc(io, std.testing.allocator, "EFI/EMPTY"));
+}
+
+test "truncate shrinks files and frees unused clusters" {
+    const io = std.testing.io;
+    const path = "test-fat32-truncate.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const partition_len: u64 = 64 * 1024 * 1024;
+    var img = try Image.create(io, path, .raw, partition_len, .{});
+    defer img.close(io);
+
+    try format(&img, io, .{ .partition_offset = 0, .partition_len = partition_len });
+
+    var fs = try open(&img, io, .{ .offset = 0, .length = partition_len });
+    const cluster_size = fs.info.clusterSize();
+
+    const contents = try allocPattern(std.testing.allocator, cluster_size * 3 + 57, 0x21);
+    defer std.testing.allocator.free(contents);
+    try fs.writeFile(io, "payload.bin", contents);
+
+    const parent = try fs.resolveParent(io, "payload.bin");
+    const entry = (try fs.findEntry(io, parent.cluster, parent.name)).?;
+    const original_chain = try collectClusterChain(&fs, io, std.testing.allocator, entry.first_cluster);
+    defer std.testing.allocator.free(original_chain);
+    const free_before = fs.free_cluster_count;
+
+    const truncated_size: u32 = @intCast(cluster_size + 31);
+    try fs.truncateFile(io, "payload.bin", truncated_size);
+
+    const truncated_entry = (try fs.findEntry(io, parent.cluster, parent.name)).?;
+    try std.testing.expectEqual(truncated_size, truncated_entry.size);
+    try std.testing.expectEqual(original_chain[0], truncated_entry.first_cluster);
+    try std.testing.expectEqual(fat_entry_eoc, try fs.readFatEntry(io, original_chain[1]));
+    for (original_chain[2..]) |cluster| {
+        try std.testing.expectEqual(@as(u32, 0), try fs.readFatEntry(io, cluster));
+    }
+    try std.testing.expectEqual(
+        free_before + @as(u32, @intCast(original_chain.len - 2)),
+        fs.free_cluster_count,
+    );
+
+    const truncated = try fs.readFileAlloc(io, std.testing.allocator, "payload.bin");
+    defer std.testing.allocator.free(truncated);
+    try std.testing.expectEqualSlices(u8, contents[0..truncated_size], truncated);
+
+    var tail: [64]u8 = undefined;
+    try fs.readRegion(io, &tail, fs.clusterOffset(original_chain[1]) + truncated_size % cluster_size);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** tail.len), &tail);
+
+    try std.testing.expectError(error.InvalidTruncateSize, fs.truncateFile(io, "payload.bin", truncated_size + 1));
+
+    try fs.truncateFile(io, "payload.bin", 0);
+    const emptied_entry = (try fs.findEntry(io, parent.cluster, parent.name)).?;
+    try std.testing.expectEqual(@as(u32, 0), emptied_entry.size);
+    try std.testing.expectEqual(@as(u32, 0), emptied_entry.first_cluster);
+    try std.testing.expectEqual(@as(u32, 0), try fs.readFatEntry(io, original_chain[0]));
+    try std.testing.expectEqual(@as(u32, 0), try fs.readFatEntry(io, original_chain[1]));
+
+    const emptied = try fs.readFileAlloc(io, std.testing.allocator, "payload.bin");
+    defer std.testing.allocator.free(emptied);
+    try std.testing.expectEqual(@as(usize, 0), emptied.len);
+}
+
+test "streaming writes match whole-buffer writes" {
+    const io = std.testing.io;
+    const path = "test-fat32-stream.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const partition_len: u64 = 64 * 1024 * 1024;
+    var img = try Image.create(io, path, .raw, partition_len, .{});
+    defer img.close(io);
+
+    try format(&img, io, .{ .partition_offset = 0, .partition_len = partition_len });
+
+    var fs = try open(&img, io, .{ .offset = 0, .length = partition_len });
+    const cluster_size = fs.info.clusterSize();
+    try fs.createDir(io, "EFI/BOOT");
+
+    const contents = try allocPattern(std.testing.allocator, cluster_size * 2 + 137, 0x73);
+    defer std.testing.allocator.free(contents);
+
+    var writer = try fs.beginFile(io, "EFI/BOOT/streamed payload.bin");
+    errdefer writer.abort(io) catch {};
+    try writer.writeChunk(io, contents[0..17]);
+    try writer.writeChunk(io, contents[17 .. 17 + cluster_size + 9]);
+    try writer.writeChunk(io, contents[17 + cluster_size + 9 ..]);
+    try writer.endFile(io);
+
+    var empty_writer = try fs.beginFile(io, "EFI/BOOT/empty.bin");
+    errdefer empty_writer.abort(io) catch {};
+    try empty_writer.endFile(io);
+
+    try fs.writeFile(io, "EFI/BOOT/whole payload.bin", contents);
+
+    const streamed = try fs.readFileAlloc(io, std.testing.allocator, "EFI/BOOT/streamed payload.bin");
+    defer std.testing.allocator.free(streamed);
+    const whole = try fs.readFileAlloc(io, std.testing.allocator, "EFI/BOOT/whole payload.bin");
+    defer std.testing.allocator.free(whole);
+    const empty = try fs.readFileAlloc(io, std.testing.allocator, "EFI/BOOT/empty.bin");
+    defer std.testing.allocator.free(empty);
+
+    try std.testing.expectEqualSlices(u8, contents, streamed);
+    try std.testing.expectEqualSlices(u8, contents, whole);
+    try std.testing.expectEqualSlices(u8, whole, streamed);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
 }
