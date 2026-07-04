@@ -4,11 +4,12 @@
 //! the Azure Linux + container build-image workflow this library exists to
 //! support.
 //!
-//! Milestone 5 status: raw + fixed/dynamic vhd read/write, MBR + GPT
-//! partition table read/write, FAT32 filesystem read/write, VHDX
-//! **read-only**, qcow2 **read-only**, ISO9660/squashfs **read-only**,
-//! local OCI image ingestion, a minimal native ext4 writer/readback
-//! helper, and COSI output packaging.
+//! Milestone 6 status: raw + fixed/dynamic vhd read/write, MBR + GPT
+//! partition table read/write, FAT32 filesystem read/write, native ESP
+//! bootloader population (copy EFI binaries + generate grub.cfg/BLS),
+//! VHDX **read-only**, qcow2 **read-only**, ISO9660/squashfs
+//! **read-only**, local OCI image ingestion, a minimal native ext4
+//! writer/readback helper, and COSI output packaging.
 
 const std = @import("std");
 
@@ -19,6 +20,7 @@ pub const fat32 = @import("fat32.zig");
 pub const iso9660 = @import("iso9660.zig");
 pub const squashfs = @import("squashfs.zig");
 pub const ext4 = @import("ext4.zig");
+pub const bootconfig = @import("bootconfig.zig");
 pub const guid = @import("guid.zig");
 pub const mbr = @import("mbr.zig");
 pub const gpt = @import("gpt.zig");
