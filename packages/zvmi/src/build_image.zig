@@ -69,7 +69,6 @@ pub fn build(
 ) !BuildImageReport {
     const output_format = try resolveOutputFormat(options.output_format, options.output_path);
     const disk_size = if (output_format == .vhd) azure.alignSizeToMib(options.size) else options.size;
-    if (options.verity and options.generation == .gen1) return error.UnsupportedGenerationForVerity;
 
     if (options.verbose and output_format == .vhd and disk_size != options.size) {
         std.debug.print("build-image: aligned requested VHD size from {d} to {d} bytes for Azure compatibility\n", .{ options.size, disk_size });
@@ -197,6 +196,7 @@ pub fn build(
         try bootconfig.installBiosBoot(allocator, io, &raw_img, &source_tree.view, .{
             .planned_partitions = planned_partitions,
             .architecture = architecture,
+            .verity = report.verity,
         });
     }
 
@@ -317,6 +317,7 @@ fn planGen1PartitionIdentities(
     if (disk_size <= offset_bytes + mib) return error.DiskTooSmall;
     const usable_bytes = alignDown(disk_size - offset_bytes, mib);
     if (usable_bytes == 0) return error.DiskTooSmall;
+    const disk_signature = randomDiskSignature(io);
 
     const identities = try allocator.alloc(bootconfig.PlannedPartitionIdentity, 1);
     identities[0] = .{ .planned = .{
@@ -325,7 +326,7 @@ fn planGen1PartitionIdentities(
         .type_guid = root_role.defaultTypeGuid(),
         .offset_bytes = offset_bytes,
         .length_bytes = usable_bytes,
-    }, .unique_guid = randomGuid(io) };
+    }, .unique_guid = randomGuid(io), .mbr_disk_signature = disk_signature };
     return identities;
 }
 
@@ -339,6 +340,12 @@ fn randomGuid(io: Io) guid.Guid {
     bytes[6] = (bytes[6] & 0x0F) | 0x40;
     bytes[8] = (bytes[8] & 0x3F) | 0x80;
     return bytes;
+}
+
+fn randomDiskSignature(io: Io) u32 {
+    var disk_signature: u32 = 0;
+    while (disk_signature == 0) Io.random(io, std.mem.asBytes(&disk_signature));
+    return disk_signature;
 }
 
 fn writeGptLayout(
@@ -373,8 +380,10 @@ fn writeMbrLayout(
     const root_partition = findAnyRootPartition(planned) orelse return error.MissingRootPartition;
     const first_lba = std.math.cast(u32, root_partition.planned.firstLba()) orelse return error.PartitionTooLargeForMbr;
     const sector_count = std.math.cast(u32, root_partition.planned.sizeSectors()) orelse return error.PartitionTooLargeForMbr;
-    const table = mbr.singleLinuxPartitionMbr(first_lba, sector_count).encode();
-    try img.pwrite(io, &table, 0);
+    var table = mbr.singleLinuxPartitionMbr(first_lba, sector_count);
+    table.disk_signature = root_partition.mbr_disk_signature orelse 0;
+    const encoded = table.encode();
+    try img.pwrite(io, &encoded, 0);
 }
 
 fn convertRawToOutput(
@@ -1946,10 +1955,12 @@ test "build-image installs a Gen1 BIOS GRUB chain into the post-MBR gap" {
     std.mem.writeInt(u64, expected_boot[0x5C..][0..8], 1, .little);
     try std.testing.expectEqualSlices(u8, expected_boot[0..0x1B8], sector0[0..0x1B8]);
 
-    const expected_table_tail = mbr.singleLinuxPartitionMbr(
+    var expected_mbr = mbr.singleLinuxPartitionMbr(
         @intCast(report.planned_partitions[0].planned.firstLba()),
         @intCast(report.planned_partitions[0].planned.sizeSectors()),
-    ).encode();
+    );
+    expected_mbr.disk_signature = report.planned_partitions[0].mbr_disk_signature.?;
+    const expected_table_tail = expected_mbr.encode();
     try std.testing.expectEqualSlices(u8, expected_table_tail[0x1B8..], sector0[0x1B8..]);
 
     const core_sector_count = std.math.divCeil(usize, fixture.bios_core_img.len, mbr.sector_size) catch unreachable;
@@ -1965,18 +1976,6 @@ test "build-image installs a Gen1 BIOS GRUB chain into the post-MBR gap" {
     std.mem.writeInt(u16, expected_core[508..][0..2], @intCast(core_sector_count - 1), .little);
     std.mem.writeInt(u16, expected_core[510..][0..2], 0x820, .little);
     try std.testing.expectEqualSlices(u8, expected_core, embedded_core);
-}
-
-test "build-image rejects dm-verity for Gen1 builds" {
-    try std.testing.expectError(error.UnsupportedGenerationForVerity, build(std.testing.allocator, std.testing.io, .{
-        .iso_path = "unused.iso",
-        .container_path = "unused-oci",
-        .output_path = "unused.raw",
-        .output_format = .raw,
-        .generation = .gen1,
-        .size = 256 * mib,
-        .verity = true,
-    }));
 }
 
 test "build-image can append a dm-verity tree and pass metadata through COSI output" {
@@ -2042,6 +2041,61 @@ test "build-image can append a dm-verity tree and pass metadata through COSI out
     try std.testing.expect(std.mem.indexOf(u8, cosi_bytes, root_hash_text) != null);
     try std.testing.expect(std.mem.indexOf(u8, cosi_bytes, "\"hashAlgorithm\":\"sha256\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, cosi_bytes, "\"hashOffset\":") != null);
+}
+
+test "build-image can append a dm-verity tree for Gen1 builds and synthesize an MBR PARTUUID cmdline" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const iso_path = "test-build-image-verity-gen1.iso";
+    const oci_root = "test-build-image-verity-gen1-oci";
+    const output_path = "test-build-image-verity-gen1.raw";
+    defer Io.Dir.cwd().deleteFile(io, iso_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, oci_root) catch {};
+    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
+
+    const squashfs_bytes = try squashfs.buildSyntheticSquashfsImage(allocator, .{ .compression = .xz });
+    defer allocator.free(squashfs_bytes);
+    try writeMinimalIsoWithFile(allocator, io, iso_path, "ROOT.SQUASHFS;1", squashfs_bytes);
+
+    var fixture = try createBuildImageOciFixture(allocator, io, oci_root);
+    defer fixture.deinit(allocator);
+
+    var report = try build(allocator, io, .{
+        .iso_path = iso_path,
+        .container_path = oci_root,
+        .output_path = output_path,
+        .output_format = .raw,
+        .generation = .gen1,
+        .size = 256 * mib,
+        .verity = true,
+    });
+    defer report.deinit(allocator);
+
+    try std.testing.expect(report.verity != null);
+    try std.testing.expectEqual(@as(usize, 1), report.planned_partitions.len);
+    try std.testing.expect(report.planned_partitions[0].mbr_disk_signature != null);
+
+    var img = try Image.openPath(io, output_path);
+    defer img.close(io);
+
+    var sector0: [mbr.sector_size]u8 = undefined;
+    _ = try img.pread(io, &sector0, 0);
+    const parsed_mbr = try mbr.Mbr.decode(&sector0);
+    try std.testing.expectEqual(report.planned_partitions[0].mbr_disk_signature.?, parsed_mbr.disk_signature);
+
+    var partuuid_buf: [mbr.partuuid_len]u8 = undefined;
+    const root_partuuid_text = mbr.formatPartuuid(&partuuid_buf, parsed_mbr.disk_signature, 1);
+    const kernel_options = try bootconfig.renderKernelOptions(allocator, root_partuuid_text, "", report.verity);
+    defer allocator.free(kernel_options);
+
+    var root_hash_buf: [verity.digest_size * 2]u8 = undefined;
+    const root_hash_text = report.verity.?.formatRootHash(&root_hash_buf);
+    try std.testing.expect(std.mem.indexOf(u8, kernel_options, "root=/dev/mapper/root ro") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kernel_options, root_hash_text) != null);
+    try std.testing.expect(std.mem.indexOf(u8, kernel_options, "systemd.verity_root_data=PARTUUID=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kernel_options, "systemd.verity_root_hash=PARTUUID=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kernel_options, root_partuuid_text) != null);
 }
 
 test "build-image reports errors cleanly (no double-free) when squashfs open fails after partition planning" {
