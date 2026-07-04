@@ -1,8 +1,8 @@
 # zvmi
 
 A Zig 0.16 library and CLI for reading and writing VM disk image formats
-(raw, VHD/VPC, and eventually VHDX/qcow2) plus FAT32 filesystem contents,
-analogous to `qemu-img`.
+(raw, VHD/VPC, plus read-only VHDX/qcow2) plus filesystem/image-build
+orchestration, analogous to `qemu-img`.
 
 ## Goal
 
@@ -56,6 +56,7 @@ zvmi/
         tar_writer.zig         # minimal private USTAR writer for COSI packaging
         zstd.zig               # minimal private raw-block zstd codec for COSI
         cosi.zig               # COSI writer (tar + metadata.json + raw.zst parts)
+        build_image.zig        # ISO + OCI -> raw/fixed-VHD orchestration
         formats.zig           # Format enum (raw, vhd, vhdx, qcow2)
         size.zig              # qemu-img-style size suffix parsing (K/M/G/T)
   cli/
@@ -70,6 +71,7 @@ zvmi/
         map.zig               # `zvmi map`
         azure.zig             # `zvmi azure fixup`
         cosi.zig              # `zvmi cosi`
+        build_image.zig       # `zvmi build-image`
         opts.zig              # shared `-o subformat=...` parsing
 ```
 
@@ -85,7 +87,7 @@ zig build test       # run all tests
 zig build run -- <args>   # run the CLI, e.g. `zig build run -- info foo.vhd`
 ```
 
-## Status (Milestone 6)
+## Status (Milestone 7)
 
 Supports `raw`, fixed `vhd`, dynamic `vhd`, MBR/GPT partition tables, native
 FAT32 filesystem read/write for ESP-style partitions, native ESP bootloader
@@ -93,7 +95,8 @@ population (copy prebuilt EFI binaries + generate `grub.cfg`/BLS text), an
 Azure-readiness check, **read-only** `vhdx`, **read-only** `qcow2`,
 **read-only** ISO9660 (+Rock Ridge/Joliet) and squashfs readers, local OCI
 container image ingestion, a minimal native ext4 writer/readback library API,
-and COSI output packaging:
+COSI output packaging, and a first `zvmi build-image` orchestration path that
+builds `raw` and fixed-`vhd` disk images from an ISO + local OCI layout:
 
 ```
 zvmi create -f vhd disk.vhd 32M                          # dynamic by default (matches qemu-img)
@@ -107,6 +110,8 @@ zvmi check disk.vhd
 zvmi map disk.vhd
 zvmi azure fixup --generation 1|2 disk.vhd  # pads to 1 MiB, checks MBR/GPT
 zvmi cosi disk.img -o disk.cosi              # tar + metadata.json + per-partition raw.zst
+zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G -o output.vhd
+zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G -o output.raw -O raw
 ```
 
 `convert` skips all-zero chunks (aligned to the destination's block size for
@@ -172,8 +177,11 @@ try zvmi.bootconfig.populateEsp(allocator, io, &esp_fs, &tree, .{
 });
 ```
 
-qcow2 and the `zvmi build-image` Azure Linux + container workflow are future
-milestones.
+`zvmi build-image` currently writes `raw` and fixed `vhd` outputs. `vhdx` and
+`qcow2` remain read-only source formats for now, so build-image output support
+for them is deferred until write/create support lands separately. The Gen2
+path is the fully wired Azure-ready target today; Gen1 currently produces a
+plain-MBR/rootfs image but does not yet install a BIOS boot sector.
 
 ## Notes on Zig 0.16
 
