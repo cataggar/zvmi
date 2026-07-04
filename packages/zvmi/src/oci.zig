@@ -6,11 +6,12 @@
 //!  - Supports uncompressed, gzip-compressed, and zstd-compressed tar layers.
 //!  - `loadLayout()` remains available for callers that explicitly require
 //!    an OCI image-layout directory.
-//!  - Docker save tarballs with multiple manifest entries currently load the
-//!    first entry; manifest selection is only supported for OCI layouts.
+//!  - Docker save tarballs may select a manifest entry by exact `RepoTags`
+//!    match via `LoadOptions.repo_tag`; otherwise the first entry is loaded.
 //!  - Registry/network access, signatures, and manifest-list/platform
 //!    resolution are out of scope; callers may optionally pick a specific
-//!    manifest digest when `index.json` contains more than one entry.
+//!    manifest digest when `index.json` contains more than one entry, or a
+//!    specific docker/podman save tag when `manifest.json` has multiple items.
 
 const std = @import("std");
 const Io = std.Io;
@@ -105,8 +106,16 @@ pub const Image = struct {
 };
 
 pub const LoadOptions = struct {
-    /// Applies to OCI image-layout directories only.
+    /// Selects an OCI image-layout manifest by exact digest match.
+    ///
+    /// Docker/podman save archives do not expose per-entry manifest digests in
+    /// `manifest.json`; use `repo_tag` to select those entries instead.
     manifest_digest: ?[]const u8 = null,
+    /// Selects a docker/podman save manifest entry by exact `RepoTags` match.
+    ///
+    /// When unset, docker/podman save archives continue to load the first
+    /// manifest entry for backward compatibility.
+    repo_tag: ?[]const u8 = null,
     max_blob_size: usize = 64 * 1024 * 1024,
     max_layer_size: usize = 128 * 1024 * 1024,
     max_archive_size: usize = 512 * 1024 * 1024,
@@ -287,7 +296,7 @@ fn loadDockerSaveArchive(allocator: Allocator, archive_bytes: []const u8, option
     });
     defer manifest_doc.deinit();
 
-    const manifest_entry = selectDockerSaveManifest(manifest_doc.value) orelse return error.MissingImageManifest;
+    const manifest_entry = selectDockerSaveManifest(manifest_doc.value, options.repo_tag) orelse return error.MissingImageManifest;
 
     const config_path = try normalizeArchivePath(allocator, manifest_entry.Config);
     defer allocator.free(config_path);
@@ -327,7 +336,19 @@ fn loadDockerSaveArchive(allocator: Allocator, archive_bytes: []const u8, option
     };
 }
 
-fn selectDockerSaveManifest(manifests: []const DockerSaveManifestItem) ?DockerSaveManifestItem {
+fn selectDockerSaveManifest(
+    manifests: []const DockerSaveManifestItem,
+    requested_repo_tag: ?[]const u8,
+) ?DockerSaveManifestItem {
+    if (requested_repo_tag) |repo_tag| {
+        for (manifests) |manifest| {
+            const repo_tags = manifest.RepoTags orelse continue;
+            for (repo_tags) |candidate| {
+                if (std.mem.eql(u8, candidate, repo_tag)) return manifest;
+            }
+        }
+        return null;
+    }
     return if (manifests.len == 0) null else manifests[0];
 }
 
@@ -771,6 +792,29 @@ test "load auto-detects docker save tarballs and merges whiteouts" {
     try expectMergedFixtureImage(image);
 }
 
+test "load selects docker save manifest entries by repo tag and defaults to the first entry" {
+    const io = std.testing.io;
+    const fixture_path = "test-docker-save-multi-fixture.tar";
+    defer Io.Dir.cwd().deleteFile(io, fixture_path) catch {};
+
+    try createDockerSaveMultiManifestFixture(std.testing.allocator, io, fixture_path);
+
+    var default_image = try load(io, std.testing.allocator, fixture_path, .{});
+    defer default_image.deinit();
+    try expectMergedFixtureImage(default_image);
+
+    var selected_image = try load(io, std.testing.allocator, fixture_path, .{
+        .repo_tag = "example.com/alt:latest",
+    });
+    defer selected_image.deinit();
+
+    try std.testing.expectEqualStrings("arm64", selected_image.config.architecture.?);
+    try std.testing.expectEqualStrings("linux", selected_image.config.os.?);
+    try std.testing.expectEqualStrings("hello from alt\n", selected_image.get("hello.txt").?.content);
+    try std.testing.expectEqualStrings("selected from alt\n", selected_image.get("alt.txt").?.content);
+    try std.testing.expect(selected_image.get("etc/keep.txt") == null);
+}
+
 test "loadLayout merges zstd-compressed OCI layers" {
     const io = std.testing.io;
     const fixture_root = "test-oci-layout-zstd-fixture";
@@ -925,6 +969,75 @@ fn createDockerSaveFixture(allocator: Allocator, io: Io, tarball_path: []const u
             .content = "[{\"Config\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json\",\"RepoTags\":[\"example.com/test:latest\"],\"Layers\":[\"1111111111111111111111111111111111111111111111111111111111111111/layer.tar\",\"2222222222222222222222222222222222222222222222222222222222222222/layer.tar\"]}]",
             .link_name = null,
         },
+        .{ .path = "repositories", .mode = 0o644, .typeflag = '0', .content = repositories_json, .link_name = null },
+    });
+    defer allocator.free(outer_tar);
+
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = tarball_path, .data = outer_tar });
+}
+
+fn createDockerSaveMultiManifestFixture(allocator: Allocator, io: Io, tarball_path: []const u8) !void {
+    const base_layer1_tar = try buildTarArchive(allocator, &.{
+        .{ .path = "etc/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
+        .{ .path = "etc/keep.txt", .mode = 0o644, .typeflag = '0', .content = "keep from base\n", .link_name = null },
+        .{ .path = "etc/remove.txt", .mode = 0o644, .typeflag = '0', .content = "remove me\n", .link_name = null },
+        .{ .path = "etc/opaque/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
+        .{ .path = "etc/opaque/from-base.txt", .mode = 0o644, .typeflag = '0', .content = "base hidden\n", .link_name = null },
+        .{ .path = "hello.txt", .mode = 0o644, .typeflag = '0', .content = "hello from base\n", .link_name = null },
+        .{ .path = "links/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
+        .{ .path = "links/config", .mode = 0o777, .typeflag = '2', .content = "", .link_name = "../etc/keep.txt" },
+    });
+    defer allocator.free(base_layer1_tar);
+
+    const base_layer2_tar = try buildTarArchive(allocator, &.{
+        .{ .path = "etc/.wh.remove.txt", .mode = 0o000, .typeflag = '0', .content = "", .link_name = null },
+        .{ .path = "etc/opaque/.wh..wh..opq", .mode = 0o000, .typeflag = '0', .content = "", .link_name = null },
+        .{ .path = "etc/opaque/from-top.txt", .mode = 0o644, .typeflag = '0', .content = "top survives\n", .link_name = null },
+        .{ .path = "hello.txt", .mode = 0o644, .typeflag = '0', .content = "hello from top\n", .link_name = null },
+    });
+    defer allocator.free(base_layer2_tar);
+
+    const alt_layer_tar = try buildTarArchive(allocator, &.{
+        .{ .path = "hello.txt", .mode = 0o644, .typeflag = '0', .content = "hello from alt\n", .link_name = null },
+        .{ .path = "alt.txt", .mode = 0o644, .typeflag = '0', .content = "selected from alt\n", .link_name = null },
+    });
+    defer allocator.free(alt_layer_tar);
+
+    const base_config_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"architecture\":\"amd64\",\"os\":\"linux\",\"rootfs\":{{\"type\":\"layers\",\"diff_ids\":[]}}}}",
+        .{},
+    );
+    defer allocator.free(base_config_json);
+
+    const alt_config_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"architecture\":\"arm64\",\"os\":\"linux\",\"rootfs\":{{\"type\":\"layers\",\"diff_ids\":[]}}}}",
+        .{},
+    );
+    defer allocator.free(alt_config_json);
+
+    const manifest_json = try std.fmt.allocPrint(
+        allocator,
+        \\[
+        \\  {{"Config":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json","RepoTags":["example.com/test:latest"],"Layers":["1111111111111111111111111111111111111111111111111111111111111111/layer.tar","2222222222222222222222222222222222222222222222222222222222222222/layer.tar"]}},
+        \\  {{"Config":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json","RepoTags":["example.com/alt:latest","example.com/alt:stable"],"Layers":["3333333333333333333333333333333333333333333333333333333333333333/layer.tar"]}}
+        \\]
+    ,
+        .{},
+    );
+    defer allocator.free(manifest_json);
+
+    const repositories_json =
+        "{\"example.com/test\":{\"latest\":\"2222222222222222222222222222222222222222222222222222222222222222\"},\"example.com/alt\":{\"latest\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"stable\":\"3333333333333333333333333333333333333333333333333333333333333333\"}}";
+
+    const outer_tar = try buildTarArchive(allocator, &.{
+        .{ .path = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json", .mode = 0o644, .typeflag = '0', .content = base_config_json, .link_name = null },
+        .{ .path = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json", .mode = 0o644, .typeflag = '0', .content = alt_config_json, .link_name = null },
+        .{ .path = "1111111111111111111111111111111111111111111111111111111111111111/layer.tar", .mode = 0o644, .typeflag = '0', .content = base_layer1_tar, .link_name = null },
+        .{ .path = "2222222222222222222222222222222222222222222222222222222222222222/layer.tar", .mode = 0o644, .typeflag = '0', .content = base_layer2_tar, .link_name = null },
+        .{ .path = "3333333333333333333333333333333333333333333333333333333333333333/layer.tar", .mode = 0o644, .typeflag = '0', .content = alt_layer_tar, .link_name = null },
+        .{ .path = "manifest.json", .mode = 0o644, .typeflag = '0', .content = manifest_json, .link_name = null },
         .{ .path = "repositories", .mode = 0o644, .typeflag = '0', .content = repositories_json, .link_name = null },
     });
     defer allocator.free(outer_tar);
