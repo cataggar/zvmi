@@ -3,12 +3,11 @@
 //! Scope / limitations:
 //!  - `load()` auto-detects OCI image-layout directories and docker/podman
 //!    save tarballs on local disk.
-//!  - Supports uncompressed and gzip-compressed tar layers.
+//!  - Supports uncompressed, gzip-compressed, and zstd-compressed tar layers.
 //!  - `loadLayout()` remains available for callers that explicitly require
 //!    an OCI image-layout directory.
 //!  - Docker save tarballs with multiple manifest entries currently load the
 //!    first entry; manifest selection is only supported for OCI layouts.
-//!  - zstd-compressed layers are not supported yet.
 //!  - Registry/network access, signatures, and manifest-list/platform
 //!    resolution are out of scope; callers may optionally pick a specific
 //!    manifest digest when `index.json` contains more than one entry.
@@ -228,9 +227,9 @@ const ManifestDocument = struct {
 };
 
 const DockerSaveManifestItem = struct {
-    @"Config": []const u8,
-    @"RepoTags": ?[]const []const u8 = null,
-    @"Layers": []const []const u8,
+    Config: []const u8,
+    RepoTags: ?[]const []const u8 = null,
+    Layers: []const []const u8,
 };
 
 const ConfigDocument = struct {
@@ -290,7 +289,7 @@ fn loadDockerSaveArchive(allocator: Allocator, archive_bytes: []const u8, option
 
     const manifest_entry = selectDockerSaveManifest(manifest_doc.value) orelse return error.MissingImageManifest;
 
-    const config_path = try normalizeArchivePath(allocator, manifest_entry.@"Config");
+    const config_path = try normalizeArchivePath(allocator, manifest_entry.Config);
     defer allocator.free(config_path);
     const config_file = archive.getFile(config_path) orelse return error.MissingDockerConfig;
     const config_doc = try std.json.parseFromSlice(ConfigDocument, allocator, config_file.content, .{
@@ -302,7 +301,7 @@ fn loadDockerSaveArchive(allocator: Allocator, archive_bytes: []const u8, option
     var entry_map_owned = true;
     errdefer if (entry_map_owned) deinitEntryMap(&entry_map, allocator);
 
-    for (manifest_entry.@"Layers") |layer_path_raw| {
+    for (manifest_entry.Layers) |layer_path_raw| {
         const layer_path = try normalizeArchivePath(allocator, layer_path_raw);
         defer allocator.free(layer_path);
 
@@ -375,7 +374,7 @@ fn applyLayerBytes(
     const layer_bytes = switch (detectCompression(media_type, layer_blob)) {
         .none => if (layer_blob.len > options.max_layer_size) return error.LayerTooLarge else try allocator.dupe(u8, layer_blob),
         .gzip => try decompressGzip(allocator, layer_blob, options.max_layer_size),
-        .zstd => return error.UnsupportedLayerCompression,
+        .zstd => try decompressZstd(allocator, layer_blob, options.max_layer_size),
     };
     defer allocator.free(layer_bytes);
 
@@ -423,6 +422,16 @@ fn decompressGzip(allocator: Allocator, bytes: []const u8, max_size: usize) Load
     var input = Io.Reader.fixed(bytes);
     var window: [std.compress.flate.max_window_len]u8 = undefined;
     var decompressor: std.compress.flate.Decompress = .init(&input, .gzip, &window);
+    return decompressor.reader.allocRemaining(allocator, .limited(max_size)) catch |err| switch (err) {
+        error.ReadFailed => error.LayerDecompressionFailed,
+        error.StreamTooLong => error.LayerTooLarge,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
+
+fn decompressZstd(allocator: Allocator, bytes: []const u8, max_size: usize) LoadError![]u8 {
+    var input = Io.Reader.fixed(bytes);
+    var decompressor = std.compress.zstd.Decompress.init(&input, &.{}, .{});
     return decompressor.reader.allocRemaining(allocator, .limited(max_size)) catch |err| switch (err) {
         error.ReadFailed => error.LayerDecompressionFailed,
         error.StreamTooLong => error.LayerTooLarge,
@@ -732,32 +741,13 @@ test "load auto-detects OCI layouts and merges gzip layers, whiteouts, and opaqu
     const fixture_root = "test-oci-layout-fixture";
     defer Io.Dir.cwd().deleteTree(io, fixture_root) catch {};
 
-    var fixture = try createFixtureLayout(std.testing.allocator, io, fixture_root);
+    var fixture = try createFixtureLayout(std.testing.allocator, io, fixture_root, .gzip);
     defer fixture.deinit(std.testing.allocator);
 
     var image = try load(io, std.testing.allocator, fixture_root, .{});
     defer image.deinit();
 
-    try std.testing.expectEqualStrings("amd64", image.config.architecture.?);
-    try std.testing.expectEqualStrings("linux", image.config.os.?);
-
-    const hello = image.get("hello.txt").?;
-    try std.testing.expectEqual(EntryKind.file, hello.kind);
-    try std.testing.expectEqualStrings("hello from top\n", hello.content);
-
-    const keep = image.get("etc/keep.txt").?;
-    try std.testing.expectEqualStrings("keep from base\n", keep.content);
-    try std.testing.expect(image.get("etc/remove.txt") == null);
-
-    const opaque_dir = image.get("etc/opaque").?;
-    try std.testing.expectEqual(EntryKind.directory, opaque_dir.kind);
-    try std.testing.expect(image.get("etc/opaque/from-base.txt") == null);
-    const opaque_top = image.get("etc/opaque/from-top.txt").?;
-    try std.testing.expectEqualStrings("top survives\n", opaque_top.content);
-
-    const symlink = image.get("links/config").?;
-    try std.testing.expectEqual(EntryKind.symlink, symlink.kind);
-    try std.testing.expectEqualStrings("../etc/keep.txt", symlink.link_name.?);
+    try expectMergedFixtureImage(image);
 
     var iter = image.iterator();
     var seen: usize = 0;
@@ -778,63 +768,28 @@ test "load auto-detects docker save tarballs and merges whiteouts" {
     try std.testing.expectEqualStrings("amd64", image.config.architecture.?);
     try std.testing.expectEqualStrings("linux", image.config.os.?);
     try std.testing.expect(std.mem.startsWith(u8, image.config.manifest_digest, "sha256:"));
-
-    const hello = image.get("hello.txt").?;
-    try std.testing.expectEqual(EntryKind.file, hello.kind);
-    try std.testing.expectEqualStrings("hello from top\n", hello.content);
-
-    const keep = image.get("etc/keep.txt").?;
-    try std.testing.expectEqualStrings("keep from base\n", keep.content);
-    try std.testing.expect(image.get("etc/remove.txt") == null);
-
-    const opaque_dir = image.get("etc/opaque").?;
-    try std.testing.expectEqual(EntryKind.directory, opaque_dir.kind);
-    try std.testing.expect(image.get("etc/opaque/from-base.txt") == null);
-    const opaque_top = image.get("etc/opaque/from-top.txt").?;
-    try std.testing.expectEqualStrings("top survives\n", opaque_top.content);
-
-    const symlink = image.get("links/config").?;
-    try std.testing.expectEqual(EntryKind.symlink, symlink.kind);
-    try std.testing.expectEqualStrings("../etc/keep.txt", symlink.link_name.?);
+    try expectMergedFixtureImage(image);
 }
 
-test "loadLayout rejects zstd layer media types" {
+test "loadLayout merges zstd-compressed OCI layers" {
     const io = std.testing.io;
     const fixture_root = "test-oci-layout-zstd-fixture";
     defer Io.Dir.cwd().deleteTree(io, fixture_root) catch {};
 
-    var fixture = try createFixtureLayout(std.testing.allocator, io, fixture_root);
+    var fixture = try createFixtureLayout(std.testing.allocator, io, fixture_root, .zstd);
     defer fixture.deinit(std.testing.allocator);
 
-    var dir = try Io.Dir.cwd().openDir(io, fixture_root, .{});
-    defer dir.close(io);
+    var image = try loadLayout(io, std.testing.allocator, fixture_root, .{});
+    defer image.deinit();
 
-    const zstd_manifest_json = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "{{\"schemaVersion\":2,\"config\":{{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\"{s}\",\"size\":{d}}},\"layers\":[{{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+zstd\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
-        .{ fixture.config_digest, fixture.config_json.len, fixture.layer1_digest, fixture.layer1_gzip.len },
-    );
-    defer std.testing.allocator.free(zstd_manifest_json);
-
-    const zstd_manifest_digest = try writeBlobAndDigest(std.testing.allocator, io, dir, zstd_manifest_json);
-    defer std.testing.allocator.free(zstd_manifest_digest);
-
-    const zstd_index_json = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
-        .{ zstd_manifest_digest, zstd_manifest_json.len },
-    );
-    defer std.testing.allocator.free(zstd_index_json);
-    try dir.writeFile(io, .{ .sub_path = "index.json", .data = zstd_index_json });
-
-    try std.testing.expectError(error.UnsupportedLayerCompression, loadLayout(io, std.testing.allocator, fixture_root, .{}));
+    try expectMergedFixtureImage(image);
 }
 
 const FixtureLayout = struct {
     layer1_tar: []u8,
     layer2_tar: []u8,
-    layer1_gzip: []u8,
-    layer2_gzip: []u8,
+    layer1_blob: []u8,
+    layer2_blob: []u8,
     config_digest: []u8,
     layer1_digest: []u8,
     layer2_digest: []u8,
@@ -846,8 +801,8 @@ const FixtureLayout = struct {
     fn deinit(self: *FixtureLayout, allocator: Allocator) void {
         allocator.free(self.layer1_tar);
         allocator.free(self.layer2_tar);
-        allocator.free(self.layer1_gzip);
-        allocator.free(self.layer2_gzip);
+        allocator.free(self.layer1_blob);
+        allocator.free(self.layer2_blob);
         allocator.free(self.config_digest);
         allocator.free(self.layer1_digest);
         allocator.free(self.layer2_digest);
@@ -859,7 +814,9 @@ const FixtureLayout = struct {
     }
 };
 
-fn createFixtureLayout(allocator: Allocator, io: Io, root: []const u8) !FixtureLayout {
+const FixtureCompression = enum { gzip, zstd };
+
+fn createFixtureLayout(allocator: Allocator, io: Io, root: []const u8, compression: FixtureCompression) !FixtureLayout {
     try Io.Dir.cwd().createDirPath(io, root);
     var dir = try Io.Dir.cwd().openDir(io, root, .{});
     defer dir.close(io);
@@ -882,8 +839,8 @@ fn createFixtureLayout(allocator: Allocator, io: Io, root: []const u8) !FixtureL
         .{ .path = "hello.txt", .mode = 0o644, .typeflag = '0', .content = "hello from top\n", .link_name = null },
     });
 
-    const layer1_gzip = try gzipBytes(allocator, layer1_tar);
-    const layer2_gzip = try gzipBytes(allocator, layer2_tar);
+    const layer1_blob = try compressFixtureLayer(allocator, compression, layer1_tar);
+    const layer2_blob = try compressFixtureLayer(allocator, compression, layer2_tar);
     const config_json = try std.fmt.allocPrint(
         allocator,
         "{{\"architecture\":\"amd64\",\"os\":\"linux\",\"rootfs\":{{\"type\":\"layers\",\"diff_ids\":[]}}}}",
@@ -891,13 +848,14 @@ fn createFixtureLayout(allocator: Allocator, io: Io, root: []const u8) !FixtureL
     );
 
     const config_digest = try writeBlobAndDigest(allocator, io, dir, config_json);
-    const layer1_digest = try writeBlobAndDigest(allocator, io, dir, layer1_gzip);
-    const layer2_digest = try writeBlobAndDigest(allocator, io, dir, layer2_gzip);
+    const layer1_digest = try writeBlobAndDigest(allocator, io, dir, layer1_blob);
+    const layer2_digest = try writeBlobAndDigest(allocator, io, dir, layer2_blob);
+    const layer_media_type = fixtureLayerMediaType(compression);
 
     const manifest_json = try std.fmt.allocPrint(
         allocator,
-        "{{\"schemaVersion\":2,\"config\":{{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\"{s}\",\"size\":{d}}},\"layers\":[{{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\",\"digest\":\"{s}\",\"size\":{d}}},{{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
-        .{ config_digest, config_json.len, layer1_digest, layer1_gzip.len, layer2_digest, layer2_gzip.len },
+        "{{\"schemaVersion\":2,\"config\":{{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\"{s}\",\"size\":{d}}},\"layers\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}},{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
+        .{ config_digest, config_json.len, layer_media_type, layer1_digest, layer1_blob.len, layer_media_type, layer2_digest, layer2_blob.len },
     );
     const manifest_digest = try writeBlobAndDigest(allocator, io, dir, manifest_json);
 
@@ -913,8 +871,8 @@ fn createFixtureLayout(allocator: Allocator, io: Io, root: []const u8) !FixtureL
     return .{
         .layer1_tar = layer1_tar,
         .layer2_tar = layer2_tar,
-        .layer1_gzip = layer1_gzip,
-        .layer2_gzip = layer2_gzip,
+        .layer1_blob = layer1_blob,
+        .layer2_blob = layer2_blob,
         .config_digest = config_digest,
         .layer1_digest = layer1_digest,
         .layer2_digest = layer2_digest,
@@ -964,8 +922,7 @@ fn createDockerSaveFixture(allocator: Allocator, io: Io, tarball_path: []const u
             .path = "manifest.json",
             .mode = 0o644,
             .typeflag = '0',
-            .content =
-            "[{\"Config\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json\",\"RepoTags\":[\"example.com/test:latest\"],\"Layers\":[\"1111111111111111111111111111111111111111111111111111111111111111/layer.tar\",\"2222222222222222222222222222222222222222222222222222222222222222/layer.tar\"]}]",
+            .content = "[{\"Config\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json\",\"RepoTags\":[\"example.com/test:latest\"],\"Layers\":[\"1111111111111111111111111111111111111111111111111111111111111111/layer.tar\",\"2222222222222222222222222222222222222222222222222222222222222222/layer.tar\"]}]",
             .link_name = null,
         },
         .{ .path = "repositories", .mode = 0o644, .typeflag = '0', .content = repositories_json, .link_name = null },
@@ -973,6 +930,20 @@ fn createDockerSaveFixture(allocator: Allocator, io: Io, tarball_path: []const u
     defer allocator.free(outer_tar);
 
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = tarball_path, .data = outer_tar });
+}
+
+fn fixtureLayerMediaType(compression: FixtureCompression) []const u8 {
+    return switch (compression) {
+        .gzip => "application/vnd.oci.image.layer.v1.tar+gzip",
+        .zstd => "application/vnd.oci.image.layer.v1.tar+zstd",
+    };
+}
+
+fn compressFixtureLayer(allocator: Allocator, compression: FixtureCompression, data: []const u8) ![]u8 {
+    return switch (compression) {
+        .gzip => gzipBytes(allocator, data),
+        .zstd => zstdBytes(allocator, data),
+    };
 }
 
 fn writeBlobAndDigest(allocator: Allocator, io: Io, dir: Io.Dir, data: []const u8) ![]u8 {
@@ -1037,6 +1008,57 @@ fn gzipBytes(allocator: Allocator, data: []const u8) ![]u8 {
     try compressor.writer.writeAll(data);
     try compressor.finish();
     return out.toOwnedSlice();
+}
+
+fn zstdBytes(allocator: Allocator, data: []const u8) ![]u8 {
+    const encoded_len = std.base64.standard.Encoder.calcSize(data.len);
+    const encoded = try allocator.alloc(u8, encoded_len);
+    defer allocator.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, data);
+
+    const result = try std.process.run(allocator, std.testing.io, .{
+        .argv = &.{
+            "sh",
+            "-c",
+            "printf '%s' \"$1\" | base64 -d | zstd -q -c",
+            "sh",
+            encoded,
+        },
+        .cwd = .{ .path = "." },
+    });
+    defer allocator.free(result.stderr);
+    errdefer allocator.free(result.stdout);
+
+    switch (result.term) {
+        .exited => |code| if (code == 0) return result.stdout,
+        else => {},
+    }
+
+    allocator.free(result.stdout);
+    return error.ExternalCompressionFailed;
+}
+
+fn expectMergedFixtureImage(image: Image) !void {
+    try std.testing.expectEqualStrings("amd64", image.config.architecture.?);
+    try std.testing.expectEqualStrings("linux", image.config.os.?);
+
+    const hello = image.get("hello.txt").?;
+    try std.testing.expectEqual(EntryKind.file, hello.kind);
+    try std.testing.expectEqualStrings("hello from top\n", hello.content);
+
+    const keep = image.get("etc/keep.txt").?;
+    try std.testing.expectEqualStrings("keep from base\n", keep.content);
+    try std.testing.expect(image.get("etc/remove.txt") == null);
+
+    const opaque_dir = image.get("etc/opaque").?;
+    try std.testing.expectEqual(EntryKind.directory, opaque_dir.kind);
+    try std.testing.expect(image.get("etc/opaque/from-base.txt") == null);
+    const opaque_top = image.get("etc/opaque/from-top.txt").?;
+    try std.testing.expectEqualStrings("top survives\n", opaque_top.content);
+
+    const symlink = image.get("links/config").?;
+    try std.testing.expectEqual(EntryKind.symlink, symlink.kind);
+    try std.testing.expectEqualStrings("../etc/keep.txt", symlink.link_name.?);
 }
 
 fn writeOctalField(field: []u8, value: u64) !void {
