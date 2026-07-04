@@ -27,6 +27,8 @@ zvmi/
                               #   (spec + QEMU-verified)
         vhdx.zig              # VHDX **read-only** codec (header, region
                               #   table, metadata, BAT -- QEMU-verified)
+        ext4.zig              # minimal native ext4 writer + readback helper
+                              #   (no journal, linear dirs, inline extents)
         guid.zig               # mixed-endian GUID encoding + well-known
                               #   partition type GUIDs (ESP, Linux data)
         mbr.zig                # MBR partition table codec (protective +
@@ -63,10 +65,11 @@ zig build test       # run all tests
 zig build run -- <args>   # run the CLI, e.g. `zig build run -- info foo.vhd`
 ```
 
-## Status (Milestone 4)
+## Status (Milestone 5)
 
 Supports `raw`, fixed `vhd`, dynamic `vhd`, MBR/GPT partition tables, an
-Azure-readiness check, and **read-only** `vhdx`:
+Azure-readiness check, **read-only** `vhdx`, and a minimal native ext4
+writer/readback library API:
 
 ```
 zvmi create -f vhd disk.vhd 32M                          # dynamic by default (matches qemu-img)
@@ -100,6 +103,26 @@ correctness was verified against QEMU's own `block/vhdx.c`/`vhdx.h` (struct
 layout, CRC-32C checksums, and the BAT chunk-ratio interleaving formula) plus
 a hand-built synthetic fixture exercised through the full `Image` API in
 `packages/zvmi/src/image.zig`'s test suite.
+
+Phase-1 ext4 lives at `zvmi.ext4`. The writer entry point is:
+
+```zig
+try zvmi.ext4.populate(io, file, allocator, &tree, .{
+    .offset = 0,
+    .length = fs_bytes,
+    .block_size = 4096,
+    .label = "rootfs",
+});
+```
+
+`tree` is a small vtable-style `FileTreeView` owned by `ext4.zig`: each
+`next()` yields a relative path plus `{ kind, mode, uid, gid, size }` and an
+optional `content.readAt(buffer, offset)` callback for regular files and
+symlinks. Paths are relative to the ext4 root; the root directory itself is
+implicit. The phase-1 writer emits no journal, no dir_index/htree, and no
+metadata checksums; it writes linear directory blocks plus inline extents in
+each inode. The paired reader API can `statPath`, `listDir`, `preadPath`,
+`readExtents`, and `readLinkAlloc` for round-trip verification.
 
 qcow2 and the `zvmi build-image` Azure Linux + container workflow are future
 milestones.
