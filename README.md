@@ -55,8 +55,8 @@ zvmi/
                               #   (CRC-32, spec-verified layout)
         azure.zig              # 1 MiB alignment + Gen1/Gen2 partition-style
                               #   checks (backs `zvmi azure fixup`)
-        tar.zig                # minimal private USTAR reader for OCI layers
-        tar_writer.zig         # minimal private USTAR writer for COSI packaging
+        tar.zig                # minimal private USTAR reader/writer shared by
+                              #   OCI layer ingestion and COSI packaging
         zstd.zig               # minimal private raw-block zstd codec for COSI
         cosi.zig               # COSI writer (tar + metadata.json + raw.zst parts)
         build_image.zig        # ISO + OCI -> raw/fixed-VHD orchestration

@@ -20,7 +20,7 @@ const ext4 = @import("ext4.zig");
 const guid = @import("guid.zig");
 const gpt = @import("gpt.zig");
 const image_mod = @import("image.zig");
-const tar = @import("tar_writer.zig");
+const tar = @import("tar.zig");
 const zstd = @import("zstd.zig");
 
 const Image = image_mod.Image;
