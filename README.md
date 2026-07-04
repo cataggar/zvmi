@@ -164,15 +164,19 @@ metadata checksums; it writes linear directory blocks plus inline extents in
 each inode. The paired reader API can `statPath`, `listDir`, `preadPath`,
 `readExtents`, and `readLinkAlloc` for round-trip verification.
 
-ESP bootloader population lives at `zvmi.bootconfig`. It reuses the exact same
-`FileTreeView` shape as `zvmi.ext4`, so future orchestration can drive both
-rootfs population and ESP population from one merged source-tree interface.
-Callers pass the planned GPT partitions plus their unique GUIDs, then
-`populateEsp()` copies discovered `EFI/.../*.efi` binaries into a FAT32 ESP
-and, depending on `boot_mode`, generates the existing shim/GRUB/BLS text files,
-named `EFI/Linux/*.efi` UKIs, or both. The same pass also copies shim/MOK
-auxiliary assets such as `mm*.efi`, `MokManager`, and enrollment/config files
-that already exist in the source tree.
+Bootloader population lives at `zvmi.bootconfig`. It reuses the exact same
+`FileTreeView` shape as `zvmi.ext4`, so future orchestration can drive rootfs
+population plus either ESP/UEFI or BIOS/MBR boot installation from one merged
+source-tree interface. For Gen2/GPT callers pass the planned GPT partitions
+plus their unique GUIDs, then `populateEsp()` copies discovered
+`EFI/.../*.efi` binaries into a FAT32 ESP and, depending on `boot_mode`,
+generates the existing shim/GRUB/BLS text files, named `EFI/Linux/*.efi`
+UKIs, or both. The same pass also copies shim/MOK auxiliary assets such as
+`mm*.efi`, `MokManager`, and enrollment/config files that already exist in the
+source tree. For Gen1/MBR, `installBiosBoot()` discovers prebuilt
+`boot/grub2/i386-pc/boot.img` + `core.img` assets (or equivalent common
+locations) and embeds them into the post-MBR gap ahead of the first 1 MiB
+aligned root partition while preserving the existing MBR partition table.
 
 ```zig
 try zvmi.bootconfig.populateEsp(allocator, io, &esp_fs, &tree, .{
@@ -193,9 +197,9 @@ with `.linux`, `.initrd`, `.cmdline`, `.osrel`, `.uname`, and optional
 
 `zvmi build-image` currently writes `raw` and fixed `vhd` outputs. `vhdx` and
 `qcow2` remain read-only source formats for now, so build-image output support
-for them is deferred until write/create support lands separately. The Gen2
-path is the fully wired Azure-ready target today; Gen1 currently produces a
-plain-MBR/rootfs image but does not yet install a BIOS boot sector.
+for them is deferred until write/create support lands separately. Both Gen2
+(UEFI/protective-MBR+GPT+ESP) and Gen1 (BIOS/plain-MBR with GRUB embedded into
+the post-MBR gap) are now fully wired in `zvmi build-image`.
 
 ## Notes on Zig 0.16
 
