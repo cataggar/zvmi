@@ -17,13 +17,14 @@
 //!     sparse-super rule, and metadata-bearing structures are checksummed with
 //!     crc32c.
 //!
-//! Deliberate phase-2 non-goals: no journal replay/log writing, no quota
-//! files, and no multi-level extent trees. Extents are still encoded inline in
-//! the inode's `i_block` area, so files/directories that would need more than
-//! four extents return `error.TooManyExtents`. Resizing is supported as an
-//! offline, in-place grow operation that rewrites the superblock/GDTs and
-//! initializes new block groups without enabling ext4's separate
-//! `RESIZE_INODE` online-resize scaffolding.
+//! Deliberate phase-2 non-goals: no journal replay/log writing and no quota
+//! files. Extents stay inline for small files, but larger fragmented files now
+//! spill into standard ext4 extent/index blocks with recursive readback
+//! support. With 4 KiB blocks this writer supports extent-tree depths up to 4,
+//! which is enough to cover the filesystem's 32-bit logical-block space.
+//! Resizing is supported as an offline, in-place grow operation that rewrites
+//! the superblock/GDTs and initializes new block groups without enabling
+//! ext4's separate `RESIZE_INODE` online-resize scaffolding.
 
 const std = @import("std");
 const Io = std.Io;
@@ -36,10 +37,13 @@ pub const first_non_reserved_inode: u32 = 11;
 const inode_size: u16 = 128;
 const group_desc_size: u16 = 32;
 const max_inline_extents: usize = 4;
+const max_supported_extent_depth: u16 = 4;
 const superblock_size: usize = 1024;
 const superblock_offset: u64 = 1024;
 const dir_entry_alignment: usize = 4;
 const sectors_per_block: u32 = default_block_size / 512;
+const extent_header_size: usize = 12;
+const extent_entry_size: usize = 12;
 
 const super_magic: u16 = 0xEF53;
 const state_clean: u16 = 0x0001;
@@ -288,12 +292,35 @@ const Node = struct {
     xattr_block_bytes: ?[]u8 = null,
     size_on_disk: u64 = 0,
     data_block_count: u32 = 0,
-    extents: [max_inline_extents]Extent = undefined,
-    extent_count: usize = 0,
+    extents: []Extent = &.{},
+    extent_root: [60]u8 = [_]u8{0} ** 60,
+    extent_tree_blocks: []ExtentTreeBlock = &.{},
     xattr_block: ?u64 = null,
     link_count: u16 = 1,
     uses_fast_symlink: bool = false,
     uses_hashed_directory: bool = false,
+};
+
+const ExtentHeader = struct {
+    entries: u16,
+    max: u16,
+    depth: u16,
+    generation: u32,
+};
+
+const ExtentIndex = struct {
+    logical_block: u32,
+    leaf_block: u64,
+};
+
+const ExtentTreeBlock = struct {
+    block_number: u64,
+    bytes: [default_block_size]u8 = [_]u8{0} ** default_block_size,
+};
+
+const ExtentNodeRef = struct {
+    logical_block: u32,
+    block_number: u64,
 };
 
 const Layout = struct {
@@ -331,6 +358,8 @@ const WriterPlan = struct {
         for (self.nodes) |node| {
             if (node.dir_bytes) |bytes| allocator.free(bytes);
             if (node.xattr_block_bytes) |bytes| allocator.free(bytes);
+            if (node.extents.len > 0) allocator.free(node.extents);
+            if (node.extent_tree_blocks.len > 0) allocator.free(node.extent_tree_blocks);
             for (node.xattrs) |xattr| {
                 allocator.free(xattr.name);
                 allocator.free(xattr.value);
@@ -375,7 +404,7 @@ pub fn populate(
     const free_blocks_before = countFreeBlocks(layout.groups);
     if (plan.data_blocks_needed > free_blocks_before) return error.NotEnoughSpace;
 
-    try allocateNodeBlocks(plan.nodes, &layout);
+    try allocateNodeBlocks(allocator, plan.nodes, &layout);
     try writeNodeData(io, file, plan.nodes, options);
     try zeroUnusedInodeTableBlocks(io, file, layout, options.offset);
     try writeBitmaps(io, file, layout, options.offset);
@@ -685,7 +714,7 @@ pub const Reader = struct {
         if (inode.kind == .symlink and inode.isFastSymlink()) {
             return allocator.alloc(Extent, 0);
         }
-        return inode.readExtentsAlloc(allocator);
+        return self.readInodeExtentsAlloc(io, allocator, inode);
     }
 
     pub fn readXattrsAlloc(self: Reader, io: Io, allocator: std.mem.Allocator, path: []const u8) ReadError![]OwnedXattr {
@@ -754,7 +783,8 @@ pub const Reader = struct {
             return want;
         }
 
-        const extents = try inode.readExtents();
+        const extents = try self.readInodeExtentsAlloc(io, self.allocator, inode);
+        defer self.allocator.free(extents);
         var done: usize = 0;
         var remaining = want;
         var logical_offset = offset;
@@ -782,9 +812,11 @@ pub const Reader = struct {
             return data;
         }
 
+        const extents = try self.readInodeExtentsAlloc(io, allocator, inode);
+        defer allocator.free(extents);
         var offset: usize = 0;
         while (offset < data.len) {
-            offset += try self.preadInode(io, inode, data[offset..], offset);
+            offset += try self.preadInodeWithExtents(io, inode, extents, data[offset..], offset);
         }
         return data;
     }
@@ -839,6 +871,82 @@ pub const Reader = struct {
 
     fn blockOffset(self: Reader, block_number: u64) u64 {
         return self.offset + block_number * self.block_size;
+    }
+
+    fn readInodeExtentsAlloc(self: Reader, io: Io, allocator: std.mem.Allocator, inode: ParsedInode) ReadError![]Extent {
+        if ((inode.flags & inode_flag_extents) == 0) return error.UnsupportedInodeLayout;
+
+        var extents = std.array_list.Managed(Extent).init(allocator);
+        errdefer extents.deinit();
+        try self.appendExtentTreeEntries(io, &extents, inode.block_bytes[0..], max_inline_extents, null);
+        return extents.toOwnedSlice();
+    }
+
+    fn appendExtentTreeEntries(
+        self: Reader,
+        io: Io,
+        extents: *std.array_list.Managed(Extent),
+        node_bytes: []const u8,
+        node_capacity: usize,
+        expected_depth: ?u16,
+    ) ReadError!void {
+        const header = try parseExtentHeader(node_bytes[0..extent_header_size]);
+        if (expected_depth) |depth| {
+            if (header.depth != depth) return error.UnsupportedInodeLayout;
+        }
+        if (header.depth > max_supported_extent_depth) return error.UnsupportedExtentDepth;
+        if (header.entries > header.max or header.max > node_capacity) return error.UnsupportedInodeLayout;
+
+        var entry_index: usize = 0;
+        if (header.depth == 0) {
+            while (entry_index < header.entries) : (entry_index += 1) {
+                const base = extent_header_size + entry_index * extent_entry_size;
+                try extents.append(decodeExtent(node_bytes[base .. base + extent_entry_size]));
+            }
+            return;
+        }
+
+        var child_block: [default_block_size]u8 = undefined;
+        while (entry_index < header.entries) : (entry_index += 1) {
+            const base = extent_header_size + entry_index * extent_entry_size;
+            const child = decodeExtentIndex(node_bytes[base .. base + extent_entry_size]);
+            _ = try self.file.readPositionalAll(io, &child_block, self.blockOffset(child.leaf_block));
+            try self.appendExtentTreeEntries(
+                io,
+                extents,
+                child_block[0..],
+                extentEntriesPerBlock(self.block_size),
+                header.depth - 1,
+            );
+        }
+    }
+
+    fn preadInodeWithExtents(
+        self: Reader,
+        io: Io,
+        inode: ParsedInode,
+        extents: []const Extent,
+        buffer: []u8,
+        offset: u64,
+    ) ReadError!usize {
+        if (offset >= inode.size) return 0;
+        const max_len = std.math.cast(usize, inode.size - offset) orelse return error.FileTooLarge;
+        const want = @min(buffer.len, max_len);
+
+        var done: usize = 0;
+        var remaining = want;
+        var logical_offset = offset;
+        while (remaining > 0) {
+            const logical_block: u32 = @intCast(logical_offset / self.block_size);
+            const within_block: usize = @intCast(logical_offset % self.block_size);
+            const physical_block = findPhysicalBlock(extents, logical_block) orelse return error.UnsupportedInodeLayout;
+            const chunk = @min(remaining, @as(usize, self.block_size) - within_block);
+            _ = try self.file.readPositionalAll(io, buffer[done .. done + chunk], self.blockOffset(physical_block) + within_block);
+            done += chunk;
+            remaining -= chunk;
+            logical_offset += chunk;
+        }
+        return done;
     }
 };
 
@@ -898,44 +1006,6 @@ const ParsedInode = struct {
         return self.kind == .symlink and self.size <= 60 and (self.flags & inode_flag_extents) == 0;
     }
 
-    fn readExtents(self: ParsedInode) ReadError![max_inline_extents]ExtentWithCount {
-        if ((self.flags & inode_flag_extents) == 0) return error.UnsupportedInodeLayout;
-        const header = self.block_bytes[0..12];
-        if (readInt(u16, header[0..2]) != extent_magic) return error.UnsupportedInodeLayout;
-        const entries = readInt(u16, header[2..4]);
-        const depth = readInt(u16, header[6..8]);
-        if (depth != 0) return error.UnsupportedExtentDepth;
-        if (entries > max_inline_extents) return error.UnsupportedInodeLayout;
-
-        var out: [max_inline_extents]ExtentWithCount = undefined;
-        var index: usize = 0;
-        while (index < entries) : (index += 1) {
-            const base = 12 + index * 12;
-            const block = readInt(u32, self.block_bytes[base .. base + 4]);
-            const len = readInt(u16, self.block_bytes[base + 4 .. base + 6]);
-            const start_hi = readInt(u16, self.block_bytes[base + 6 .. base + 8]);
-            const start_lo = readInt(u32, self.block_bytes[base + 8 .. base + 12]);
-            out[index] = .{ .extent = .{ .logical_block = block, .start_block = (@as(u64, start_hi) << 32) | start_lo, .block_count = len }, .count = entries };
-        }
-        while (index < max_inline_extents) : (index += 1) {
-            out[index] = .{ .extent = .{ .logical_block = 0, .start_block = 0, .block_count = 0 }, .count = entries };
-        }
-        return out;
-    }
-
-    fn readExtentsAlloc(self: ParsedInode, allocator: std.mem.Allocator) ReadError![]Extent {
-        const decoded = try self.readExtents();
-        const count = decoded[0].count;
-        const extents = try allocator.alloc(Extent, count);
-        var index: usize = 0;
-        while (index < count) : (index += 1) extents[index] = decoded[index].extent;
-        return extents;
-    }
-};
-
-const ExtentWithCount = struct {
-    extent: Extent,
-    count: usize,
 };
 
 fn buildPlan(allocator: std.mem.Allocator, tree: *FileTreeView, options: PopulateOptions) PopulateError!WriterPlan {
@@ -1153,13 +1223,16 @@ fn assignInodesToGroups(nodes: []Node, groups: []GroupLayout, inodes_per_group: 
     groups[0].used_inode_count += first_non_reserved_inode - 2;
 }
 
-fn allocateNodeBlocks(nodes: []Node, layout: *Layout) PopulateError!void {
+fn allocateNodeBlocks(allocator: std.mem.Allocator, nodes: []Node, layout: *Layout) PopulateError!void {
     var allocator_state = BlockAllocator{ .groups = layout.groups };
     for (nodes) |*node| {
         if (node.data_block_count == 0) {
-            node.extent_count = 0;
+            node.extents = &.{};
         } else {
-            node.extent_count = try allocator_state.allocate(node.data_block_count, &node.extents);
+            node.extents = try allocator_state.allocate(allocator, node.data_block_count);
+        }
+        if (!node.uses_fast_symlink) {
+            try allocateExtentTreeBlocks(allocator, &allocator_state, node, default_block_size);
         }
         if (node.xattr_block_bytes != null) {
             node.xattr_block = try allocator_state.allocateSingle();
@@ -1171,10 +1244,11 @@ const BlockAllocator = struct {
     groups: []GroupLayout,
     current_group: usize = 0,
 
-    fn allocate(self: *BlockAllocator, block_count: u32, extents: *[max_inline_extents]Extent) PopulateError!usize {
+    fn allocate(self: *BlockAllocator, allocator: std.mem.Allocator, block_count: u32) PopulateError![]Extent {
+        var extents = std.array_list.Managed(Extent).init(allocator);
+        errdefer extents.deinit();
         var remaining = block_count;
         var logical: u32 = 0;
-        var count: usize = 0;
         while (remaining > 0) {
             while (self.current_group < self.groups.len and self.groups[self.current_group].used_data_blocks == self.groups[self.current_group].data_capacity) {
                 self.current_group += 1;
@@ -1184,18 +1258,16 @@ const BlockAllocator = struct {
             var group = &self.groups[self.current_group];
             const available = group.data_capacity - group.used_data_blocks;
             const take = @min(remaining, available);
-            if (count >= max_inline_extents) return error.TooManyExtents;
-            extents[count] = .{
+            try extents.append(.{
                 .logical_block = logical,
                 .start_block = group.data_start_block + group.used_data_blocks,
                 .block_count = @intCast(take),
-            };
+            });
             group.used_data_blocks += take;
             logical += take;
             remaining -= take;
-            count += 1;
         }
-        return count;
+        return extents.toOwnedSlice();
     }
 
     fn allocateSingle(self: *BlockAllocator) PopulateError!u64 {
@@ -1231,7 +1303,7 @@ fn writeNodeData(io: Io, file: Io.File, nodes: []Node, options: PopulateOptions)
                     }
                 }
                 var extent_index: usize = 0;
-                while (extent_index < node.extent_count) : (extent_index += 1) {
+                while (extent_index < node.extents.len) : (extent_index += 1) {
                     const extent = node.extents[extent_index];
                     const byte_len = @as(usize, extent.block_count) * options.block_size;
                     const file_off = options.offset + extent.start_block * options.block_size;
@@ -1244,7 +1316,7 @@ fn writeNodeData(io: Io, file: Io.File, nodes: []Node, options: PopulateOptions)
                 const content = node.content orelse return error.MissingContentReader;
                 var written_data: u64 = 0;
                 var extent_index: usize = 0;
-                while (extent_index < node.extent_count) : (extent_index += 1) {
+                while (extent_index < node.extents.len) : (extent_index += 1) {
                     const extent = node.extents[extent_index];
                     var block_index: u16 = 0;
                     while (block_index < extent.block_count) : (block_index += 1) {
@@ -1263,6 +1335,9 @@ fn writeNodeData(io: Io, file: Io.File, nodes: []Node, options: PopulateOptions)
                     }
                 }
             },
+        }
+        for (node.extent_tree_blocks) |block| {
+            try file.writePositionalAll(io, &block.bytes, options.offset + block.block_number * options.block_size);
         }
         if (node.xattr_block_bytes) |xattr_block| {
             const block_number = node.xattr_block orelse unreachable;
@@ -1343,7 +1418,7 @@ fn writeInodes(io: Io, file: Io.File, nodes: []Node, layout: Layout, options: Po
                 if (got != want) return error.UnexpectedContentLength;
             }
         } else {
-            encodeExtents(buf[40..100], node.extents[0..node.extent_count]);
+            @memcpy(buf[40..100], &node.extent_root);
         }
 
         writeInt(u32, buf[104..108], @truncate(node.xattr_block orelse 0));
@@ -1751,20 +1826,126 @@ fn inodeMode(node: Node) u16 {
     return kindToModeBits(node.kind) | (node.mode & 0x0FFF);
 }
 
-fn encodeExtents(buf: []u8, extents: []const Extent) void {
+fn encodeExtentHeader(buf: []u8, entries: usize, max_entries: usize, depth: u16) void {
     @memset(buf, 0);
     writeInt(u16, buf[0..2], extent_magic);
-    writeInt(u16, buf[2..4], @intCast(extents.len));
-    writeInt(u16, buf[4..6], max_inline_extents);
-    writeInt(u16, buf[6..8], 0);
+    writeInt(u16, buf[2..4], @intCast(entries));
+    writeInt(u16, buf[4..6], @intCast(max_entries));
+    writeInt(u16, buf[6..8], depth);
     writeInt(u32, buf[8..12], 0);
+}
+
+fn encodeExtentLeafNode(buf: []u8, max_entries: usize, extents: []const Extent) void {
+    encodeExtentHeader(buf, extents.len, max_entries, 0);
     for (extents, 0..) |extent, index| {
-        const base = 12 + index * 12;
+        const base = extent_header_size + index * extent_entry_size;
         writeInt(u32, buf[base .. base + 4], extent.logical_block);
         writeInt(u16, buf[base + 4 .. base + 6], extent.block_count);
         writeInt(u16, buf[base + 6 .. base + 8], @as(u16, @truncate(extent.start_block >> 32)));
         writeInt(u32, buf[base + 8 .. base + 12], @as(u32, @truncate(extent.start_block)));
     }
+}
+
+fn encodeExtentIndexNode(buf: []u8, max_entries: usize, depth: u16, children: []const ExtentNodeRef) void {
+    encodeExtentHeader(buf, children.len, max_entries, depth);
+    for (children, 0..) |child, index| {
+        const base = extent_header_size + index * extent_entry_size;
+        writeInt(u32, buf[base .. base + 4], child.logical_block);
+        writeInt(u32, buf[base + 4 .. base + 8], @as(u32, @truncate(child.block_number)));
+        writeInt(u16, buf[base + 8 .. base + 10], @as(u16, @truncate(child.block_number >> 32)));
+        writeInt(u16, buf[base + 10 .. base + 12], 0);
+    }
+}
+
+fn extentEntriesPerBlock(block_size: u32) usize {
+    return (block_size - extent_header_size) / extent_entry_size;
+}
+
+fn extentTreeShape(extent_count: usize, block_size: u32) PopulateError!struct { depth: u16, block_count: usize } {
+    if (extent_count <= max_inline_extents) return .{ .depth = 0, .block_count = 0 };
+
+    const block_capacity = extentEntriesPerBlock(block_size);
+    var depth: u16 = 1;
+    var nodes_at_level = divCeil(extent_count, block_capacity);
+    var total_blocks = nodes_at_level;
+    while (nodes_at_level > max_inline_extents) {
+        if (depth == max_supported_extent_depth) return error.TooManyExtents;
+        nodes_at_level = divCeil(nodes_at_level, block_capacity);
+        total_blocks += nodes_at_level;
+        depth += 1;
+    }
+    return .{ .depth = depth, .block_count = total_blocks };
+}
+
+fn allocateExtentTreeBlocks(
+    allocator: std.mem.Allocator,
+    block_allocator: *BlockAllocator,
+    node: *Node,
+    block_size: u32,
+) PopulateError!void {
+    const shape = try extentTreeShape(node.extents.len, block_size);
+    if (shape.block_count > 0) {
+        node.extent_tree_blocks = try allocator.alloc(ExtentTreeBlock, shape.block_count);
+        errdefer allocator.free(node.extent_tree_blocks);
+        for (node.extent_tree_blocks) |*block| {
+            block.* = .{ .block_number = try block_allocator.allocateSingle() };
+        }
+    } else {
+        node.extent_tree_blocks = &.{};
+    }
+    try buildExtentTree(allocator, node, block_size, shape.depth);
+}
+
+fn buildExtentTree(allocator: std.mem.Allocator, node: *Node, block_size: u32, depth: u16) PopulateError!void {
+    if (depth == 0) {
+        encodeExtentLeafNode(node.extent_root[0..], max_inline_extents, node.extents);
+        return;
+    }
+
+    const block_capacity = extentEntriesPerBlock(block_size);
+    const leaf_count = divCeil(node.extents.len, block_capacity);
+    var current = try allocator.alloc(ExtentNodeRef, leaf_count);
+    defer allocator.free(current);
+
+    var block_cursor: usize = 0;
+    var leaf_index: usize = 0;
+    while (leaf_index < leaf_count) : (leaf_index += 1) {
+        const start = leaf_index * block_capacity;
+        const end = @min(start + block_capacity, node.extents.len);
+        encodeExtentLeafNode(node.extent_tree_blocks[block_cursor].bytes[0..], block_capacity, node.extents[start..end]);
+        current[leaf_index] = .{
+            .logical_block = node.extents[start].logical_block,
+            .block_number = node.extent_tree_blocks[block_cursor].block_number,
+        };
+        block_cursor += 1;
+    }
+
+    var child_depth: u16 = 0;
+    while (current.len > max_inline_extents) {
+        const next_count = divCeil(current.len, block_capacity);
+        const next = try allocator.alloc(ExtentNodeRef, next_count);
+        var parent_index: usize = 0;
+        while (parent_index < next_count) : (parent_index += 1) {
+            const start = parent_index * block_capacity;
+            const end = @min(start + block_capacity, current.len);
+            encodeExtentIndexNode(
+                node.extent_tree_blocks[block_cursor].bytes[0..],
+                block_capacity,
+                child_depth + 1,
+                current[start..end],
+            );
+            next[parent_index] = .{
+                .logical_block = current[start].logical_block,
+                .block_number = node.extent_tree_blocks[block_cursor].block_number,
+            };
+            block_cursor += 1;
+        }
+        allocator.free(current);
+        current = next;
+        child_depth += 1;
+    }
+
+    encodeExtentIndexNode(node.extent_root[0..], max_inline_extents, child_depth + 1, current);
 }
 
 fn encodeLabel(label: []const u8) [16]u8 {
@@ -1806,11 +1987,37 @@ fn modeToKind(mode: u16) ?Kind {
     };
 }
 
-fn findPhysicalBlock(extents: [max_inline_extents]ExtentWithCount, logical_block: u32) ?u64 {
-    const count = extents[0].count;
-    var index: usize = 0;
-    while (index < count) : (index += 1) {
-        const extent = extents[index].extent;
+fn parseExtentHeader(buf: []const u8) ReadError!ExtentHeader {
+    if (readInt(u16, buf[0..2]) != extent_magic) return error.UnsupportedInodeLayout;
+    return .{
+        .entries = readInt(u16, buf[2..4]),
+        .max = readInt(u16, buf[4..6]),
+        .depth = readInt(u16, buf[6..8]),
+        .generation = readInt(u32, buf[8..12]),
+    };
+}
+
+fn decodeExtent(buf: []const u8) Extent {
+    const start_hi = readInt(u16, buf[6..8]);
+    const start_lo = readInt(u32, buf[8..12]);
+    return .{
+        .logical_block = readInt(u32, buf[0..4]),
+        .start_block = (@as(u64, start_hi) << 32) | start_lo,
+        .block_count = readInt(u16, buf[4..6]),
+    };
+}
+
+fn decodeExtentIndex(buf: []const u8) ExtentIndex {
+    const leaf_lo = readInt(u32, buf[4..8]);
+    const leaf_hi = readInt(u16, buf[8..10]);
+    return .{
+        .logical_block = readInt(u32, buf[0..4]),
+        .leaf_block = (@as(u64, leaf_hi) << 32) | leaf_lo,
+    };
+}
+
+fn findPhysicalBlock(extents: []const Extent, logical_block: u32) ?u64 {
+    for (extents) |extent| {
         if (logical_block >= extent.logical_block and logical_block < extent.logical_block + extent.block_count) {
             return extent.start_block + (logical_block - extent.logical_block);
         }
@@ -2487,7 +2694,7 @@ test "large directories use htree indexing" {
 
     const dir_inode = try reader.readInode(io, try reader.lookupPath(io, "big"));
     try std.testing.expect(dir_inode.flags & inode_flag_index != 0);
-    const extents = try dir_inode.readExtentsAlloc(std.testing.allocator);
+    const extents = try reader.readInodeExtentsAlloc(io, std.testing.allocator, dir_inode);
     defer std.testing.allocator.free(extents);
     try std.testing.expect(extents.len >= 1);
 
@@ -2696,7 +2903,7 @@ fn expectMetadataChecksumsValid(io: Io, file: Io.File, offset: u64, file_path: [
 
     const dir_inode_number = try reader.lookupPath(io, dir_path);
     const dir_inode = try reader.readInode(io, dir_inode_number);
-    const dir_extents = try dir_inode.readExtentsAlloc(std.testing.allocator);
+    const dir_extents = try reader.readInodeExtentsAlloc(io, std.testing.allocator, dir_inode);
     defer std.testing.allocator.free(dir_extents);
     var dir_block: [default_block_size]u8 = undefined;
     _ = try file.readPositionalAll(io, &dir_block, offset + dir_extents[0].start_block * default_block_size);
