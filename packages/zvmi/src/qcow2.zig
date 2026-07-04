@@ -2131,6 +2131,29 @@ test "createSnapshot preserves pre-write active state" {
     try check(file, io, reopened);
 }
 
+test "openSnapshot views remain read-only for writes" {
+    const io = std.testing.io;
+    const path = "test-qcow2-snapshot-write-reject.qcow2";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+
+    var info = try create(io, file, 2 * (1 << default_cluster_bits));
+    try pwrite(file, io, &info, "SNAPSHOT-OLD", 0);
+    try createSnapshot(file, io, &info, .{ .id = "snap-1", .name = "first snapshot" });
+
+    const reopened = try open(io, file);
+    const snapshots = try listSnapshots(file, io, reopened, std.testing.allocator);
+    defer {
+        for (snapshots) |*snapshot| snapshot.deinit(std.testing.allocator);
+        std.testing.allocator.free(snapshots);
+    }
+
+    var snapshot_info = openSnapshot(reopened, snapshots[0]);
+    try std.testing.expectError(error.SnapshotViewNotWritable, pwrite(file, io, &snapshot_info, "NEW", 0));
+}
+
 test "openAtPath reads qcow2 external data files" {
     const io = std.testing.io;
     const meta_path = "test-qcow2-external-data.qcow2";
