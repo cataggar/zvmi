@@ -1497,6 +1497,32 @@ test "populate respects non-zero partition-relative offsets" {
     try std.testing.expectEqualSlices(u8, "NAME=zvmi", contents);
 }
 
+test "populate round-trips empty regular files" {
+    const io = std.testing.io;
+    const path = "test-ext4-empty.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "empty", .kind = .file, .mode = 0o640, .uid = 7, .gid = 8, .size = 0 },
+    });
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = 8 * 1024 * 1024 });
+
+    var reader = try open(io, file, std.testing.allocator, .{});
+    defer reader.deinit();
+    const stat = try reader.statPath(io, "empty");
+    try std.testing.expectEqual(Kind.file, stat.kind);
+    try std.testing.expectEqual(@as(u16, 0o640), stat.mode);
+    try std.testing.expectEqual(@as(u64, 0), stat.size);
+
+    const contents = try reader.readFileAlloc(io, std.testing.allocator, "empty");
+    defer std.testing.allocator.free(contents);
+    try std.testing.expectEqual(@as(usize, 0), contents.len);
+}
+
 const InMemoryEntry = struct {
     path: []const u8,
     kind: Kind,
