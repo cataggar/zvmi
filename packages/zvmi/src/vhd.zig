@@ -13,6 +13,7 @@
 const std = @import("std");
 
 pub const footer_size: usize = 512;
+pub const sector_size: u64 = 512;
 
 pub const cookie_conectix: [8]u8 = "conectix".*;
 
@@ -43,6 +44,18 @@ pub const Geometry = struct {
         return @as(u64, self.cylinders) * self.heads * self.sectors_per_track;
     }
 };
+
+const SizeCalcType = enum {
+    current_size,
+    chs_geometry,
+};
+
+fn sizeCalcTypeForCreatorApplication(creator_application: [4]u8) SizeCalcType {
+    if (std.mem.eql(u8, &creator_application, "vpc ")) return .chs_geometry;
+    if (std.mem.eql(u8, &creator_application, "vs  ")) return .chs_geometry;
+    if (std.mem.eql(u8, &creator_application, "qemu")) return .chs_geometry;
+    return .current_size;
+}
 
 const max_chs_cylinders: u64 = 65535;
 const max_chs_heads: u64 = 16;
@@ -133,6 +146,19 @@ pub const Footer = struct {
             .geometry = calculateGeometry(total_sectors),
             .disk_type = .dynamic,
             .unique_id = unique_id,
+        };
+    }
+
+    /// Imported VHDs historically disagree on which footer field defines the
+    /// virtual size. Old Virtual PC (`vpc ` / `vs  `) and legacy QEMU (`qemu`)
+    /// readers treat CHS Disk Geometry as authoritative, while newer writers
+    /// (including `zvmi` and QEMU's `qem2`) rely on `current_size`. Preserve
+    /// that quirk on read so third-party images report the same size as the
+    /// tool that created them.
+    pub fn virtualSize(self: Footer) u64 {
+        return switch (sizeCalcTypeForCreatorApplication(self.creator_application)) {
+            .current_size => self.current_size,
+            .chs_geometry => self.geometry.totalSectors() * sector_size,
         };
     }
 
@@ -418,6 +444,40 @@ test "Footer.decode rejects corrupted checksum" {
     var encoded = footer.encode();
     encoded[100] ^= 0xFF; // corrupt a reserved byte
     try std.testing.expectError(error.BadChecksum, Footer.decode(&encoded));
+}
+
+test "Footer.virtualSize uses CHS geometry for legacy qemu creator app" {
+    var footer = Footer.forFixedDisk(4 * 1024 * 1024, [_]u8{3} ** 16, timestamp_base);
+    footer.creator_application = "qemu".*;
+    footer.current_size = 8 * 1024 * 1024;
+    footer.geometry = .{
+        .cylinders = 10,
+        .heads = 4,
+        .sectors_per_track = 17,
+    };
+
+    const fixture = footer.encode();
+    const decoded = try Footer.decode(&fixture);
+
+    try std.testing.expectEqual(@as(u64, 10 * 4 * 17) * sector_size, decoded.virtualSize());
+    try std.testing.expectEqual(@as(u64, 8 * 1024 * 1024), decoded.current_size);
+}
+
+test "Footer.virtualSize defaults to current_size for unknown creator app" {
+    var footer = Footer.forFixedDisk(4 * 1024 * 1024, [_]u8{4} ** 16, timestamp_base);
+    footer.creator_application = .{ 0, 0, 0, 0 };
+    footer.current_size = 8 * 1024 * 1024;
+    footer.geometry = .{
+        .cylinders = 10,
+        .heads = 4,
+        .sectors_per_track = 17,
+    };
+
+    const fixture = footer.encode();
+    const decoded = try Footer.decode(&fixture);
+
+    try std.testing.expectEqual(@as(u64, 8 * 1024 * 1024), decoded.virtualSize());
+    try std.testing.expectEqual(@as(u64, 10 * 4 * 17) * sector_size, decoded.geometry.totalSectors() * sector_size);
 }
 
 test "bitmapSize matches known QEMU value for the default 2 MiB block size" {

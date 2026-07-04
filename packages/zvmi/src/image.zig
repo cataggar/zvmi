@@ -136,7 +136,7 @@ pub const Image = struct {
                             .file = file,
                             .format = .vhd,
                             .data_offset = 0,
-                            .virtual_size = footer.current_size,
+                            .virtual_size = footer.virtualSize(),
                         },
                         .dynamic => return try openDynamic(io, file, footer, footer_buf),
                         else => return error.UnsupportedVhdDiskType,
@@ -177,7 +177,7 @@ pub const Image = struct {
             .file = file,
             .format = .vhd,
             .data_offset = 0,
-            .virtual_size = footer.current_size,
+            .virtual_size = footer.virtualSize(),
             .dynamic = .{
                 .bat_offset = header.table_offset,
                 .max_table_entries = header.max_table_entries,
