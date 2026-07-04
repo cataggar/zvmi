@@ -46,6 +46,8 @@ zvmi/
                               #   + Secure Boot MOK/UKI orchestration)
         uki.zig                # low-level UKI/systemd-stub PE section
                               #   assembly helpers
+        verity.zig             # dm-verity SHA-256 hash-tree generation +
+                              #   kernel cmdline metadata helpers
         layout.zig             # partition-layout planner (sizing math,
                               #   alignment, DPS type GUIDs)
         guid.zig               # mixed-endian GUID encoding + well-known
@@ -118,6 +120,7 @@ zvmi cosi disk.img -o disk.cosi              # tar + metadata.json + per-partiti
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G -o output.vhd
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G -o output.raw -O raw
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G -o output.qcow2 -O qcow2
+zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G --verity -o output.vhd
 ```
 
 `convert` skips all-zero chunks (aligned to the destination's block size for
@@ -201,7 +204,11 @@ with `.linux`, `.initrd`, `.cmdline`, `.osrel`, `.uname`, and optional
 `vhdx` remains a read-only source format for now, so `build-image` VHDX output
 is still deferred pending separate VHDX write/create support. Both Gen2
 (UEFI/protective-MBR+GPT+ESP) and Gen1 (BIOS/plain-MBR with GRUB embedded into
-the post-MBR gap) are now fully wired in `zvmi build-image`.
+the post-MBR gap) are now fully wired in `zvmi build-image`, and Gen2 images
+can optionally append a same-partition dm-verity SHA-256 hash tree with
+`--verity`, wiring the resulting `roothash=`/`systemd.verity_root_*`
+parameters into the generated BLS + GRUB entries while exposing the matching
+metadata through `zvmi.cosi.writeWithOptions`.
 
 ## Notes on Zig 0.16
 

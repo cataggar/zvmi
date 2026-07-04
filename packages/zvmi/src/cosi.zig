@@ -21,6 +21,7 @@ const guid = @import("guid.zig");
 const gpt = @import("gpt.zig");
 const image_mod = @import("image.zig");
 const tar = @import("tar.zig");
+const verity = @import("verity.zig");
 const zstd = @import("zstd.zig");
 
 const Image = image_mod.Image;
@@ -72,6 +73,7 @@ pub const WriteOptions = struct {
     os_arch: ?[]const u8 = null,
     os_release: ?[]const u8 = null,
     bootloader: CosiBootloader = .{},
+    root_verity: ?verity.Info = null,
     os_packages: []const OsPackage = &.{},
     compression: Compression = .{},
 };
@@ -410,6 +412,12 @@ const MetadataImage = struct {
 const MetadataVerity = struct {
     image: MetadataImage,
     roothash: []const u8,
+    hashAlgorithm: []const u8,
+    salt: []const u8,
+    dataBlockSize: u32,
+    hashBlockSize: u32,
+    dataBlocks: u64,
+    format: u32,
     hashOffset: ?u64 = null,
 };
 
@@ -464,15 +472,22 @@ fn buildMetadataJson(
         .type = "primary-gpt",
     };
     for (partitions, 0..) |part, i| {
+        const part_image: MetadataImage = .{
+            .path = part.image.path,
+            .compressedSize = part.image.compressedSize,
+            .uncompressedSize = part.image.uncompressedSize,
+            .sha384 = part.image.sha384,
+        };
         fs_entries[i] = .{
-            .image = .{ .path = part.image.path, .compressedSize = part.image.compressedSize, .uncompressedSize = part.image.uncompressedSize, .sha384 = part.image.sha384 },
+            .image = part_image,
             .mountPoint = part.mount_point,
             .fsType = part.fs_type,
             .fsUuid = part.fs_uuid,
             .partType = part.part_type,
+            .verity = try buildVerityMetadata(arena, part.mount_point, part_image, options.root_verity),
         };
         gpt_regions[i + 1] = .{
-            .image = .{ .path = part.image.path, .compressedSize = part.image.compressedSize, .uncompressedSize = part.image.uncompressedSize, .sha384 = part.image.sha384 },
+            .image = part_image,
             .type = "partition",
             .number = part.number,
         };
@@ -496,6 +511,31 @@ fn buildMetadataJson(
     };
 
     return try std.json.Stringify.valueAlloc(arena, metadata, .{});
+}
+
+fn buildVerityMetadata(
+    arena: std.mem.Allocator,
+    mount_point: []const u8,
+    image: MetadataImage,
+    info: ?verity.Info,
+) std.mem.Allocator.Error!?MetadataVerity {
+    if (info == null or !std.mem.eql(u8, mount_point, "/")) return null;
+
+    var root_hash_buf: [verity.digest_size * 2]u8 = undefined;
+    var salt_buf: [verity.salt_size * 2]u8 = undefined;
+    const value = info.?;
+
+    return .{
+        .image = image,
+        .roothash = try arena.dupe(u8, value.formatRootHash(&root_hash_buf)),
+        .hashAlgorithm = value.hashAlgorithm,
+        .salt = try arena.dupe(u8, value.formatSalt(&salt_buf)),
+        .dataBlockSize = value.dataBlockSize,
+        .hashBlockSize = value.hashBlockSize,
+        .dataBlocks = value.dataBlocks,
+        .format = value.format,
+        .hashOffset = value.hashOffset,
+    };
 }
 
 fn detectOsArch(partitions: []const PartitionArtifact) []const u8 {
@@ -677,6 +717,10 @@ test "write builds a COSI tarball with GPT metadata and raw-zst partitions" {
         .{ .name = "bash", .version = "5.1.8", .release = "1", .arch = "x86_64" },
         .{ .name = "coreutils", .version = "9.5", .release = "2", .arch = "x86_64" },
     };
+    var verity_salt: [verity.salt_size]u8 = undefined;
+    var verity_root_hash: [verity.digest_size]u8 = undefined;
+    for (&verity_salt, 0..) |*byte, index| byte.* = @intCast(index);
+    for (&verity_root_hash, 0..) |*byte, index| byte.* = @intCast(index + 1);
     try writeWithOptions(img, io, std.testing.allocator, cosi_path, .{
         .bootloader = .{
             .type = "systemd-boot",
@@ -690,6 +734,15 @@ test "write builds a COSI tarball with GPT metadata and raw-zst partitions" {
                     },
                 },
             },
+        },
+        .root_verity = .{
+            .dataBlockSize = 4096,
+            .hashBlockSize = 4096,
+            .dataBlocks = 2048,
+            .hashOffset = 8 * 1024 * 1024,
+            .hashTreeSize = 4096,
+            .salt = verity_salt,
+            .rootHash = verity_root_hash,
         },
         .os_packages = &packages,
         .compression = .{ .maxWindowLog = 23 },
@@ -784,6 +837,12 @@ test "write builds a COSI tarball with GPT metadata and raw-zst partitions" {
                     sha384: []const u8,
                 },
                 roothash: []const u8,
+                hashAlgorithm: []const u8,
+                salt: []const u8,
+                dataBlockSize: u32,
+                hashBlockSize: u32,
+                dataBlocks: u64,
+                format: u32,
                 hashOffset: ?u64 = null,
             } = null,
         },
@@ -828,7 +887,13 @@ test "write builds a COSI tarball with GPT metadata and raw-zst partitions" {
     try std.testing.expectEqualStrings("ext4", parsed_json.value.images[1].fsType);
     try std.testing.expectEqualStrings("88d2fa9b-7a32-450a-a9f8-aa9c3de79298", parsed_json.value.images[1].fsUuid);
     try std.testing.expect(parsed_json.value.images[0].verity == null);
-    try std.testing.expect(parsed_json.value.images[1].verity == null);
+    try std.testing.expect(parsed_json.value.images[1].verity != null);
+    try std.testing.expectEqualStrings("sha256", parsed_json.value.images[1].verity.?.hashAlgorithm);
+    try std.testing.expectEqual(@as(u32, 4096), parsed_json.value.images[1].verity.?.dataBlockSize);
+    try std.testing.expectEqual(@as(u32, 4096), parsed_json.value.images[1].verity.?.hashBlockSize);
+    try std.testing.expectEqual(@as(u64, 2048), parsed_json.value.images[1].verity.?.dataBlocks);
+    try std.testing.expectEqual(@as(u32, 1), parsed_json.value.images[1].verity.?.format);
+    try std.testing.expectEqual(@as(?u64, 8 * 1024 * 1024), parsed_json.value.images[1].verity.?.hashOffset);
     try std.testing.expectEqualStrings(os_release, parsed_json.value.osRelease);
     try std.testing.expectEqualStrings("x86_64", parsed_json.value.osArch);
     try std.testing.expectEqualStrings("systemd-boot", parsed_json.value.bootloader.type);

@@ -17,6 +17,7 @@ const Image = @import("image.zig").Image;
 const mbr = @import("mbr.zig");
 const gpt = @import("gpt.zig");
 const uki = @import("uki.zig");
+const verity = @import("verity.zig");
 
 pub const SourceTreeView = ext4.FileTreeView;
 pub const SourceKind = ext4.Kind;
@@ -89,6 +90,10 @@ pub const PopulateOptions = struct {
     /// Extra kernel command-line arguments appended after
     /// `root=PARTUUID=<...>`.
     extra_kernel_options: []const u8 = "",
+    /// Optional dm-verity metadata used to switch the generated kernel
+    /// command line to `root=/dev/mapper/root` plus the matching
+    /// `roothash=`/`systemd.verity_root_*` arguments.
+    verity: ?verity.Info = null,
     /// Select whether `populateEsp()` emits the existing shim/GRUB/BLS chain,
     /// generated UKIs, or both.
     boot_mode: BootMode = .bls_only,
@@ -284,7 +289,7 @@ pub fn populateEsp(
         defer allocator.free(loader_conf);
         try writeGeneratedFile(io, esp, "loader/loader.conf", loader_conf);
 
-        const grub_cfg = try renderGrubCfg(allocator, boot_entries, root_partuuid, kernel_device_partuuid, options.extra_kernel_options, options.grub_timeout_seconds);
+        const grub_cfg = try renderGrubCfg(allocator, boot_entries, root_partuuid, kernel_device_partuuid, options.extra_kernel_options, options.verity, options.grub_timeout_seconds);
         defer allocator.free(grub_cfg);
 
         try writeGeneratedFile(io, esp, "EFI/BOOT/grub.cfg", grub_cfg);
@@ -297,7 +302,7 @@ pub fn populateEsp(
         for (vendor_cfg_paths.items) |path| try writeGeneratedFile(io, esp, path, grub_cfg);
 
         for (boot_entries) |entry| {
-            const bls_text = try renderBlsEntry(allocator, entry, root_partuuid, options.extra_kernel_options);
+            const bls_text = try renderBlsEntry(allocator, entry, root_partuuid, options.extra_kernel_options, options.verity);
             defer allocator.free(bls_text);
             const bls_path = try std.fmt.allocPrint(allocator, "loader/entries/{s}.conf", .{entry.id});
             defer allocator.free(bls_path);
@@ -1099,7 +1104,7 @@ fn generateUkis(
             null;
         defer if (initrd_bytes) |bytes| allocator.free(bytes);
 
-        const cmdline = try renderKernelOptions(allocator, root_partuuid, options.extra_kernel_options);
+        const cmdline = try renderKernelOptions(allocator, root_partuuid, options.extra_kernel_options, options.verity);
         defer allocator.free(cmdline);
 
         const uname = kernelReleaseName(entry.kernel.source_path);
@@ -1266,13 +1271,37 @@ fn renderKernelOptions(
     allocator: std.mem.Allocator,
     root_partuuid: guid.Guid,
     extra_kernel_options: []const u8,
+    verity_info: ?verity.Info,
 ) std.mem.Allocator.Error![]u8 {
     var root_guid_buf: [36]u8 = undefined;
     const root_partuuid_text = guid.formatLower(&root_guid_buf, root_partuuid);
+
+    const base = if (verity_info) |info| blk: {
+        var root_hash_buf: [verity.digest_size * 2]u8 = undefined;
+        var salt_buf: [verity.salt_size * 2]u8 = undefined;
+        break :blk try std.fmt.allocPrint(
+            allocator,
+            "root=/dev/mapper/root ro roothash={s} systemd.verity_root_data=PARTUUID={s} systemd.verity_root_hash=PARTUUID={s} systemd.verity_root_options=superblock=0,format={d},data-block-size={d},hash-block-size={d},data-blocks={d},hash-offset={d},salt={s},hash={s}",
+            .{
+                info.formatRootHash(&root_hash_buf),
+                root_partuuid_text,
+                root_partuuid_text,
+                info.format,
+                info.dataBlockSize,
+                info.hashBlockSize,
+                info.dataBlocks,
+                info.hashOffset,
+                info.formatSalt(&salt_buf),
+                info.hashAlgorithm,
+            },
+        );
+    } else try std.fmt.allocPrint(allocator, "root=PARTUUID={s}", .{root_partuuid_text});
+    defer allocator.free(base);
+
     return if (extra_kernel_options.len == 0)
-        std.fmt.allocPrint(allocator, "root=PARTUUID={s}", .{root_partuuid_text})
+        allocator.dupe(u8, base)
     else
-        std.fmt.allocPrint(allocator, "root=PARTUUID={s} {s}", .{ root_partuuid_text, extra_kernel_options });
+        std.fmt.allocPrint(allocator, "{s} {s}", .{ base, extra_kernel_options });
 }
 
 fn effectiveUkiOutputDirectory(output_directory: []const u8) []const u8 {
@@ -1301,11 +1330,10 @@ fn renderGrubCfg(
     root_partuuid: guid.Guid,
     kernel_device_partuuid: guid.Guid,
     extra_kernel_options: []const u8,
+    verity_info: ?verity.Info,
     timeout_seconds: u32,
 ) std.mem.Allocator.Error![]u8 {
-    var root_guid_buf: [36]u8 = undefined;
     var kernel_guid_buf: [36]u8 = undefined;
-    const root_partuuid_text = guid.formatLower(&root_guid_buf, root_partuuid);
     const kernel_partuuid_text = guid.formatLower(&kernel_guid_buf, kernel_device_partuuid);
 
     var out = std.Io.Writer.Allocating.init(allocator);
@@ -1317,10 +1345,10 @@ fn renderGrubCfg(
     ) catch return error.OutOfMemory;
 
     for (entries) |entry| {
+        const kernel_options = try renderKernelOptions(allocator, root_partuuid, extra_kernel_options, verity_info);
+        defer allocator.free(kernel_options);
         out.writer.print("menuentry '{s}' --id '{s}' {{\n", .{ entry.title, entry.id }) catch return error.OutOfMemory;
-        out.writer.print("    linux ($kernel_root){s} root=PARTUUID={s}", .{ entry.kernel.config_path, root_partuuid_text }) catch return error.OutOfMemory;
-        if (extra_kernel_options.len != 0) out.writer.print(" {s}", .{extra_kernel_options}) catch return error.OutOfMemory;
-        out.writer.writeAll("\n") catch return error.OutOfMemory;
+        out.writer.print("    linux ($kernel_root){s} {s}\n", .{ entry.kernel.config_path, kernel_options }) catch return error.OutOfMemory;
         if (entry.initrd) |initrd| {
             out.writer.print("    initrd ($kernel_root){s}\n", .{initrd.config_path}) catch return error.OutOfMemory;
         }
@@ -1335,12 +1363,12 @@ fn renderBlsEntry(
     entry: BootEntry,
     root_partuuid: guid.Guid,
     extra_kernel_options: []const u8,
+    verity_info: ?verity.Info,
 ) std.mem.Allocator.Error![]u8 {
-    var root_guid_buf: [36]u8 = undefined;
-    const root_partuuid_text = guid.formatLower(&root_guid_buf, root_partuuid);
-
     var out = std.Io.Writer.Allocating.init(allocator);
     errdefer out.deinit();
+    const kernel_options = try renderKernelOptions(allocator, root_partuuid, extra_kernel_options, verity_info);
+    defer allocator.free(kernel_options);
 
     out.writer.print(
         "title {s}\nversion {s}\nlinux {s}\n",
@@ -1349,9 +1377,7 @@ fn renderBlsEntry(
     if (entry.initrd) |initrd| {
         out.writer.print("initrd {s}\n", .{initrd.config_path}) catch return error.OutOfMemory;
     }
-    out.writer.print("options root=PARTUUID={s}", .{root_partuuid_text}) catch return error.OutOfMemory;
-    if (extra_kernel_options.len != 0) out.writer.print(" {s}", .{extra_kernel_options}) catch return error.OutOfMemory;
-    out.writer.writeAll("\n") catch return error.OutOfMemory;
+    out.writer.print("options {s}\n", .{kernel_options}) catch return error.OutOfMemory;
 
     return out.toOwnedSlice();
 }
@@ -1571,6 +1597,92 @@ test "populateEsp synthesizes fallback BOOTX64.EFI from shim when needed" {
     const shim = try esp.readFileAlloc(io, std.testing.allocator, "EFI/Test/shimx64.efi");
     defer std.testing.allocator.free(shim);
     try std.testing.expectEqualStrings("shim-payload", shim);
+}
+
+test "populateEsp appends dm-verity kernel arguments to grub.cfg and BLS entries" {
+    const io = std.testing.io;
+    const path = "test-bootconfig-verity.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const esp_len = 96 * 1024 * 1024;
+    var img = try Image.create(io, path, .raw, esp_len * 2, .{});
+    defer img.close(io);
+    try fat32.format(&img, io, .{ .partition_offset = 0, .partition_len = esp_len });
+    var esp = try fat32.open(&img, io, .{ .offset = 0, .length = esp_len });
+
+    const planned = [_]PlannedPartitionIdentity{
+        .{ .planned = .{
+            .name = "ESP",
+            .role = .esp,
+            .type_guid = guid.esp,
+            .offset_bytes = 0,
+            .length_bytes = esp_len,
+        }, .unique_guid = guid.parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa") },
+        .{ .planned = .{
+            .name = "root",
+            .role = .root_x86_64,
+            .type_guid = guid.linux_root_x86_64,
+            .offset_bytes = esp_len,
+            .length_bytes = esp_len,
+        }, .unique_guid = guid.parse("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb") },
+    };
+
+    var salt: [verity.salt_size]u8 = undefined;
+    var root_hash: [verity.digest_size]u8 = undefined;
+    for (&salt, 0..) |*byte, index| byte.* = @intCast(index);
+    for (&root_hash, 0..) |*byte, index| byte.* = @intCast(0xF0 - index);
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "EFI/BOOT/BOOTX64.EFI", .kind = .file, .bytes = "bootx64-bytes" },
+        .{ .path = "EFI/Acme/grubx64.efi", .kind = .file, .bytes = "grubx64-bytes" },
+        .{ .path = "boot/vmlinuz-test", .kind = .file, .bytes = "kernel-bits" },
+        .{ .path = "boot/initramfs-test.img", .kind = .file, .bytes = "initrd-bits" },
+    });
+    tree.bind();
+
+    _ = try populateEsp(std.testing.allocator, io, &esp, &tree.view, .{
+        .planned_partitions = &planned,
+        .extra_kernel_options = "console=ttyS0 quiet",
+        .verity = .{
+            .dataBlockSize = 4096,
+            .hashBlockSize = 4096,
+            .dataBlocks = 1234,
+            .hashOffset = 5054464,
+            .hashTreeSize = 4096,
+            .salt = salt,
+            .rootHash = root_hash,
+        },
+    });
+
+    var salt_buf: [verity.salt_size * 2]u8 = undefined;
+    var root_hash_buf: [verity.digest_size * 2]u8 = undefined;
+    const expected_verity: verity.Info = .{
+        .dataBlockSize = 4096,
+        .hashBlockSize = 4096,
+        .dataBlocks = 1234,
+        .hashOffset = 5054464,
+        .hashTreeSize = 4096,
+        .salt = salt,
+        .rootHash = root_hash,
+    };
+    const expected_options = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "root=/dev/mapper/root ro roothash={s} systemd.verity_root_data=PARTUUID=bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb systemd.verity_root_hash=PARTUUID=bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb systemd.verity_root_options=superblock=0,format=1,data-block-size=4096,hash-block-size=4096,data-blocks=1234,hash-offset=5054464,salt={s},hash=sha256 console=ttyS0 quiet",
+        .{
+            expected_verity.formatRootHash(&root_hash_buf),
+            expected_verity.formatSalt(&salt_buf),
+        },
+    );
+    defer std.testing.allocator.free(expected_options);
+
+    const grub_cfg = try esp.readFileAlloc(io, std.testing.allocator, "EFI/BOOT/grub.cfg");
+    defer std.testing.allocator.free(grub_cfg);
+    try std.testing.expect(std.mem.indexOf(u8, grub_cfg, expected_options) != null);
+
+    const bls_entry = try esp.readFileAlloc(io, std.testing.allocator, "loader/entries/vmlinuz-test.conf");
+    defer std.testing.allocator.free(bls_entry);
+    const parsed_bls = try parseBlsEntry(bls_entry);
+    try std.testing.expectEqualStrings(expected_options, parsed_bls.options.?);
 }
 
 test "populateEsp copies MOK assets and emits UKIs when requested" {

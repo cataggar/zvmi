@@ -1,4 +1,4 @@
-//! `zvmi build-image --iso <file.iso> --container <oci-layout> --generation 1|2 --size <size> -o <output.{raw|vhd|qcow2}>`
+//! `zvmi build-image --iso <file.iso> --container <oci-layout> --generation 1|2 --size <size> -o <output.{raw|vhd|qcow2}> [--verity]`
 
 const std = @import("std");
 const zvmi = @import("zvmi");
@@ -12,6 +12,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     var generation: zvmi.azure.Generation = .gen2;
     var size: ?u64 = null;
     var esp_size: ?u64 = null;
+    var enable_verity = false;
     var dry_run = false;
     var verbose = false;
 
@@ -59,12 +60,14 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
             i += 1;
             if (i >= args.len) return fail("build-image: --rootfs-path requires a path", .{});
             rootfs_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--verity")) {
+            enable_verity = true;
         } else if (std.mem.eql(u8, arg, "--dry-run")) {
             dry_run = true;
         } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
             verbose = true;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            return fail("usage: zvmi build-image --iso <file.iso> --container <oci-layout> --generation 1|2 --size <size> -o <output.{{raw|vhd|qcow2}}> [-O raw|vhd|qcow2] [--rootfs-path <path>] [--esp-size <size>] [--dry-run] [-v]", .{});
+            return fail("usage: zvmi build-image --iso <file.iso> --container <oci-layout> --generation 1|2 --size <size> -o <output.{{raw|vhd|qcow2}}> [-O raw|vhd|qcow2] [--rootfs-path <path>] [--esp-size <size>] [--verity] [--dry-run] [-v]", .{});
         } else {
             return fail("build-image: unexpected argument '{s}'", .{arg});
         }
@@ -80,6 +83,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
             .output_format = output_format,
             .rootfs_path_in_iso = rootfs_path,
             .esp_size = esp_size orelse zvmi.build_image.default_esp_size,
+            .verity = enable_verity,
             .dry_run = dry_run,
             .verbose = verbose,
         }) catch |err| return fail("build-image: failed: {s}", .{@errorName(err)});
