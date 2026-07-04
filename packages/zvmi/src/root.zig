@@ -16,6 +16,7 @@ pub const guid = @import("guid.zig");
 pub const mbr = @import("mbr.zig");
 pub const gpt = @import("gpt.zig");
 pub const azure = @import("azure.zig");
+pub const oci = @import("oci.zig");
 const image_mod = @import("image.zig");
 const size_mod = @import("size.zig");
 
