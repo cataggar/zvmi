@@ -37,6 +37,9 @@ pub const Architecture = enum {
 pub const PlannedPartitionIdentity = struct {
     planned: layout.PlannedPartition,
     unique_guid: guid.Guid,
+    /// Optional DOS/MBR disk signature used to synthesize Linux PARTUUID text
+    /// (`<8-hex-signature>-<2-hex-partition-number>`) for BIOS/MBR builds.
+    mbr_disk_signature: ?u32 = null,
 };
 
 pub const BootMode = enum {
@@ -68,7 +71,8 @@ pub const UkiOptions = struct {
 };
 
 pub const PopulateOptions = struct {
-    /// The planned GPT partitions plus the unique GUIDs written into the GPT.
+    /// The planned partitions plus the on-disk identifiers used to reference
+    /// them from generated kernel command lines.
     planned_partitions: []const PlannedPartitionIdentity,
     /// Optional explicit CPU architecture. If omitted, the module infers it
     /// from EFI binary names and/or the planned root-partition role.
@@ -133,6 +137,10 @@ pub const InstallBiosOptions = struct {
     planned_partitions: []const PlannedPartitionIdentity,
     architecture: ?Architecture = null,
     root_role: ?layout.PartitionRole = null,
+    /// Optional dm-verity metadata preserved alongside BIOS installation
+    /// options so BIOS/MBR callers can share the same root-cmdline inputs as
+    /// GPT/UEFI callers.
+    verity: ?verity.Info = null,
 };
 
 pub const InstallBiosError = PopulateError || Image.PreadError || Image.PwriteError || error{
@@ -149,6 +157,7 @@ const grub_bios_boot_img_preserve_offset: usize = 0x1B8;
 const grub_bios_core_blocklist_offset: usize = mbr.sector_size - 12;
 const grub_bios_kernel_segment: u16 = 0x800;
 const grub_bios_second_sector_segment: u16 = grub_bios_kernel_segment + 0x20;
+const max_partuuid_text_len: usize = 36;
 
 const EfiBinaryKind = enum {
     default_boot,
@@ -270,8 +279,16 @@ pub fn populateEsp(
 
     const architecture = try resolveArchitecture(scan.efi_binaries, options);
     const esp_partuuid = findPartitionGuidByRole(options.planned_partitions, .esp) orelse return error.MissingEspPartition;
-    const root_partuuid = try resolveRootPartitionGuid(options.planned_partitions, architecture, options.root_role);
+    const root_partition = try resolveRootPartition(options.planned_partitions, architecture, options.root_role);
+    const root_partuuid = root_partition.unique_guid;
     const kernel_device_partuuid = options.kernel_device_partuuid orelse root_partuuid;
+    var root_partuuid_buf: [max_partuuid_text_len]u8 = undefined;
+    const root_partuuid_text = formatPlannedPartitionPartuuid(&root_partuuid_buf, options.planned_partitions, root_partition);
+    var kernel_device_partuuid_buf: [max_partuuid_text_len]u8 = undefined;
+    const kernel_device_partuuid_text = if (options.kernel_device_partuuid == null)
+        root_partuuid_text
+    else
+        guid.formatLower(&kernel_device_partuuid_buf, kernel_device_partuuid);
 
     const copy_plan = try buildCopyPlan(allocator, scan.efi_binaries, architecture, options.boot_mode);
     defer freeCopyPlan(allocator, copy_plan);
@@ -289,7 +306,7 @@ pub fn populateEsp(
         defer allocator.free(loader_conf);
         try writeGeneratedFile(io, esp, "loader/loader.conf", loader_conf);
 
-        const grub_cfg = try renderGrubCfg(allocator, boot_entries, root_partuuid, kernel_device_partuuid, options.extra_kernel_options, options.verity, options.grub_timeout_seconds);
+        const grub_cfg = try renderGrubCfg(allocator, boot_entries, root_partuuid_text, kernel_device_partuuid_text, options.extra_kernel_options, options.verity, options.grub_timeout_seconds);
         defer allocator.free(grub_cfg);
 
         try writeGeneratedFile(io, esp, "EFI/BOOT/grub.cfg", grub_cfg);
@@ -302,7 +319,7 @@ pub fn populateEsp(
         for (vendor_cfg_paths.items) |path| try writeGeneratedFile(io, esp, path, grub_cfg);
 
         for (boot_entries) |entry| {
-            const bls_text = try renderBlsEntry(allocator, entry, root_partuuid, options.extra_kernel_options, options.verity);
+            const bls_text = try renderBlsEntry(allocator, entry, root_partuuid_text, options.extra_kernel_options, options.verity);
             defer allocator.free(bls_text);
             const bls_path = try std.fmt.allocPrint(allocator, "loader/entries/{s}.conf", .{entry.id});
             defer allocator.free(bls_path);
@@ -311,7 +328,7 @@ pub fn populateEsp(
     }
 
     const uki_count = if (options.boot_mode.includesUki())
-        try generateUkis(allocator, io, esp, source, architecture, boot_entries, root_partuuid, options)
+        try generateUkis(allocator, io, esp, source, architecture, boot_entries, root_partuuid_text, options)
     else
         0;
 
@@ -1070,7 +1087,7 @@ fn generateUkis(
     source: *SourceTreeView,
     architecture: Architecture,
     entries: []const BootEntry,
-    root_partuuid: guid.Guid,
+    root_partuuid_text: []const u8,
     options: PopulateOptions,
 ) PopulateError!usize {
     std.debug.assert(entries.len != 0);
@@ -1104,7 +1121,7 @@ fn generateUkis(
             null;
         defer if (initrd_bytes) |bytes| allocator.free(bytes);
 
-        const cmdline = try renderKernelOptions(allocator, root_partuuid, options.extra_kernel_options, options.verity);
+        const cmdline = try renderKernelOptions(allocator, root_partuuid_text, options.extra_kernel_options, options.verity);
         defer allocator.free(cmdline);
 
         const uname = kernelReleaseName(entry.kernel.source_path);
@@ -1267,15 +1284,15 @@ fn synthesizeOsRelease(allocator: std.mem.Allocator, title_prefix: []const u8) s
     );
 }
 
-fn renderKernelOptions(
+/// Renders the shared kernel command line used by generated GRUB, BLS, and
+/// UKI boot entries. `root_partuuid_text` may be a GPT partition GUID or the
+/// synthesized Linux MBR PARTUUID form (`<disk-signature>-<partition-number>`).
+pub fn renderKernelOptions(
     allocator: std.mem.Allocator,
-    root_partuuid: guid.Guid,
+    root_partuuid_text: []const u8,
     extra_kernel_options: []const u8,
     verity_info: ?verity.Info,
 ) std.mem.Allocator.Error![]u8 {
-    var root_guid_buf: [36]u8 = undefined;
-    const root_partuuid_text = guid.formatLower(&root_guid_buf, root_partuuid);
-
     const base = if (verity_info) |info| blk: {
         var root_hash_buf: [verity.digest_size * 2]u8 = undefined;
         var salt_buf: [verity.salt_size * 2]u8 = undefined;
@@ -1327,25 +1344,22 @@ fn renderLoaderConf(
 fn renderGrubCfg(
     allocator: std.mem.Allocator,
     entries: []const BootEntry,
-    root_partuuid: guid.Guid,
-    kernel_device_partuuid: guid.Guid,
+    root_partuuid_text: []const u8,
+    kernel_device_partuuid_text: []const u8,
     extra_kernel_options: []const u8,
     verity_info: ?verity.Info,
     timeout_seconds: u32,
 ) std.mem.Allocator.Error![]u8 {
-    var kernel_guid_buf: [36]u8 = undefined;
-    const kernel_partuuid_text = guid.formatLower(&kernel_guid_buf, kernel_device_partuuid);
-
     var out = std.Io.Writer.Allocating.init(allocator);
     errdefer out.deinit();
 
     out.writer.print(
         "set default=0\nset timeout={d}\n\ninsmod part_gpt\ninsmod ext2\nsearch --no-floppy --partuuid --set=kernel_root {s}\n\n",
-        .{ timeout_seconds, kernel_partuuid_text },
+        .{ timeout_seconds, kernel_device_partuuid_text },
     ) catch return error.OutOfMemory;
 
     for (entries) |entry| {
-        const kernel_options = try renderKernelOptions(allocator, root_partuuid, extra_kernel_options, verity_info);
+        const kernel_options = try renderKernelOptions(allocator, root_partuuid_text, extra_kernel_options, verity_info);
         defer allocator.free(kernel_options);
         out.writer.print("menuentry '{s}' --id '{s}' {{\n", .{ entry.title, entry.id }) catch return error.OutOfMemory;
         out.writer.print("    linux ($kernel_root){s} {s}\n", .{ entry.kernel.config_path, kernel_options }) catch return error.OutOfMemory;
@@ -1361,13 +1375,13 @@ fn renderGrubCfg(
 fn renderBlsEntry(
     allocator: std.mem.Allocator,
     entry: BootEntry,
-    root_partuuid: guid.Guid,
+    root_partuuid_text: []const u8,
     extra_kernel_options: []const u8,
     verity_info: ?verity.Info,
 ) std.mem.Allocator.Error![]u8 {
     var out = std.Io.Writer.Allocating.init(allocator);
     errdefer out.deinit();
-    const kernel_options = try renderKernelOptions(allocator, root_partuuid, extra_kernel_options, verity_info);
+    const kernel_options = try renderKernelOptions(allocator, root_partuuid_text, extra_kernel_options, verity_info);
     defer allocator.free(kernel_options);
 
     out.writer.print(
@@ -1380,6 +1394,32 @@ fn renderBlsEntry(
     out.writer.print("options {s}\n", .{kernel_options}) catch return error.OutOfMemory;
 
     return out.toOwnedSlice();
+}
+
+fn formatPlannedPartitionPartuuid(
+    buf: *[max_partuuid_text_len]u8,
+    planned_partitions: []const PlannedPartitionIdentity,
+    partition: PlannedPartitionIdentity,
+) []const u8 {
+    if (partition.mbr_disk_signature) |disk_signature| {
+        var mbr_buf: [mbr.partuuid_len]u8 = undefined;
+        const text = mbr.formatPartuuid(&mbr_buf, disk_signature, partitionIndex1Based(planned_partitions, partition));
+        @memcpy(buf[0..text.len], text);
+        return buf[0..text.len];
+    }
+    return guid.formatLower(buf, partition.unique_guid);
+}
+
+fn partitionIndex1Based(
+    planned_partitions: []const PlannedPartitionIdentity,
+    partition: PlannedPartitionIdentity,
+) u8 {
+    for (planned_partitions, 0..) |candidate, index| {
+        if (std.mem.eql(u8, &candidate.unique_guid, &partition.unique_guid)) {
+            return std.math.cast(u8, index + 1) orelse unreachable;
+        }
+    }
+    unreachable;
 }
 
 fn collectVendorGrubCfgPaths(
@@ -1683,6 +1723,31 @@ test "populateEsp appends dm-verity kernel arguments to grub.cfg and BLS entries
     defer std.testing.allocator.free(bls_entry);
     const parsed_bls = try parseBlsEntry(bls_entry);
     try std.testing.expectEqualStrings(expected_options, parsed_bls.options.?);
+}
+
+test "renderKernelOptions accepts synthesized MBR PARTUUID text for dm-verity" {
+    var partuuid_buf: [mbr.partuuid_len]u8 = undefined;
+    const root_partuuid_text = mbr.formatPartuuid(&partuuid_buf, 0xA1B2C3D4, 1);
+
+    var salt: [verity.salt_size]u8 = undefined;
+    var root_hash: [verity.digest_size]u8 = undefined;
+    for (&salt, 0..) |*byte, index| byte.* = @intCast(index);
+    for (&root_hash, 0..) |*byte, index| byte.* = @intCast(0xF0 - index);
+
+    const rendered = try renderKernelOptions(std.testing.allocator, root_partuuid_text, "console=ttyS0 quiet", .{
+        .dataBlockSize = 4096,
+        .hashBlockSize = 4096,
+        .dataBlocks = 1234,
+        .hashOffset = 5054464,
+        .hashTreeSize = 4096,
+        .salt = salt,
+        .rootHash = root_hash,
+    });
+    defer std.testing.allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "systemd.verity_root_data=PARTUUID=a1b2c3d4-01") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "systemd.verity_root_hash=PARTUUID=a1b2c3d4-01") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "console=ttyS0 quiet") != null);
 }
 
 test "populateEsp copies MOK assets and emits UKIs when requested" {

@@ -14,6 +14,7 @@ pub const entry_size: usize = 16;
 pub const max_entries: usize = 4;
 
 pub const boot_signature: [2]u8 = .{ 0x55, 0xAA };
+pub const partuuid_len: usize = 11;
 
 pub const PartitionType = enum(u8) {
     empty = 0x00,
@@ -154,6 +155,12 @@ pub fn singleLinuxPartitionMbr(first_lba: u32, sector_count: u32) Mbr {
     return mbr;
 }
 
+/// Formats the Linux/udev-synthesized PARTUUID used for DOS/MBR partition
+/// tables: `<8-hex-disk-signature>-<2-hex-partition-number>`.
+pub fn formatPartuuid(buf: *[partuuid_len]u8, disk_signature: u32, partition_index_1based: u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{x:0>8}-{x:0>2}", .{ disk_signature, partition_index_1based }) catch unreachable;
+}
+
 test "protectiveMbr encode/decode round-trip" {
     const total_sectors: u64 = 32 * 1024 * 1024 / 512; // 32 MiB disk
     const mbr = protectiveMbr(total_sectors);
@@ -187,4 +194,10 @@ test "Mbr.decode rejects a bad boot signature" {
 test "chsForLba clamps to the sentinel for large LBAs" {
     const chs = chsForLba(0xFFFF_FFFF);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0xFE, 0xFF, 0xFF }, &chs);
+}
+
+test "formatPartuuid renders Linux MBR-style PARTUUID text" {
+    var buf: [partuuid_len]u8 = undefined;
+    try std.testing.expectEqualStrings("a1b2c3d4-01", formatPartuuid(&buf, 0xA1B2C3D4, 1));
+    try std.testing.expectEqualStrings("0000000f-0a", formatPartuuid(&buf, 0x0000000F, 10));
 }
