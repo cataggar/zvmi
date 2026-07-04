@@ -1,7 +1,7 @@
 //! The `Image` abstraction: a format-agnostic view over a disk image file,
 //! analogous to qemu's `BlockDriver`. Supports `raw`, fixed `vhd`, and
-//! dynamic `vhd` (sparse, block-allocated). MBR/GPT, VHDX, and qcow2 are
-//! later milestones (see the project plan). Because there are only ever a
+//! dynamic `vhd` (sparse, block-allocated), VHDX (read-only), and qcow2
+//! (read-only). Because there are only ever a
 //! handful of formats, this uses a plain tagged union rather than a
 //! vtable/`anyopaque` interface -- simpler and fully type-safe for a small,
 //! closed set of variants.
@@ -20,13 +20,14 @@ const std = @import("std");
 const Io = std.Io;
 const vhd = @import("vhd.zig");
 const vhdx = @import("vhdx.zig");
+const qcow2 = @import("qcow2.zig");
 pub const Format = @import("formats.zig").Format;
 
 pub const OpenError = error{
     UnsupportedVhdDiskType,
     InvalidBlockSize,
 } || Io.File.OpenError || Io.File.ReadPositionalError || Io.File.StatError ||
-    vhd.Footer.DecodeError || vhd.DynamicHeader.DecodeError || vhdx.OpenError;
+    vhd.Footer.DecodeError || vhd.DynamicHeader.DecodeError || vhdx.OpenError || qcow2.OpenError;
 
 pub const CreateError = error{
     SizeNotSectorAligned,
@@ -92,6 +93,7 @@ pub const Image = struct {
     virtual_size: u64,
     dynamic: ?DynamicState = null,
     vhdx: ?VhdxState = null,
+    qcow2: ?qcow2.Info = null,
 
     pub fn openPath(io: Io, path: []const u8) OpenError!Image {
         const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
@@ -103,13 +105,24 @@ pub const Image = struct {
     pub fn openFile(io: Io, file: Io.File) OpenError!Image {
         const file_size = (try file.stat(io)).size;
 
-        // VHDX's signature lives at the very start of the file (unlike
-        // VHD's footer, which trails the data); check it first so we never
-        // misdetect a VHDX as raw. Once the signature matches, any further
-        // parse failure is a real error, not a fallback-to-raw case.
-        if (file_size >= 8) {
+        // qcow2 and VHDX signatures both live at the very start of the file
+        // (unlike VHD's footer, which trails the data); sniff them first so
+        // we never misdetect either format as raw. Once a signature matches,
+        // any further parse failure is a real error, not a fallback-to-raw
+        // case.
+        if (file_size >= 4) {
             var sig_buf: [8]u8 = undefined;
             const n = try file.readPositionalAll(io, &sig_buf, 0);
+            if (n >= 4 and std.mem.eql(u8, sig_buf[0..4], &qcow2.file_signature)) {
+                const qcow2_info = try qcow2.open(io, file);
+                return .{
+                    .file = file,
+                    .format = .qcow2,
+                    .data_offset = 0,
+                    .virtual_size = qcow2_info.virtual_size,
+                    .qcow2 = qcow2_info,
+                };
+            }
             if (n == 8 and std.mem.eql(u8, &sig_buf, &vhdx.file_signature)) {
                 const vhdx_info = try vhdx.open(io, file);
                 return .{
@@ -193,9 +206,9 @@ pub const Image = struct {
     /// `size` must be a multiple of the 512-byte sector size.
     pub fn create(io: Io, path: []const u8, format: Format, size: u64, options: CreateOptions) CreateError!Image {
         if (size % 512 != 0) return error.SizeNotSectorAligned;
-        // VHDX support is read-only (see vhdx.zig) -- reject before creating
-        // any file on disk.
-        if (format == .vhdx) return error.UnsupportedFormatForCreate;
+        // VHDX/qcow2 support is read-only (see vhdx.zig/qcow2.zig) -- reject
+        // before creating any file on disk.
+        if (format == .vhdx or format == .qcow2) return error.UnsupportedFormatForCreate;
 
         const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
         errdefer file.close(io);
@@ -215,7 +228,7 @@ pub const Image = struct {
                 },
                 .dynamic => return try createDynamic(io, file, size),
             },
-            .vhdx => unreachable, // rejected above
+            .vhdx, .qcow2 => unreachable, // rejected above
         }
     }
 
@@ -271,9 +284,10 @@ pub const Image = struct {
         return .{ .format = self.format, .virtual_size = self.virtual_size, .file_size = file_size, .subformat = subformat };
     }
 
-    pub const PreadError = error{UnsupportedVhdxBlockState} || Io.File.ReadPositionalError;
+    pub const PreadError = error{UnsupportedVhdxBlockState} || qcow2.PreadError || Io.File.ReadPositionalError;
 
     pub fn pread(self: Image, io: Io, buffer: []u8, offset: u64) PreadError!usize {
+        if (self.qcow2) |q| return qcow2.pread(self.file, io, q, buffer, offset);
         if (self.dynamic) |d| {
             var total: usize = 0;
             var off = offset;
@@ -335,7 +349,7 @@ pub const Image = struct {
     pub const PwriteError = error{ReadOnlyFormat} || Io.File.ReadPositionalError || Io.File.WritePositionalError;
 
     pub fn pwrite(self: *Image, io: Io, buffer: []const u8, offset: u64) PwriteError!void {
-        if (self.format == .vhdx) return error.ReadOnlyFormat;
+        if (self.format == .vhdx or self.format == .qcow2) return error.ReadOnlyFormat;
         if (self.dynamic) |*d| {
             var off = offset;
             var remaining = buffer.len;
@@ -378,10 +392,11 @@ pub const Image = struct {
     /// allocated BAT capacity, i.e. no BAT growth -- otherwise returns
     /// `error.ExceedsAllocatedBatCapacity`). Shrinking is not yet supported
     /// (`error.ShrinkNotSupported`) since it requires format-specific data
-    /// loss handling that qemu-img itself guards behind `--shrink`. VHDX is
-    /// read-only, so resizing it always fails (`error.ReadOnlyFormat`).
+    /// loss handling that qemu-img itself guards behind `--shrink`. VHDX and
+    /// qcow2 are read-only, so resizing them always fails
+    /// (`error.ReadOnlyFormat`).
     pub fn resize(self: *Image, io: Io, new_size: u64) ResizeError!void {
-        if (self.format == .vhdx) return error.ReadOnlyFormat;
+        if (self.format == .vhdx or self.format == .qcow2) return error.ReadOnlyFormat;
         if (new_size < self.virtual_size) return error.ShrinkNotSupported;
         if (new_size == self.virtual_size) return;
 
@@ -408,21 +423,20 @@ pub const Image = struct {
                     self.virtual_size = new_size;
                 }
             },
-            .vhdx => unreachable, // rejected above
+            .vhdx, .qcow2 => unreachable, // rejected above
         }
     }
 
-    pub const CheckError = vhdx.OpenError || Io.File.StatError;
+    pub const CheckError = vhdx.OpenError || qcow2.OpenError || qcow2.CheckError || Io.File.StatError;
 
     pub const CheckResult = struct {
         ok: bool,
         message: []const u8,
     };
 
-    /// Validates footer/header checksums and (for dynamic vhd) that every
-    /// allocated BAT entry points within the file. Roughly analogous to
-    /// qemu-img's `check`, scoped to what these simple formats can have
-    /// wrong (there are no refcounts/clusters to leak like qcow2).
+    /// Validates format metadata: VHD footer/header checksums and BAT bounds,
+    /// VHDX header/region/metadata parsing, and qcow2 header/L1/L2 mapping
+    /// sanity for the active image state.
     pub fn check(self: Image, io: Io) CheckError!CheckResult {
         if (self.format == .raw) return .{ .ok = true, .message = "raw image: nothing to check" };
 
@@ -432,6 +446,14 @@ pub const Image = struct {
                 .message = @errorName(err),
             };
             return .{ .ok = true, .message = "vhdx header/region/metadata checks passed" };
+        }
+
+        if (self.qcow2) |q| {
+            qcow2.check(self.file, io, q) catch |err| return .{
+                .ok = false,
+                .message = @errorName(err),
+            };
+            return .{ .ok = true, .message = "qcow2 header/L1/L2 checks passed" };
         }
 
         const file_size = (try self.file.stat(io)).size;
@@ -472,13 +494,14 @@ pub const Image = struct {
         allocated: bool,
     };
 
-    pub const MapError = Io.File.ReadPositionalError || std.mem.Allocator.Error;
+    pub const MapError = Io.File.ReadPositionalError || qcow2.MapError || std.mem.Allocator.Error;
 
     /// Returns the list of allocated/unallocated extents covering the whole
     /// virtual disk (coalescing adjacent same-state blocks), analogous to
     /// `qemu-img map`. Caller owns the returned slice. `raw` and fixed `vhd`
     /// report a single, fully allocated extent (neither format has a sparse
-    /// concept); dynamic `vhd` and `vhdx` walk their respective BATs.
+    /// concept); dynamic `vhd`, `vhdx`, and `qcow2` walk their format-specific
+    /// mapping tables.
     pub fn mapExtents(self: Image, io: Io, allocator: std.mem.Allocator) MapError![]Extent {
         if (self.dynamic) |d| {
             var extents = std.array_list.Managed(Extent).init(allocator);
@@ -524,6 +547,17 @@ pub const Image = struct {
                 index = run_end_index;
             }
             return extents.toOwnedSlice();
+        }
+
+        if (self.qcow2) |q| {
+            const src_extents = try qcow2.mapExtents(self.file, io, q, allocator);
+            defer allocator.free(src_extents);
+
+            const dst_extents = try allocator.alloc(Extent, src_extents.len);
+            for (src_extents, 0..) |e, i| {
+                dst_extents[i] = .{ .offset = e.offset, .length = e.length, .allocated = e.allocated };
+            }
+            return dst_extents;
         }
 
         const single = try allocator.alloc(Extent, 1);
@@ -916,6 +950,118 @@ test "resize rejects shrinking" {
     var img = try Image.create(io, path, .raw, 4096, .{});
     defer img.close(io);
     try std.testing.expectError(error.ShrinkNotSupported, img.resize(io, 1024));
+}
+
+// ---- qcow2 end-to-end integration test ----
+//
+// No real qemu/qemu-img install was available in this environment, so this
+// test builds a minimal qcow2 image by hand and then verifies
+// `Image.openPath`/`pread`/`check`/`mapExtents` against it. The fixture has
+// three guest clusters: allocated, sparse, allocated.
+test "Image reads a hand-built minimal qcow2 file" {
+    const io = std.testing.io;
+    const path = "test-qcow2-fixture.qcow2";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const total_file_size: u64 = 7 * 4096;
+    var img = try Image.create(io, path, .raw, total_file_size, .{});
+    const fixture = try writeQcow2TestFixture(&img, io, .{});
+    img.close(io);
+
+    var opened = try Image.openPath(io, path);
+    defer opened.close(io);
+    try std.testing.expectEqual(Format.qcow2, opened.format);
+    try std.testing.expectEqual(fixture.virtual_size, opened.virtual_size);
+
+    var block0: [13]u8 = undefined;
+    _ = try opened.pread(io, &block0, 0);
+    try std.testing.expectEqualSlices(u8, "QCOW2BLOCK000", &block0);
+
+    var zero_buf: [64]u8 = undefined;
+    _ = try opened.pread(io, &zero_buf, fixture.cluster_size);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 64), &zero_buf);
+
+    var block2: [13]u8 = undefined;
+    _ = try opened.pread(io, &block2, 2 * fixture.cluster_size + 32);
+    try std.testing.expectEqualSlices(u8, "QCOW2BLOCK222", &block2);
+
+    var one_byte: [1]u8 = .{1};
+    try std.testing.expectError(error.ReadOnlyFormat, opened.pwrite(io, &one_byte, 0));
+    try std.testing.expectError(error.ReadOnlyFormat, opened.resize(io, fixture.virtual_size + fixture.cluster_size));
+
+    const result = try opened.check(io);
+    try std.testing.expect(result.ok);
+
+    const extents = try opened.mapExtents(io, std.testing.allocator);
+    defer std.testing.allocator.free(extents);
+    try std.testing.expectEqual(@as(usize, 3), extents.len);
+    try std.testing.expectEqual(true, extents[0].allocated);
+    try std.testing.expectEqual(false, extents[1].allocated);
+    try std.testing.expectEqual(true, extents[2].allocated);
+}
+
+const Qcow2Fixture = struct {
+    cluster_size: u64,
+    virtual_size: u64,
+};
+
+const Qcow2FixtureOptions = struct {
+    dirty: bool = false,
+    corrupt: bool = false,
+};
+
+fn writeQcow2TestFixture(img: *Image, io: Io, options: Qcow2FixtureOptions) !Qcow2Fixture {
+    const cluster_bits: u32 = 12;
+    const cluster_size: u64 = 1 << cluster_bits;
+    const refcount_table_offset: u64 = 1 * cluster_size;
+    const refcount_block_offset: u64 = 2 * cluster_size;
+    const l1_table_offset: u64 = 3 * cluster_size;
+    const l2_table_offset: u64 = 4 * cluster_size;
+    const data0_offset: u64 = 5 * cluster_size;
+    const data2_offset: u64 = 6 * cluster_size;
+    const virtual_size: u64 = 3 * cluster_size;
+
+    var header: [112]u8 = [_]u8{0} ** 112;
+    header[0..4].* = qcow2.file_signature;
+    std.mem.writeInt(u32, header[4..8], 3, .big);
+    std.mem.writeInt(u32, header[20..24], cluster_bits, .big);
+    std.mem.writeInt(u64, header[24..32], virtual_size, .big);
+    std.mem.writeInt(u32, header[36..40], 1, .big);
+    std.mem.writeInt(u64, header[40..48], l1_table_offset, .big);
+    std.mem.writeInt(u64, header[48..56], refcount_table_offset, .big);
+    std.mem.writeInt(u32, header[56..60], 1, .big);
+    var incompatible_features: u64 = 0;
+    if (options.dirty) incompatible_features |= qcow2.incompatible_dirty;
+    if (options.corrupt) incompatible_features |= qcow2.incompatible_corrupt;
+    std.mem.writeInt(u64, header[72..80], incompatible_features, .big);
+    std.mem.writeInt(u32, header[96..100], 4, .big);
+    std.mem.writeInt(u32, header[100..104], 104, .big);
+    try img.pwrite(io, &header, 0);
+
+    var refcount_table: [4096]u8 = [_]u8{0} ** 4096;
+    std.mem.writeInt(u64, refcount_table[0..8], refcount_block_offset, .big);
+    try img.pwrite(io, &refcount_table, refcount_table_offset);
+
+    var refcount_block: [4096]u8 = [_]u8{0} ** 4096;
+    var cluster_index: usize = 0;
+    while (cluster_index < 7) : (cluster_index += 1) {
+        std.mem.writeInt(u16, refcount_block[cluster_index * 2 ..][0..2], 1, .big);
+    }
+    try img.pwrite(io, &refcount_block, refcount_block_offset);
+
+    var l1_table: [4096]u8 = [_]u8{0} ** 4096;
+    std.mem.writeInt(u64, l1_table[0..8], l2_table_offset | qcow2.copied_mask, .big);
+    try img.pwrite(io, &l1_table, l1_table_offset);
+
+    var l2_table: [4096]u8 = [_]u8{0} ** 4096;
+    std.mem.writeInt(u64, l2_table[0..8], data0_offset | qcow2.copied_mask, .big);
+    std.mem.writeInt(u64, l2_table[16..24], data2_offset | qcow2.copied_mask, .big);
+    try img.pwrite(io, &l2_table, l2_table_offset);
+
+    try img.pwrite(io, "QCOW2BLOCK000", data0_offset);
+    try img.pwrite(io, "QCOW2BLOCK222", data2_offset + 32);
+
+    return .{ .cluster_size = cluster_size, .virtual_size = virtual_size };
 }
 
 // ---- VHDX end-to-end integration test ----
