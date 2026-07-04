@@ -61,11 +61,10 @@ pub const Mbr = struct {
 
     pub fn encode(self: Mbr) [sector_size]u8 {
         var buf: [sector_size]u8 = [_]u8{0} ** sector_size;
-        // Bootstrap code area (0..0x1B8) intentionally left zeroed -- this
-        // library only produces partition *tables*, not boot code. Anything
-        // that boots the resulting Gen1 disk must chainload via a
-        // bootloader installed separately (e.g. grub-install writing its
-        // own stage1 into this area).
+        // Bootstrap code area (0..0x1B8) intentionally starts zeroed because
+        // this codec only produces partition *tables*, not boot code.
+        // Higher-level callers such as `build_image` may later overlay BIOS
+        // stage-1 bytes here while preserving the table/signature tail.
         std.mem.writeInt(u32, buf[0x1B8..0x1BC], self.disk_signature, .little);
 
         for (self.entries, 0..) |entry, i| {

@@ -1,7 +1,7 @@
-//! ESP/bootloader population helpers: discover prebuilt signed EFI binaries
-//! in a merged source tree, copy them into a FAT32 ESP, and generate minimal
-//! GRUB + Boot Loader Specification text configuration without invoking any
-//! external bootloader tooling.
+//! Bootloader population helpers: discover prebuilt EFI and BIOS GRUB assets
+//! in a merged source tree, copy/install them into their target on-disk
+//! locations, and generate minimal GRUB + Boot Loader Specification text
+//! configuration without invoking any external bootloader tooling.
 //!
 //! To keep future image-build orchestration consistent with `zvmi.ext4`, this
 //! module reuses the exact same vtable-style source-tree interface:
@@ -14,6 +14,7 @@ const fat32 = @import("fat32.zig");
 const guid = @import("guid.zig");
 const layout = @import("layout.zig");
 const Image = @import("image.zig").Image;
+const mbr = @import("mbr.zig");
 const gpt = @import("gpt.zig");
 const uki = @import("uki.zig");
 
@@ -122,6 +123,27 @@ pub const PopulateError = std.mem.Allocator.Error || fat32.MutationError ||
     MissingUkiStub,
     UnexpectedSourceLength,
 };
+
+pub const InstallBiosOptions = struct {
+    planned_partitions: []const PlannedPartitionIdentity,
+    architecture: ?Architecture = null,
+    root_role: ?layout.PartitionRole = null,
+};
+
+pub const InstallBiosError = PopulateError || Image.PreadError || Image.PwriteError || error{
+    BiosEmbedAreaTooSmall,
+    InvalidBiosBootImgSize,
+    InvalidBiosCoreImgSize,
+    MissingBiosBootImg,
+    MissingBiosCoreImg,
+    UnsupportedBiosArchitecture,
+};
+
+const grub_bios_boot_img_kernel_sector_offset: usize = 0x5C;
+const grub_bios_boot_img_preserve_offset: usize = 0x1B8;
+const grub_bios_core_blocklist_offset: usize = mbr.sector_size - 12;
+const grub_bios_kernel_segment: u16 = 0x800;
+const grub_bios_second_sector_segment: u16 = grub_bios_kernel_segment + 0x20;
 
 const EfiBinaryKind = enum {
     default_boot,
@@ -299,6 +321,64 @@ pub fn populateEsp(
         .root_partuuid = root_partuuid,
         .kernel_device_partuuid = kernel_device_partuuid,
     };
+}
+
+/// Installs a BIOS/MBR GRUB chain by embedding `core.img` into the classic
+/// post-MBR gap (sector 1 up to the first partition) and overlaying GRUB's
+/// stage-1 `boot.img` onto the existing MBR while preserving the disk
+/// signature, partition table, and boot signature already written there.
+pub fn installBiosBoot(
+    allocator: std.mem.Allocator,
+    io: Io,
+    img: *Image,
+    source: *SourceTreeView,
+    options: InstallBiosOptions,
+) InstallBiosError!void {
+    const architecture = options.architecture orelse try resolveArchitectureFromPlannedPartitions(options.planned_partitions, options.root_role);
+    if (architecture != .x86_64) return error.UnsupportedBiosArchitecture;
+
+    const root_partition = try resolveRootPartition(options.planned_partitions, architecture, options.root_role);
+    const embed_start_lba: u64 = 1;
+    const available_embed_sectors = root_partition.planned.firstLba() -| embed_start_lba;
+    if (available_embed_sectors == 0) return error.BiosEmbedAreaTooSmall;
+
+    var assets = try discoverBiosGrubAssets(allocator, source);
+    defer assets.deinit(allocator);
+
+    const boot_img_bytes = try readSourceFileAlloc(allocator, assets.boot_img.content, assets.boot_img.size);
+    defer allocator.free(boot_img_bytes);
+    if (boot_img_bytes.len != mbr.sector_size) return error.InvalidBiosBootImgSize;
+
+    const core_img_bytes = try readSourceFileAlloc(allocator, assets.core_img.content, assets.core_img.size);
+    defer allocator.free(core_img_bytes);
+    if (core_img_bytes.len < mbr.sector_size) return error.InvalidBiosCoreImgSize;
+
+    const core_sector_count = std.math.divCeil(u64, core_img_bytes.len, mbr.sector_size) catch unreachable;
+    if (core_sector_count > available_embed_sectors) return error.BiosEmbedAreaTooSmall;
+    const remaining_sector_count = core_sector_count - 1;
+    if (remaining_sector_count > std.math.maxInt(u16)) return error.BiosEmbedAreaTooSmall;
+
+    var mbr_sector: [mbr.sector_size]u8 = undefined;
+    _ = try img.pread(io, &mbr_sector, 0);
+    std.mem.copyForwards(u8, mbr_sector[0..grub_bios_boot_img_preserve_offset], boot_img_bytes[0..grub_bios_boot_img_preserve_offset]);
+    std.mem.writeInt(u64, mbr_sector[grub_bios_boot_img_kernel_sector_offset..][0..8], embed_start_lba, .little);
+    try img.pwrite(io, &mbr_sector, 0);
+
+    const padded_core_len = std.math.cast(usize, core_sector_count * mbr.sector_size) orelse return error.FileTooLarge;
+    const padded_core_img = try allocator.alloc(u8, padded_core_len);
+    defer allocator.free(padded_core_img);
+    @memset(padded_core_img, 0);
+    std.mem.copyForwards(u8, padded_core_img[0..core_img_bytes.len], core_img_bytes);
+
+    if (remaining_sector_count == 0) {
+        @memset(padded_core_img[grub_bios_core_blocklist_offset..][0..12], 0);
+    } else {
+        std.mem.writeInt(u64, padded_core_img[grub_bios_core_blocklist_offset..][0..8], embed_start_lba + 1, .little);
+        std.mem.writeInt(u16, padded_core_img[grub_bios_core_blocklist_offset + 8 ..][0..2], @intCast(remaining_sector_count), .little);
+        std.mem.writeInt(u16, padded_core_img[grub_bios_core_blocklist_offset + 10 ..][0..2], grub_bios_second_sector_segment, .little);
+    }
+
+    try img.pwrite(io, padded_core_img, embed_start_lba * mbr.sector_size);
 }
 
 fn scanSourceTree(
@@ -553,6 +633,27 @@ fn resolveArchitecture(efi_binaries: []const EfiBinary, options: PopulateOptions
     return error.AmbiguousArchitecture;
 }
 
+fn resolveArchitectureFromPlannedPartitions(
+    planned_partitions: []const PlannedPartitionIdentity,
+    override_role: ?layout.PartitionRole,
+) error{AmbiguousArchitecture}!Architecture {
+    if (override_role) |role| {
+        if (architectureForRole(role)) |architecture| return architecture;
+    }
+
+    var inferred: ?Architecture = null;
+    for (planned_partitions) |partition| {
+        const architecture = architectureForRole(partition.planned.role) orelse continue;
+        if (inferred == null) {
+            inferred = architecture;
+        } else if (inferred.? != architecture) {
+            return error.AmbiguousArchitecture;
+        }
+    }
+
+    return inferred orelse error.AmbiguousArchitecture;
+}
+
 fn architectureForRole(role: layout.PartitionRole) ?Architecture {
     return switch (role) {
         .root_x86_64, .usr_x86_64 => .x86_64,
@@ -578,33 +679,114 @@ fn findPartitionGuidByRole(
     return null;
 }
 
-fn resolveRootPartitionGuid(
+fn resolveRootPartition(
     planned_partitions: []const PlannedPartitionIdentity,
     architecture: Architecture,
     override_role: ?layout.PartitionRole,
-) PopulateError!guid.Guid {
+) error{ AmbiguousRootPartition, MissingRootPartition }!PlannedPartitionIdentity {
     if (override_role) |role| {
-        return findPartitionGuidByRole(planned_partitions, role) orelse error.MissingRootPartition;
+        for (planned_partitions) |partition| {
+            if (partition.planned.role == role) return partition;
+        }
+        return error.MissingRootPartition;
     }
 
-    if (findPartitionGuidByRole(planned_partitions, defaultRootRoleForArchitecture(architecture))) |partition_guid| {
-        return partition_guid;
+    const default_role = defaultRootRoleForArchitecture(architecture);
+    for (planned_partitions) |partition| {
+        if (partition.planned.role == default_role) return partition;
     }
 
-    var fallback: ?guid.Guid = null;
+    var fallback: ?PlannedPartitionIdentity = null;
     for (planned_partitions) |partition| {
         switch (partition.planned.role) {
             .root_x86_64, .root_aarch64, .linux_filesystem_data => {
                 if (fallback == null) {
-                    fallback = partition.unique_guid;
-                } else if (!std.mem.eql(u8, &fallback.?, &partition.unique_guid)) {
+                    fallback = partition;
+                } else if (!std.mem.eql(u8, &fallback.?.unique_guid, &partition.unique_guid)) {
                     return error.AmbiguousRootPartition;
                 }
             },
             else => {},
         }
     }
+
     return fallback orelse error.MissingRootPartition;
+}
+
+fn resolveRootPartitionGuid(
+    planned_partitions: []const PlannedPartitionIdentity,
+    architecture: Architecture,
+    override_role: ?layout.PartitionRole,
+) PopulateError!guid.Guid {
+    return (try resolveRootPartition(planned_partitions, architecture, override_role)).unique_guid;
+}
+
+const BiosGrubAssets = struct {
+    boot_img: SourceAsset,
+    core_img: SourceAsset,
+
+    fn deinit(self: *BiosGrubAssets, allocator: std.mem.Allocator) void {
+        allocator.free(self.boot_img.source_path);
+        allocator.free(self.core_img.source_path);
+        self.* = undefined;
+    }
+};
+
+fn discoverBiosGrubAssets(allocator: std.mem.Allocator, source: *SourceTreeView) InstallBiosError!BiosGrubAssets {
+    var best_boot_img: ?SourceAsset = null;
+    var best_boot_score: usize = std.math.maxInt(usize);
+    var best_core_img: ?SourceAsset = null;
+    var best_core_score: usize = std.math.maxInt(usize);
+
+    errdefer {
+        if (best_boot_img) |asset| allocator.free(asset.source_path);
+        if (best_core_img) |asset| allocator.free(asset.source_path);
+    }
+
+    source.reset();
+    while (try source.next()) |entry| {
+        if (entry.kind != .file or entry.content == null) continue;
+        const content = entry.content.?;
+
+        if (biosBootImgScore(entry.path)) |score| {
+            if (score < best_boot_score) {
+                if (best_boot_img) |asset| allocator.free(asset.source_path);
+                best_boot_img = try dupeSourceAsset(allocator, entry.path, entry.size, content);
+                best_boot_score = score;
+            }
+        }
+
+        if (biosCoreImgScore(entry.path)) |score| {
+            if (score < best_core_score) {
+                if (best_core_img) |asset| allocator.free(asset.source_path);
+                best_core_img = try dupeSourceAsset(allocator, entry.path, entry.size, content);
+                best_core_score = score;
+            }
+        }
+    }
+
+    return .{
+        .boot_img = best_boot_img orelse return error.MissingBiosBootImg,
+        .core_img = best_core_img orelse return error.MissingBiosCoreImg,
+    };
+}
+
+fn biosBootImgScore(path: []const u8) ?usize {
+    if (std.ascii.eqlIgnoreCase(path, "boot/grub2/i386-pc/boot.img")) return 0;
+    if (std.ascii.eqlIgnoreCase(path, "boot/grub/i386-pc/boot.img")) return 1;
+    if (std.ascii.eqlIgnoreCase(path, "usr/lib/grub/i386-pc/boot.img")) return 2;
+    if (std.ascii.eqlIgnoreCase(path, "usr/share/grub/i386-pc/boot.img")) return 3;
+    if (endsWithIgnoreCase(path, "/i386-pc/boot.img")) return 10;
+    return null;
+}
+
+fn biosCoreImgScore(path: []const u8) ?usize {
+    if (std.ascii.eqlIgnoreCase(path, "boot/grub2/i386-pc/core.img")) return 0;
+    if (std.ascii.eqlIgnoreCase(path, "boot/grub/i386-pc/core.img")) return 1;
+    if (std.ascii.eqlIgnoreCase(path, "usr/lib/grub/i386-pc/core.img")) return 2;
+    if (std.ascii.eqlIgnoreCase(path, "usr/share/grub/i386-pc/core.img")) return 3;
+    if (endsWithIgnoreCase(path, "/i386-pc/core.img")) return 10;
+    return null;
 }
 
 fn buildCopyPlan(
