@@ -57,6 +57,26 @@ pub const esp: Guid = parse("C12A7328-F81F-11D2-BA4B-00A0C93EC93B");
 /// etc.): 0FC63DAF-8483-4772-8E79-3D69D8477DE4.
 pub const linux_filesystem_data: Guid = parse("0FC63DAF-8483-4772-8E79-3D69D8477DE4");
 
+/// Discoverable Partitions Specification root (`/`) type GUID for x86-64:
+/// 4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709.
+pub const linux_root_x86_64: Guid = parse("4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709");
+
+/// Discoverable Partitions Specification root (`/`) type GUID for
+/// 64-bit ARM/AArch64: B921B045-1DF0-41C3-AF44-4C6F280D3FAE.
+pub const linux_root_aarch64: Guid = parse("B921B045-1DF0-41C3-AF44-4C6F280D3FAE");
+
+/// Discoverable Partitions Specification `/usr/` type GUID for x86-64:
+/// 8484680C-9521-48C6-9C11-B0720656F69E.
+pub const linux_usr_x86_64: Guid = parse("8484680C-9521-48C6-9C11-B0720656F69E");
+
+/// Discoverable Partitions Specification `/usr/` type GUID for
+/// 64-bit ARM/AArch64: B0E01050-EE5F-4390-949A-9101B17104E9.
+pub const linux_usr_aarch64: Guid = parse("B0E01050-EE5F-4390-949A-9101B17104E9");
+
+/// Discoverable Partitions Specification XBOOTLDR (`/boot/`) type GUID:
+/// BC13C2FF-59E6-4262-A352-B275FD6F7172.
+pub const linux_xbootldr: Guid = parse("BC13C2FF-59E6-4262-A352-B275FD6F7172");
+
 /// Microsoft Basic Data type GUID (Windows data volumes; included for
 /// completeness): EBD0A0A2-B9E5-4433-87C0-68B6B72699C7.
 pub const microsoft_basic_data: Guid = parse("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7");

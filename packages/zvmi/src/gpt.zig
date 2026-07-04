@@ -155,50 +155,31 @@ pub const Placement = struct {
 pub const WriteError = error{
     TooManyPartitions,
     NotEnoughSpace,
+    InvalidPlacement,
 } || Image.PreadError || Image.PwriteError;
 
-/// Writes a full protective-MBR + primary GPT (header+array) + backup GPT
-/// (array+header) layout to `img`, placing each of `specs` back-to-back
-/// starting at the first usable LBA. `img`'s current virtual size
-/// determines the disk's total sector count -- create/resize it to its
-/// final size *before* calling this. Returns each spec's chosen
-/// (first_lba,last_lba) into `out_placements` (same length as `specs`).
-pub fn writeGpt(
+pub const PlacedPartitionSpec = struct {
+    type_guid: guid.Guid,
+    unique_guid: guid.Guid,
+    placement: Placement,
+    name_utf16le: [36]u16 = [_]u16{0} ** 36,
+};
+
+fn writePartitionTables(
     img: *Image,
     io: Io,
     disk_guid: guid.Guid,
-    specs: []const PartitionSpec,
-    out_placements: []Placement,
+    entries: []const PartitionEntry,
 ) WriteError!void {
-    std.debug.assert(specs.len == out_placements.len);
-    if (specs.len > default_num_partition_entries) return error.TooManyPartitions;
-
-    const total_sectors = img.virtual_size / sector_size;
-    const first_usable_lba: u64 = 2 + partition_array_sectors;
-    const last_usable_lba: u64 = total_sectors - 2 - partition_array_sectors;
-
-    var cursor = first_usable_lba;
-    for (specs, 0..) |spec, i| {
-        if (spec.size_sectors == 0) return error.NotEnoughSpace;
-        const last = cursor + spec.size_sectors - 1;
-        if (last > last_usable_lba) return error.NotEnoughSpace;
-        out_placements[i] = .{ .first_lba = cursor, .last_lba = last };
-        cursor = last + 1;
-    }
-
     var array_buf: [default_num_partition_entries * partition_entry_size]u8 = [_]u8{0} ** (default_num_partition_entries * partition_entry_size);
-    for (specs, 0..) |spec, i| {
-        const entry = PartitionEntry{
-            .partition_type_guid = spec.type_guid,
-            .unique_partition_guid = spec.unique_guid,
-            .first_lba = out_placements[i].first_lba,
-            .last_lba = out_placements[i].last_lba,
-            .name_utf16le = spec.name_utf16le,
-        };
+    for (entries, 0..) |entry, i| {
         entry.encode(array_buf[i * partition_entry_size ..][0..partition_entry_size]);
     }
     const array_crc = std.hash.crc.Crc32.hash(&array_buf);
 
+    const total_sectors = img.virtual_size / sector_size;
+    const first_usable_lba: u64 = 2 + partition_array_sectors;
+    const last_usable_lba: u64 = total_sectors - 2 - partition_array_sectors;
     const backup_array_lba = total_sectors - 1 - partition_array_sectors;
 
     const primary = Header{
@@ -226,6 +207,84 @@ pub fn writeGpt(
     try img.pwrite(io, &array_buf, sector_size * 2);
     try img.pwrite(io, &array_buf, sector_size * backup_array_lba);
     try img.pwrite(io, &backup.encode(), sector_size * (total_sectors - 1));
+}
+
+/// Writes a full protective-MBR + primary GPT (header+array) + backup GPT
+/// (array+header) layout to `img`, placing each of `specs` back-to-back
+/// starting at the first usable LBA. `img`'s current virtual size
+/// determines the disk's total sector count -- create/resize it to its
+/// final size *before* calling this. Returns each spec's chosen
+/// (first_lba,last_lba) into `out_placements` (same length as `specs`).
+pub fn writeGpt(
+    img: *Image,
+    io: Io,
+    disk_guid: guid.Guid,
+    specs: []const PartitionSpec,
+    out_placements: []Placement,
+) WriteError!void {
+    std.debug.assert(specs.len == out_placements.len);
+    if (specs.len > default_num_partition_entries) return error.TooManyPartitions;
+
+    const total_sectors = img.virtual_size / sector_size;
+    const first_usable_lba: u64 = 2 + partition_array_sectors;
+    const last_usable_lba: u64 = total_sectors - 2 - partition_array_sectors;
+
+    var entries: [default_num_partition_entries]PartitionEntry = [_]PartitionEntry{.{}} ** default_num_partition_entries;
+    var cursor = first_usable_lba;
+    for (specs, 0..) |spec, i| {
+        if (spec.size_sectors == 0) return error.NotEnoughSpace;
+        const last = cursor + spec.size_sectors - 1;
+        if (last > last_usable_lba) return error.NotEnoughSpace;
+        out_placements[i] = .{ .first_lba = cursor, .last_lba = last };
+        entries[i] = .{
+            .partition_type_guid = spec.type_guid,
+            .unique_partition_guid = spec.unique_guid,
+            .first_lba = cursor,
+            .last_lba = last,
+            .name_utf16le = spec.name_utf16le,
+        };
+        cursor = last + 1;
+    }
+
+    try writePartitionTables(img, io, disk_guid, entries[0..specs.len]);
+}
+
+/// Writes a full protective-MBR + GPT layout to `img` using explicit
+/// partition placements chosen by the caller. Each placement must be
+/// within the GPT's usable LBA range, non-empty, and in strictly
+/// increasing non-overlapping order.
+pub fn writeGptPlaced(
+    img: *Image,
+    io: Io,
+    disk_guid: guid.Guid,
+    specs: []const PlacedPartitionSpec,
+) WriteError!void {
+    if (specs.len > default_num_partition_entries) return error.TooManyPartitions;
+
+    const total_sectors = img.virtual_size / sector_size;
+    const first_usable_lba: u64 = 2 + partition_array_sectors;
+    const last_usable_lba: u64 = total_sectors - 2 - partition_array_sectors;
+
+    var entries: [default_num_partition_entries]PartitionEntry = [_]PartitionEntry{.{}} ** default_num_partition_entries;
+    var prev_last_lba: u64 = 0;
+    for (specs, 0..) |spec, i| {
+        const placement = spec.placement;
+        if (placement.first_lba < first_usable_lba) return error.InvalidPlacement;
+        if (placement.last_lba < placement.first_lba) return error.InvalidPlacement;
+        if (placement.last_lba > last_usable_lba) return error.NotEnoughSpace;
+        if (i > 0 and placement.first_lba <= prev_last_lba) return error.InvalidPlacement;
+
+        entries[i] = .{
+            .partition_type_guid = spec.type_guid,
+            .unique_partition_guid = spec.unique_guid,
+            .first_lba = placement.first_lba,
+            .last_lba = placement.last_lba,
+            .name_utf16le = spec.name_utf16le,
+        };
+        prev_last_lba = placement.last_lba;
+    }
+
+    try writePartitionTables(img, io, disk_guid, entries[0..specs.len]);
 }
 
 pub const ParsedGpt = struct {
