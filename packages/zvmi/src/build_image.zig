@@ -158,6 +158,14 @@ pub fn build(
         .label = options.ext4_label,
     });
 
+    if (options.generation == .gen1) {
+        logStep(options.verbose, "install BIOS GRUB boot chain");
+        try bootconfig.installBiosBoot(allocator, io, &raw_img, &source_tree.view, .{
+            .planned_partitions = planned_partitions,
+            .architecture = architecture,
+        });
+    }
+
     if (findPartitionByRole(planned_partitions, .esp)) |esp_partition| {
         logStep(options.verbose, "populate ESP boot files");
         var esp_fs = try fat32.open(&raw_img, io, .{
@@ -269,6 +277,8 @@ fn planGen1PartitionIdentities(
         .x86_64 => .root_x86_64,
         .aarch64 => .root_aarch64,
     };
+    // Reserve the classic post-MBR embedding gap (sector 1 up to the first
+    // 1 MiB-aligned partition) so BIOS GRUB can place `core.img` there.
     const offset_bytes = mib;
     if (disk_size <= offset_bytes + mib) return error.DiskTooSmall;
     const usable_bytes = alignDown(disk_size - offset_bytes, mib);
@@ -1047,6 +1057,76 @@ test "build-image builds a Gen2 Azure-ready VHD from XZ squashfs + OCI layout" {
     try std.testing.expectEqualStrings("kernel-from-oci", boot_kernel);
 }
 
+test "build-image installs a Gen1 BIOS GRUB chain into the post-MBR gap" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const iso_path = "test-build-image-gen1.iso";
+    const oci_root = "test-build-image-gen1-oci";
+    const output_path = "test-build-image-gen1.raw";
+    defer Io.Dir.cwd().deleteFile(io, iso_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, oci_root) catch {};
+    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
+
+    const squashfs_bytes = try squashfs.buildSyntheticSquashfsImage(allocator, .{ .compression = .xz });
+    defer allocator.free(squashfs_bytes);
+    try writeMinimalIsoWithFile(allocator, io, iso_path, "ROOT.SQUASHFS;1", squashfs_bytes);
+
+    var fixture = try createBuildImageOciFixture(allocator, io, oci_root);
+    defer fixture.deinit(allocator);
+
+    var report = try build(allocator, io, .{
+        .iso_path = iso_path,
+        .container_path = oci_root,
+        .output_path = output_path,
+        .output_format = .raw,
+        .generation = .gen1,
+        .size = 256 * mib,
+    });
+    defer report.deinit(allocator);
+
+    try std.testing.expectEqual(Format.raw, report.output_format);
+    try std.testing.expect(report.partition_style.?.ok);
+    try std.testing.expectEqual(@as(usize, 1), report.planned_partitions.len);
+    try std.testing.expectEqual(@as(u64, mib), report.planned_partitions[0].planned.offset_bytes);
+
+    var img = try Image.openPath(io, output_path);
+    defer img.close(io);
+
+    var sector0: [mbr.sector_size]u8 = undefined;
+    _ = try img.pread(io, &sector0, 0);
+    const parsed_mbr = try mbr.Mbr.decode(&sector0);
+    try std.testing.expect(parsed_mbr.entries[0].bootable);
+    try std.testing.expectEqual(mbr.PartitionType.linux, parsed_mbr.entries[0].partition_type);
+    try std.testing.expectEqual(@as(u32, @intCast(report.planned_partitions[0].planned.firstLba())), parsed_mbr.entries[0].first_lba);
+    try std.testing.expectEqual(@as(u32, @intCast(report.planned_partitions[0].planned.sizeSectors())), parsed_mbr.entries[0].sector_count);
+
+    var expected_boot = try allocator.dupe(u8, fixture.bios_boot_img);
+    defer allocator.free(expected_boot);
+    std.mem.writeInt(u64, expected_boot[0x5C..][0..8], 1, .little);
+    try std.testing.expectEqualSlices(u8, expected_boot[0..0x1B8], sector0[0..0x1B8]);
+
+    const expected_table_tail = mbr.singleLinuxPartitionMbr(
+        @intCast(report.planned_partitions[0].planned.firstLba()),
+        @intCast(report.planned_partitions[0].planned.sizeSectors()),
+    ).encode();
+    try std.testing.expectEqualSlices(u8, expected_table_tail[0x1B8..], sector0[0x1B8..]);
+
+    const core_sector_count = std.math.divCeil(usize, fixture.bios_core_img.len, mbr.sector_size) catch unreachable;
+    const embedded_core = try allocator.alloc(u8, core_sector_count * mbr.sector_size);
+    defer allocator.free(embedded_core);
+    _ = try img.pread(io, embedded_core, mbr.sector_size);
+
+    var expected_core = try allocator.alloc(u8, embedded_core.len);
+    defer allocator.free(expected_core);
+    @memset(expected_core, 0);
+    std.mem.copyForwards(u8, expected_core[0..fixture.bios_core_img.len], fixture.bios_core_img);
+    std.mem.writeInt(u64, expected_core[500..][0..8], 2, .little);
+    std.mem.writeInt(u16, expected_core[508..][0..2], @intCast(core_sector_count - 1), .little);
+    std.mem.writeInt(u16, expected_core[510..][0..2], 0x820, .little);
+    try std.testing.expectEqualSlices(u8, expected_core, embedded_core);
+}
+
 test "build-image reports errors cleanly (no double-free) when squashfs open fails after partition planning" {
     // Regression test for a bug found via real-world testing against the real
     // Azure Linux 4.0 ISO (https://aka.ms/azurelinux-4.0-x86_64.iso), whose
@@ -1098,6 +1178,8 @@ test "build-image reports errors cleanly (no double-free) when squashfs open fai
 }
 
 const BuildImageOciFixture = struct {
+    bios_boot_img: []u8,
+    bios_core_img: []u8,
     layer1_tar: []u8,
     layer2_tar: []u8,
     layer1_gzip: []u8,
@@ -1111,6 +1193,8 @@ const BuildImageOciFixture = struct {
     index_json: []u8,
 
     fn deinit(self: *BuildImageOciFixture, allocator: std.mem.Allocator) void {
+        allocator.free(self.bios_boot_img);
+        allocator.free(self.bios_core_img);
         allocator.free(self.layer1_tar);
         allocator.free(self.layer2_tar);
         allocator.free(self.layer1_gzip);
@@ -1136,10 +1220,18 @@ fn createBuildImageOciFixture(
     defer dir.close(io);
     try dir.createDirPath(io, "blobs/sha256");
 
+    const bios_boot_img = try makeSyntheticBiosBootImg(allocator);
+    errdefer allocator.free(bios_boot_img);
+    const bios_core_img = try makeSyntheticBiosCoreImg(allocator);
+    errdefer allocator.free(bios_core_img);
     const layer1_tar = try buildTarArchive(allocator, &.{
         .{ .path = "boot/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
         .{ .path = "boot/vmlinuz-test", .mode = 0o644, .typeflag = '0', .content = "kernel-from-oci", .link_name = null },
         .{ .path = "boot/initramfs-test.img", .mode = 0o644, .typeflag = '0', .content = "initrd-from-oci", .link_name = null },
+        .{ .path = "boot/grub2/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
+        .{ .path = "boot/grub2/i386-pc/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
+        .{ .path = "boot/grub2/i386-pc/boot.img", .mode = 0o644, .typeflag = '0', .content = bios_boot_img, .link_name = null },
+        .{ .path = "boot/grub2/i386-pc/core.img", .mode = 0o644, .typeflag = '0', .content = bios_core_img, .link_name = null },
         .{ .path = "EFI/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
         .{ .path = "EFI/BOOT/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
         .{ .path = "EFI/BOOT/BOOTX64.EFI", .mode = 0o644, .typeflag = '0', .content = "bootx64-from-oci", .link_name = null },
@@ -1184,6 +1276,8 @@ fn createBuildImageOciFixture(
     try dir.writeFile(io, .{ .sub_path = "index.json", .data = index_json });
 
     return .{
+        .bios_boot_img = bios_boot_img,
+        .bios_core_img = bios_core_img,
         .layer1_tar = layer1_tar,
         .layer2_tar = layer2_tar,
         .layer1_gzip = layer1_gzip,
@@ -1286,6 +1380,18 @@ fn writeChecksumField(field: []u8, value: u32) !void {
     @memcpy(field[start .. start + octal.len], octal);
     field[field.len - 2] = 0;
     field[field.len - 1] = ' ';
+}
+
+fn makeSyntheticBiosBootImg(allocator: std.mem.Allocator) ![]u8 {
+    const bytes = try allocator.alloc(u8, mbr.sector_size);
+    for (bytes, 0..) |*byte, index| byte.* = @intCast((index * 17 + 11) % 251);
+    return bytes;
+}
+
+fn makeSyntheticBiosCoreImg(allocator: std.mem.Allocator) ![]u8 {
+    const bytes = try allocator.alloc(u8, 900);
+    for (bytes, 0..) |*byte, index| byte.* = @intCast((index * 29 + 7) % 253);
+    return bytes;
 }
 
 fn appendU16Le(list: *std.array_list.Managed(u8), value: u16) !void {
