@@ -672,6 +672,35 @@ fn deinitEntryMap(entry_map: *StringHashMap(FileTree.Entry), allocator: Allocato
     entry_map.deinit();
 }
 
+fn finalizeTree(allocator: Allocator, entry_map: *StringHashMap(FileTree.Entry)) LoadError!FileTree {
+    const entries = try allocator.alloc(FileTree.Entry, entry_map.count());
+    errdefer allocator.free(entries);
+
+    var iter = entry_map.iterator();
+    var index_out: usize = 0;
+    while (iter.next()) |kv| {
+        entries[index_out] = kv.value_ptr.*;
+        index_out += 1;
+    }
+    entry_map.deinit();
+    errdefer {
+        var tree = FileTree{ .allocator = allocator, .entries = entries };
+        tree.deinit();
+    }
+
+    std.mem.sort(FileTree.Entry, entries, {}, struct {
+        fn lessThan(_: void, a: FileTree.Entry, b: FileTree.Entry) bool {
+            return std.mem.lessThan(u8, a.path, b.path);
+        }
+    }.lessThan);
+
+    return .{ .allocator = allocator, .entries = entries };
+}
+
+fn normalizeArchivePath(allocator: Allocator, raw_path: []const u8) LoadError![]u8 {
+    return normalizeLayerPath(allocator, raw_path);
+}
+
 fn readBlob(io: Io, allocator: Allocator, layout_dir: Io.Dir, digest: []const u8, max_size: usize) LoadError![]u8 {
     if (!std.mem.startsWith(u8, digest, "sha256:")) return error.UnsupportedDigestAlgorithm;
     const hex = digest[7..];
@@ -691,7 +720,14 @@ fn readFileAtMost(io: Io, allocator: Allocator, dir: Io.Dir, sub_path: []const u
     return bytes;
 }
 
-test "loadLayout merges gzip layers, whiteouts, and opaque directories" {
+fn sha256DigestString(allocator: Allocator, data: []const u8) ![]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return std.fmt.allocPrint(allocator, "sha256:{s}", .{hex});
+}
+
+test "load auto-detects OCI layouts and merges gzip layers, whiteouts, and opaque directories" {
     const io = std.testing.io;
     const fixture_root = "test-oci-layout-fixture";
     defer Io.Dir.cwd().deleteTree(io, fixture_root) catch {};
@@ -699,7 +735,7 @@ test "loadLayout merges gzip layers, whiteouts, and opaque directories" {
     var fixture = try createFixtureLayout(std.testing.allocator, io, fixture_root);
     defer fixture.deinit(std.testing.allocator);
 
-    var image = try loadLayout(io, std.testing.allocator, fixture_root, .{});
+    var image = try load(io, std.testing.allocator, fixture_root, .{});
     defer image.deinit();
 
     try std.testing.expectEqualStrings("amd64", image.config.architecture.?);
@@ -727,6 +763,39 @@ test "loadLayout merges gzip layers, whiteouts, and opaque directories" {
     var seen: usize = 0;
     while (iter.next()) |_| seen += 1;
     try std.testing.expect(seen >= 7);
+}
+
+test "load auto-detects docker save tarballs and merges whiteouts" {
+    const io = std.testing.io;
+    const fixture_path = "test-docker-save-fixture.tar";
+    defer Io.Dir.cwd().deleteFile(io, fixture_path) catch {};
+
+    try createDockerSaveFixture(std.testing.allocator, io, fixture_path);
+
+    var image = try load(io, std.testing.allocator, fixture_path, .{});
+    defer image.deinit();
+
+    try std.testing.expectEqualStrings("amd64", image.config.architecture.?);
+    try std.testing.expectEqualStrings("linux", image.config.os.?);
+    try std.testing.expect(std.mem.startsWith(u8, image.config.manifest_digest, "sha256:"));
+
+    const hello = image.get("hello.txt").?;
+    try std.testing.expectEqual(EntryKind.file, hello.kind);
+    try std.testing.expectEqualStrings("hello from top\n", hello.content);
+
+    const keep = image.get("etc/keep.txt").?;
+    try std.testing.expectEqualStrings("keep from base\n", keep.content);
+    try std.testing.expect(image.get("etc/remove.txt") == null);
+
+    const opaque_dir = image.get("etc/opaque").?;
+    try std.testing.expectEqual(EntryKind.directory, opaque_dir.kind);
+    try std.testing.expect(image.get("etc/opaque/from-base.txt") == null);
+    const opaque_top = image.get("etc/opaque/from-top.txt").?;
+    try std.testing.expectEqualStrings("top survives\n", opaque_top.content);
+
+    const symlink = image.get("links/config").?;
+    try std.testing.expectEqual(EntryKind.symlink, symlink.kind);
+    try std.testing.expectEqualStrings("../etc/keep.txt", symlink.link_name.?);
 }
 
 test "loadLayout rejects zstd layer media types" {
@@ -856,12 +925,59 @@ fn createFixtureLayout(allocator: Allocator, io: Io, root: []const u8) !FixtureL
     };
 }
 
+fn createDockerSaveFixture(allocator: Allocator, io: Io, tarball_path: []const u8) !void {
+    const layer1_tar = try buildTarArchive(allocator, &.{
+        .{ .path = "etc/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
+        .{ .path = "etc/keep.txt", .mode = 0o644, .typeflag = '0', .content = "keep from base\n", .link_name = null },
+        .{ .path = "etc/remove.txt", .mode = 0o644, .typeflag = '0', .content = "remove me\n", .link_name = null },
+        .{ .path = "etc/opaque/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
+        .{ .path = "etc/opaque/from-base.txt", .mode = 0o644, .typeflag = '0', .content = "base hidden\n", .link_name = null },
+        .{ .path = "hello.txt", .mode = 0o644, .typeflag = '0', .content = "hello from base\n", .link_name = null },
+        .{ .path = "links/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
+        .{ .path = "links/config", .mode = 0o777, .typeflag = '2', .content = "", .link_name = "../etc/keep.txt" },
+    });
+    defer allocator.free(layer1_tar);
+
+    const layer2_tar = try buildTarArchive(allocator, &.{
+        .{ .path = "etc/.wh.remove.txt", .mode = 0o000, .typeflag = '0', .content = "", .link_name = null },
+        .{ .path = "etc/opaque/.wh..wh..opq", .mode = 0o000, .typeflag = '0', .content = "", .link_name = null },
+        .{ .path = "etc/opaque/from-top.txt", .mode = 0o644, .typeflag = '0', .content = "top survives\n", .link_name = null },
+        .{ .path = "hello.txt", .mode = 0o644, .typeflag = '0', .content = "hello from top\n", .link_name = null },
+    });
+    defer allocator.free(layer2_tar);
+
+    const config_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"architecture\":\"amd64\",\"os\":\"linux\",\"rootfs\":{{\"type\":\"layers\",\"diff_ids\":[]}}}}",
+        .{},
+    );
+    defer allocator.free(config_json);
+
+    const repositories_json =
+        "{\"example.com/test\":{\"latest\":\"2222222222222222222222222222222222222222222222222222222222222222\"}}";
+
+    const outer_tar = try buildTarArchive(allocator, &.{
+        .{ .path = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json", .mode = 0o644, .typeflag = '0', .content = config_json, .link_name = null },
+        .{ .path = "1111111111111111111111111111111111111111111111111111111111111111/layer.tar", .mode = 0o644, .typeflag = '0', .content = layer1_tar, .link_name = null },
+        .{ .path = "2222222222222222222222222222222222222222222222222222222222222222/layer.tar", .mode = 0o644, .typeflag = '0', .content = layer2_tar, .link_name = null },
+        .{
+            .path = "manifest.json",
+            .mode = 0o644,
+            .typeflag = '0',
+            .content =
+            "[{\"Config\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json\",\"RepoTags\":[\"example.com/test:latest\"],\"Layers\":[\"1111111111111111111111111111111111111111111111111111111111111111/layer.tar\",\"2222222222222222222222222222222222222222222222222222222222222222/layer.tar\"]}]",
+            .link_name = null,
+        },
+        .{ .path = "repositories", .mode = 0o644, .typeflag = '0', .content = repositories_json, .link_name = null },
+    });
+    defer allocator.free(outer_tar);
+
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = tarball_path, .data = outer_tar });
+}
+
 fn writeBlobAndDigest(allocator: Allocator, io: Io, dir: Io.Dir, data: []const u8) ![]u8 {
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
-    const hex = std.fmt.bytesToHex(digest, .lower);
-    const digest_string = try std.fmt.allocPrint(allocator, "sha256:{s}", .{hex});
-    const blob_path = try std.fmt.allocPrint(allocator, "blobs/sha256/{s}", .{hex});
+    const digest_string = try sha256DigestString(allocator, data);
+    const blob_path = try std.fmt.allocPrint(allocator, "blobs/sha256/{s}", .{digest_string[7..]});
     defer allocator.free(blob_path);
     try dir.writeFile(io, .{ .sub_path = blob_path, .data = data });
     return digest_string;
