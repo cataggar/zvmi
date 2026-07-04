@@ -7,7 +7,7 @@
 //! Milestone 7 status: raw + fixed/dynamic vhd read/write, MBR + GPT
 //! partition table read/write, FAT32 filesystem read/write, native ESP
 //! bootloader population (copy EFI binaries + generate grub.cfg/BLS),
-//! VHDX **read-only**, qcow2 **read-only**, ISO9660/squashfs
+//! qcow2 read/write, VHDX **read-only**, ISO9660/squashfs
 //! **read-only** (including squashfs XZ/zstd-compressed blocks), local OCI image ingestion, a minimal native ext4
 //! writer/readback helper, COSI output packaging, and the initial
 //! `build-image` orchestration pipeline for ISO + OCI -> raw/fixed-VHD.
