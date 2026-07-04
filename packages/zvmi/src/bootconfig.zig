@@ -15,6 +15,7 @@ const guid = @import("guid.zig");
 const layout = @import("layout.zig");
 const Image = @import("image.zig").Image;
 const gpt = @import("gpt.zig");
+const uki = @import("uki.zig");
 
 pub const SourceTreeView = ext4.FileTreeView;
 pub const SourceKind = ext4.Kind;
@@ -34,6 +35,34 @@ pub const Architecture = enum {
 pub const PlannedPartitionIdentity = struct {
     planned: layout.PlannedPartition,
     unique_guid: guid.Guid,
+};
+
+pub const BootMode = enum {
+    bls_only,
+    uki_only,
+    bls_and_uki,
+
+    fn includesBls(self: BootMode) bool {
+        return self != .uki_only;
+    }
+
+    fn includesUki(self: BootMode) bool {
+        return self != .bls_only;
+    }
+};
+
+pub const UkiOptions = struct {
+    /// Optional source-tree override for the PE/EFI stub. When omitted,
+    /// `populateEsp()` discovers common `systemd-stub` filenames.
+    stub_source_path: ?[]const u8 = null,
+    /// Optional source-tree override for the os-release payload. When omitted,
+    /// `populateEsp()` prefers `usr/lib/os-release` then `etc/os-release`,
+    /// falling back to a synthesized minimal payload if neither exists.
+    os_release_source_path: ?[]const u8 = null,
+    /// Optional source-tree path for a splash image embedded into `.splash`.
+    splash_source_path: ?[]const u8 = null,
+    /// Directory inside the ESP that receives generated named UKIs.
+    output_directory: []const u8 = "EFI/Linux",
 };
 
 pub const PopulateOptions = struct {
@@ -59,13 +88,21 @@ pub const PopulateOptions = struct {
     /// Extra kernel command-line arguments appended after
     /// `root=PARTUUID=<...>`.
     extra_kernel_options: []const u8 = "",
+    /// Select whether `populateEsp()` emits the existing shim/GRUB/BLS chain,
+    /// generated UKIs, or both.
+    boot_mode: BootMode = .bls_only,
+    /// UKI-specific discovery/output controls used when `boot_mode` includes
+    /// `.uki_only` or `.bls_and_uki`.
+    uki: UkiOptions = .{},
     grub_timeout_seconds: u32 = 1,
 };
 
 pub const PopulateReport = struct {
     architecture: Architecture,
     copied_efi_file_count: usize,
+    copied_secure_boot_file_count: usize,
     bls_entry_count: usize,
+    uki_count: usize,
     default_bootloader_path: []const u8,
     esp_partuuid: guid.Guid,
     root_partuuid: guid.Guid,
@@ -73,7 +110,7 @@ pub const PopulateReport = struct {
 };
 
 pub const PopulateError = std.mem.Allocator.Error || fat32.MutationError ||
-    SourceTreeView.IteratorError || SourceTreeView.ContentError || error{
+    SourceTreeView.IteratorError || SourceTreeView.ContentError || uki.GenerateError || error{
     AmbiguousArchitecture,
     AmbiguousRootPartition,
     FileTooLarge,
@@ -82,6 +119,7 @@ pub const PopulateError = std.mem.Allocator.Error || fat32.MutationError ||
     MissingEspPartition,
     MissingKernel,
     MissingRootPartition,
+    MissingUkiStub,
     UnexpectedSourceLength,
 };
 
@@ -100,19 +138,49 @@ const EfiBinary = struct {
     content: SourceTreeView.ContentReader,
 };
 
-const KernelCandidate = struct {
+const CopyableFile = struct {
+    destination_path: []u8,
+    size: u64,
+    content: SourceTreeView.ContentReader,
+};
+
+const BootArtifactCandidate = struct {
     source_path: []u8,
     config_path: []u8,
+    size: u64,
+    content: SourceTreeView.ContentReader,
+};
+
+const SourceAsset = struct {
+    source_path: []u8,
+    size: u64,
+    content: SourceTreeView.ContentReader,
+};
+
+const UkiAssets = struct {
+    stub: SourceAsset,
+    os_release: ?SourceAsset,
+    splash: ?SourceAsset,
+
+    fn deinit(self: *UkiAssets, allocator: std.mem.Allocator) void {
+        allocator.free(self.stub.source_path);
+        if (self.os_release) |*asset| allocator.free(asset.source_path);
+        if (self.splash) |*asset| allocator.free(asset.source_path);
+        self.* = undefined;
+    }
 };
 
 const ScanResult = struct {
     efi_binaries: []EfiBinary,
-    kernels: []KernelCandidate,
-    initrds: []KernelCandidate,
+    secure_boot_files: []CopyableFile,
+    kernels: []BootArtifactCandidate,
+    initrds: []BootArtifactCandidate,
 
     fn deinit(self: *ScanResult, allocator: std.mem.Allocator) void {
         for (self.efi_binaries) |binary| allocator.free(binary.destination_path);
         allocator.free(self.efi_binaries);
+        for (self.secure_boot_files) |file| allocator.free(file.destination_path);
+        allocator.free(self.secure_boot_files);
         freeCandidates(allocator, self.kernels);
         freeCandidates(allocator, self.initrds);
         self.* = undefined;
@@ -128,11 +196,11 @@ const CopyPlanEntry = struct {
 const BootEntry = struct {
     id: []u8,
     title: []u8,
-    linux_path: []const u8,
-    initrd_path: ?[]const u8,
+    kernel: BootArtifactCandidate,
+    initrd: ?BootArtifactCandidate,
 };
 
-fn freeCandidates(allocator: std.mem.Allocator, entries: []KernelCandidate) void {
+fn freeCandidates(allocator: std.mem.Allocator, entries: []BootArtifactCandidate) void {
     for (entries) |entry| {
         allocator.free(entry.source_path);
         allocator.free(entry.config_path);
@@ -154,8 +222,9 @@ fn freeCopyPlan(allocator: std.mem.Allocator, entries: []CopyPlanEntry) void {
 }
 
 /// Discovers EFI binaries + kernel/initrd paths in `source`, copies the EFI
-/// binaries into `esp`, and generates `EFI/.../grub.cfg`, `loader/loader.conf`,
-/// and `loader/entries/*.conf` files.
+/// binaries into `esp`, and generates `EFI/.../grub.cfg`,
+/// `loader/loader.conf`, `loader/entries/*.conf`, and/or `EFI/Linux/*.efi`
+/// UKIs depending on `options.boot_mode`.
 pub fn populateEsp(
     allocator: std.mem.Allocator,
     io: Io,
@@ -166,7 +235,7 @@ pub fn populateEsp(
     var scan = try scanSourceTree(allocator, source, options.path_strip_prefix);
     defer scan.deinit(allocator);
 
-    if (scan.efi_binaries.len == 0) return error.MissingBootloader;
+    if (options.boot_mode.includesBls() and scan.efi_binaries.len == 0) return error.MissingBootloader;
     if (scan.kernels.len == 0) return error.MissingKernel;
 
     sortKernelCandidates(scan.kernels);
@@ -177,42 +246,54 @@ pub fn populateEsp(
     const root_partuuid = try resolveRootPartitionGuid(options.planned_partitions, architecture, options.root_role);
     const kernel_device_partuuid = options.kernel_device_partuuid orelse root_partuuid;
 
-    const copy_plan = try buildCopyPlan(allocator, scan.efi_binaries, architecture);
+    const copy_plan = try buildCopyPlan(allocator, scan.efi_binaries, architecture, options.boot_mode);
     defer freeCopyPlan(allocator, copy_plan);
+    const secure_boot_plan = try buildSecureBootCopyPlan(allocator, scan.secure_boot_files, copy_plan, architecture, options.boot_mode);
+    defer freeCopyPlan(allocator, secure_boot_plan);
 
     for (copy_plan) |entry| try copyIntoFat32(allocator, io, esp, entry);
+    for (secure_boot_plan) |entry| try copyIntoFat32(allocator, io, esp, entry);
 
     const boot_entries = try buildBootEntries(allocator, scan.kernels, scan.initrds, options.title_prefix);
     defer freeBootEntries(allocator, boot_entries);
 
-    const loader_conf = try renderLoaderConf(allocator, boot_entries, options.grub_timeout_seconds);
-    defer allocator.free(loader_conf);
-    try writeGeneratedFile(io, esp, "loader/loader.conf", loader_conf);
+    if (options.boot_mode.includesBls()) {
+        const loader_conf = try renderLoaderConf(allocator, boot_entries, options.grub_timeout_seconds);
+        defer allocator.free(loader_conf);
+        try writeGeneratedFile(io, esp, "loader/loader.conf", loader_conf);
 
-    const grub_cfg = try renderGrubCfg(allocator, boot_entries, root_partuuid, kernel_device_partuuid, options.extra_kernel_options, options.grub_timeout_seconds);
-    defer allocator.free(grub_cfg);
+        const grub_cfg = try renderGrubCfg(allocator, boot_entries, root_partuuid, kernel_device_partuuid, options.extra_kernel_options, options.grub_timeout_seconds);
+        defer allocator.free(grub_cfg);
 
-    try writeGeneratedFile(io, esp, "EFI/BOOT/grub.cfg", grub_cfg);
+        try writeGeneratedFile(io, esp, "EFI/BOOT/grub.cfg", grub_cfg);
 
-    var vendor_cfg_paths = try collectVendorGrubCfgPaths(allocator, copy_plan);
-    defer {
-        for (vendor_cfg_paths.items) |path| allocator.free(path);
-        vendor_cfg_paths.deinit();
+        var vendor_cfg_paths = try collectVendorGrubCfgPaths(allocator, copy_plan);
+        defer {
+            for (vendor_cfg_paths.items) |path| allocator.free(path);
+            vendor_cfg_paths.deinit();
+        }
+        for (vendor_cfg_paths.items) |path| try writeGeneratedFile(io, esp, path, grub_cfg);
+
+        for (boot_entries) |entry| {
+            const bls_text = try renderBlsEntry(allocator, entry, root_partuuid, options.extra_kernel_options);
+            defer allocator.free(bls_text);
+            const bls_path = try std.fmt.allocPrint(allocator, "loader/entries/{s}.conf", .{entry.id});
+            defer allocator.free(bls_path);
+            try writeGeneratedFile(io, esp, bls_path, bls_text);
+        }
     }
-    for (vendor_cfg_paths.items) |path| try writeGeneratedFile(io, esp, path, grub_cfg);
 
-    for (boot_entries) |entry| {
-        const bls_text = try renderBlsEntry(allocator, entry, root_partuuid, options.extra_kernel_options);
-        defer allocator.free(bls_text);
-        const bls_path = try std.fmt.allocPrint(allocator, "loader/entries/{s}.conf", .{entry.id});
-        defer allocator.free(bls_path);
-        try writeGeneratedFile(io, esp, bls_path, bls_text);
-    }
+    const uki_count = if (options.boot_mode.includesUki())
+        try generateUkis(allocator, io, esp, source, architecture, boot_entries, root_partuuid, options)
+    else
+        0;
 
     return .{
         .architecture = architecture,
         .copied_efi_file_count = copy_plan.len,
-        .bls_entry_count = boot_entries.len,
+        .copied_secure_boot_file_count = secure_boot_plan.len,
+        .bls_entry_count = if (options.boot_mode.includesBls()) boot_entries.len else 0,
+        .uki_count = uki_count,
         .default_bootloader_path = architecture.defaultBootPath(),
         .esp_partuuid = esp_partuuid,
         .root_partuuid = root_partuuid,
@@ -231,13 +312,19 @@ fn scanSourceTree(
         efi_binaries.deinit();
     }
 
-    var kernels = std.array_list.Managed(KernelCandidate).init(allocator);
+    var secure_boot_files = std.array_list.Managed(CopyableFile).init(allocator);
+    errdefer {
+        for (secure_boot_files.items) |entry| allocator.free(entry.destination_path);
+        secure_boot_files.deinit();
+    }
+
+    var kernels = std.array_list.Managed(BootArtifactCandidate).init(allocator);
     errdefer {
         freeCandidates(allocator, kernels.items);
         kernels.deinit();
     }
 
-    var initrds = std.array_list.Managed(KernelCandidate).init(allocator);
+    var initrds = std.array_list.Managed(BootArtifactCandidate).init(allocator);
     errdefer {
         freeCandidates(allocator, initrds.items);
         initrds.deinit();
@@ -255,6 +342,12 @@ fn scanSourceTree(
                         .size = entry.size,
                         .content = content,
                     });
+                } else if (try classifySecureBootFile(allocator, entry.path)) |destination_path| {
+                    try secure_boot_files.append(.{
+                        .destination_path = destination_path,
+                        .size = entry.size,
+                        .content = content,
+                    });
                 }
             }
         }
@@ -264,17 +357,22 @@ fn scanSourceTree(
             try kernels.append(.{
                 .source_path = try allocator.dupe(u8, entry.path),
                 .config_path = try makeConfigPath(allocator, entry.path, strip_prefix),
+                .size = entry.size,
+                .content = entry.content orelse return error.MissingContentReader,
             });
         } else if (isInitrdPath(entry.path)) {
             try initrds.append(.{
                 .source_path = try allocator.dupe(u8, entry.path),
                 .config_path = try makeConfigPath(allocator, entry.path, strip_prefix),
+                .size = entry.size,
+                .content = entry.content orelse return error.MissingContentReader,
             });
         }
     }
 
     return .{
         .efi_binaries = try efi_binaries.toOwnedSlice(),
+        .secure_boot_files = try secure_boot_files.toOwnedSlice(),
         .kernels = try kernels.toOwnedSlice(),
         .initrds = try initrds.toOwnedSlice(),
     };
@@ -315,6 +413,38 @@ fn classifyEfiBinary(
         .architecture = classification.?.architecture,
         .kind = classification.?.kind,
     };
+}
+
+fn classifySecureBootFile(allocator: std.mem.Allocator, path: []const u8) std.mem.Allocator.Error!?[]u8 {
+    const destination_path = try efiDestinationPath(allocator, path) orelse return null;
+    errdefer allocator.free(destination_path);
+
+    const basename = baseName(path);
+    if (isSecureBootAuxiliaryEfi(basename) or isSecureBootConfigFile(basename)) {
+        return destination_path;
+    }
+
+    allocator.free(destination_path);
+    return null;
+}
+
+fn isSecureBootAuxiliaryEfi(basename: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(basename, "MokManager.efi") or
+        std.ascii.eqlIgnoreCase(basename, "MokManagerX64.efi") or
+        std.ascii.eqlIgnoreCase(basename, "MokManagerAA64.efi") or
+        std.ascii.eqlIgnoreCase(basename, "fbx64.efi") or
+        std.ascii.eqlIgnoreCase(basename, "fbaa64.efi") or
+        std.ascii.eqlIgnoreCase(basename, "fallback.efi");
+}
+
+fn isSecureBootConfigFile(basename: []const u8) bool {
+    return endsWithIgnoreCase(basename, ".csv") or
+        endsWithIgnoreCase(basename, ".cer") or
+        endsWithIgnoreCase(basename, ".crt") or
+        endsWithIgnoreCase(basename, ".der") or
+        endsWithIgnoreCase(basename, ".esl") or
+        endsWithIgnoreCase(basename, ".auth") or
+        endsWithIgnoreCase(basename, ".conf");
 }
 
 fn efiDestinationPath(allocator: std.mem.Allocator, path: []const u8) std.mem.Allocator.Error!?[]u8 {
@@ -382,12 +512,12 @@ fn trimSlashes(value: []const u8) []const u8 {
     return value[start..end];
 }
 
-fn sortKernelCandidates(entries: []KernelCandidate) void {
+fn sortKernelCandidates(entries: []BootArtifactCandidate) void {
     var i: usize = 1;
     while (i < entries.len) : (i += 1) {
         var j = i;
         while (j > 0 and std.mem.lessThan(u8, entries[j].source_path, entries[j - 1].source_path)) : (j -= 1) {
-            std.mem.swap(KernelCandidate, &entries[j], &entries[j - 1]);
+            std.mem.swap(BootArtifactCandidate, &entries[j], &entries[j - 1]);
         }
     }
 }
@@ -481,6 +611,7 @@ fn buildCopyPlan(
     allocator: std.mem.Allocator,
     efi_binaries: []const EfiBinary,
     architecture: Architecture,
+    boot_mode: BootMode,
 ) std.mem.Allocator.Error![]CopyPlanEntry {
     var plan = std.array_list.Managed(CopyPlanEntry).init(allocator);
     errdefer {
@@ -489,6 +620,7 @@ fn buildCopyPlan(
     }
 
     for (efi_binaries) |binary| {
+        if (boot_mode == .uki_only and std.ascii.eqlIgnoreCase(binary.destination_path, architecture.defaultBootPath())) continue;
         if (containsPathIgnoreCase(plan.items, binary.destination_path)) continue;
         try plan.append(.{
             .destination_path = try allocator.dupe(u8, binary.destination_path),
@@ -498,7 +630,7 @@ fn buildCopyPlan(
     }
 
     const fallback_path = architecture.defaultBootPath();
-    if (!containsPathIgnoreCase(plan.items, fallback_path)) {
+    if (boot_mode.includesBls() and !containsPathIgnoreCase(plan.items, fallback_path)) {
         if (bestFallbackBinary(efi_binaries, architecture)) |binary| {
             try plan.append(.{
                 .destination_path = try allocator.dupe(u8, fallback_path),
@@ -506,6 +638,33 @@ fn buildCopyPlan(
                 .content = binary.content,
             });
         }
+    }
+
+    return plan.toOwnedSlice();
+}
+
+fn buildSecureBootCopyPlan(
+    allocator: std.mem.Allocator,
+    files: []const CopyableFile,
+    existing_plan: []const CopyPlanEntry,
+    architecture: Architecture,
+    boot_mode: BootMode,
+) std.mem.Allocator.Error![]CopyPlanEntry {
+    var plan = std.array_list.Managed(CopyPlanEntry).init(allocator);
+    errdefer {
+        for (plan.items) |entry| allocator.free(entry.destination_path);
+        plan.deinit();
+    }
+
+    const default_boot_path = architecture.defaultBootPath();
+    for (files) |file| {
+        if (boot_mode == .uki_only and std.ascii.eqlIgnoreCase(file.destination_path, default_boot_path)) continue;
+        if (containsPathIgnoreCase(existing_plan, file.destination_path) or containsPathIgnoreCase(plan.items, file.destination_path)) continue;
+        try plan.append(.{
+            .destination_path = try allocator.dupe(u8, file.destination_path),
+            .size = file.size,
+            .content = file.content,
+        });
     }
 
     return plan.toOwnedSlice();
@@ -568,8 +727,8 @@ fn readSourceFileAlloc(
 
 fn buildBootEntries(
     allocator: std.mem.Allocator,
-    kernels: []const KernelCandidate,
-    initrds: []const KernelCandidate,
+    kernels: []const BootArtifactCandidate,
+    initrds: []const BootArtifactCandidate,
     title_prefix: []const u8,
 ) std.mem.Allocator.Error![]BootEntry {
     var used_ids = std.array_list.Managed([]u8).init(allocator);
@@ -605,8 +764,8 @@ fn buildBootEntries(
         try entries.append(.{
             .id = id,
             .title = title,
-            .linux_path = kernel.config_path,
-            .initrd_path = if (initrd) |value| value.config_path else null,
+            .kernel = kernel,
+            .initrd = initrd,
         });
     }
 
@@ -653,7 +812,7 @@ fn containsString(existing: []const []u8, candidate: []const u8) bool {
     return false;
 }
 
-fn bestMatchingInitrd(kernel: KernelCandidate, initrds: []const KernelCandidate) ?KernelCandidate {
+fn bestMatchingInitrd(kernel: BootArtifactCandidate, initrds: []const BootArtifactCandidate) ?BootArtifactCandidate {
     var best_index: ?usize = null;
     var best_score: i32 = -1;
     for (initrds, 0..) |candidate, index| {
@@ -667,7 +826,7 @@ fn bestMatchingInitrd(kernel: KernelCandidate, initrds: []const KernelCandidate)
     return initrds[best_index.?];
 }
 
-fn scoreKernelInitrdPair(kernel: KernelCandidate, initrd: KernelCandidate) i32 {
+fn scoreKernelInitrdPair(kernel: BootArtifactCandidate, initrd: BootArtifactCandidate) i32 {
     var score: i32 = 1;
     if (std.ascii.eqlIgnoreCase(dirName(kernel.source_path), dirName(initrd.source_path))) score += 10;
 
@@ -717,6 +876,234 @@ fn endsWithIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return std.ascii.eqlIgnoreCase(haystack[haystack.len - needle.len ..], needle);
 }
 
+fn generateUkis(
+    allocator: std.mem.Allocator,
+    io: Io,
+    esp: *fat32.FileSystem,
+    source: *SourceTreeView,
+    architecture: Architecture,
+    entries: []const BootEntry,
+    root_partuuid: guid.Guid,
+    options: PopulateOptions,
+) PopulateError!usize {
+    std.debug.assert(entries.len != 0);
+
+    var assets = try discoverUkiAssets(allocator, source, architecture, options.uki);
+    defer assets.deinit(allocator);
+
+    const stub_bytes = try readSourceFileAlloc(allocator, assets.stub.content, assets.stub.size);
+    defer allocator.free(stub_bytes);
+
+    const os_release_bytes = if (assets.os_release) |asset|
+        try readSourceFileAlloc(allocator, asset.content, asset.size)
+    else
+        try synthesizeOsRelease(allocator, options.title_prefix);
+    defer allocator.free(os_release_bytes);
+
+    const splash_bytes = if (assets.splash) |asset|
+        try readSourceFileAlloc(allocator, asset.content, asset.size)
+    else
+        null;
+    defer if (splash_bytes) |bytes| allocator.free(bytes);
+
+    const output_directory = effectiveUkiOutputDirectory(options.uki.output_directory);
+    for (entries, 0..) |entry, index| {
+        const kernel_bytes = try readSourceFileAlloc(allocator, entry.kernel.content, entry.kernel.size);
+        defer allocator.free(kernel_bytes);
+
+        const initrd_bytes = if (entry.initrd) |initrd|
+            try readSourceFileAlloc(allocator, initrd.content, initrd.size)
+        else
+            null;
+        defer if (initrd_bytes) |bytes| allocator.free(bytes);
+
+        const cmdline = try renderKernelOptions(allocator, root_partuuid, options.extra_kernel_options);
+        defer allocator.free(cmdline);
+
+        const uname = kernelReleaseName(entry.kernel.source_path);
+        const uki_bytes = try uki.generate(allocator, .{
+            .stub = stub_bytes,
+            .linux = kernel_bytes,
+            .initrd = initrd_bytes,
+            .cmdline = cmdline,
+            .os_release = os_release_bytes,
+            .uname = uname,
+            .splash = splash_bytes,
+        });
+        defer allocator.free(uki_bytes);
+
+        const destination_path = try std.fmt.allocPrint(allocator, "{s}/{s}.efi", .{ output_directory, entry.id });
+        defer allocator.free(destination_path);
+        try writeGeneratedFile(io, esp, destination_path, uki_bytes);
+
+        if (options.boot_mode == .uki_only and index == 0) {
+            try writeGeneratedFile(io, esp, architecture.defaultBootPath(), uki_bytes);
+        }
+    }
+
+    return entries.len;
+}
+
+fn discoverUkiAssets(
+    allocator: std.mem.Allocator,
+    source: *SourceTreeView,
+    architecture: Architecture,
+    options: UkiOptions,
+) PopulateError!UkiAssets {
+    var best_stub: ?SourceAsset = null;
+    var best_stub_score: usize = std.math.maxInt(usize);
+    var explicit_os_release: ?SourceAsset = null;
+    var usr_lib_os_release: ?SourceAsset = null;
+    var etc_os_release: ?SourceAsset = null;
+    var splash: ?SourceAsset = null;
+
+    errdefer {
+        if (best_stub) |asset| allocator.free(asset.source_path);
+        if (explicit_os_release) |asset| allocator.free(asset.source_path);
+        if (usr_lib_os_release) |asset| allocator.free(asset.source_path);
+        if (etc_os_release) |asset| allocator.free(asset.source_path);
+        if (splash) |asset| allocator.free(asset.source_path);
+    }
+
+    source.reset();
+    while (try source.next()) |entry| {
+        if (entry.kind != .file or entry.content == null) continue;
+        const content = entry.content.?;
+
+        if (options.stub_source_path) |stub_source_path| {
+            if (std.ascii.eqlIgnoreCase(entry.path, stub_source_path)) {
+                if (best_stub) |asset| allocator.free(asset.source_path);
+                best_stub = try dupeSourceAsset(allocator, entry.path, entry.size, content);
+                best_stub_score = 0;
+            }
+        } else if (ukiStubScore(entry.path, architecture)) |score| {
+            if (score < best_stub_score) {
+                if (best_stub) |asset| allocator.free(asset.source_path);
+                best_stub = try dupeSourceAsset(allocator, entry.path, entry.size, content);
+                best_stub_score = score;
+            }
+        }
+
+        if (options.os_release_source_path) |os_release_source_path| {
+            if (std.ascii.eqlIgnoreCase(entry.path, os_release_source_path)) {
+                if (explicit_os_release) |asset| allocator.free(asset.source_path);
+                explicit_os_release = try dupeSourceAsset(allocator, entry.path, entry.size, content);
+            }
+        } else if (std.ascii.eqlIgnoreCase(entry.path, "usr/lib/os-release")) {
+            if (usr_lib_os_release) |asset| allocator.free(asset.source_path);
+            usr_lib_os_release = try dupeSourceAsset(allocator, entry.path, entry.size, content);
+        } else if (std.ascii.eqlIgnoreCase(entry.path, "etc/os-release")) {
+            if (etc_os_release) |asset| allocator.free(asset.source_path);
+            etc_os_release = try dupeSourceAsset(allocator, entry.path, entry.size, content);
+        }
+
+        if (options.splash_source_path) |splash_source_path| {
+            if (std.ascii.eqlIgnoreCase(entry.path, splash_source_path)) {
+                if (splash) |asset| allocator.free(asset.source_path);
+                splash = try dupeSourceAsset(allocator, entry.path, entry.size, content);
+            }
+        }
+    }
+
+    const stub = best_stub orelse return error.MissingUkiStub;
+    var os_release: ?SourceAsset = null;
+    if (explicit_os_release) |asset| {
+        os_release = asset;
+        if (usr_lib_os_release) |other| allocator.free(other.source_path);
+        if (etc_os_release) |other| allocator.free(other.source_path);
+    } else if (usr_lib_os_release) |asset| {
+        os_release = asset;
+        if (etc_os_release) |other| allocator.free(other.source_path);
+    } else if (etc_os_release) |asset| {
+        os_release = asset;
+    }
+
+    return .{
+        .stub = stub,
+        .os_release = os_release,
+        .splash = splash,
+    };
+}
+
+fn dupeSourceAsset(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    size: u64,
+    content: SourceTreeView.ContentReader,
+) std.mem.Allocator.Error!SourceAsset {
+    return .{
+        .source_path = try allocator.dupe(u8, path),
+        .size = size,
+        .content = content,
+    };
+}
+
+fn ukiStubScore(path: []const u8, architecture: Architecture) ?usize {
+    const basename = baseName(path);
+    const preferred_dir_bonus: usize = if (containsIgnoreCase(path, "systemd/boot/efi")) 0 else 10;
+    return switch (architecture) {
+        .x86_64 => if (std.ascii.eqlIgnoreCase(basename, "linuxx64.efi.stub"))
+            preferred_dir_bonus
+        else if (std.ascii.eqlIgnoreCase(basename, "systemd-stubx64.efi"))
+            preferred_dir_bonus + 1
+        else if (std.ascii.eqlIgnoreCase(basename, "stubx64.efi"))
+            preferred_dir_bonus + 2
+        else
+            null,
+        .aarch64 => if (std.ascii.eqlIgnoreCase(basename, "linuxaa64.efi.stub"))
+            preferred_dir_bonus
+        else if (std.ascii.eqlIgnoreCase(basename, "systemd-stubaa64.efi"))
+            preferred_dir_bonus + 1
+        else if (std.ascii.eqlIgnoreCase(basename, "stubaa64.efi"))
+            preferred_dir_bonus + 2
+        else
+            null,
+    };
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var start: usize = 0;
+    while (start + needle.len <= haystack.len) : (start += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[start .. start + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+fn synthesizeOsRelease(allocator: std.mem.Allocator, title_prefix: []const u8) std.mem.Allocator.Error![]u8 {
+    const pretty_name = if (title_prefix.len != 0) title_prefix else "zvmi";
+    return std.fmt.allocPrint(
+        allocator,
+        "ID=zvmi\nNAME=\"zvmi\"\nPRETTY_NAME=\"{s}\"\n",
+        .{pretty_name},
+    );
+}
+
+fn renderKernelOptions(
+    allocator: std.mem.Allocator,
+    root_partuuid: guid.Guid,
+    extra_kernel_options: []const u8,
+) std.mem.Allocator.Error![]u8 {
+    var root_guid_buf: [36]u8 = undefined;
+    const root_partuuid_text = guid.formatLower(&root_guid_buf, root_partuuid);
+    return if (extra_kernel_options.len == 0)
+        std.fmt.allocPrint(allocator, "root=PARTUUID={s}", .{root_partuuid_text})
+    else
+        std.fmt.allocPrint(allocator, "root=PARTUUID={s} {s}", .{ root_partuuid_text, extra_kernel_options });
+}
+
+fn effectiveUkiOutputDirectory(output_directory: []const u8) []const u8 {
+    const trimmed = trimSlashes(output_directory);
+    return if (trimmed.len == 0) "EFI/Linux" else trimmed;
+}
+
+fn kernelReleaseName(kernel_source_path: []const u8) []const u8 {
+    const basename = baseName(kernel_source_path);
+    const version = versionKey(basename, true);
+    return if (version.len != 0) version else basename;
+}
+
 fn renderLoaderConf(
     allocator: std.mem.Allocator,
     entries: []const BootEntry,
@@ -749,11 +1136,11 @@ fn renderGrubCfg(
 
     for (entries) |entry| {
         out.writer.print("menuentry '{s}' --id '{s}' {{\n", .{ entry.title, entry.id }) catch return error.OutOfMemory;
-        out.writer.print("    linux ($kernel_root){s} root=PARTUUID={s}", .{ entry.linux_path, root_partuuid_text }) catch return error.OutOfMemory;
+        out.writer.print("    linux ($kernel_root){s} root=PARTUUID={s}", .{ entry.kernel.config_path, root_partuuid_text }) catch return error.OutOfMemory;
         if (extra_kernel_options.len != 0) out.writer.print(" {s}", .{extra_kernel_options}) catch return error.OutOfMemory;
         out.writer.writeAll("\n") catch return error.OutOfMemory;
-        if (entry.initrd_path) |initrd_path| {
-            out.writer.print("    initrd ($kernel_root){s}\n", .{initrd_path}) catch return error.OutOfMemory;
+        if (entry.initrd) |initrd| {
+            out.writer.print("    initrd ($kernel_root){s}\n", .{initrd.config_path}) catch return error.OutOfMemory;
         }
         out.writer.writeAll("}\n\n") catch return error.OutOfMemory;
     }
@@ -775,10 +1162,10 @@ fn renderBlsEntry(
 
     out.writer.print(
         "title {s}\nversion {s}\nlinux {s}\n",
-        .{ entry.title, baseName(entry.linux_path), entry.linux_path },
+        .{ entry.title, baseName(entry.kernel.config_path), entry.kernel.config_path },
     ) catch return error.OutOfMemory;
-    if (entry.initrd_path) |initrd_path| {
-        out.writer.print("initrd {s}\n", .{initrd_path}) catch return error.OutOfMemory;
+    if (entry.initrd) |initrd| {
+        out.writer.print("initrd {s}\n", .{initrd.config_path}) catch return error.OutOfMemory;
     }
     out.writer.print("options root=PARTUUID={s}", .{root_partuuid_text}) catch return error.OutOfMemory;
     if (extra_kernel_options.len != 0) out.writer.print(" {s}", .{extra_kernel_options}) catch return error.OutOfMemory;
@@ -902,7 +1289,9 @@ test "populateEsp copies EFI binaries and generates grub.cfg plus BLS entries" {
     });
     try std.testing.expectEqual(Architecture.x86_64, report.architecture);
     try std.testing.expectEqual(@as(usize, 4), report.copied_efi_file_count);
+    try std.testing.expectEqual(@as(usize, 0), report.copied_secure_boot_file_count);
     try std.testing.expectEqual(@as(usize, 1), report.bls_entry_count);
+    try std.testing.expectEqual(@as(usize, 0), report.uki_count);
 
     const parsed = try gpt.readGpt(img, io, std.testing.allocator);
     defer std.testing.allocator.free(parsed.partitions);
@@ -1002,6 +1391,135 @@ test "populateEsp synthesizes fallback BOOTX64.EFI from shim when needed" {
     try std.testing.expectEqualStrings("shim-payload", shim);
 }
 
+test "populateEsp copies MOK assets and emits UKIs when requested" {
+    const io = std.testing.io;
+    const path = "test-bootconfig-secureboot-uki.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const esp_len = 96 * 1024 * 1024;
+    var img = try Image.create(io, path, .raw, esp_len * 2, .{});
+    defer img.close(io);
+    try fat32.format(&img, io, .{ .partition_offset = 0, .partition_len = esp_len });
+    var esp = try fat32.open(&img, io, .{ .offset = 0, .length = esp_len });
+
+    const planned = [_]PlannedPartitionIdentity{
+        .{ .planned = .{
+            .name = "ESP",
+            .role = .esp,
+            .type_guid = guid.esp,
+            .offset_bytes = 0,
+            .length_bytes = esp_len,
+        }, .unique_guid = guid.parse("66666666-6666-6666-6666-666666666666") },
+        .{ .planned = .{
+            .name = "root",
+            .role = .root_x86_64,
+            .type_guid = guid.linux_root_x86_64,
+            .offset_bytes = esp_len,
+            .length_bytes = esp_len,
+        }, .unique_guid = guid.parse("77777777-7777-7777-7777-777777777777") },
+    };
+
+    const stub = try makeTestStubPe(std.testing.allocator, 0x8664);
+    defer std.testing.allocator.free(stub);
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "EFI/Acme/shimx64.efi", .kind = .file, .bytes = "shimx64" },
+        .{ .path = "EFI/Acme/grubx64.efi", .kind = .file, .bytes = "grubx64" },
+        .{ .path = "EFI/Acme/mmx64.efi", .kind = .file, .bytes = "mmx64" },
+        .{ .path = "EFI/Acme/MokManager.efi", .kind = .file, .bytes = "mokmanager" },
+        .{ .path = "EFI/Acme/BOOTX64.CSV", .kind = .file, .bytes = "\"zvmi\",\"grubx64.efi\",\"shim managed entry\"" },
+        .{ .path = "EFI/Acme/MOK.der", .kind = .file, .bytes = "mok-der" },
+        .{ .path = "usr/lib/systemd/boot/efi/linuxx64.efi.stub", .kind = .file, .bytes = stub },
+        .{ .path = "usr/lib/os-release", .kind = .file, .bytes = "ID=zvmi\nPRETTY_NAME=\"zvmi test\"\n" },
+        .{ .path = "boot/vmlinuz-6.8.12-test", .kind = .file, .bytes = "kernel-payload" },
+        .{ .path = "boot/initramfs-6.8.12-test.img", .kind = .file, .bytes = "initrd-payload" },
+    });
+    tree.bind();
+
+    const report = try populateEsp(std.testing.allocator, io, &esp, &tree.view, .{
+        .planned_partitions = &planned,
+        .boot_mode = .bls_and_uki,
+        .extra_kernel_options = "quiet splash",
+    });
+    try std.testing.expectEqual(@as(usize, 4), report.copied_efi_file_count);
+    try std.testing.expectEqual(@as(usize, 3), report.copied_secure_boot_file_count);
+    try std.testing.expectEqual(@as(usize, 1), report.bls_entry_count);
+    try std.testing.expectEqual(@as(usize, 1), report.uki_count);
+
+    const mok_manager = try esp.readFileAlloc(io, std.testing.allocator, "EFI/Acme/MokManager.efi");
+    defer std.testing.allocator.free(mok_manager);
+    try std.testing.expectEqualStrings("mokmanager", mok_manager);
+
+    const boot_csv = try esp.readFileAlloc(io, std.testing.allocator, "EFI/Acme/BOOTX64.CSV");
+    defer std.testing.allocator.free(boot_csv);
+    try std.testing.expectEqualStrings("\"zvmi\",\"grubx64.efi\",\"shim managed entry\"", boot_csv);
+
+    const mok_cert = try esp.readFileAlloc(io, std.testing.allocator, "EFI/Acme/MOK.der");
+    defer std.testing.allocator.free(mok_cert);
+    try std.testing.expectEqualStrings("mok-der", mok_cert);
+
+    const named_uki = try esp.readFileAlloc(io, std.testing.allocator, "EFI/Linux/vmlinuz-6.8.12-test.efi");
+    defer std.testing.allocator.free(named_uki);
+    try std.testing.expectEqualStrings("MZ", named_uki[0..2]);
+}
+
+test "populateEsp can generate UKI-only ESP boot path" {
+    const io = std.testing.io;
+    const path = "test-bootconfig-uki-only.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const esp_len = 96 * 1024 * 1024;
+    var img = try Image.create(io, path, .raw, esp_len * 2, .{});
+    defer img.close(io);
+    try fat32.format(&img, io, .{ .partition_offset = 0, .partition_len = esp_len });
+    var esp = try fat32.open(&img, io, .{ .offset = 0, .length = esp_len });
+
+    const planned = [_]PlannedPartitionIdentity{
+        .{ .planned = .{
+            .name = "ESP",
+            .role = .esp,
+            .type_guid = guid.esp,
+            .offset_bytes = 0,
+            .length_bytes = esp_len,
+        }, .unique_guid = guid.parse("88888888-8888-8888-8888-888888888888") },
+        .{ .planned = .{
+            .name = "root",
+            .role = .root_x86_64,
+            .type_guid = guid.linux_root_x86_64,
+            .offset_bytes = esp_len,
+            .length_bytes = esp_len,
+        }, .unique_guid = guid.parse("99999999-9999-9999-9999-999999999999") },
+    };
+
+    const stub = try makeTestStubPe(std.testing.allocator, 0x8664);
+    defer std.testing.allocator.free(stub);
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "usr/lib/systemd/boot/efi/linuxx64.efi.stub", .kind = .file, .bytes = stub },
+        .{ .path = "boot/vmlinuz-test", .kind = .file, .bytes = "kernel" },
+        .{ .path = "boot/initrd-test.img", .kind = .file, .bytes = "initrd" },
+    });
+    tree.bind();
+
+    const report = try populateEsp(std.testing.allocator, io, &esp, &tree.view, .{
+        .planned_partitions = &planned,
+        .boot_mode = .uki_only,
+    });
+    try std.testing.expectEqual(@as(usize, 0), report.copied_efi_file_count);
+    try std.testing.expectEqual(@as(usize, 0), report.bls_entry_count);
+    try std.testing.expectEqual(@as(usize, 1), report.uki_count);
+
+    const fallback = try esp.readFileAlloc(io, std.testing.allocator, "EFI/BOOT/BOOTX64.EFI");
+    defer std.testing.allocator.free(fallback);
+    try std.testing.expectEqualStrings("MZ", fallback[0..2]);
+
+    const named = try esp.readFileAlloc(io, std.testing.allocator, "EFI/Linux/vmlinuz-test.efi");
+    defer std.testing.allocator.free(named);
+    try std.testing.expectEqualStrings("MZ", named[0..2]);
+
+    try std.testing.expectError(error.PathNotFound, esp.readFileAlloc(io, std.testing.allocator, "loader/loader.conf"));
+}
+
 const ParsedBlsEntry = struct {
     title: ?[]const u8 = null,
     version: ?[]const u8 = null,
@@ -1025,6 +1543,63 @@ fn parseBlsEntry(contents: []const u8) !ParsedBlsEntry {
     try std.testing.expect(parsed.linux != null);
     try std.testing.expect(parsed.options != null);
     return parsed;
+}
+
+fn makeTestStubPe(allocator: std.mem.Allocator, machine: u16) ![]u8 {
+    const file_alignment: u32 = 0x200;
+    const section_alignment: u32 = 0x1000;
+    const pe_offset: usize = 0x80;
+    const optional_header_size: usize = 240;
+    const section_count: usize = 1;
+    const file_header_size = 20;
+    const section_header_size = 40;
+    const size_of_headers = std.mem.alignForward(u32, pe_offset + 4 + file_header_size + optional_header_size + section_count * section_header_size, file_alignment);
+    const file_len = size_of_headers + file_alignment;
+
+    var buffer = try allocator.alloc(u8, file_len);
+    @memset(buffer, 0);
+
+    std.mem.copyForwards(u8, buffer[0..2], "MZ");
+    std.mem.writeInt(u32, buffer[0x3C..0x40], pe_offset, .little);
+    std.mem.copyForwards(u8, buffer[pe_offset .. pe_offset + 4], "PE\x00\x00");
+
+    const file_header_offset = pe_offset + 4;
+    std.mem.writeInt(u16, buffer[file_header_offset..][0..2], machine, .little);
+    std.mem.writeInt(u16, buffer[file_header_offset + 2 ..][0..2], section_count, .little);
+    std.mem.writeInt(u16, buffer[file_header_offset + 16 ..][0..2], optional_header_size, .little);
+    std.mem.writeInt(u16, buffer[file_header_offset + 18 ..][0..2], 0x202, .little);
+
+    const optional_header_offset = file_header_offset + file_header_size;
+    std.mem.writeInt(u16, buffer[optional_header_offset..][0..2], 0x20B, .little);
+    std.mem.writeInt(u32, buffer[optional_header_offset + 4 ..][0..4], file_alignment, .little);
+    std.mem.writeInt(u32, buffer[optional_header_offset + 16 ..][0..4], 0x1000, .little);
+    std.mem.writeInt(u32, buffer[optional_header_offset + 20 ..][0..4], 0x1000, .little);
+    std.mem.writeInt(u64, buffer[optional_header_offset + 24 ..][0..8], 0x400000, .little);
+    std.mem.writeInt(u32, buffer[optional_header_offset + 32 ..][0..4], section_alignment, .little);
+    std.mem.writeInt(u32, buffer[optional_header_offset + 36 ..][0..4], file_alignment, .little);
+    std.mem.writeInt(u16, buffer[optional_header_offset + 40 ..][0..2], 6, .little);
+    std.mem.writeInt(u16, buffer[optional_header_offset + 48 ..][0..2], 6, .little);
+    std.mem.writeInt(u32, buffer[optional_header_offset + 56 ..][0..4], 0x2000, .little);
+    std.mem.writeInt(u32, buffer[optional_header_offset + 60 ..][0..4], size_of_headers, .little);
+    std.mem.writeInt(u16, buffer[optional_header_offset + 68 ..][0..2], 10, .little);
+    std.mem.writeInt(u16, buffer[optional_header_offset + 70 ..][0..2], 0x160, .little);
+    std.mem.writeInt(u64, buffer[optional_header_offset + 72 ..][0..8], 0x100000, .little);
+    std.mem.writeInt(u64, buffer[optional_header_offset + 80 ..][0..8], 0x1000, .little);
+    std.mem.writeInt(u64, buffer[optional_header_offset + 88 ..][0..8], 0x100000, .little);
+    std.mem.writeInt(u64, buffer[optional_header_offset + 96 ..][0..8], 0x1000, .little);
+    std.mem.writeInt(u32, buffer[optional_header_offset + 108 ..][0..4], 16, .little);
+
+    const section_header_offset = optional_header_offset + optional_header_size;
+    const header = buffer[section_header_offset .. section_header_offset + section_header_size];
+    std.mem.copyForwards(u8, header[0..5], ".text");
+    std.mem.writeInt(u32, header[8..12], 1, .little);
+    std.mem.writeInt(u32, header[12..16], 0x1000, .little);
+    std.mem.writeInt(u32, header[16..20], file_alignment, .little);
+    std.mem.writeInt(u32, header[20..24], size_of_headers, .little);
+    std.mem.writeInt(u32, header[36..40], 0x60000020, .little);
+
+    buffer[size_of_headers] = 0xC3;
+    return buffer;
 }
 
 const InMemoryEntry = struct {
