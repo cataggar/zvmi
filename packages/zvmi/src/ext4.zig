@@ -2507,6 +2507,115 @@ test "populate ext4 and round-trip a small tree with a multi-extent file" {
     }
 }
 
+test "populate round-trips files that require extent index blocks" {
+    const io = std.testing.io;
+    const path = "test-ext4-multilevel-extents.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const fs_size: u64 = 768 * 1024 * 1024;
+    const big_size: u64 = 544 * 1024 * 1024;
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "boot", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "boot/rootfs.img", .kind = .file, .mode = 0o600, .uid = 0, .gid = 0, .size = big_size, .generator = .pattern },
+    });
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{
+        .length = fs_size,
+        .uuid = [_]u8{0x33} ** 16,
+        .timestamp = 1_717_171_717,
+    });
+
+    var reader = try open(io, file, std.testing.allocator, .{});
+    defer reader.deinit();
+
+    const inode_number = try reader.lookupPath(io, "boot/rootfs.img");
+    const inode = try reader.readInode(io, inode_number);
+    const root_header = try parseExtentHeader(inode.block_bytes[0..extent_header_size]);
+    try std.testing.expectEqual(@as(u16, 1), root_header.depth);
+
+    const extents = try reader.readExtents(io, std.testing.allocator, "boot/rootfs.img");
+    defer std.testing.allocator.free(extents);
+    try std.testing.expect(extents.len > max_inline_extents);
+
+    var offset: u64 = 0;
+    var buf: [1024 * 1024]u8 = undefined;
+    var expected: [1024 * 1024]u8 = undefined;
+    while (offset < big_size) {
+        const chunk = @min(buf.len, @as(usize, @intCast(big_size - offset)));
+        const got = try reader.preadPath(io, "boot/rootfs.img", buf[0..chunk], offset);
+        try std.testing.expectEqual(chunk, got);
+        fillPattern(expected[0..chunk], offset);
+        try std.testing.expectEqualSlices(u8, expected[0..chunk], buf[0..chunk]);
+        offset += chunk;
+    }
+}
+
+test "synthetic extent trees encode and decode beyond depth one" {
+    const extent_count = max_inline_extents * extentEntriesPerBlock(default_block_size) + 1;
+    const extents = try std.testing.allocator.alloc(Extent, extent_count);
+    defer std.testing.allocator.free(extents);
+    for (extents, 0..) |*extent, index| {
+        extent.* = .{
+            .logical_block = @intCast(index),
+            .start_block = 10_000 + index,
+            .block_count = 1,
+        };
+    }
+
+    var node = Node{
+        .path = "synthetic",
+        .name = "synthetic",
+        .parent_path = "",
+        .parent_index = 0,
+        .inode = 12,
+        .kind = .file,
+        .mode = 0o644,
+        .uid = 0,
+        .gid = 0,
+        .declared_size = @as(u64, extent_count) * default_block_size,
+        .content = null,
+        .xattrs = &.{},
+        .extents = extents,
+    };
+
+    const shape = try extentTreeShape(extent_count, default_block_size);
+    try std.testing.expectEqual(@as(u16, 2), shape.depth);
+    try std.testing.expectEqual(@as(usize, 6), shape.block_count);
+
+    node.extent_tree_blocks = try std.testing.allocator.alloc(ExtentTreeBlock, shape.block_count);
+    defer std.testing.allocator.free(node.extent_tree_blocks);
+    for (node.extent_tree_blocks, 0..) |*block, index| {
+        block.* = .{ .block_number = 20_000 + index };
+    }
+
+    try buildExtentTree(std.testing.allocator, &node, default_block_size, shape.depth);
+
+    const root_header = try parseExtentHeader(node.extent_root[0..extent_header_size]);
+    try std.testing.expectEqual(@as(u16, 2), root_header.depth);
+    try std.testing.expectEqual(@as(u16, 1), root_header.entries);
+    const root_child = decodeExtentIndex(node.extent_root[extent_header_size .. extent_header_size + extent_entry_size]);
+    try std.testing.expectEqual(node.extent_tree_blocks[shape.block_count - 1].block_number, root_child.leaf_block);
+    const internal_header = try parseExtentHeader(node.extent_tree_blocks[shape.block_count - 1].bytes[0..extent_header_size]);
+    try std.testing.expectEqual(@as(u16, 1), internal_header.depth);
+    try std.testing.expectEqual(@as(u16, 5), internal_header.entries);
+    for (0..internal_header.entries) |entry_index| {
+        const base = extent_header_size + entry_index * extent_entry_size;
+        const child = decodeExtentIndex(node.extent_tree_blocks[shape.block_count - 1].bytes[base .. base + extent_entry_size]);
+        try std.testing.expectEqual(node.extent_tree_blocks[entry_index].block_number, child.leaf_block);
+    }
+
+    const decoded = try decodeSyntheticExtentTree(std.testing.allocator, node.extent_root[0..], node.extent_tree_blocks[0..]);
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqual(extents.len, decoded.len);
+    for (extents, decoded) |expected, actual| {
+        try std.testing.expectEqualDeep(expected, actual);
+    }
+}
+
 test "reader rejects missing paths and wrong node kinds" {
     const io = std.testing.io;
     const path = "test-ext4-errors.img";
@@ -2822,6 +2931,60 @@ fn fillPattern(buffer: []u8, offset: u64) void {
     for (buffer, 0..) |*byte, index| {
         byte.* = @truncate(((offset + index) * 31 + 17) & 0xFF);
     }
+}
+
+fn decodeSyntheticExtentTree(
+    allocator: std.mem.Allocator,
+    root_bytes: []const u8,
+    blocks: []const ExtentTreeBlock,
+) ![]Extent {
+    var extents = std.array_list.Managed(Extent).init(allocator);
+    errdefer extents.deinit();
+    try appendSyntheticExtentTreeEntries(&extents, root_bytes, max_inline_extents, blocks, null);
+    return extents.toOwnedSlice();
+}
+
+fn appendSyntheticExtentTreeEntries(
+    extents: *std.array_list.Managed(Extent),
+    node_bytes: []const u8,
+    node_capacity: usize,
+    blocks: []const ExtentTreeBlock,
+    expected_depth: ?u16,
+) !void {
+    const header = try parseExtentHeader(node_bytes[0..extent_header_size]);
+    if (expected_depth) |depth| try std.testing.expectEqual(depth, header.depth);
+    try std.testing.expect(header.entries <= header.max);
+    try std.testing.expect(header.max <= node_capacity);
+
+    if (header.depth == 0) {
+        var entry_index: usize = 0;
+        while (entry_index < header.entries) : (entry_index += 1) {
+            const base = extent_header_size + entry_index * extent_entry_size;
+            try extents.append(decodeExtent(node_bytes[base .. base + extent_entry_size]));
+        }
+        return;
+    }
+
+    var entry_index: usize = 0;
+    while (entry_index < header.entries) : (entry_index += 1) {
+        const base = extent_header_size + entry_index * extent_entry_size;
+        const child = decodeExtentIndex(node_bytes[base .. base + extent_entry_size]);
+        const child_block = findSyntheticExtentTreeBlock(blocks, child.leaf_block) orelse return error.TestUnexpectedResult;
+        try appendSyntheticExtentTreeEntries(
+            extents,
+            child_block[0..],
+            extentEntriesPerBlock(default_block_size),
+            blocks,
+            header.depth - 1,
+        );
+    }
+}
+
+fn findSyntheticExtentTreeBlock(blocks: []const ExtentTreeBlock, block_number: u64) ?[]const u8 {
+    for (blocks) |*block| {
+        if (block.block_number == block_number) return block.bytes[0..];
+    }
+    return null;
 }
 
 fn expectXattrValue(xattrs: []const OwnedXattr, name: []const u8, value: []const u8) !void {
