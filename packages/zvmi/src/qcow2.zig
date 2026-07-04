@@ -392,6 +392,20 @@ test "pread zero-fills sparse clusters" {
     try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 64), &zeroes);
 }
 
+test "check reports dirty images" {
+    const io = std.testing.io;
+    const path = "test-qcow2-dirty.qcow2";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    _ = try writeTestFixture(io, path, .{ .dirty = true });
+
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer file.close(io);
+
+    const info = try open(io, file);
+    try std.testing.expectError(error.ImageMarkedDirty, check(file, io, info));
+}
+
 const TestFixture = struct {
     cluster_size: u64,
     l1_table_offset: u64,
