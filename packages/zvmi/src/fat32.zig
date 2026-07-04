@@ -65,6 +65,7 @@ pub const Error = error{
     BadClusterChain,
     UnexpectedEndOfFile,
     FileTooLarge,
+    StreamClosed,
     InvalidTruncateSize,
 };
 
@@ -73,6 +74,78 @@ pub const OpenError = Error || Image.PreadError || Image.PwriteError;
 pub const MutationError = Error || Image.PreadError || Image.PwriteError;
 pub const ListError = Error || Image.PreadError || Image.PwriteError || std.mem.Allocator.Error;
 pub const ReadFileError = Error || Image.PreadError || Image.PwriteError || std.mem.Allocator.Error;
+
+/// Incremental file writer returned by `FileSystem.beginFile`.
+pub const FileWriter = struct {
+    fs: *FileSystem,
+    dir_cluster: u32,
+    entry_location: DirectoryEntryLocation,
+    first_cluster: u32 = 0,
+    last_cluster: u32 = 0,
+    size: u32 = 0,
+    closed: bool = false,
+
+    /// Appends `chunk` to the file at the current end offset.
+    pub fn writeChunk(self: *FileWriter, io: Io, chunk: []const u8) MutationError!void {
+        if (self.closed) return error.StreamClosed;
+        if (chunk.len == 0) return;
+        if (chunk.len > std.math.maxInt(u32) - self.size) return error.FileTooLarge;
+
+        const cluster_size = self.fs.info.clusterSize();
+        var written: usize = 0;
+        while (written < chunk.len) {
+            const offset_in_cluster = self.size % cluster_size;
+            if (self.first_cluster == 0) {
+                const cluster = try self.fs.allocateCluster(io);
+                self.first_cluster = cluster;
+                self.last_cluster = cluster;
+            } else if (self.size != 0 and offset_in_cluster == 0) {
+                const cluster = try self.fs.allocateCluster(io);
+                try self.fs.writeFatEntry(io, self.last_cluster, cluster);
+                self.last_cluster = cluster;
+            }
+
+            const take = @min(chunk.len - written, cluster_size - offset_in_cluster);
+            try self.fs.writeRegion(
+                io,
+                chunk[written .. written + take],
+                self.fs.clusterOffset(self.last_cluster) + offset_in_cluster,
+            );
+            written += take;
+            self.size += @intCast(take);
+        }
+
+        try self.fs.updateDirectoryEntry(io, self.dir_cluster, self.entry_location, self.first_cluster, self.size);
+    }
+
+    /// Finalizes the file and zero-fills the unused tail of the last cluster.
+    pub fn endFile(self: *FileWriter, io: Io) MutationError!void {
+        if (self.closed) return error.StreamClosed;
+        if (self.first_cluster != 0) {
+            const cluster_size = self.fs.info.clusterSize();
+            const tail = self.size % cluster_size;
+            if (tail != 0) {
+                var zeros: [max_cluster_size]u8 = [_]u8{0} ** max_cluster_size;
+                try self.fs.writeRegion(
+                    io,
+                    zeros[0 .. cluster_size - tail],
+                    self.fs.clusterOffset(self.last_cluster) + tail,
+                );
+            }
+        }
+
+        try self.fs.updateDirectoryEntry(io, self.dir_cluster, self.entry_location, self.first_cluster, self.size);
+        self.closed = true;
+    }
+
+    /// Removes the partially written file and frees any allocated clusters.
+    pub fn abort(self: *FileWriter, io: Io) MutationError!void {
+        if (self.closed) return;
+        if (self.first_cluster != 0) try self.fs.releaseChain(io, self.first_cluster);
+        try self.fs.markEntryDeleted(io, self.dir_cluster, self.entry_location);
+        self.closed = true;
+    }
+};
 
 pub const FileSystem = struct {
     image: *Image,
@@ -100,6 +173,22 @@ pub const FileSystem = struct {
             try self.appendDirectoryEntry(io, current, component, .directory, cluster, 0);
             current = cluster;
         }
+    }
+
+    /// Begins creating a new file whose contents will be supplied via
+    /// repeated `FileWriter.writeChunk` calls followed by `FileWriter.endFile`.
+    /// Call `FileWriter.abort` to remove a partially written file.
+    pub fn beginFile(self: *FileSystem, io: Io, path: []const u8) MutationError!FileWriter {
+        const parent = try self.resolveParent(io, path);
+        if (parent.name.len == 0) return error.InvalidPath;
+        if (try self.findEntry(io, parent.cluster, parent.name)) |_| return error.AlreadyExists;
+
+        const entry_location = try self.appendDirectoryEntryTracked(io, parent.cluster, parent.name, .file, 0, 0);
+        return .{
+            .fs = self,
+            .dir_cluster = parent.cluster,
+            .entry_location = entry_location,
+        };
     }
 
     /// Creates a new file and writes its full contents in one call.
