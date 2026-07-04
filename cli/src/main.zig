@@ -1,6 +1,7 @@
 //! `zvmi`: a qemu-img-like CLI over the `zvmi` library. Supports `create`,
-//! `info`, `convert`, `resize`, `check`, and `map` for `raw`, `vhd`, `vhdx`,
-//! and `qcow2` (the latter two are read-only source formats).
+//! `info`, `convert`, `resize`, `check`, `map`, `build-image`, `azure`, and
+//! `cosi` over `raw`, `vhd`, `vhdx`, and `qcow2` (the latter two are
+//! read-only source formats).
 
 const std = @import("std");
 const zvmi = @import("zvmi");
@@ -13,6 +14,7 @@ const check_cmd = @import("commands/check.zig");
 const map_cmd = @import("commands/map.zig");
 const azure_cmd = @import("commands/azure.zig");
 const cosi_cmd = @import("commands/cosi.zig");
+const build_image_cmd = @import("commands/build_image.zig");
 
 const usage =
     \\Usage: zvmi <command> [options]
@@ -26,6 +28,7 @@ const usage =
     \\  map [--output=human|json] <file>
     \\  azure fixup --generation 1|2 <file>
     \\  cosi <disk-image> -o <output.cosi>
+    \\  build-image --iso <file.iso> --container <oci-layout> --generation 1|2 --size <size> -o <output.{{raw|vhd}}>
     \\
     \\Formats: raw, vhd (alias: vpc), vhdx, qcow2 (vhdx/qcow2 are read-only)
     \\Sizes accept K/M/G/T binary suffixes (e.g. 20G).
@@ -59,6 +62,7 @@ fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     if (std.mem.eql(u8, command, "map")) return map_cmd.run(gpa, io, rest);
     if (std.mem.eql(u8, command, "azure")) return azure_cmd.run(gpa, io, rest);
     if (std.mem.eql(u8, command, "cosi")) return cosi_cmd.run(gpa, io, rest);
+    if (std.mem.eql(u8, command, "build-image")) return build_image_cmd.run(gpa, io, rest);
     if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h") or std.mem.eql(u8, command, "help")) {
         std.debug.print("{s}", .{usage});
         return 0;
@@ -76,4 +80,5 @@ test {
     _ = map_cmd;
     _ = azure_cmd;
     _ = cosi_cmd;
+    _ = build_image_cmd;
 }
