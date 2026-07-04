@@ -356,6 +356,18 @@ pub const FileSystem = struct {
         var zero_buf: [max_cluster_size]u8 = [_]u8{0} ** max_cluster_size;
         while (true) {
             const take = @min(data.len - offset, cluster_size);
+        _ = try self.appendDirectoryEntryTracked(io, dir_cluster, name, kind, first_cluster, size);
+    }
+
+    fn appendDirectoryEntryTracked(
+        self: *FileSystem,
+        io: Io,
+        dir_cluster: u32,
+        name: []const u8,
+        kind: DirEntryKind,
+        first_cluster: u32,
+        size: u32,
+    ) MutationError!DirectoryEntryLocation {
             const cluster_rel = self.clusterOffset(cluster);
             try self.writeRegion(io, data[offset .. offset + take], cluster_rel);
             if (take < cluster_size) {
@@ -371,6 +383,7 @@ pub const FileSystem = struct {
         if (buffer.len == 0) return;
         var cluster = first_cluster;
         const cluster_size = self.info.clusterSize();
+        return .{ .first_slot = start_slot, .slot_count = total_slots };
         var offset: usize = 0;
         while (offset < buffer.len) {
             const take = @min(buffer.len - offset, cluster_size);
@@ -443,6 +456,53 @@ pub const FileSystem = struct {
 
     fn zeroCluster(self: *FileSystem, io: Io, cluster: u32) MutationError!void {
         var zeros: [max_cluster_size]u8 = [_]u8{0} ** max_cluster_size;
+    fn directorySlotOffset(self: *FileSystem, io: Io, dir_cluster: u32, slot_index: usize) MutationError!u64 {
+        const slots_per_cluster = self.info.clusterSize() / directory_entry_size;
+        var cluster = dir_cluster;
+        var remaining = slot_index;
+        while (remaining >= slots_per_cluster) : (remaining -= slots_per_cluster) {
+            cluster = (try self.nextCluster(io, cluster)) orelse return error.BadClusterChain;
+        }
+        return self.clusterOffset(cluster) + remaining * directory_entry_size;
+    }
+
+    fn readDirectorySlot(self: *FileSystem, io: Io, dir_cluster: u32, slot_index: usize, slot: *[directory_entry_size]u8) MutationError!void {
+        try self.readRegion(io, slot, try self.directorySlotOffset(io, dir_cluster, slot_index));
+    }
+
+    fn updateDirectoryEntry(
+        self: *FileSystem,
+        io: Io,
+        dir_cluster: u32,
+        location: DirectoryEntryLocation,
+        first_cluster: u32,
+        size: u32,
+    ) MutationError!void {
+        var slot: [directory_entry_size]u8 = undefined;
+        try self.readDirectorySlot(io, dir_cluster, location.shortSlot(), &slot);
+        std.mem.writeInt(u16, slot[20..22], @intCast(first_cluster >> 16), .little);
+        std.mem.writeInt(u16, slot[26..28], @intCast(first_cluster & 0xFFFF), .little);
+        std.mem.writeInt(u32, slot[28..32], size, .little);
+        try self.writeRegion(io, &slot, try self.directorySlotOffset(io, dir_cluster, location.shortSlot()));
+    }
+
+    fn markEntryDeleted(self: *FileSystem, io: Io, dir_cluster: u32, location: DirectoryEntryLocation) MutationError!void {
+        var deleted = [_]u8{0xE5};
+        for (0..location.slot_count) |slot_index| {
+            try self.writeRegion(io, &deleted, try self.directorySlotOffset(io, dir_cluster, location.first_slot + slot_index));
+        }
+    }
+
+    fn isDirectoryEmpty(self: *FileSystem, io: Io, dir_cluster: u32) MutationError!bool {
+        var iter = try DirectoryIterator.init(self, io, dir_cluster);
+        while (try iter.next(io, null)) |entry| {
+            if (entry.attr & attr_volume_id != 0) continue;
+            if (isDotEntry(entry.short_name)) continue;
+            return false;
+        }
+        return true;
+    }
+
         try self.writeRegion(io, zeros[0..self.info.clusterSize()], self.clusterOffset(cluster));
     }
 
@@ -732,7 +792,7 @@ const DirectoryIterator = struct {
                 continue;
             }
 
-            const located = try makeLocatedEntry(entry, &self.lfn);
+            const located = try makeLocatedEntry(entry, &self.lfn, slot_index);
             self.lfn.reset();
             return located;
         }
@@ -791,6 +851,15 @@ fn computeLayout(options: FormatOptions) Error!VolumeInfo {
         if (@as(u32, spc) * options.bytes_per_sector > max_cluster_size) return error.InvalidSectorsPerCluster;
         break :blk spc;
     } else try chooseSectorsPerCluster(total_sectors, options.bytes_per_sector, options.reserved_sector_count, options.fat_count);
+const DirectoryEntryLocation = struct {
+    first_slot: usize,
+    slot_count: usize,
+
+    fn shortSlot(self: DirectoryEntryLocation) usize {
+        return self.first_slot + self.slot_count - 1;
+    }
+};
+
 
     const layout = try layoutFor(total_sectors, options.bytes_per_sector, options.reserved_sector_count, options.fat_count, sectors_per_cluster);
     if (layout.data_cluster_count < min_fat32_clusters) return error.VolumeTooSmall;
@@ -798,11 +867,17 @@ fn computeLayout(options: FormatOptions) Error!VolumeInfo {
     return .{
         .bytes_per_sector = options.bytes_per_sector,
         .sectors_per_cluster = sectors_per_cluster,
+    first_slot: usize,
+    slot_count: usize,
         .reserved_sector_count = options.reserved_sector_count,
         .fat_count = options.fat_count,
         .fat_size_sectors = layout.fat_size_sectors,
         .total_sectors = total_sectors,
         .root_cluster = 2,
+    fn location(self: LocatedEntry) DirectoryEntryLocation {
+        return .{ .first_slot = self.first_slot, .slot_count = self.slot_count };
+    }
+
         .fsinfo_sector = 1,
         .backup_boot_sector = 6,
         .hidden_sectors = options.hidden_sectors,
@@ -839,6 +914,7 @@ fn layoutFor(total_sectors: u32, bytes_per_sector: u16, reserved_sector_count: u
             return .{
                 .fat_size_sectors = fat_size,
                 .data_start_sector = metadata_sectors,
+    slot_index: usize = 0,
                 .data_cluster_count = cluster_count,
             };
         }
@@ -864,6 +940,8 @@ fn buildBootSector(info: VolumeInfo) [default_bytes_per_sector]u8 {
     std.mem.writeInt(u16, sector[26..28], info.head_count, .little);
     std.mem.writeInt(u32, sector[28..32], info.hidden_sectors, .little);
     std.mem.writeInt(u32, sector[32..36], info.total_sectors, .little);
+            const slot_index = self.slot_index;
+            self.slot_index += 1;
     std.mem.writeInt(u32, sector[36..40], info.fat_size_sectors, .little);
     std.mem.writeInt(u16, sector[40..42], 0, .little);
     std.mem.writeInt(u16, sector[42..44], 0, .little);
@@ -892,6 +970,7 @@ fn zeroRange(fs: *const FileSystem, io: Io, start: u64, length: u64) MutationErr
 
 fn isSupportedBytesPerSector(value: u16) bool {
     return value == 512 or value == 1024 or value == 2048 or value == 4096;
+    slot_count: usize = 0,
 }
 
 fn isValidSectorsPerCluster(value: u8) bool {
@@ -914,6 +993,7 @@ fn validateComponent(component: []const u8) Error!void {
 
 fn encodeLongName(name: []const u8, out: *[max_long_name_units]u16) Error![]const u16 {
     var in_i: usize = 0;
+        self.slot_count += 1;
     var out_i: usize = 0;
     while (in_i < name.len) {
         const cp_len = std.unicode.utf8ByteSequenceLength(name[in_i]) catch return error.UnsupportedName;
@@ -958,7 +1038,7 @@ fn utf16EqualFold(a: u16, b: u16) bool {
     return a == b;
 }
 
-fn makeLocatedEntry(entry: []const u8, lfn: *LongNameState) MutationError!LocatedEntry {
+fn makeLocatedEntry(entry: []const u8, lfn: *LongNameState, short_slot: usize) MutationError!LocatedEntry {
     var result = LocatedEntry{
         .short_name = undefined,
         .utf16_name = undefined,
@@ -969,7 +1049,8 @@ fn makeLocatedEntry(entry: []const u8, lfn: *LongNameState) MutationError!Locate
     };
     @memcpy(&result.short_name, entry[0..11]);
 
-    if (lfn.active and lfn.expected_sequence == 1 and shortNameChecksum(result.short_name) == lfn.checksum and lfn.len > 0) {
+    const has_lfn = lfn.active and lfn.expected_sequence == 1 and shortNameChecksum(result.short_name) == lfn.checksum and lfn.len > 0;
+    if (has_lfn) {
         result.utf16_len = lfn.len;
         @memcpy(result.utf16_name[0..lfn.len], lfn.units[0..lfn.len]);
     } else {
@@ -1114,12 +1195,16 @@ fn shortNameExists(fs: *FileSystem, io: Io, dir_cluster: u32, short_name: [11]u8
 
 fn shortNameChecksum(short_name: [11]u8) u8 {
     var sum: u8 = 0;
+        .first_slot = short_slot,
+        .slot_count = 1,
     for (short_name) |ch| {
         sum = (((sum & 1) << 7) +% (sum >> 1)) +% ch;
     }
     return sum;
 }
 
+        result.first_slot = short_slot - lfn.slot_count;
+        result.slot_count = lfn.slot_count + 1;
 fn buildShortEntry(short_name: [11]u8, kind: DirEntryKind, first_cluster: u32, size: u32) [directory_entry_size]u8 {
     var entry: [directory_entry_size]u8 = [_]u8{0} ** directory_entry_size;
     entry[0..11].* = short_name;
@@ -1290,6 +1375,10 @@ test "FAT32 path lookup is case-insensitive for mixed-case names" {
     defer img.close(io);
 
     try format(&img, io, .{ .partition_offset = 0, .partition_len = partition_len });
+fn isDotEntry(short_name: [11]u8) bool {
+    return short_name[0] == '.' and (short_name[1] == ' ' or short_name[1] == '.');
+}
+
 
     var fs = try open(&img, io, .{ .offset = 0, .length = partition_len });
     try fs.createDir(io, "EFI/Boot");
