@@ -16,6 +16,7 @@ const mbr = @import("mbr.zig");
 const oci = @import("oci.zig");
 const iso9660 = @import("iso9660.zig");
 const qcow2 = @import("qcow2.zig");
+const vhdx = @import("vhdx.zig");
 const squashfs = @import("squashfs.zig");
 const verity = @import("verity.zig");
 
@@ -250,10 +251,7 @@ fn resolveOutputFormat(explicit: ?Format, output_path: []const u8) !Format {
         break :blk Format.raw;
     };
 
-    return switch (resolved) {
-        .raw, .vhd, .qcow2 => resolved,
-        .vhdx => error.UnsupportedOutputFormat,
-    };
+    return resolved;
 }
 
 fn inferArchitecture(raw_arch: ?[]const u8) bootconfig.Architecture {
@@ -1685,17 +1683,19 @@ fn extractImageRegionToPath(
     }
 }
 
-test "build-image builds Gen2 VHD and qcow2 outputs from XZ squashfs + OCI layout" {
+test "build-image builds Gen2 VHD, VHDX, and qcow2 outputs from XZ squashfs + OCI layout" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
     const iso_path = "test-build-image.iso";
     const oci_root = "test-build-image-oci";
     const vhd_output_path = "test-build-image.vhd";
+    const vhdx_output_path = "test-build-image.vhdx";
     const qcow2_output_path = "test-build-image.qcow2";
     defer Io.Dir.cwd().deleteFile(io, iso_path) catch {};
     defer Io.Dir.cwd().deleteTree(io, oci_root) catch {};
     defer Io.Dir.cwd().deleteFile(io, vhd_output_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, vhdx_output_path) catch {};
     defer Io.Dir.cwd().deleteFile(io, qcow2_output_path) catch {};
 
     const squashfs_bytes = try squashfs.buildSyntheticSquashfsImage(allocator, .{ .compression = .xz });
@@ -1722,6 +1722,30 @@ test "build-image builds Gen2 VHD and qcow2 outputs from XZ squashfs + OCI layou
     var vhd_img = try Image.openPath(io, vhd_output_path);
     defer vhd_img.close(io);
     try expectGen2BuiltImageContents(allocator, io, &vhd_img, vhd_report, vhd_output_path);
+
+    var vhdx_report = try build(allocator, io, .{
+        .iso_path = iso_path,
+        .container_path = oci_root,
+        .output_path = vhdx_output_path,
+        .output_format = .vhdx,
+        .generation = .gen2,
+        .size = 256 * mib,
+    });
+    defer vhdx_report.deinit(allocator);
+
+    try std.testing.expectEqual(Format.vhdx, vhdx_report.output_format);
+    try std.testing.expect(vhdx_report.partition_style.?.ok);
+    try std.testing.expectEqual(@as(usize, 2), vhdx_report.planned_partitions.len);
+
+    const vhdx_file = try Io.Dir.cwd().openFile(io, vhdx_output_path, .{});
+    defer vhdx_file.close(io);
+    const vhdx_info = try vhdx.open(io, vhdx_file);
+    try std.testing.expectEqual(vhdx_report.disk_size, vhdx_info.virtual_size);
+
+    var vhdx_img = try Image.openPath(io, vhdx_output_path);
+    defer vhdx_img.close(io);
+    try std.testing.expectEqual(Format.vhdx, vhdx_img.format);
+    try expectGen2BuiltImageContents(allocator, io, &vhdx_img, vhdx_report, vhdx_output_path);
 
     var qcow2_report = try build(allocator, io, .{
         .iso_path = iso_path,

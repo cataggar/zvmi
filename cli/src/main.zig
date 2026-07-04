@@ -1,7 +1,6 @@
 //! `zvmi`: a qemu-img-like CLI over the `zvmi` library. Supports `create`,
 //! `info`, `convert`, `resize`, `check`, `map`, `build-image`, `azure`, and
-//! `cosi` over `raw`, `vhd`, `vhdx`, and `qcow2` (the latter two are
-//! read-only source formats).
+//! `cosi` over `raw`, `vhd`, `vhdx`, and `qcow2`.
 
 const std = @import("std");
 const zvmi = @import("zvmi");
@@ -28,9 +27,9 @@ const usage =
     \\  map [--output=human|json] <file>
     \\  azure fixup --generation 1|2 <file>
     \\  cosi <disk-image> -o <output.cosi>
-    \\  build-image --iso <file.iso> --container <oci-layout> --generation 1|2 --size <size> -o <output.{{raw|vhd}}> [--verity]
+    \\  build-image --iso <file.iso> --container <oci-layout> --generation 1|2 --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}> [--verity]
     \\
-    \\Formats: raw, vhd (alias: vpc), vhdx, qcow2 (vhdx/qcow2 are read-only)
+    \\Formats: raw, vhd (alias: vpc), vhdx, qcow2
     \\Sizes accept K/M/G/T binary suffixes (e.g. 20G).
     \\
 ;

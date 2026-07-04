@@ -1,4 +1,4 @@
-//! `zvmi build-image --iso <file.iso> --container <oci-layout> --generation 1|2 --size <size> -o <output.{raw|vhd|qcow2}> [--verity]`
+//! `zvmi build-image --iso <file.iso> --container <oci-layout> --generation 1|2 --size <size> -o <output.{raw|vhd|vhdx|qcow2}> [--verity]`
 
 const std = @import("std");
 const zvmi = @import("zvmi");
@@ -67,7 +67,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
         } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
             verbose = true;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            return fail("usage: zvmi build-image --iso <file.iso> --container <oci-layout> --generation 1|2 --size <size> -o <output.{{raw|vhd|qcow2}}> [-O raw|vhd|qcow2] [--rootfs-path <path>] [--esp-size <size>] [--verity] [--dry-run] [-v]", .{});
+            return fail("usage: zvmi build-image --iso <file.iso> --container <oci-layout> --generation 1|2 --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}> [-O raw|vhd|vhdx|qcow2] [--rootfs-path <path>] [--esp-size <size>] [--verity] [--dry-run] [-v]", .{});
         } else {
             return fail("build-image: unexpected argument '{s}'", .{arg});
         }
