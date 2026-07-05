@@ -126,7 +126,20 @@ zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G -o output.vhdx -O vhdx
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G -o output.qcow2 -O qcow2
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G --verity -o output.vhd
+zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G --boot-mode uki --esp-size 512M -o output-uki.vhd
 ```
+
+For `--boot-mode uki` or `--boot-mode both`, the default 96 MiB ESP is sized
+for the GRUB+BLS path and is often too small for real distro UKIs. Start with
+`--esp-size 512M` and increase it further if your kernel+initrd payloads are
+especially large.
+
+UKI generation also requires a systemd EFI stub such as `linuxx64.efi.stub`
+or `linuxaa64.efi.stub`, typically from the `systemd-boot-unsigned` package,
+to exist somewhere in the merged ISO/squashfs/container source tree. If the
+base OS image does not ship it, inject that package via an extra container
+layer or point `--stub-source-path` at the non-standard in-tree path where you
+added the stub.
 
 `convert` skips all-zero chunks (aligned to the destination's block size for
 sparse block formats such as dynamic vhd and vhdx), so converting a
