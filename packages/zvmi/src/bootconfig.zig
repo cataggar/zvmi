@@ -253,6 +253,85 @@ const BootEntry = struct {
     initrd: ?BootArtifactCandidate,
 };
 
+const GrubPartitionModule = enum {
+    gpt,
+    msdos,
+
+    fn name(self: GrubPartitionModule) []const u8 {
+        return switch (self) {
+            .gpt => "part_gpt",
+            .msdos => "part_msdos",
+        };
+    }
+};
+
+const BootPlanOptions = struct {
+    planned_partitions: []const PlannedPartitionIdentity,
+    architecture: ?Architecture = null,
+    root_role: ?layout.PartitionRole = null,
+    kernel_device_partuuid: ?guid.Guid = null,
+    root_filesystem_uuid: ?[16]u8 = null,
+    path_strip_prefix: []const u8 = "",
+    title_prefix: []const u8 = "",
+};
+
+const BootPlan = struct {
+    scan: ScanResult,
+    architecture: Architecture,
+    root_partition: PlannedPartitionIdentity,
+    kernel_device_partuuid: guid.Guid,
+    root_partuuid_buf: [max_partuuid_text_len]u8 = undefined,
+    root_partuuid_len: usize = 0,
+    kernel_device_partuuid_buf: [max_partuuid_text_len]u8 = undefined,
+    kernel_device_partuuid_len: usize = 0,
+    root_filesystem_uuid_buf: [36]u8 = undefined,
+    root_filesystem_uuid_len: ?usize = null,
+    boot_entries: []BootEntry,
+
+    fn deinit(self: *BootPlan, allocator: std.mem.Allocator) void {
+        freeBootEntries(allocator, self.boot_entries);
+        self.scan.deinit(allocator);
+        self.* = undefined;
+    }
+
+    fn rootPartuuidText(self: *const BootPlan) []const u8 {
+        return self.root_partuuid_buf[0..self.root_partuuid_len];
+    }
+
+    fn kernelDevicePartuuidText(self: *const BootPlan) []const u8 {
+        return self.kernel_device_partuuid_buf[0..self.kernel_device_partuuid_len];
+    }
+
+    fn rootFilesystemUuidText(self: *const BootPlan) ?[]const u8 {
+        const len = self.root_filesystem_uuid_len orelse return null;
+        return self.root_filesystem_uuid_buf[0..len];
+    }
+};
+
+pub const GeneratedConfigFile = struct {
+    path: []u8,
+    bytes: []u8,
+
+    pub fn deinit(self: *GeneratedConfigFile, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        allocator.free(self.bytes);
+        self.* = undefined;
+    }
+};
+
+pub const GenerateBiosGrubCfgOptions = struct {
+    planned_partitions: []const PlannedPartitionIdentity,
+    architecture: ?Architecture = null,
+    root_role: ?layout.PartitionRole = null,
+    kernel_device_partuuid: ?guid.Guid = null,
+    root_filesystem_uuid: ?[16]u8 = null,
+    path_strip_prefix: []const u8 = "",
+    title_prefix: []const u8 = "",
+    extra_kernel_options: []const u8 = "",
+    verity: ?verity.Info = null,
+    grub_timeout_seconds: u32 = 1,
+};
+
 fn freeCandidates(allocator: std.mem.Allocator, entries: []BootArtifactCandidate) void {
     for (entries) |entry| {
         allocator.free(entry.source_path);
@@ -285,50 +364,46 @@ pub fn populateEsp(
     source: *SourceTreeView,
     options: PopulateOptions,
 ) PopulateError!PopulateReport {
-    var scan = try scanSourceTree(allocator, source, options.path_strip_prefix);
-    defer scan.deinit(allocator);
+    var plan = try buildBootPlan(allocator, source, .{
+        .planned_partitions = options.planned_partitions,
+        .architecture = options.architecture,
+        .root_role = options.root_role,
+        .kernel_device_partuuid = options.kernel_device_partuuid,
+        .root_filesystem_uuid = options.root_filesystem_uuid,
+        .path_strip_prefix = options.path_strip_prefix,
+        .title_prefix = options.title_prefix,
+    });
+    defer plan.deinit(allocator);
 
-    if (options.boot_mode.includesBls() and scan.efi_binaries.len == 0) return error.MissingBootloader;
-    if (scan.kernels.len == 0) return error.MissingKernel;
+    if (options.boot_mode.includesBls() and plan.scan.efi_binaries.len == 0) return error.MissingBootloader;
 
-    sortKernelCandidates(scan.kernels);
-    sortKernelCandidates(scan.initrds);
-
-    const architecture = try resolveArchitecture(scan.efi_binaries, options);
     const esp_partuuid = findPartitionGuidByRole(options.planned_partitions, .esp) orelse return error.MissingEspPartition;
-    const root_partition = try resolveRootPartition(options.planned_partitions, architecture, options.root_role);
-    const root_partuuid = root_partition.unique_guid;
-    const kernel_device_partuuid = options.kernel_device_partuuid orelse root_partuuid;
-    var root_partuuid_buf: [max_partuuid_text_len]u8 = undefined;
-    const root_partuuid_text = formatPlannedPartitionPartuuid(&root_partuuid_buf, options.planned_partitions, root_partition);
-    var kernel_device_partuuid_buf: [max_partuuid_text_len]u8 = undefined;
-    const kernel_device_partuuid_text = if (options.kernel_device_partuuid == null)
-        root_partuuid_text
-    else
-        guid.formatLower(&kernel_device_partuuid_buf, kernel_device_partuuid);
-    var root_filesystem_uuid_buf: [36]u8 = undefined;
-    const root_filesystem_uuid_text: ?[]const u8 = if (options.root_filesystem_uuid) |fs_uuid|
-        formatPlainUuidBytes(&root_filesystem_uuid_buf, &fs_uuid)
-    else
-        null;
+    const root_partuuid = plan.root_partition.unique_guid;
 
-    const copy_plan = try buildCopyPlan(allocator, scan.efi_binaries, architecture, options.boot_mode);
+    const copy_plan = try buildCopyPlan(allocator, plan.scan.efi_binaries, plan.architecture, options.boot_mode);
     defer freeCopyPlan(allocator, copy_plan);
-    const secure_boot_plan = try buildSecureBootCopyPlan(allocator, scan.secure_boot_files, copy_plan, architecture, options.boot_mode);
+    const secure_boot_plan = try buildSecureBootCopyPlan(allocator, plan.scan.secure_boot_files, copy_plan, plan.architecture, options.boot_mode);
     defer freeCopyPlan(allocator, secure_boot_plan);
 
     for (copy_plan) |entry| try copyIntoFat32(allocator, io, esp, entry);
     for (secure_boot_plan) |entry| try copyIntoFat32(allocator, io, esp, entry);
 
-    const boot_entries = try buildBootEntries(allocator, scan.kernels, scan.initrds, options.title_prefix);
-    defer freeBootEntries(allocator, boot_entries);
-
     if (options.boot_mode.includesBls()) {
-        const loader_conf = try renderLoaderConf(allocator, boot_entries, options.grub_timeout_seconds);
+        const loader_conf = try renderLoaderConf(allocator, plan.boot_entries, options.grub_timeout_seconds);
         defer allocator.free(loader_conf);
         try writeGeneratedFile(io, esp, "loader/loader.conf", loader_conf);
 
-        const grub_cfg = try renderGrubCfg(allocator, boot_entries, root_partuuid_text, kernel_device_partuuid_text, root_filesystem_uuid_text, options.extra_kernel_options, options.verity, options.grub_timeout_seconds);
+        const grub_cfg = try renderGrubCfg(
+            allocator,
+            plan.boot_entries,
+            plan.rootPartuuidText(),
+            plan.kernelDevicePartuuidText(),
+            plan.rootFilesystemUuidText(),
+            options.extra_kernel_options,
+            options.verity,
+            .gpt,
+            options.grub_timeout_seconds,
+        );
         defer allocator.free(grub_cfg);
 
         try writeGeneratedFile(io, esp, "EFI/BOOT/grub.cfg", grub_cfg);
@@ -340,8 +415,8 @@ pub fn populateEsp(
         }
         for (vendor_cfg_paths.items) |path| try writeGeneratedFile(io, esp, path, grub_cfg);
 
-        for (boot_entries) |entry| {
-            const bls_text = try renderBlsEntry(allocator, entry, root_partuuid_text, options.extra_kernel_options, options.verity);
+        for (plan.boot_entries) |entry| {
+            const bls_text = try renderBlsEntry(allocator, entry, plan.rootPartuuidText(), options.extra_kernel_options, options.verity);
             defer allocator.free(bls_text);
             const bls_path = try std.fmt.allocPrint(allocator, "loader/entries/{s}.conf", .{entry.id});
             defer allocator.free(bls_path);
@@ -350,20 +425,20 @@ pub fn populateEsp(
     }
 
     const uki_count = if (options.boot_mode.includesUki())
-        try generateUkis(allocator, io, esp, source, architecture, boot_entries, root_partuuid_text, options)
+        try generateUkis(allocator, io, esp, source, plan.architecture, plan.boot_entries, plan.rootPartuuidText(), options)
     else
         0;
 
     return .{
-        .architecture = architecture,
+        .architecture = plan.architecture,
         .copied_efi_file_count = copy_plan.len,
         .copied_secure_boot_file_count = secure_boot_plan.len,
-        .bls_entry_count = if (options.boot_mode.includesBls()) boot_entries.len else 0,
+        .bls_entry_count = if (options.boot_mode.includesBls()) plan.boot_entries.len else 0,
         .uki_count = uki_count,
-        .default_bootloader_path = architecture.defaultBootPath(),
+        .default_bootloader_path = plan.architecture.defaultBootPath(),
         .esp_partuuid = esp_partuuid,
         .root_partuuid = root_partuuid,
-        .kernel_device_partuuid = kernel_device_partuuid,
+        .kernel_device_partuuid = plan.kernel_device_partuuid,
     };
 }
 
@@ -423,6 +498,44 @@ pub fn installBiosBoot(
     }
 
     try img.pwrite(io, padded_core_img, embed_start_lba * mbr.sector_size);
+}
+
+pub fn generateBiosGrubCfg(
+    allocator: std.mem.Allocator,
+    source: *SourceTreeView,
+    options: GenerateBiosGrubCfgOptions,
+) InstallBiosError!GeneratedConfigFile {
+    const architecture = options.architecture orelse try resolveArchitectureFromPlannedPartitions(options.planned_partitions, options.root_role);
+    if (architecture != .x86_64) return error.UnsupportedBiosArchitecture;
+
+    var assets = try discoverBiosGrubAssets(allocator, source);
+    defer assets.deinit(allocator);
+
+    var plan = try buildBootPlan(allocator, source, .{
+        .planned_partitions = options.planned_partitions,
+        .architecture = architecture,
+        .root_role = options.root_role,
+        .kernel_device_partuuid = options.kernel_device_partuuid,
+        .root_filesystem_uuid = options.root_filesystem_uuid,
+        .path_strip_prefix = options.path_strip_prefix,
+        .title_prefix = options.title_prefix,
+    });
+    defer plan.deinit(allocator);
+
+    return .{
+        .path = try allocator.dupe(u8, biosGrubConfigPathForAssetPath(assets.core_img.source_path)),
+        .bytes = try renderGrubCfg(
+            allocator,
+            plan.boot_entries,
+            plan.rootPartuuidText(),
+            plan.kernelDevicePartuuidText(),
+            plan.rootFilesystemUuidText(),
+            options.extra_kernel_options,
+            options.verity,
+            .msdos,
+            options.grub_timeout_seconds,
+        ),
+    };
 }
 
 fn scanSourceTree(
@@ -500,6 +613,52 @@ fn scanSourceTree(
         .kernels = try kernels.toOwnedSlice(),
         .initrds = try initrds.toOwnedSlice(),
     };
+}
+
+fn buildBootPlan(
+    allocator: std.mem.Allocator,
+    source: *SourceTreeView,
+    options: BootPlanOptions,
+) PopulateError!BootPlan {
+    var scan = try scanSourceTree(allocator, source, options.path_strip_prefix);
+    errdefer scan.deinit(allocator);
+
+    if (scan.kernels.len == 0) return error.MissingKernel;
+
+    sortKernelCandidates(scan.kernels);
+    sortKernelCandidates(scan.initrds);
+
+    const architecture = try resolveArchitecture(scan.efi_binaries, options);
+    const root_partition = try resolveRootPartition(options.planned_partitions, architecture, options.root_role);
+    const kernel_device_partuuid = options.kernel_device_partuuid orelse root_partition.unique_guid;
+    const boot_entries = try buildBootEntries(allocator, scan.kernels, scan.initrds, options.title_prefix);
+    errdefer freeBootEntries(allocator, boot_entries);
+
+    var plan = BootPlan{
+        .scan = scan,
+        .architecture = architecture,
+        .root_partition = root_partition,
+        .kernel_device_partuuid = kernel_device_partuuid,
+        .boot_entries = boot_entries,
+    };
+
+    const root_partuuid_text = formatPlannedPartitionPartuuid(&plan.root_partuuid_buf, options.planned_partitions, root_partition);
+    plan.root_partuuid_len = root_partuuid_text.len;
+
+    if (options.kernel_device_partuuid) |partuuid| {
+        const kernel_device_partuuid_text = guid.formatLower(&plan.kernel_device_partuuid_buf, partuuid);
+        plan.kernel_device_partuuid_len = kernel_device_partuuid_text.len;
+    } else {
+        @memcpy(plan.kernel_device_partuuid_buf[0..root_partuuid_text.len], root_partuuid_text);
+        plan.kernel_device_partuuid_len = root_partuuid_text.len;
+    }
+
+    if (options.root_filesystem_uuid) |fs_uuid| {
+        const root_filesystem_uuid_text = formatPlainUuidBytes(&plan.root_filesystem_uuid_buf, &fs_uuid);
+        plan.root_filesystem_uuid_len = root_filesystem_uuid_text.len;
+    }
+
+    return plan;
 }
 
 fn classifyEfiBinary(
@@ -684,7 +843,7 @@ fn sortKernelCandidates(entries: []BootArtifactCandidate) void {
     }
 }
 
-fn resolveArchitecture(efi_binaries: []const EfiBinary, options: PopulateOptions) PopulateError!Architecture {
+fn resolveArchitecture(efi_binaries: []const EfiBinary, options: BootPlanOptions) PopulateError!Architecture {
     if (options.architecture) |architecture| return architecture;
     if (options.root_role) |role| {
         if (architectureForRole(role)) |architecture| return architecture;
@@ -813,6 +972,13 @@ const BiosGrubAssets = struct {
         self.* = undefined;
     }
 };
+
+fn biosGrubConfigPathForAssetPath(core_img_source_path: []const u8) []const u8 {
+    return if (containsPathSegmentIgnoreCase(core_img_source_path, "grub2"))
+        "boot/grub2/grub.cfg"
+    else
+        "boot/grub/grub.cfg";
+}
 
 fn discoverBiosGrubAssets(allocator: std.mem.Allocator, source: *SourceTreeView) InstallBiosError!BiosGrubAssets {
     var best_boot_img: ?SourceAsset = null;
@@ -1409,12 +1575,13 @@ fn renderGrubCfg(
     root_filesystem_uuid_text: ?[]const u8,
     extra_kernel_options: []const u8,
     verity_info: ?verity.Info,
+    partition_module: GrubPartitionModule,
     timeout_seconds: u32,
 ) std.mem.Allocator.Error![]u8 {
     var out = std.Io.Writer.Allocating.init(allocator);
     errdefer out.deinit();
 
-    out.writer.print("set default=0\nset timeout={d}\n\ninsmod part_gpt\ninsmod ext2\n", .{timeout_seconds}) catch return error.OutOfMemory;
+    out.writer.print("set default=0\nset timeout={d}\n\ninsmod {s}\ninsmod ext2\n", .{ timeout_seconds, partition_module.name() }) catch return error.OutOfMemory;
     if (root_filesystem_uuid_text) |fs_uuid_text| {
         // GRUB's `search` command has no `--partuuid` search type -- only
         // `--file`, `--label`, and `--fs-uuid` are recognized. Searching by
@@ -1943,6 +2110,77 @@ test "renderKernelOptions accepts synthesized MBR PARTUUID text for dm-verity" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "systemd.verity_root_data=PARTUUID=a1b2c3d4-01") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "systemd.verity_root_hash=PARTUUID=a1b2c3d4-01") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "console=ttyS0 quiet") != null);
+}
+
+test "generateBiosGrubCfg renders an MBR grub.cfg for the discovered kernel" {
+    const planned = [_]PlannedPartitionIdentity{
+        .{ .planned = .{
+            .name = "root",
+            .role = .root_x86_64,
+            .type_guid = guid.linux_root_x86_64,
+            .offset_bytes = 1024 * 1024,
+            .length_bytes = 128 * 1024 * 1024,
+        }, .unique_guid = guid.parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"), .mbr_disk_signature = 0xA1B2C3D4 },
+    };
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "boot/grub2/i386-pc/boot.img", .kind = .file, .bytes = "boot-img" },
+        .{ .path = "boot/grub2/i386-pc/core.img", .kind = .file, .bytes = "core-img" },
+        .{ .path = "boot/grub2/grub.cfg", .kind = .file, .bytes = "linux /boot/x86_64/loader/linux root=live:CDLABEL=CDROM\n" },
+        .{ .path = "boot/x86_64/loader/linux", .kind = .file, .bytes = "installer-kernel" },
+        .{ .path = "boot/x86_64/loader/initrd", .kind = .file, .bytes = "installer-initrd" },
+        .{ .path = "boot/vmlinuz-6.8.12-test", .kind = .file, .bytes = "kernel-bits" },
+        .{ .path = "boot/initramfs-6.8.12-test.img", .kind = .file, .bytes = "initrd-bits" },
+    });
+    tree.bind();
+
+    var grub_cfg = try generateBiosGrubCfg(std.testing.allocator, &tree.view, .{
+        .planned_partitions = &planned,
+        .root_filesystem_uuid = [_]u8{
+            0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89,
+            0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89,
+        },
+        .extra_kernel_options = "console=ttyS0 quiet",
+        .title_prefix = "zvmi",
+    });
+    defer grub_cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("boot/grub2/grub.cfg", grub_cfg.path);
+    try std.testing.expect(std.mem.indexOf(u8, grub_cfg.bytes, "insmod part_msdos") != null);
+    try std.testing.expect(std.mem.indexOf(u8, grub_cfg.bytes, "insmod part_gpt") == null);
+    try std.testing.expect(std.mem.indexOf(u8, grub_cfg.bytes, "search --no-floppy --fs-uuid --set=kernel_root abcdef01-2345-6789-abcd-ef0123456789") != null);
+    try std.testing.expect(std.mem.indexOf(u8, grub_cfg.bytes, "menuentry 'zvmi vmlinuz-6.8.12-test' --id 'vmlinuz-6.8.12-test'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, grub_cfg.bytes, "linux ($kernel_root)/boot/vmlinuz-6.8.12-test root=PARTUUID=a1b2c3d4-01 console=ttyS0 quiet") != null);
+    try std.testing.expect(std.mem.indexOf(u8, grub_cfg.bytes, "initrd ($kernel_root)/boot/initramfs-6.8.12-test.img") != null);
+    try std.testing.expect(std.mem.indexOf(u8, grub_cfg.bytes, "boot/x86_64/loader/linux") == null);
+    try std.testing.expect(std.mem.indexOf(u8, grub_cfg.bytes, "root=live:CDLABEL=CDROM") == null);
+}
+
+test "generateBiosGrubCfg selects boot/grub/grub.cfg for legacy BIOS assets" {
+    const planned = [_]PlannedPartitionIdentity{
+        .{ .planned = .{
+            .name = "root",
+            .role = .root_x86_64,
+            .type_guid = guid.linux_root_x86_64,
+            .offset_bytes = 1024 * 1024,
+            .length_bytes = 128 * 1024 * 1024,
+        }, .unique_guid = guid.parse("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"), .mbr_disk_signature = 0x55667788 },
+    };
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "boot/grub/i386-pc/boot.img", .kind = .file, .bytes = "boot-img" },
+        .{ .path = "boot/grub/i386-pc/core.img", .kind = .file, .bytes = "core-img" },
+        .{ .path = "boot/vmlinuz-test", .kind = .file, .bytes = "kernel-bits" },
+        .{ .path = "boot/initramfs-test.img", .kind = .file, .bytes = "initrd-bits" },
+    });
+    tree.bind();
+
+    var grub_cfg = try generateBiosGrubCfg(std.testing.allocator, &tree.view, .{
+        .planned_partitions = &planned,
+    });
+    defer grub_cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("boot/grub/grub.cfg", grub_cfg.path);
 }
 
 test "populateEsp copies MOK assets and emits UKIs when requested" {

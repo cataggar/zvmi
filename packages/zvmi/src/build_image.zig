@@ -181,13 +181,27 @@ pub fn build(
 
     logStep(options.verbose, "populate root ext4 filesystem");
     // Generate a real, random ext4 filesystem UUID and thread it into the
-    // generated grub.cfg's `search --fs-uuid` line -- GRUB's `search` command
-    // has no `--partuuid` search type, so without this the generated boot
-    // chain fails to locate the root filesystem at all (see issue #72,
+    // generated GRUB configs' `search --fs-uuid` lines -- GRUB's `search`
+    // command has no `--partuuid` search type, so without this the generated
+    // boot chain fails to locate the root filesystem at all (see issue #72,
     // confirmed via real QEMU + OVMF boot testing against the real Azure
     // Linux 4.0 ISO).
     var root_filesystem_uuid: [16]u8 = undefined;
     Io.random(io, &root_filesystem_uuid);
+    if (options.generation == .gen1 and !options.verity) {
+        // Non-verity Gen1 can safely overlay a generated BIOS grub.cfg into
+        // the source tree before `ext4.populate()`. Gen1+verity remains a
+        // follow-up: once grub.cfg lives inside the verified root filesystem,
+        // embedding the final `roothash=` there becomes self-referential.
+        logStep(options.verbose, "generate BIOS GRUB configuration");
+        const bios_grub_cfg = try bootconfig.generateBiosGrubCfg(allocator, &source_tree.view, .{
+            .planned_partitions = planned_partitions,
+            .architecture = architecture,
+            .root_filesystem_uuid = root_filesystem_uuid,
+            .extra_kernel_options = options.extra_kernel_options,
+        });
+        try source_tree.upsertOwnedFile(allocator, bios_grub_cfg.path, bios_grub_cfg.bytes);
+    }
     _ = try ext4.populate(io, raw_img.file, allocator, &source_tree.view, .{
         .offset = root_partition.planned.offset_bytes,
         .length = rootfs_length,
@@ -690,11 +704,7 @@ const MergedSourceTree = struct {
             out_index += 1;
         }
 
-        std.mem.sort(MergedEntry, entries, {}, struct {
-            fn lessThan(_: void, a: MergedEntry, b: MergedEntry) bool {
-                return std.mem.lessThan(u8, a.path, b.path);
-            }
-        }.lessThan);
+        sortMergedEntries(entries);
 
         return .{
             .io = io,
@@ -760,7 +770,111 @@ const MergedSourceTree = struct {
             .nested_ext4_file => |file| file.reader.preadPath(file.io, file.path, buffer, offset) catch error.ReadFailed,
         };
     }
+
+    fn findEntryIndex(self: *const MergedSourceTree, path: []const u8) ?usize {
+        for (self.entries, 0..) |entry, index| {
+            if (std.mem.eql(u8, entry.path, path)) return index;
+        }
+        return null;
+    }
+
+    fn ensureParentDirectories(self: *MergedSourceTree, allocator: std.mem.Allocator, path: []const u8) !void {
+        var missing = std.array_list.Managed([]u8).init(allocator);
+        defer {
+            for (missing.items) |parent| allocator.free(parent);
+            missing.deinit();
+        }
+
+        var end_opt = std.mem.lastIndexOfScalar(u8, path, '/');
+        while (end_opt) |end| {
+            const parent = path[0..end];
+            if (self.findEntryIndex(parent)) |index| {
+                var entry = &self.entries[index];
+                if (entry.kind != .directory) {
+                    deinitContentSource(allocator, &entry.content);
+                    if (entry.xattrs) |xattrs| {
+                        ext4.freeXattrs(allocator, xattrs);
+                        entry.xattrs = null;
+                    }
+                    entry.kind = .directory;
+                    entry.mode = 0o755;
+                    entry.uid = 0;
+                    entry.gid = 0;
+                    entry.size = 0;
+                }
+            } else {
+                try missing.append(try allocator.dupe(u8, parent));
+            }
+            end_opt = std.mem.lastIndexOfScalar(u8, parent, '/');
+        }
+
+        if (missing.items.len == 0) return;
+
+        const old_len = self.entries.len;
+        self.entries = try allocator.realloc(self.entries, old_len + missing.items.len);
+        var write_index = old_len;
+        while (missing.pop()) |owned_parent| {
+            self.entries[write_index] = .{
+                .path = owned_parent,
+                .kind = .directory,
+                .mode = 0o755,
+                .uid = 0,
+                .gid = 0,
+                .size = 0,
+            };
+            write_index += 1;
+        }
+        sortMergedEntries(self.entries);
+    }
+
+    fn upsertOwnedFile(self: *MergedSourceTree, allocator: std.mem.Allocator, path: []u8, bytes: []u8) !void {
+        errdefer allocator.free(path);
+        errdefer allocator.free(bytes);
+
+        try self.ensureParentDirectories(allocator, path);
+
+        if (self.findEntryIndex(path)) |index| {
+            var entry = &self.entries[index];
+            const existing_mode = if (entry.kind == .file) entry.mode else 0o644;
+            const existing_uid = entry.uid;
+            const existing_gid = entry.gid;
+            deinitContentSource(allocator, &entry.content);
+            if (entry.xattrs) |xattrs| {
+                ext4.freeXattrs(allocator, xattrs);
+                entry.xattrs = null;
+            }
+            entry.kind = .file;
+            entry.mode = normalizeMode(.file, existing_mode);
+            entry.uid = existing_uid;
+            entry.gid = existing_gid;
+            entry.size = bytes.len;
+            entry.content = .{ .owned_bytes = bytes };
+            allocator.free(path);
+            return;
+        }
+
+        const old_len = self.entries.len;
+        self.entries = try allocator.realloc(self.entries, old_len + 1);
+        self.entries[old_len] = .{
+            .path = path,
+            .kind = .file,
+            .mode = 0o644,
+            .uid = 0,
+            .gid = 0,
+            .size = bytes.len,
+            .content = .{ .owned_bytes = bytes },
+        };
+        sortMergedEntries(self.entries);
+    }
 };
+
+fn sortMergedEntries(entries: []MergedSourceTree.MergedEntry) void {
+    std.mem.sort(MergedSourceTree.MergedEntry, entries, {}, struct {
+        fn lessThan(_: void, a: MergedSourceTree.MergedEntry, b: MergedSourceTree.MergedEntry) bool {
+            return std.mem.lessThan(u8, a.path, b.path);
+        }
+    }.lessThan);
+}
 
 const NestedFilesystemKind = enum {
     ext4,
@@ -1997,6 +2111,26 @@ test "build-image installs a Gen1 BIOS GRUB chain into the post-MBR gap" {
     std.mem.writeInt(u16, expected_core[508..][0..2], @intCast(core_sector_count - 1), .little);
     std.mem.writeInt(u16, expected_core[510..][0..2], 0x820, .little);
     try std.testing.expectEqualSlices(u8, expected_core, embedded_core);
+
+    const root_partition = report.planned_partitions[0].planned;
+    const rootfs_scratch_path = try std.fmt.allocPrint(allocator, "{s}.test-rootfs.raw", .{output_path});
+    defer allocator.free(rootfs_scratch_path);
+    defer Io.Dir.cwd().deleteFile(io, rootfs_scratch_path) catch {};
+    try extractImageRegionToPath(allocator, io, &img, root_partition.offset_bytes, root_partition.length_bytes, rootfs_scratch_path);
+
+    const rootfs_scratch = try Io.Dir.cwd().openFile(io, rootfs_scratch_path, .{});
+    defer rootfs_scratch.close(io);
+    var root_reader = try ext4.open(io, rootfs_scratch, allocator, .{});
+    defer root_reader.deinit();
+
+    const grub_cfg = try root_reader.readFileAlloc(io, allocator, "boot/grub2/grub.cfg");
+    defer allocator.free(grub_cfg);
+    try std.testing.expect(std.mem.indexOf(u8, grub_cfg, "insmod part_msdos") != null);
+    try std.testing.expect(std.mem.indexOf(u8, grub_cfg, "search --no-floppy --fs-uuid --set=kernel_root ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, grub_cfg, "linux ($kernel_root)/boot/vmlinuz-test root=PARTUUID=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, grub_cfg, "initrd ($kernel_root)/boot/initramfs-test.img") != null);
+    try std.testing.expect(std.mem.indexOf(u8, grub_cfg, "boot/x86_64/loader/linux") == null);
+    try std.testing.expect(std.mem.indexOf(u8, grub_cfg, "root=live:CDLABEL=CDROM") == null);
 }
 
 test "build-image can append a dm-verity tree and pass metadata through COSI output" {
@@ -2221,6 +2355,13 @@ fn createBuildImageOciFixture(
         .{ .path = "boot/vmlinuz-test", .mode = 0o644, .typeflag = '0', .content = "kernel-from-oci", .link_name = null },
         .{ .path = "boot/initramfs-test.img", .mode = 0o644, .typeflag = '0', .content = "initrd-from-oci", .link_name = null },
         .{ .path = "boot/grub2/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
+        .{
+            .path = "boot/grub2/grub.cfg",
+            .mode = 0o644,
+            .typeflag = '0',
+            .content = "set default=0\nlinux /boot/x86_64/loader/linux root=live:CDLABEL=CDROM rd.live.image\ninitrd /boot/x86_64/loader/initrd\n",
+            .link_name = null,
+        },
         .{ .path = "boot/grub2/i386-pc/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
         .{ .path = "boot/grub2/i386-pc/boot.img", .mode = 0o644, .typeflag = '0', .content = bios_boot_img, .link_name = null },
         .{ .path = "boot/grub2/i386-pc/core.img", .mode = 0o644, .typeflag = '0', .content = bios_core_img, .link_name = null },
