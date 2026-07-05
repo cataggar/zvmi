@@ -1,4 +1,4 @@
-//! `zvmi build-image --iso <file.iso> --container <oci-layout> --generation 1|2 --size <size> -o <output.{raw|vhd|vhdx|qcow2}> [--verity]`
+//! `zvmi build-image --iso <file.iso> --container <oci-layout> --generation 1|2 --size <size> -o <output.{raw|vhd|vhdx|qcow2}> [--verity] [--extra-kernel-options <opts>]`
 
 const std = @import("std");
 const zvmi = @import("zvmi");
@@ -13,6 +13,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     var size: ?u64 = null;
     var esp_size: ?u64 = null;
     var enable_verity = false;
+    var extra_kernel_options: []const u8 = "";
     var dry_run = false;
     var verbose = false;
 
@@ -62,12 +63,16 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
             rootfs_path = args[i];
         } else if (std.mem.eql(u8, arg, "--verity")) {
             enable_verity = true;
+        } else if (std.mem.eql(u8, arg, "--extra-kernel-options")) {
+            i += 1;
+            if (i >= args.len) return fail("build-image: --extra-kernel-options requires a value", .{});
+            extra_kernel_options = args[i];
         } else if (std.mem.eql(u8, arg, "--dry-run")) {
             dry_run = true;
         } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
             verbose = true;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            return fail("usage: zvmi build-image --iso <file.iso> --container <oci-layout> --generation 1|2 --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}> [-O raw|vhd|vhdx|qcow2] [--rootfs-path <path>] [--esp-size <size>] [--verity] [--dry-run] [-v]", .{});
+            return fail("usage: zvmi build-image --iso <file.iso> --container <oci-layout> --generation 1|2 --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}> [-O raw|vhd|vhdx|qcow2] [--rootfs-path <path>] [--esp-size <size>] [--verity] [--extra-kernel-options <opts>] [--dry-run] [-v]", .{});
         } else {
             return fail("build-image: unexpected argument '{s}'", .{arg});
         }
@@ -84,6 +89,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
             .rootfs_path_in_iso = rootfs_path,
             .esp_size = esp_size orelse zvmi.build_image.default_esp_size,
             .verity = enable_verity,
+            .extra_kernel_options = extra_kernel_options,
             .dry_run = dry_run,
             .verbose = verbose,
         }) catch |err| return fail("build-image: failed: {s}", .{@errorName(err)});
