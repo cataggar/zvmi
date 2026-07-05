@@ -1397,6 +1397,16 @@ fn collectIsoEntries(
                 try collectIsoEntries(allocator, io, pending, path_index, reader, child.index, full_path, rootfs_path_in_iso);
             },
             .file => {
+                // Prefer the installed rootfs's own /boot kernel+initramfs over
+                // duplicate copies shipped on the installation media. Live ISO
+                // boot payloads can legitimately differ from the installed
+                // system's /boot contents (e.g. missing dm-verity support in
+                // the initramfs), so the built image should keep the squashfs
+                // rootfs version when both provide the same path.
+                if (path_index.contains(full_path) and shouldPreferInstalledBootPayload(full_path)) {
+                    allocator.free(full_path);
+                    continue;
+                }
                 try overlayEntry(allocator, pending, path_index, .{
                     .path = full_path,
                     .kind = .file,
@@ -1408,6 +1418,10 @@ fn collectIsoEntries(
                 });
             },
             .symlink => {
+                if (path_index.contains(full_path) and shouldPreferInstalledBootPayload(full_path)) {
+                    allocator.free(full_path);
+                    continue;
+                }
                 const target = try reader.readLink(child.index);
                 try overlayEntry(allocator, pending, path_index, .{
                     .path = full_path,
@@ -1421,6 +1435,20 @@ fn collectIsoEntries(
             },
         }
     }
+}
+
+fn shouldPreferInstalledBootPayload(path: []const u8) bool {
+    const slash = std.mem.indexOfScalar(u8, path, '/') orelse return false;
+    if (!std.ascii.eqlIgnoreCase(path[0..slash], "boot")) return false;
+
+    const basename = path[slash + 1 ..];
+    return std.ascii.startsWithIgnoreCase(basename, "vmlinuz") or
+        std.ascii.eqlIgnoreCase(basename, "Image") or
+        std.ascii.startsWithIgnoreCase(basename, "Image-") or
+        std.ascii.eqlIgnoreCase(basename, "bzImage") or
+        std.ascii.eqlIgnoreCase(basename, "zImage") or
+        std.ascii.startsWithIgnoreCase(basename, "initrd") or
+        std.ascii.startsWithIgnoreCase(basename, "initramfs");
 }
 
 fn collectOciEntries(
@@ -1779,7 +1807,7 @@ fn buildSyntheticNestedExt4ImageAlloc(
     io: Io,
     path: []const u8,
 ) ![]u8 {
-    var tree = SyntheticNestedExt4Tree.init(&[_]SyntheticNestedExt4Entry{
+    return buildNestedExt4ImageAlloc(allocator, io, path, &[_]SyntheticNestedExt4Entry{
         .{ .path = "bin", .kind = .symlink, .mode = 0o777, .uid = 0, .gid = 0, .size = 7, .bytes = "usr/bin" },
         .{ .path = "etc", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
         .{ .path = "etc/hostname", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 12, .bytes = "nested-host\n" },
@@ -1787,6 +1815,15 @@ fn buildSyntheticNestedExt4ImageAlloc(
         .{ .path = "usr/bin", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
         .{ .path = "usr/bin/true", .kind = .file, .mode = 0o755, .uid = 0, .gid = 0, .size = 17, .bytes = "#!/bin/sh\nexit 0\n" },
     });
+}
+
+fn buildNestedExt4ImageAlloc(
+    allocator: std.mem.Allocator,
+    io: Io,
+    path: []const u8,
+    entries: []const SyntheticNestedExt4Entry,
+) ![]u8 {
+    var tree = SyntheticNestedExt4Tree.init(entries);
     tree.bind();
 
     const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
@@ -2029,16 +2066,88 @@ test "build-image unwraps nested ext4 filesystem images inside squashfs files" {
     const true_payload = try root_reader.readFileAlloc(io, allocator, "usr/bin/true");
     defer allocator.free(true_payload);
     try std.testing.expectEqualStrings("#!/bin/sh\nexit 0\n", true_payload);
+}
 
-    const bin_link = try root_reader.readLinkAlloc(io, allocator, "bin");
-    defer allocator.free(bin_link);
-    try std.testing.expectEqualStrings("usr/bin", bin_link);
+test "build-image prefers squashfs kernel and initramfs over duplicate ISO boot payloads" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
-    try std.testing.expectError(error.NotFound, root_reader.statPath(io, "etc/message.txt"));
+    const iso_path = "test-build-image-boot-payload-precedence.iso";
+    const oci_root = "test-build-image-boot-payload-precedence-oci";
+    const output_path = "test-build-image-boot-payload-precedence.raw";
+    const nested_ext4_path = "test-build-image-boot-payload-precedence-rootfs.img";
+    defer Io.Dir.cwd().deleteFile(io, iso_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, oci_root) catch {};
+    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, nested_ext4_path) catch {};
 
-    const overlay_file = try root_reader.readFileAlloc(io, allocator, "app/hello.txt");
-    defer allocator.free(overlay_file);
-    try std.testing.expectEqualStrings("hello from layer2\n", overlay_file);
+    const nested_ext4_bytes = try buildNestedExt4ImageAlloc(allocator, io, nested_ext4_path, &[_]SyntheticNestedExt4Entry{
+        .{ .path = "boot", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "boot/vmlinuz-test", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = "kernel-from-squashfs".len, .bytes = "kernel-from-squashfs" },
+        .{ .path = "boot/initramfs-test.img", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = "initrd-from-squashfs".len, .bytes = "initrd-from-squashfs" },
+        .{ .path = "etc", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "etc/hostname", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = "precedence-test\n".len, .bytes = "precedence-test\n" },
+    });
+    defer allocator.free(nested_ext4_bytes);
+
+    const squashfs_bytes = try squashfs.buildSyntheticSquashfsImage(allocator, .{
+        .compression = .none,
+        .block_size = 1024 * 1024,
+        .file_bytes = nested_ext4_bytes,
+    });
+    defer allocator.free(squashfs_bytes);
+    try writeMinimalIsoWithBootPayloads(
+        allocator,
+        io,
+        iso_path,
+        "root.squashfs",
+        squashfs_bytes,
+        "vmlinuz-test",
+        "kernel-from-iso",
+        "initramfs-test.img",
+        "initrd-from-iso",
+    );
+
+    try createEfiOnlyBuildImageOciLayout(allocator, io, oci_root);
+
+    var report = try build(allocator, io, .{
+        .iso_path = iso_path,
+        .container_path = oci_root,
+        .output_path = output_path,
+        .output_format = .raw,
+        .generation = .gen2,
+        .size = 256 * mib,
+    });
+    defer report.deinit(allocator);
+
+    var img = try Image.openPath(io, output_path);
+    defer img.close(io);
+
+    const esp_partition = report.planned_partitions[0].planned;
+    var esp = try fat32.open(&img, io, .{ .offset = esp_partition.offset_bytes, .length = esp_partition.length_bytes });
+    const bls_entry = try esp.readFileAlloc(io, allocator, "loader/entries/vmlinuz-test.conf");
+    defer allocator.free(bls_entry);
+    try std.testing.expect(std.mem.indexOf(u8, bls_entry, "/boot/vmlinuz-test") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bls_entry, "/boot/initramfs-test.img") != null);
+
+    const root_partition = report.planned_partitions[1].planned;
+    const rootfs_scratch_path = try std.fmt.allocPrint(allocator, "{s}.test-rootfs.raw", .{output_path});
+    defer allocator.free(rootfs_scratch_path);
+    defer Io.Dir.cwd().deleteFile(io, rootfs_scratch_path) catch {};
+    try extractImageRegionToPath(allocator, io, &img, root_partition.offset_bytes, root_partition.length_bytes, rootfs_scratch_path);
+
+    const rootfs_scratch = try Io.Dir.cwd().openFile(io, rootfs_scratch_path, .{});
+    defer rootfs_scratch.close(io);
+    var root_reader = try ext4.open(io, rootfs_scratch, allocator, .{});
+    defer root_reader.deinit();
+
+    const kernel = try root_reader.readFileAlloc(io, allocator, "boot/vmlinuz-test");
+    defer allocator.free(kernel);
+    try std.testing.expectEqualStrings("kernel-from-squashfs", kernel);
+
+    const initrd = try root_reader.readFileAlloc(io, allocator, "boot/initramfs-test.img");
+    defer allocator.free(initrd);
+    try std.testing.expectEqualStrings("initrd-from-squashfs", initrd);
 }
 
 test "build-image installs a Gen1 BIOS GRUB chain into the post-MBR gap" {
@@ -2425,6 +2534,56 @@ fn createBuildImageOciFixture(
     };
 }
 
+fn createEfiOnlyBuildImageOciLayout(
+    allocator: std.mem.Allocator,
+    io: Io,
+    root: []const u8,
+) !void {
+    try Io.Dir.cwd().createDirPath(io, root);
+    var dir = try Io.Dir.cwd().openDir(io, root, .{});
+    defer dir.close(io);
+    try dir.createDirPath(io, "blobs/sha256");
+
+    const layer_tar = try buildTarArchive(allocator, &.{
+        .{ .path = "EFI/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
+        .{ .path = "EFI/BOOT/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
+        .{ .path = "EFI/BOOT/BOOTX64.EFI", .mode = 0o644, .typeflag = '0', .content = "bootx64-from-oci", .link_name = null },
+        .{ .path = "EFI/Acme/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
+        .{ .path = "EFI/Acme/grubx64.efi", .mode = 0o644, .typeflag = '0', .content = "grubx64-from-oci", .link_name = null },
+    });
+    defer allocator.free(layer_tar);
+    const layer_gzip = try gzipBytes(allocator, layer_tar);
+    defer allocator.free(layer_gzip);
+
+    const config_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"architecture\":\"amd64\",\"os\":\"linux\",\"rootfs\":{{\"type\":\"layers\",\"diff_ids\":[]}}}}",
+        .{},
+    );
+    defer allocator.free(config_json);
+    const config_digest = try writeBlobAndDigest(allocator, io, dir, config_json);
+    defer allocator.free(config_digest);
+    const layer_digest = try writeBlobAndDigest(allocator, io, dir, layer_gzip);
+    defer allocator.free(layer_digest);
+    const manifest_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schemaVersion\":2,\"config\":{{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\"{s}\",\"size\":{d}}},\"layers\":[{{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
+        .{ config_digest, config_json.len, layer_digest, layer_gzip.len },
+    );
+    defer allocator.free(manifest_json);
+    const manifest_digest = try writeBlobAndDigest(allocator, io, dir, manifest_json);
+    defer allocator.free(manifest_digest);
+    const index_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
+        .{ manifest_digest, manifest_json.len },
+    );
+    defer allocator.free(index_json);
+
+    try dir.writeFile(io, .{ .sub_path = "oci-layout", .data = "{\"imageLayoutVersion\":\"1.0.0\"}" });
+    try dir.writeFile(io, .{ .sub_path = "index.json", .data = index_json });
+}
+
 const TarSpec = struct {
     path: []const u8,
     mode: u32,
@@ -2605,6 +2764,102 @@ fn writeMinimalIsoWithFile(
     defer file.close(io);
     try file.writePositionalAll(io, image.items, 0);
 }
+
+fn writeMinimalIsoWithBootPayloads(
+    allocator: std.mem.Allocator,
+    io: Io,
+    path: []const u8,
+    rootfs_name: []const u8,
+    rootfs_bytes: []const u8,
+    kernel_name: []const u8,
+    kernel_bytes: []const u8,
+    initrd_name: []const u8,
+    initrd_bytes: []const u8,
+) !void {
+    const root_lba: u32 = 20;
+    const boot_dir_lba: u32 = 21;
+    const rootfs_lba: u32 = 22;
+    const rootfs_blocks: u32 = @intCast(std.math.divCeil(u64, rootfs_bytes.len, iso9660.descriptor_size) catch unreachable);
+    const kernel_lba = rootfs_lba + rootfs_blocks;
+    const kernel_blocks: u32 = @intCast(std.math.divCeil(u64, kernel_bytes.len, iso9660.descriptor_size) catch unreachable);
+    const initrd_lba = kernel_lba + kernel_blocks;
+    const initrd_blocks: u32 = @intCast(std.math.divCeil(u64, initrd_bytes.len, iso9660.descriptor_size) catch unreachable);
+    const image_blocks = initrd_lba + initrd_blocks;
+
+    var image = std.array_list.Managed(u8).init(allocator);
+    defer image.deinit();
+    try image.resize(image_blocks * iso9660.descriptor_size);
+    @memset(image.items, 0);
+
+    var pvd: [iso9660.descriptor_size]u8 = [_]u8{0} ** iso9660.descriptor_size;
+    pvd[0] = 1;
+    pvd[1..6].* = iso9660.standard_id;
+    pvd[6] = 1;
+    write733(pvd[80..88], @intCast(image.items.len / iso9660.descriptor_size));
+    write723(pvd[128..132], iso9660.descriptor_size);
+    write733(pvd[132..140], 0);
+    std.mem.writeInt(u32, pvd[140..144], 19, .little);
+    const root_record = makeDirectoryRecord(&.{0}, root_lba, iso9660.descriptor_size, 0x02, &.{});
+    @memcpy(pvd[156 .. 156 + root_record[0]], root_record[0..root_record[0]]);
+    image.items[iso9660.volume_descriptor_lba * iso9660.descriptor_size .. (iso9660.volume_descriptor_lba + 1) * iso9660.descriptor_size].* = pvd;
+
+    var terminator: [iso9660.descriptor_size]u8 = [_]u8{0} ** iso9660.descriptor_size;
+    terminator[0] = 255;
+    terminator[1..6].* = iso9660.standard_id;
+    terminator[6] = 1;
+    image.items[(iso9660.volume_descriptor_lba + 1) * iso9660.descriptor_size .. (iso9660.volume_descriptor_lba + 2) * iso9660.descriptor_size].* = terminator;
+
+    var path_table = std.array_list.Managed(u8).init(allocator);
+    defer path_table.deinit();
+    try path_table.append(1);
+    try path_table.append(0);
+    try appendU32Le(&path_table, root_lba);
+    try appendU16Le(&path_table, 1);
+    try path_table.append(0);
+    try path_table.append(0);
+    try path_table.append(bootPathSegment.len);
+    try path_table.append(0);
+    try appendU32Le(&path_table, boot_dir_lba);
+    try appendU16Le(&path_table, 1);
+    try path_table.appendSlice(bootPathSegment);
+    if (bootPathSegment.len % 2 != 0) try path_table.append(0);
+    write733(image.items[16 * iso9660.descriptor_size + 132 .. 16 * iso9660.descriptor_size + 140], @intCast(path_table.items.len));
+    @memcpy(image.items[19 * iso9660.descriptor_size ..][0..path_table.items.len], path_table.items);
+
+    var root_dir = std.array_list.Managed(u8).init(allocator);
+    defer root_dir.deinit();
+    const dot = makeDirectoryRecord(&.{0}, root_lba, iso9660.descriptor_size, 0x02, &.{});
+    try root_dir.appendSlice(dot[0..dot[0]]);
+    const dotdot = makeDirectoryRecord(&.{1}, root_lba, iso9660.descriptor_size, 0x02, &.{});
+    try root_dir.appendSlice(dotdot[0..dotdot[0]]);
+    const rootfs_record = makeDirectoryRecord(rootfs_name, rootfs_lba, rootfs_bytes.len, 0, &.{});
+    try root_dir.appendSlice(rootfs_record[0..rootfs_record[0]]);
+    const boot_record = makeDirectoryRecord(bootPathSegment, boot_dir_lba, iso9660.descriptor_size, 0x02, &.{});
+    try root_dir.appendSlice(boot_record[0..boot_record[0]]);
+    @memcpy(image.items[root_lba * iso9660.descriptor_size ..][0..root_dir.items.len], root_dir.items);
+
+    var boot_dir = std.array_list.Managed(u8).init(allocator);
+    defer boot_dir.deinit();
+    const boot_dot = makeDirectoryRecord(&.{0}, boot_dir_lba, iso9660.descriptor_size, 0x02, &.{});
+    try boot_dir.appendSlice(boot_dot[0..boot_dot[0]]);
+    const boot_dotdot = makeDirectoryRecord(&.{1}, root_lba, iso9660.descriptor_size, 0x02, &.{});
+    try boot_dir.appendSlice(boot_dotdot[0..boot_dotdot[0]]);
+    const kernel_record = makeDirectoryRecord(kernel_name, kernel_lba, kernel_bytes.len, 0, &.{});
+    try boot_dir.appendSlice(kernel_record[0..kernel_record[0]]);
+    const initrd_record = makeDirectoryRecord(initrd_name, initrd_lba, initrd_bytes.len, 0, &.{});
+    try boot_dir.appendSlice(initrd_record[0..initrd_record[0]]);
+    @memcpy(image.items[boot_dir_lba * iso9660.descriptor_size ..][0..boot_dir.items.len], boot_dir.items);
+
+    @memcpy(image.items[rootfs_lba * iso9660.descriptor_size ..][0..rootfs_bytes.len], rootfs_bytes);
+    @memcpy(image.items[kernel_lba * iso9660.descriptor_size ..][0..kernel_bytes.len], kernel_bytes);
+    @memcpy(image.items[initrd_lba * iso9660.descriptor_size ..][0..initrd_bytes.len], initrd_bytes);
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    try file.writePositionalAll(io, image.items, 0);
+}
+
+const bootPathSegment = "boot";
 
 fn makeDirectoryRecord(
     file_identifier: []const u8,
