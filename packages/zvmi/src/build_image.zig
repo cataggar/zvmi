@@ -48,6 +48,9 @@ pub const BuildImageOptions = struct {
     /// generated Unified Kernel Image (UKI), or both. No effect on Gen1
     /// (BIOS) builds, which don't use `bootconfig.populateEsp()`.
     boot_mode: bootconfig.BootMode = .bls_only,
+    /// Additional UKI discovery/output controls forwarded to
+    /// `bootconfig.populateEsp()`.
+    uki: bootconfig.UkiOptions = .{},
     dry_run: bool = false,
     verbose: bool = false,
 };
@@ -224,14 +227,21 @@ pub fn build(
             .offset = esp_partition.planned.offset_bytes,
             .length = esp_partition.planned.length_bytes,
         });
-        _ = try bootconfig.populateEsp(allocator, io, &esp_fs, &source_tree.view, .{
+        _ = bootconfig.populateEsp(allocator, io, &esp_fs, &source_tree.view, .{
             .planned_partitions = planned_partitions,
             .architecture = architecture,
             .verity = report.verity,
             .root_filesystem_uuid = root_filesystem_uuid,
             .boot_mode = options.boot_mode,
             .extra_kernel_options = options.extra_kernel_options,
-        });
+            .uki = options.uki,
+        }) catch |err| switch (err) {
+            error.NoSpaceLeft => if (options.boot_mode != .bls_only)
+                return error.EspTooSmallForBootArtifacts
+            else
+                return err,
+            else => return err,
+        };
     }
 
     raw_img.close(io);
@@ -2169,6 +2179,152 @@ test "build-image reports errors cleanly (no double-free) when squashfs open fai
     }));
 }
 
+test "build-image reports MissingUkiStub for UKI mode without a stub" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const iso_path = "test-build-image-missing-uki-stub.iso";
+    const oci_root = "test-build-image-missing-uki-stub-oci";
+    const output_path = "test-build-image-missing-uki-stub.raw";
+    defer Io.Dir.cwd().deleteFile(io, iso_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, oci_root) catch {};
+    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
+
+    const squashfs_bytes = try squashfs.buildSyntheticSquashfsImage(allocator, .{ .compression = .xz });
+    defer allocator.free(squashfs_bytes);
+    try writeMinimalIsoWithFile(allocator, io, iso_path, "ROOT.SQUASHFS;1", squashfs_bytes);
+
+    var fixture = try createBuildImageOciFixture(allocator, io, oci_root);
+    defer fixture.deinit(allocator);
+
+    try std.testing.expectError(error.MissingUkiStub, build(allocator, io, .{
+        .iso_path = iso_path,
+        .container_path = oci_root,
+        .output_path = output_path,
+        .output_format = .raw,
+        .generation = .gen2,
+        .size = 256 * mib,
+        .boot_mode = .uki_only,
+    }));
+}
+
+test "build-image wraps ESP NoSpaceLeft as EspTooSmallForBootArtifacts for UKI mode" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const iso_path = "test-build-image-uki-esp-too-small.iso";
+    const oci_root = "test-build-image-uki-esp-too-small-oci";
+    const output_path = "test-build-image-uki-esp-too-small.raw";
+    defer Io.Dir.cwd().deleteFile(io, iso_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, oci_root) catch {};
+    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
+
+    const squashfs_bytes = try squashfs.buildSyntheticSquashfsImage(allocator, .{ .compression = .xz });
+    defer allocator.free(squashfs_bytes);
+    try writeMinimalIsoWithFile(allocator, io, iso_path, "ROOT.SQUASHFS;1", squashfs_bytes);
+
+    const stub_bytes = try makeTestStubPe(allocator, 0x8664);
+    defer allocator.free(stub_bytes);
+
+    const kernel_bytes = try allocator.alloc(u8, @intCast(20 * mib));
+    defer allocator.free(kernel_bytes);
+    @memset(kernel_bytes, 'K');
+
+    const initrd_bytes = try allocator.alloc(u8, @intCast(20 * mib));
+    defer allocator.free(initrd_bytes);
+    @memset(initrd_bytes, 'I');
+
+    var fixture = try createBuildImageOciFixtureWithOptions(allocator, io, oci_root, .{
+        .kernel_bytes = kernel_bytes,
+        .initrd_bytes = initrd_bytes,
+        .uki_stub_path = "custom/linuxx64.efi.stub",
+        .uki_stub_bytes = stub_bytes,
+    });
+    defer fixture.deinit(allocator);
+
+    try std.testing.expectError(error.EspTooSmallForBootArtifacts, build(allocator, io, .{
+        .iso_path = iso_path,
+        .container_path = oci_root,
+        .output_path = output_path,
+        .output_format = .raw,
+        .generation = .gen2,
+        .size = 512 * mib,
+        .esp_size = 64 * mib,
+        .boot_mode = .uki_only,
+        .uki = .{
+            .stub_source_path = "custom/linuxx64.efi.stub",
+        },
+    }));
+}
+
+fn makeTestStubPe(allocator: std.mem.Allocator, machine: u16) ![]u8 {
+    const file_alignment: u32 = 0x200;
+    const section_alignment: u32 = 0x1000;
+    const pe_offset: usize = 0x80;
+    const optional_header_size: usize = 240;
+    const section_count: usize = 1;
+    const file_header_size = 20;
+    const section_header_size = 40;
+    const size_of_headers = std.mem.alignForward(
+        u32,
+        pe_offset + 4 + file_header_size + optional_header_size + section_count * section_header_size,
+        file_alignment,
+    );
+    const file_len = size_of_headers + file_alignment;
+
+    var buffer = try allocator.alloc(u8, file_len);
+    @memset(buffer, 0);
+
+    std.mem.copyForwards(u8, buffer[0..2], "MZ");
+    std.mem.writeInt(u32, buffer[0x3C..0x40], pe_offset, .little);
+    std.mem.copyForwards(u8, buffer[pe_offset .. pe_offset + 4], "PE\x00\x00");
+
+    const file_header_offset = pe_offset + 4;
+    std.mem.writeInt(u16, buffer[file_header_offset..][0..2], machine, .little);
+    std.mem.writeInt(u16, buffer[file_header_offset + 2 ..][0..2], section_count, .little);
+    std.mem.writeInt(u16, buffer[file_header_offset + 16 ..][0..2], optional_header_size, .little);
+    std.mem.writeInt(u16, buffer[file_header_offset + 18 ..][0..2], 0x202, .little);
+
+    const optional_header_offset = file_header_offset + file_header_size;
+    std.mem.writeInt(u16, buffer[optional_header_offset..][0..2], 0x20B, .little);
+    std.mem.writeInt(u32, buffer[optional_header_offset + 4 ..][0..4], file_alignment, .little);
+    std.mem.writeInt(u32, buffer[optional_header_offset + 16 ..][0..4], 0x1000, .little);
+    std.mem.writeInt(u32, buffer[optional_header_offset + 20 ..][0..4], 0x1000, .little);
+    std.mem.writeInt(u64, buffer[optional_header_offset + 24 ..][0..8], 0x400000, .little);
+    std.mem.writeInt(u32, buffer[optional_header_offset + 32 ..][0..4], section_alignment, .little);
+    std.mem.writeInt(u32, buffer[optional_header_offset + 36 ..][0..4], file_alignment, .little);
+    std.mem.writeInt(u16, buffer[optional_header_offset + 40 ..][0..2], 6, .little);
+    std.mem.writeInt(u16, buffer[optional_header_offset + 48 ..][0..2], 6, .little);
+    std.mem.writeInt(u32, buffer[optional_header_offset + 56 ..][0..4], 0x2000, .little);
+    std.mem.writeInt(u32, buffer[optional_header_offset + 60 ..][0..4], size_of_headers, .little);
+    std.mem.writeInt(u16, buffer[optional_header_offset + 68 ..][0..2], 10, .little);
+    std.mem.writeInt(u16, buffer[optional_header_offset + 70 ..][0..2], 0x160, .little);
+    std.mem.writeInt(u64, buffer[optional_header_offset + 72 ..][0..8], 0x100000, .little);
+    std.mem.writeInt(u64, buffer[optional_header_offset + 80 ..][0..8], 0x1000, .little);
+    std.mem.writeInt(u64, buffer[optional_header_offset + 88 ..][0..8], 0x100000, .little);
+    std.mem.writeInt(u64, buffer[optional_header_offset + 96 ..][0..8], 0x1000, .little);
+    std.mem.writeInt(u32, buffer[optional_header_offset + 108 ..][0..4], 16, .little);
+
+    const section_header_offset = optional_header_offset + optional_header_size;
+    const header = buffer[section_header_offset .. section_header_offset + section_header_size];
+    std.mem.copyForwards(u8, header[0..5], ".text");
+    std.mem.writeInt(u32, header[8..12], 1, .little);
+    std.mem.writeInt(u32, header[12..16], 0x1000, .little);
+    std.mem.writeInt(u32, header[16..20], file_alignment, .little);
+    std.mem.writeInt(u32, header[20..24], size_of_headers, .little);
+    std.mem.writeInt(u32, header[36..40], 0x60000020, .little);
+
+    buffer[size_of_headers] = 0xC3;
+    return buffer;
+}
+
+const BuildImageOciFixtureOptions = struct {
+    kernel_bytes: []const u8 = "kernel-from-oci",
+    initrd_bytes: []const u8 = "initrd-from-oci",
+    uki_stub_path: ?[]const u8 = null,
+    uki_stub_bytes: []const u8 = "",
+};
+
 const BuildImageOciFixture = struct {
     bios_boot_img: []u8,
     bios_core_img: []u8,
@@ -2207,6 +2363,15 @@ fn createBuildImageOciFixture(
     io: Io,
     root: []const u8,
 ) !BuildImageOciFixture {
+    return createBuildImageOciFixtureWithOptions(allocator, io, root, .{});
+}
+
+fn createBuildImageOciFixtureWithOptions(
+    allocator: std.mem.Allocator,
+    io: Io,
+    root: []const u8,
+    options: BuildImageOciFixtureOptions,
+) !BuildImageOciFixture {
     try Io.Dir.cwd().createDirPath(io, root);
     var dir = try Io.Dir.cwd().openDir(io, root, .{});
     defer dir.close(io);
@@ -2216,10 +2381,14 @@ fn createBuildImageOciFixture(
     errdefer allocator.free(bios_boot_img);
     const bios_core_img = try makeSyntheticBiosCoreImg(allocator);
     errdefer allocator.free(bios_core_img);
-    const layer1_tar = try buildTarArchive(allocator, &.{
+    std.debug.assert(options.uki_stub_path == null or options.uki_stub_bytes.len != 0);
+
+    var layer1_specs = std.array_list.Managed(TarSpec).init(allocator);
+    defer layer1_specs.deinit();
+    try layer1_specs.appendSlice(&.{
         .{ .path = "boot/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
-        .{ .path = "boot/vmlinuz-test", .mode = 0o644, .typeflag = '0', .content = "kernel-from-oci", .link_name = null },
-        .{ .path = "boot/initramfs-test.img", .mode = 0o644, .typeflag = '0', .content = "initrd-from-oci", .link_name = null },
+        .{ .path = "boot/vmlinuz-test", .mode = 0o644, .typeflag = '0', .content = options.kernel_bytes, .link_name = null },
+        .{ .path = "boot/initramfs-test.img", .mode = 0o644, .typeflag = '0', .content = options.initrd_bytes, .link_name = null },
         .{ .path = "boot/grub2/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
         .{ .path = "boot/grub2/i386-pc/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
         .{ .path = "boot/grub2/i386-pc/boot.img", .mode = 0o644, .typeflag = '0', .content = bios_boot_img, .link_name = null },
@@ -2234,6 +2403,16 @@ fn createBuildImageOciFixture(
         .{ .path = "etc/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
         .{ .path = "etc/remove.txt", .mode = 0o644, .typeflag = '0', .content = "remove me\n", .link_name = null },
     });
+    if (options.uki_stub_path) |uki_stub_path| {
+        try layer1_specs.append(.{
+            .path = uki_stub_path,
+            .mode = 0o644,
+            .typeflag = '0',
+            .content = options.uki_stub_bytes,
+            .link_name = null,
+        });
+    }
+    const layer1_tar = try buildTarArchive(allocator, layer1_specs.items);
     const layer2_tar = try buildTarArchive(allocator, &.{
         .{ .path = "etc/.wh.remove.txt", .mode = 0o000, .typeflag = '0', .content = "", .link_name = null },
         .{ .path = "app/hello.txt", .mode = 0o644, .typeflag = '0', .content = "hello from layer2\n", .link_name = null },

@@ -27,7 +27,7 @@ const usage =
     \\  map [--output=human|json] <file>
     \\  azure fixup --generation 1|2 <file>
     \\  cosi <disk-image> -o <output.cosi>
-    \\  build-image --iso <file.iso> --container <oci-layout> --generation 1|2 --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}> [--verity]
+    \\  build-image --iso <file.iso> --container <oci-layout> --generation 1|2 --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}> [--esp-size <size>] [--boot-mode bls|uki|both] [--stub-source-path <path>] [--verity]
     \\
     \\Formats: raw, vhd (alias: vpc), vhdx, qcow2
     \\Sizes accept K/M/G/T binary suffixes (e.g. 20G).
