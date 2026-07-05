@@ -2562,7 +2562,9 @@ test "build-image installs a Gen1 BIOS GRUB chain into the post-MBR gap" {
     defer allocator.free(squashfs_bytes);
     try writeMinimalIsoWithFile(allocator, io, iso_path, "ROOT.SQUASHFS;1", squashfs_bytes);
 
-    var fixture = try createBuildImageOciFixture(allocator, io, oci_root);
+    var fixture = try createBuildImageOciFixtureWithOptions(allocator, io, oci_root, .{
+        .bios_asset_layout = .usr_lib_grub,
+    });
     defer fixture.deinit(allocator);
 
     var report = try build(allocator, io, .{
@@ -2948,7 +2950,13 @@ fn makeTestStubPe(allocator: std.mem.Allocator, machine: u16) ![]u8 {
     return buffer;
 }
 
+const BuildImageOciFixtureBiosAssetLayout = enum {
+    boot_grub2,
+    usr_lib_grub,
+};
+
 const BuildImageOciFixtureOptions = struct {
+    bios_asset_layout: BuildImageOciFixtureBiosAssetLayout = .boot_grub2,
     kernel_bytes: []const u8 = "kernel-from-oci",
     initrd_bytes: []const u8 = "initrd-from-oci",
     uki_stub_path: ?[]const u8 = null,
@@ -3027,9 +3035,6 @@ fn createBuildImageOciFixtureWithOptions(
             .content = "set default=0\nlinux /boot/x86_64/loader/linux root=live:CDLABEL=CDROM rd.live.image\ninitrd /boot/x86_64/loader/initrd\n",
             .link_name = null,
         },
-        .{ .path = "boot/grub2/i386-pc/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
-        .{ .path = "boot/grub2/i386-pc/boot.img", .mode = 0o644, .typeflag = '0', .content = bios_boot_img, .link_name = null },
-        .{ .path = "boot/grub2/i386-pc/core.img", .mode = 0o644, .typeflag = '0', .content = bios_core_img, .link_name = null },
         .{ .path = "EFI/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
         .{ .path = "EFI/BOOT/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
         .{ .path = "EFI/BOOT/BOOTX64.EFI", .mode = 0o644, .typeflag = '0', .content = "bootx64-from-oci", .link_name = null },
@@ -3040,6 +3045,21 @@ fn createBuildImageOciFixtureWithOptions(
         .{ .path = "etc/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
         .{ .path = "etc/remove.txt", .mode = 0o644, .typeflag = '0', .content = "remove me\n", .link_name = null },
     });
+    switch (options.bios_asset_layout) {
+        .boot_grub2 => try layer1_specs.appendSlice(&.{
+            .{ .path = "boot/grub2/i386-pc/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
+            .{ .path = "boot/grub2/i386-pc/boot.img", .mode = 0o644, .typeflag = '0', .content = bios_boot_img, .link_name = null },
+            .{ .path = "boot/grub2/i386-pc/core.img", .mode = 0o644, .typeflag = '0', .content = bios_core_img, .link_name = null },
+        }),
+        .usr_lib_grub => try layer1_specs.appendSlice(&.{
+            .{ .path = "usr/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
+            .{ .path = "usr/lib/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
+            .{ .path = "usr/lib/grub/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
+            .{ .path = "usr/lib/grub/i386-pc/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
+            .{ .path = "usr/lib/grub/i386-pc/boot.img", .mode = 0o644, .typeflag = '0', .content = bios_boot_img, .link_name = null },
+            .{ .path = "usr/lib/grub/i386-pc/core.img", .mode = 0o644, .typeflag = '0', .content = bios_core_img, .link_name = null },
+        }),
+    }
     if (options.uki_stub_path) |uki_stub_path| {
         try layer1_specs.append(.{
             .path = uki_stub_path,

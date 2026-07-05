@@ -510,6 +510,8 @@ pub fn generateBiosGrubCfg(
 
     var assets = try discoverBiosGrubAssets(allocator, source);
     defer assets.deinit(allocator);
+    const config_path = (try existingBiosGrubConfigPath(source)) orelse
+        biosGrubConfigPathForAssetPath(assets.core_img.source_path);
 
     var plan = try buildBootPlan(allocator, source, .{
         .planned_partitions = options.planned_partitions,
@@ -523,7 +525,7 @@ pub fn generateBiosGrubCfg(
     defer plan.deinit(allocator);
 
     return .{
-        .path = try allocator.dupe(u8, biosGrubConfigPathForAssetPath(assets.core_img.source_path)),
+        .path = try allocator.dupe(u8, config_path),
         .bytes = try renderGrubCfg(
             allocator,
             plan.boot_entries,
@@ -973,11 +975,32 @@ const BiosGrubAssets = struct {
     }
 };
 
+const bios_grub2_config_path = "boot/grub2/grub.cfg";
+const bios_grub_config_path = "boot/grub/grub.cfg";
+
 fn biosGrubConfigPathForAssetPath(core_img_source_path: []const u8) []const u8 {
     return if (containsPathSegmentIgnoreCase(core_img_source_path, "grub2"))
-        "boot/grub2/grub.cfg"
+        bios_grub2_config_path
     else
-        "boot/grub/grub.cfg";
+        bios_grub_config_path;
+}
+
+// Some distros (including the real Azure Linux 4.0 ISO from issue #76) ship
+// BIOS GRUB's `core.img` under `usr/lib/grub/i386-pc/` even though the
+// embedded handoff still loads `/boot/grub2/grub.cfg` at boot. Prefer
+// replacing an existing on-disk BIOS grub.cfg over inferring the config path
+// from the asset install location.
+fn existingBiosGrubConfigPath(source: *SourceTreeView) SourceTreeView.IteratorError!?[]const u8 {
+    var found_legacy = false;
+
+    source.reset();
+    while (try source.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (std.mem.eql(u8, entry.path, bios_grub2_config_path)) return bios_grub2_config_path;
+        if (std.mem.eql(u8, entry.path, bios_grub_config_path)) found_legacy = true;
+    }
+
+    return if (found_legacy) bios_grub_config_path else null;
 }
 
 fn discoverBiosGrubAssets(allocator: std.mem.Allocator, source: *SourceTreeView) InstallBiosError!BiosGrubAssets {
@@ -2181,6 +2204,36 @@ test "generateBiosGrubCfg selects boot/grub/grub.cfg for legacy BIOS assets" {
     defer grub_cfg.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings("boot/grub/grub.cfg", grub_cfg.path);
+}
+
+test "generateBiosGrubCfg prefers an existing boot/grub2/grub.cfg over usr/lib BIOS assets" {
+    const planned = [_]PlannedPartitionIdentity{
+        .{ .planned = .{
+            .name = "root",
+            .role = .root_x86_64,
+            .type_guid = guid.linux_root_x86_64,
+            .offset_bytes = 1024 * 1024,
+            .length_bytes = 128 * 1024 * 1024,
+        }, .unique_guid = guid.parse("cccccccc-cccc-cccc-cccc-cccccccccccc"), .mbr_disk_signature = 0x1234ABCD },
+    };
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "usr/lib/grub/i386-pc/boot.img", .kind = .file, .bytes = "boot-img" },
+        .{ .path = "usr/lib/grub/i386-pc/core.img", .kind = .file, .bytes = "core-img" },
+        .{ .path = "boot/grub2/grub.cfg", .kind = .file, .bytes = "linux /boot/x86_64/loader/linux root=live:CDLABEL=CDROM\n" },
+        .{ .path = "boot/vmlinuz-test", .kind = .file, .bytes = "kernel-bits" },
+        .{ .path = "boot/initramfs-test.img", .kind = .file, .bytes = "initrd-bits" },
+    });
+    tree.bind();
+
+    var grub_cfg = try generateBiosGrubCfg(std.testing.allocator, &tree.view, .{
+        .planned_partitions = &planned,
+    });
+    defer grub_cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings(bios_grub2_config_path, grub_cfg.path);
+    try std.testing.expect(std.mem.indexOf(u8, grub_cfg.bytes, "root=PARTUUID=1234abcd-01") != null);
+    try std.testing.expect(std.mem.indexOf(u8, grub_cfg.bytes, "root=live:CDLABEL=CDROM") == null);
 }
 
 test "populateEsp copies MOK assets and emits UKIs when requested" {
