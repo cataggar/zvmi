@@ -125,9 +125,16 @@ zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G -o output.raw -O raw
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G -o output.vhdx -O vhdx
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G -o output.qcow2 -O qcow2
+zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 384M --skip-iso-rootfs -o output-minimal.raw -O raw
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G --verity -o output.vhd
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G --boot-mode uki --esp-size 512M -o output-uki.vhd
 ```
+
+`--skip-iso-rootfs` is useful with genuinely minimal base containers: it keeps
+the container as the effective root filesystem and carries over only the
+boot-critical assets from the ISO/squashfs (kernel, initramfs, EFI binaries,
+Secure Boot helpers, and BIOS GRUB stage images), instead of merging the
+entire live/installer rootfs into the final disk.
 
 For `--boot-mode uki` or `--boot-mode both`, the default 96 MiB ESP is sized
 for the GRUB+BLS path and is often too small for real distro UKIs. Start with

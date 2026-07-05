@@ -1,14 +1,15 @@
-//! `zvmi build-image --iso <file.iso> --container <oci-layout> --generation 1|2 --size <size> -o <output.{raw|vhd|vhdx|qcow2}> [--verity] [--extra-kernel-options <opts>] [--boot-mode bls|uki|both] [--stub-source-path <path>]`
+//! `zvmi build-image --iso <file.iso> --container <oci-layout> --generation 1|2 --size <size> -o <output.{raw|vhd|vhdx|qcow2}> [--skip-iso-rootfs] [--verity] [--extra-kernel-options <opts>] [--boot-mode bls|uki|both] [--stub-source-path <path>]`
 
 const std = @import("std");
 const zvmi = @import("zvmi");
 
 const help_text =
-    \\usage: zvmi build-image --iso <file.iso> --container <oci-layout> --generation 1|2 --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}> [-O raw|vhd|vhdx|qcow2] [--rootfs-path <path>] [--esp-size <size>] [--stub-source-path <path>] [--verity] [--extra-kernel-options <opts>] [--boot-mode bls|uki|both] [--dry-run] [-v]
+    \\usage: zvmi build-image --iso <file.iso> --container <oci-layout> --generation 1|2 --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}> [-O raw|vhd|vhdx|qcow2] [--rootfs-path <path>] [--skip-iso-rootfs] [--esp-size <size>] [--stub-source-path <path>] [--verity] [--extra-kernel-options <opts>] [--boot-mode bls|uki|both] [--dry-run] [-v]
     \\
     \\Options:
     \\  --boot-mode bls|uki|both   Gen2 boot files: GRUB+BLS only (default), UKI only, or both.
     \\  --esp-size <size>          ESP size (default 96M). UKI/both commonly need 512M or larger.
+    \\  --skip-iso-rootfs          Use the container as the root filesystem; keep only boot-critical files from the ISO/squashfs.
     \\  --stub-source-path <path>  UKI/both only: use this systemd EFI stub path from the merged source tree.
     \\  --verity                   Append a dm-verity hash tree and wire the matching kernel arguments.
     \\  --extra-kernel-options     Extra kernel command-line arguments appended after root=...
@@ -32,6 +33,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     var output_path: ?[]const u8 = null;
     var output_format: ?zvmi.Format = null;
     var rootfs_path: ?[]const u8 = null;
+    var skip_iso_rootfs = false;
     var generation: zvmi.azure.Generation = .gen2;
     var size: ?u64 = null;
     var esp_size: ?u64 = null;
@@ -90,6 +92,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
             i += 1;
             if (i >= args.len) return fail("build-image: --rootfs-path requires a path", .{});
             rootfs_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--skip-iso-rootfs")) {
+            skip_iso_rootfs = true;
         } else if (std.mem.eql(u8, arg, "--verity")) {
             enable_verity = true;
         } else if (std.mem.eql(u8, arg, "--extra-kernel-options")) {
@@ -128,6 +132,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
             .generation = generation,
             .output_format = output_format,
             .rootfs_path_in_iso = rootfs_path,
+            .skip_iso_rootfs = skip_iso_rootfs,
             .esp_size = esp_size orelse zvmi.build_image.default_esp_size,
             .verity = enable_verity,
             .extra_kernel_options = extra_kernel_options,
