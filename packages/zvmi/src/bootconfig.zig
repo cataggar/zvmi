@@ -566,15 +566,51 @@ fn efiDestinationPath(allocator: std.mem.Allocator, path: []const u8) std.mem.Al
 
 fn isKernelPath(path: []const u8) bool {
     if (!isBootScopedPath(path)) return false;
+    if (isNonKernelBootPath(path)) return false;
     const basename = baseName(path);
     return std.ascii.startsWithIgnoreCase(basename, "vmlinuz") or
-        std.ascii.startsWithIgnoreCase(basename, "linux") or
         std.ascii.eqlIgnoreCase(basename, "Image") or
-        std.ascii.startsWithIgnoreCase(basename, "Image-");
+        std.ascii.startsWithIgnoreCase(basename, "Image-") or
+        std.ascii.eqlIgnoreCase(basename, "bzImage") or
+        std.ascii.eqlIgnoreCase(basename, "zImage");
+}
+
+/// Directories that legitimately contain files whose names would otherwise
+/// look like kernel/initrd candidates but are not the installed OS's own
+/// boot payload:
+///   - `boot/grub2/**` (and per-arch variants like `boot/grub2/i386-pc/`)
+///     holds GRUB's OWN loadable modules, e.g. `linux.mod`, which implements
+///     the `linux`/`initrd` commands for legacy BIOS GRUB -- it is not a
+///     Linux kernel image and cannot be loaded by the `linux` command.
+///   - `boot/<arch>/loader/**` (e.g. `boot/x86_64/loader/linux` +
+///     `boot/x86_64/loader/initrd`) holds the distro installer's own
+///     live/install-environment boot loader binary and initrd (Anaconda-style
+///     "loader"), not the installed system's kernel.
+/// Confirmed via real QEMU + OVMF boot testing against the real Azure Linux
+/// 4.0 ISO (see issue #72): without this exclusion, `linux.mod` and
+/// `boot/x86_64/loader/linux` were previously misidentified as kernel
+/// candidates (matched by an overly broad `linux`-prefix heuristic) and one
+/// of them was picked as the default boot entry instead of the real
+/// `vmlinuz-*` kernel, causing GRUB to fail with
+/// "you need to load the kernel first."
+fn isNonKernelBootPath(path: []const u8) bool {
+    return containsPathSegmentIgnoreCase(path, "grub2") or containsPathSegmentIgnoreCase(path, "loader");
+}
+
+fn containsPathSegmentIgnoreCase(path: []const u8, segment: []const u8) bool {
+    var start: usize = 0;
+    while (start <= path.len) {
+        const end = std.mem.indexOfScalarPos(u8, path, start, '/') orelse path.len;
+        if (std.ascii.eqlIgnoreCase(path[start..end], segment)) return true;
+        if (end == path.len) break;
+        start = end + 1;
+    }
+    return false;
 }
 
 fn isInitrdPath(path: []const u8) bool {
     if (!isBootScopedPath(path)) return false;
+    if (isNonKernelBootPath(path)) return false;
     const basename = baseName(path);
     return std.ascii.startsWithIgnoreCase(basename, "initrd") or
         std.ascii.startsWithIgnoreCase(basename, "initramfs");
@@ -586,8 +622,10 @@ fn isBootScopedPath(path: []const u8) bool {
     }
     const basename = baseName(path);
     return std.ascii.startsWithIgnoreCase(basename, "vmlinuz") or
-        std.ascii.startsWithIgnoreCase(basename, "linux") or
-        std.ascii.eqlIgnoreCase(basename, "Image");
+        std.ascii.eqlIgnoreCase(basename, "Image") or
+        std.ascii.startsWithIgnoreCase(basename, "Image-") or
+        std.ascii.eqlIgnoreCase(basename, "bzImage") or
+        std.ascii.eqlIgnoreCase(basename, "zImage");
 }
 
 fn makeConfigPath(allocator: std.mem.Allocator, source_path: []const u8, strip_prefix: []const u8) std.mem.Allocator.Error![]u8 {
@@ -1588,6 +1626,96 @@ test "populateEsp copies EFI binaries and generates grub.cfg plus BLS entries" {
     try std.testing.expectEqualStrings("/boot/vmlinuz-6.8.12-test", parsed_bls.linux.?);
     try std.testing.expectEqualStrings("/boot/initramfs-6.8.12-test.img", parsed_bls.initrd.?);
     try std.testing.expectEqualStrings("root=PARTUUID=22222222-2222-2222-2222-222222222222 console=ttyS0 quiet", parsed_bls.options.?);
+}
+
+test "populateEsp ignores GRUB's own linux.mod and installer loader binaries as kernel candidates" {
+    // Regression test for a bug found via real QEMU + OVMF boot testing
+    // against the real Azure Linux 4.0 ISO (see issue #72): `isKernelPath`
+    // used to match ANY basename starting with "linux", which incorrectly
+    // picked up GRUB's own `boot/grub2/i386-pc/linux.mod` loadable module and
+    // the installer's own `boot/x86_64/loader/linux` boot binary as kernel
+    // candidates alongside the real `boot/vmlinuz-*` kernel, and one of the
+    // false positives ended up selected as the default boot entry -- GRUB
+    // then failed to boot with "you need to load the kernel first" since
+    // `linux.mod` is not a valid Linux kernel image.
+    const io = std.testing.io;
+    const path = "test-bootconfig-real-kernel-only.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const disk_size = 256 * 1024 * 1024;
+    const requests = [_]layout.PartitionRequest{
+        .{ .name = "ESP", .role = .esp, .size = .{ .fixed = 96 * 1024 * 1024 } },
+        .{ .name = "root", .role = .root_x86_64, .size = .{ .percent = 100.0 } },
+    };
+    const planned = try layout.planLayout(std.testing.allocator, disk_size, &requests, null);
+    defer std.testing.allocator.free(planned);
+
+    const identities = [_]PlannedPartitionIdentity{
+        .{ .planned = planned[0], .unique_guid = guid.parse("11111111-1111-1111-1111-111111111111") },
+        .{ .planned = planned[1], .unique_guid = guid.parse("22222222-2222-2222-2222-222222222222") },
+    };
+
+    var img = try Image.create(io, path, .raw, disk_size, .{});
+    defer img.close(io);
+
+    const specs = [_]gpt.PlacedPartitionSpec{
+        .{
+            .type_guid = identities[0].planned.type_guid,
+            .unique_guid = identities[0].unique_guid,
+            .placement = .{ .first_lba = identities[0].planned.firstLba(), .last_lba = identities[0].planned.lastLba() },
+            .name_utf16le = gpt.asciiName(identities[0].planned.name),
+        },
+        .{
+            .type_guid = identities[1].planned.type_guid,
+            .unique_guid = identities[1].unique_guid,
+            .placement = .{ .first_lba = identities[1].planned.firstLba(), .last_lba = identities[1].planned.lastLba() },
+            .name_utf16le = gpt.asciiName(identities[1].planned.name),
+        },
+    };
+    try gpt.writeGptPlaced(&img, io, guid.parse("33333333-3333-3333-3333-333333333333"), &specs);
+
+    try fat32.format(&img, io, .{
+        .partition_offset = identities[0].planned.offset_bytes,
+        .partition_len = identities[0].planned.length_bytes,
+    });
+    var esp = try fat32.open(&img, io, .{ .offset = identities[0].planned.offset_bytes, .length = identities[0].planned.length_bytes });
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "EFI/BOOT/BOOTX64.EFI", .kind = .file, .bytes = "bootx64-bytes" },
+        // GRUB's own module, matching the real ISO's boot/grub2/i386-pc/linux.mod:
+        .{ .path = "boot/grub2/i386-pc/linux.mod", .kind = .file, .bytes = "not-a-kernel" },
+        // Installer's own loader binary + initrd, matching the real ISO's boot/x86_64/loader/{linux,initrd}:
+        .{ .path = "boot/x86_64/loader/linux", .kind = .file, .bytes = "not-a-kernel-either" },
+        .{ .path = "boot/x86_64/loader/initrd", .kind = .file, .bytes = "not-an-initrd-either" },
+        // The real kernel/initrd:
+        .{ .path = "boot/vmlinuz-6.18.31-1.3.azl4.x86_64", .kind = .file, .bytes = "real-kernel-bits" },
+        .{ .path = "boot/initramfs-6.18.31-1.3.azl4.x86_64.img", .kind = .file, .bytes = "real-initrd-bits" },
+    });
+    tree.bind();
+
+    const report = try populateEsp(std.testing.allocator, io, &esp, &tree.view, .{
+        .planned_partitions = &identities,
+        .title_prefix = "zvmi",
+    });
+    // Only the real kernel should have produced a BLS entry -- not 3.
+    try std.testing.expectEqual(@as(usize, 1), report.bls_entry_count);
+
+    const loader_conf = try esp.readFileAlloc(io, std.testing.allocator, "loader/loader.conf");
+    defer std.testing.allocator.free(loader_conf);
+    try std.testing.expectEqualStrings("default vmlinuz-6.18.31-1.3.azl4.x86_64\ntimeout 1\n", loader_conf);
+
+    const grub_cfg = try esp.readFileAlloc(io, std.testing.allocator, "EFI/BOOT/grub.cfg");
+    defer std.testing.allocator.free(grub_cfg);
+    try std.testing.expect(std.mem.indexOf(u8, grub_cfg, "linux.mod") == null);
+    try std.testing.expect(std.mem.indexOf(u8, grub_cfg, "loader/linux") == null);
+    try std.testing.expect(std.mem.indexOf(u8, grub_cfg, "loader/initrd") == null);
+    try std.testing.expect(std.mem.indexOf(u8, grub_cfg, "menuentry 'zvmi vmlinuz-6.18.31-1.3.azl4.x86_64'") != null);
+
+    const bls_entry = try esp.readFileAlloc(io, std.testing.allocator, "loader/entries/vmlinuz-6.18.31-1.3.azl4.x86_64.conf");
+    defer std.testing.allocator.free(bls_entry);
+    const parsed_bls = try parseBlsEntry(bls_entry);
+    try std.testing.expectEqualStrings("/boot/vmlinuz-6.18.31-1.3.azl4.x86_64", parsed_bls.linux.?);
+    try std.testing.expectEqualStrings("/boot/initramfs-6.18.31-1.3.azl4.x86_64.img", parsed_bls.initrd.?);
 }
 
 test "populateEsp synthesizes fallback BOOTX64.EFI from shim when needed" {
