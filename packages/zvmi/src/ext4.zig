@@ -1019,7 +1019,10 @@ const ParsedInode = struct {
     }
 
     fn isFastSymlink(self: ParsedInode) bool {
-        return self.kind == .symlink and self.size <= 60 and (self.flags & inode_flag_extents) == 0;
+        // Must match the writer's fast-symlink eligibility check exactly
+        // (see the `.symlink =>` case in buildPlan's node-sizing loop) --
+        // real ext4 requires `strlen < 60` for inline storage (see issue #74).
+        return self.kind == .symlink and self.size < 60 and (self.flags & inode_flag_extents) == 0;
     }
 };
 
@@ -1115,7 +1118,20 @@ fn buildPlan(allocator: std.mem.Allocator, tree: *FileTreeView, options: Populat
             },
             .symlink => {
                 node.size_on_disk = node.declared_size;
-                node.uses_fast_symlink = node.declared_size <= 60;
+                // A "fast" symlink stores its target inline in the inode's
+                // 60-byte i_block region (bytes 40..100), relying on the
+                // zero-initialized buffer to provide an implicit NUL
+                // terminator for the target string. The real ext4 on-disk
+                // limit is therefore `strlen <= 59`, not `<= 60`: the kernel
+                // computes `disk_link.len = strlen(target) + 1` (including
+                // the NUL) and requires `disk_link.len <= 60`. A target of
+                // exactly 60 characters would fill the entire i_block region
+                // with no room for a NUL terminator, which the kernel
+                // correctly rejects on read as "invalid fast symlink length
+                // 60" (confirmed via real QEMU boot testing against a real
+                // Azure Linux image, see issue #74 -- a real distro symlink
+                // of exactly 60 characters triggered this in practice).
+                node.uses_fast_symlink = node.declared_size < 60;
                 node.data_block_count = if (node.uses_fast_symlink) 0 else blocksForBytes(node.size_on_disk, options.block_size);
                 data_blocks_needed += node.data_block_count;
             },
@@ -2723,6 +2739,76 @@ test "populate ext4 and round-trip a small tree with a multi-extent file" {
         try std.testing.expectEqualSlices(u8, expected[0..chunk], buf[0..chunk]);
         offset += chunk;
     }
+}
+
+test "symlink targets at the 60-byte fast-symlink boundary round-trip correctly" {
+    // Regression test for a real off-by-one bug found via real QEMU boot
+    // testing against a real Azure Linux image (see issue #74): a symlink
+    // target of exactly 60 characters was incorrectly written as a "fast"
+    // (inline) symlink, filling the entire 60-byte i_block region with no
+    // room for the implicit NUL terminator real ext4 requires -- the real
+    // kernel rejected it on read with "invalid fast symlink length 60".
+    // The real ext4 limit is `strlen <= 59` for fast symlinks; anything
+    // longer must be stored as a regular (data-block-backed) symlink.
+    const io = std.testing.io;
+    const path = "test-ext4-symlink-boundary.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const target_59 = "a" ** 59;
+    const target_60 = "a" ** 60;
+    const target_61 = "a" ** 61;
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "link-59", .kind = .symlink, .mode = 0o777, .uid = 0, .gid = 0, .size = target_59.len, .bytes = target_59 },
+        .{ .path = "link-60", .kind = .symlink, .mode = 0o777, .uid = 0, .gid = 0, .size = target_60.len, .bytes = target_60 },
+        .{ .path = "link-61", .kind = .symlink, .mode = 0o777, .uid = 0, .gid = 0, .size = target_61.len, .bytes = target_61 },
+    });
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{
+        .length = 64 * 1024 * 1024,
+        .label = "zvmi-ext4",
+        .uuid = [_]u8{0x11} ** 16,
+        .timestamp = 1_717_171_717,
+    });
+
+    var reader = try open(io, file, std.testing.allocator, .{});
+    defer reader.deinit();
+
+    const link_59 = try reader.readLinkAlloc(io, std.testing.allocator, "link-59");
+    defer std.testing.allocator.free(link_59);
+    try std.testing.expectEqualSlices(u8, target_59, link_59);
+
+    const link_60 = try reader.readLinkAlloc(io, std.testing.allocator, "link-60");
+    defer std.testing.allocator.free(link_60);
+    try std.testing.expectEqualSlices(u8, target_60, link_60);
+
+    const link_61 = try reader.readLinkAlloc(io, std.testing.allocator, "link-61");
+    defer std.testing.allocator.free(link_61);
+    try std.testing.expectEqualSlices(u8, target_61, link_61);
+
+    // Verify the on-disk representation, not just content round-trip:
+    // a 59-char target must be stored inline (no extents at all), while
+    // 60+ char targets must be stored as real, block-mapped ("slow")
+    // symlinks with at least one extent. Content-only round-trip alone
+    // doesn't catch the original bug, since a self-consistent writer+reader
+    // pair that both share the same off-by-one still round-trips content
+    // correctly -- it's only incompatible with a *real* Linux kernel, which
+    // enforces `strlen < 60` for inline storage independently.
+    const extents_59 = try reader.readExtents(io, std.testing.allocator, "link-59");
+    defer std.testing.allocator.free(extents_59);
+    try std.testing.expectEqual(@as(usize, 0), extents_59.len);
+
+    const extents_60 = try reader.readExtents(io, std.testing.allocator, "link-60");
+    defer std.testing.allocator.free(extents_60);
+    try std.testing.expect(extents_60.len >= 1);
+
+    const extents_61 = try reader.readExtents(io, std.testing.allocator, "link-61");
+    defer std.testing.allocator.free(extents_61);
+    try std.testing.expect(extents_61.len >= 1);
 }
 
 test "populate round-trips files that require extent index blocks" {
