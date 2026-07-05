@@ -44,6 +44,10 @@ pub const BuildImageOptions = struct {
     /// is set). Useful for e.g. `console=ttyS0,115200n8` for cloud/serial
     /// console access, matching real Azure Linux VHD conventions.
     extra_kernel_options: []const u8 = "",
+    /// Selects whether the Gen2/UEFI ESP gets the shim/GRUB/BLS chain, a
+    /// generated Unified Kernel Image (UKI), or both. No effect on Gen1
+    /// (BIOS) builds, which don't use `bootconfig.populateEsp()`.
+    boot_mode: bootconfig.BootMode = .bls_only,
     dry_run: bool = false,
     verbose: bool = false,
 };
@@ -225,6 +229,7 @@ pub fn build(
             .architecture = architecture,
             .verity = report.verity,
             .root_filesystem_uuid = root_filesystem_uuid,
+            .boot_mode = options.boot_mode,
             .extra_kernel_options = options.extra_kernel_options,
         });
     }
