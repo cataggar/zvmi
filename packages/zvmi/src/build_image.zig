@@ -39,6 +39,11 @@ pub const BuildImageOptions = struct {
     esp_size: u64 = default_esp_size,
     ext4_label: []const u8 = "rootfs",
     verity: bool = false,
+    /// Extra kernel command-line arguments appended after
+    /// `root=PARTUUID=<...>` (or `root=/dev/mapper/root ...` when `verity`
+    /// is set). Useful for e.g. `console=ttyS0,115200n8` for cloud/serial
+    /// console access, matching real Azure Linux VHD conventions.
+    extra_kernel_options: []const u8 = "",
     dry_run: bool = false,
     verbose: bool = false,
 };
@@ -171,10 +176,19 @@ pub fn build(
     const rootfs_length = if (verity_layout) |layout_for_verity| layout_for_verity.data_size else root_partition.planned.length_bytes;
 
     logStep(options.verbose, "populate root ext4 filesystem");
+    // Generate a real, random ext4 filesystem UUID and thread it into the
+    // generated grub.cfg's `search --fs-uuid` line -- GRUB's `search` command
+    // has no `--partuuid` search type, so without this the generated boot
+    // chain fails to locate the root filesystem at all (see issue #72,
+    // confirmed via real QEMU + OVMF boot testing against the real Azure
+    // Linux 4.0 ISO).
+    var root_filesystem_uuid: [16]u8 = undefined;
+    Io.random(io, &root_filesystem_uuid);
     _ = try ext4.populate(io, raw_img.file, allocator, &source_tree.view, .{
         .offset = root_partition.planned.offset_bytes,
         .length = rootfs_length,
         .label = options.ext4_label,
+        .uuid = root_filesystem_uuid,
     });
 
     if (verity_layout) |layout_for_verity| {
@@ -210,6 +224,8 @@ pub fn build(
             .planned_partitions = planned_partitions,
             .architecture = architecture,
             .verity = report.verity,
+            .root_filesystem_uuid = root_filesystem_uuid,
+            .extra_kernel_options = options.extra_kernel_options,
         });
     }
 

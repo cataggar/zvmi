@@ -84,6 +84,23 @@ pub const PopulateOptions = struct {
     /// initrd paths referenced from the generated GRUB config. Defaults to the
     /// resolved root partition.
     kernel_device_partuuid: ?guid.Guid = null,
+    /// The root ext4 filesystem's own UUID (its superblock `s_uuid`, plain
+    /// big-endian/RFC4122 byte order -- NOT the mixed-endian `guid.Guid`
+    /// convention used elsewhere in this repo for GPT GUIDs). When supplied,
+    /// the generated `grub.cfg`'s `search` command uses
+    /// `--fs-uuid <this UUID>` to locate `$kernel_root`, which is the only
+    /// search-type GRUB's `search` command actually supports for this
+    /// purpose (confirmed via real QEMU + OVMF boot testing against the real
+    /// Azure Linux 4.0 ISO, see issue #72 -- GRUB's `search` command does
+    /// NOT have a `--partuuid` flag; that flag silently fails with
+    /// "unspecified search type", leaving `$kernel_root` unset and every
+    /// menu entry failing with "you need to load the kernel first"). Callers
+    /// that actually want a bootable image MUST supply this, matching
+    /// whatever UUID was written into the root partition's ext4 superblock
+    /// (see `ext4.PopulateOptions.uuid`). If omitted, `grub.cfg` falls back
+    /// to the old (non-functional on real hardware/QEMU) `--partuuid`
+    /// search for backward compatibility with structural-only tests.
+    root_filesystem_uuid: ?[16]u8 = null,
     /// Optional leading path prefix to strip when emitting `linux`/`initrd`
     /// paths. For example, stripping `boot/` turns `boot/vmlinuz-*` into
     /// `/vmlinuz-*` for callers that materialize `/boot` into a separate
@@ -289,6 +306,11 @@ pub fn populateEsp(
         root_partuuid_text
     else
         guid.formatLower(&kernel_device_partuuid_buf, kernel_device_partuuid);
+    var root_filesystem_uuid_buf: [36]u8 = undefined;
+    const root_filesystem_uuid_text: ?[]const u8 = if (options.root_filesystem_uuid) |fs_uuid|
+        formatPlainUuidBytes(&root_filesystem_uuid_buf, &fs_uuid)
+    else
+        null;
 
     const copy_plan = try buildCopyPlan(allocator, scan.efi_binaries, architecture, options.boot_mode);
     defer freeCopyPlan(allocator, copy_plan);
@@ -306,7 +328,7 @@ pub fn populateEsp(
         defer allocator.free(loader_conf);
         try writeGeneratedFile(io, esp, "loader/loader.conf", loader_conf);
 
-        const grub_cfg = try renderGrubCfg(allocator, boot_entries, root_partuuid_text, kernel_device_partuuid_text, options.extra_kernel_options, options.verity, options.grub_timeout_seconds);
+        const grub_cfg = try renderGrubCfg(allocator, boot_entries, root_partuuid_text, kernel_device_partuuid_text, root_filesystem_uuid_text, options.extra_kernel_options, options.verity, options.grub_timeout_seconds);
         defer allocator.free(grub_cfg);
 
         try writeGeneratedFile(io, esp, "EFI/BOOT/grub.cfg", grub_cfg);
@@ -1384,6 +1406,7 @@ fn renderGrubCfg(
     entries: []const BootEntry,
     root_partuuid_text: []const u8,
     kernel_device_partuuid_text: []const u8,
+    root_filesystem_uuid_text: ?[]const u8,
     extra_kernel_options: []const u8,
     verity_info: ?verity.Info,
     timeout_seconds: u32,
@@ -1391,10 +1414,23 @@ fn renderGrubCfg(
     var out = std.Io.Writer.Allocating.init(allocator);
     errdefer out.deinit();
 
-    out.writer.print(
-        "set default=0\nset timeout={d}\n\ninsmod part_gpt\ninsmod ext2\nsearch --no-floppy --partuuid --set=kernel_root {s}\n\n",
-        .{ timeout_seconds, kernel_device_partuuid_text },
-    ) catch return error.OutOfMemory;
+    out.writer.print("set default=0\nset timeout={d}\n\ninsmod part_gpt\ninsmod ext2\n", .{timeout_seconds}) catch return error.OutOfMemory;
+    if (root_filesystem_uuid_text) |fs_uuid_text| {
+        // GRUB's `search` command has no `--partuuid` search type -- only
+        // `--file`, `--label`, and `--fs-uuid` are recognized. Searching by
+        // the root filesystem's own UUID is the correct, portable way to
+        // locate `$kernel_root` at GRUB's boot stage (distinct from the
+        // `root=PARTUUID=...` argument passed to the *kernel*, which the
+        // Linux kernel/udev resolve independently at OS boot time).
+        out.writer.print("search --no-floppy --fs-uuid --set=kernel_root {s}\n\n", .{fs_uuid_text}) catch return error.OutOfMemory;
+    } else {
+        // Fallback retained for callers/tests that don't supply the root
+        // filesystem's UUID. NOTE: `--partuuid` is not a real GRUB `search`
+        // type and will fail with "unspecified search type" on real GRUB,
+        // leaving `$kernel_root` unset (see issue #72) -- this branch exists
+        // only for structural-test backward compatibility, not real boots.
+        out.writer.print("search --no-floppy --partuuid --set=kernel_root {s}\n\n", .{kernel_device_partuuid_text}) catch return error.OutOfMemory;
+    }
 
     for (entries) |entry| {
         const kernel_options = try renderKernelOptions(allocator, root_partuuid_text, extra_kernel_options, verity_info);
@@ -1446,6 +1482,27 @@ fn formatPlannedPartitionPartuuid(
         return buf[0..text.len];
     }
     return guid.formatLower(buf, partition.unique_guid);
+}
+
+/// Formats a 16-byte UUID in plain big-endian/RFC4122 byte order (the
+/// convention used by ext4's superblock `s_uuid`, Linux's libuuid, and most
+/// POSIX tooling) as a lowercase canonical string. This is deliberately NOT
+/// `guid.formatLower`, which assumes the mixed-endian Microsoft `GUID`
+/// convention used by GPT -- using it here would silently byte-swap the
+/// ext4 filesystem UUID and produce a string GRUB's `--fs-uuid` search would
+/// never match. Mirrors `cosi.zig`'s private `formatUuidBytes` helper.
+fn formatPlainUuidBytes(buf: *[36]u8, bytes: *const [16]u8) []const u8 {
+    _ = std.fmt.bufPrint(
+        buf,
+        "{x:0>2}{x:0>2}{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}",
+        .{
+            bytes[0],  bytes[1],  bytes[2],  bytes[3],
+            bytes[4],  bytes[5],  bytes[6],  bytes[7],
+            bytes[8],  bytes[9],  bytes[10], bytes[11],
+            bytes[12], bytes[13], bytes[14], bytes[15],
+        },
+    ) catch unreachable;
+    return buf;
 }
 
 fn partitionIndex1Based(
@@ -1696,6 +1753,10 @@ test "populateEsp ignores GRUB's own linux.mod and installer loader binaries as 
     const report = try populateEsp(std.testing.allocator, io, &esp, &tree.view, .{
         .planned_partitions = &identities,
         .title_prefix = "zvmi",
+        .root_filesystem_uuid = [_]u8{
+            0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89,
+            0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89,
+        },
     });
     // Only the real kernel should have produced a BLS entry -- not 3.
     try std.testing.expectEqual(@as(usize, 1), report.bls_entry_count);
@@ -1710,6 +1771,12 @@ test "populateEsp ignores GRUB's own linux.mod and installer loader binaries as 
     try std.testing.expect(std.mem.indexOf(u8, grub_cfg, "loader/linux") == null);
     try std.testing.expect(std.mem.indexOf(u8, grub_cfg, "loader/initrd") == null);
     try std.testing.expect(std.mem.indexOf(u8, grub_cfg, "menuentry 'zvmi vmlinuz-6.18.31-1.3.azl4.x86_64'") != null);
+    // GRUB's `search` command has no `--partuuid` search type (see issue
+    // #72) -- when a root filesystem UUID is supplied, the generated
+    // grub.cfg must use `--fs-uuid` instead, in plain big-endian byte order
+    // (NOT the mixed-endian `guid.formatLower` GPT convention).
+    try std.testing.expect(std.mem.indexOf(u8, grub_cfg, "search --no-floppy --fs-uuid --set=kernel_root abcdef01-2345-6789-abcd-ef0123456789") != null);
+    try std.testing.expect(std.mem.indexOf(u8, grub_cfg, "--partuuid") == null);
 
     const bls_entry = try esp.readFileAlloc(io, std.testing.allocator, "loader/entries/vmlinuz-6.18.31-1.3.azl4.x86_64.conf");
     defer std.testing.allocator.free(bls_entry);
