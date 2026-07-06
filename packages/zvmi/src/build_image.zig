@@ -36,6 +36,12 @@ pub const BuildImageOptions = struct {
     generation: azure.Generation = .gen2,
     output_format: ?Format = null,
     rootfs_path_in_iso: ?[]const u8 = null,
+    /// When set, the container image becomes the effective root filesystem and
+    /// the ISO/squashfs contribute only the minimum boot-critical assets
+    /// (kernel, initramfs, EFI binaries, Secure Boot helpers, and BIOS GRUB
+    /// stage images). This keeps live/installer-only OS payload out of the
+    /// final root partition.
+    skip_iso_rootfs: bool = false,
     esp_size: u64 = default_esp_size,
     ext4_label: []const u8 = "rootfs",
     verity: bool = false,
@@ -140,6 +146,15 @@ pub fn build(
     var source_tree = try MergedSourceTree.init(allocator, io, &iso_reader, rootfs_path_in_iso, &squash_reader, &container_image, nested_scratch_prefix);
     source_tree.bind();
     defer source_tree.deinit(allocator);
+    if (options.skip_iso_rootfs) {
+        logStep(options.verbose, "prune merged tree to container rootfs + boot assets");
+        try source_tree.pruneToContainerRootfsAndBootAssets(
+            allocator,
+            &container_image,
+            architecture,
+            options.boot_mode != .bls_only,
+        );
+    }
 
     const raw_build_path = if (output_format == .raw)
         options.output_path
@@ -565,6 +580,60 @@ fn baseName(path: []const u8) []const u8 {
     return path[slash + 1 ..];
 }
 
+fn containsPathSegmentIgnoreCase(path: []const u8, segment: []const u8) bool {
+    var start: usize = 0;
+    while (start <= path.len) {
+        const end = std.mem.indexOfScalarPos(u8, path, start, '/') orelse path.len;
+        if (std.ascii.eqlIgnoreCase(path[start..end], segment)) return true;
+        if (end == path.len) break;
+        start = end + 1;
+    }
+    return false;
+}
+
+fn isRequiredBootAssetPath(
+    path: []const u8,
+    architecture: bootconfig.Architecture,
+    retain_uki_assets: bool,
+) bool {
+    if (shouldPreferInstalledBootPayload(path)) return true;
+    if (retain_uki_assets and bootconfig.isUkiStubPath(path, architecture)) return true;
+    if (std.ascii.eqlIgnoreCase(path, "boot/grub2/grub.cfg") or
+        std.ascii.eqlIgnoreCase(path, "boot/grub/grub.cfg"))
+    {
+        return true;
+    }
+    if (std.ascii.endsWithIgnoreCase(path, "/i386-pc/boot.img") or
+        std.ascii.endsWithIgnoreCase(path, "/i386-pc/core.img"))
+    {
+        return true;
+    }
+    if (!containsPathSegmentIgnoreCase(path, "EFI")) return false;
+
+    const basename = baseName(path);
+    return std.ascii.eqlIgnoreCase(basename, "BOOTX64.EFI") or
+        std.ascii.eqlIgnoreCase(basename, "shimx64.efi") or
+        std.ascii.eqlIgnoreCase(basename, "grubx64.efi") or
+        std.ascii.eqlIgnoreCase(basename, "mmx64.efi") or
+        std.ascii.eqlIgnoreCase(basename, "BOOTAA64.EFI") or
+        std.ascii.eqlIgnoreCase(basename, "shimaa64.efi") or
+        std.ascii.eqlIgnoreCase(basename, "grubaa64.efi") or
+        std.ascii.eqlIgnoreCase(basename, "mmaa64.efi") or
+        std.ascii.eqlIgnoreCase(basename, "MokManager.efi") or
+        std.ascii.eqlIgnoreCase(basename, "MokManagerX64.efi") or
+        std.ascii.eqlIgnoreCase(basename, "MokManagerAA64.efi") or
+        std.ascii.eqlIgnoreCase(basename, "fbx64.efi") or
+        std.ascii.eqlIgnoreCase(basename, "fbaa64.efi") or
+        std.ascii.eqlIgnoreCase(basename, "fallback.efi") or
+        std.ascii.endsWithIgnoreCase(basename, ".csv") or
+        std.ascii.endsWithIgnoreCase(basename, ".cer") or
+        std.ascii.endsWithIgnoreCase(basename, ".crt") or
+        std.ascii.endsWithIgnoreCase(basename, ".der") or
+        std.ascii.endsWithIgnoreCase(basename, ".esl") or
+        std.ascii.endsWithIgnoreCase(basename, ".auth") or
+        std.ascii.endsWithIgnoreCase(basename, ".conf");
+}
+
 fn findPartitionByRole(
     planned: []const bootconfig.PlannedPartitionIdentity,
     role: layout.PartitionRole,
@@ -875,6 +944,34 @@ const MergedSourceTree = struct {
             .content = .{ .owned_bytes = bytes },
         };
         sortMergedEntries(self.entries);
+    }
+
+    fn pruneToContainerRootfsAndBootAssets(
+        self: *MergedSourceTree,
+        allocator: std.mem.Allocator,
+        container_image: *const oci.Image,
+        architecture: bootconfig.Architecture,
+        retain_uki_assets: bool,
+    ) !void {
+        var write_index: usize = 0;
+        for (self.entries, 0..) |entry, read_index| {
+            const keep = container_image.get(entry.path) != null or
+                isRequiredBootAssetPath(entry.path, architecture, retain_uki_assets);
+            if (keep) {
+                if (write_index != read_index) self.entries[write_index] = entry;
+                write_index += 1;
+            } else {
+                deinitMergedEntry(allocator, &self.entries[read_index]);
+            }
+        }
+
+        self.entries = try allocator.realloc(self.entries, write_index);
+        self.index = 0;
+
+        var ensure_index: usize = 0;
+        while (ensure_index < self.entries.len) : (ensure_index += 1) {
+            try self.ensureParentDirectories(allocator, self.entries[ensure_index].path);
+        }
     }
 };
 
@@ -2547,6 +2644,194 @@ test "build-image prefers squashfs kernel and initramfs over duplicate ISO boot 
     try std.testing.expectEqualStrings("initrd-from-squashfs", initrd);
 }
 
+test "build-image can skip the ISO rootfs while retaining boot assets" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const iso_path = "test-build-image-skip-iso-rootfs.iso";
+    const oci_root = "test-build-image-skip-iso-rootfs-oci";
+    const output_path = "test-build-image-skip-iso-rootfs.raw";
+    const nested_ext4_path = "test-build-image-skip-iso-rootfs-rootfs.img";
+    defer Io.Dir.cwd().deleteFile(io, iso_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, oci_root) catch {};
+    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, nested_ext4_path) catch {};
+
+    const nested_ext4_bytes = try buildNestedExt4ImageAlloc(allocator, io, nested_ext4_path, &[_]SyntheticNestedExt4Entry{
+        .{ .path = "boot", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "boot/vmlinuz-test", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = "kernel-from-squashfs".len, .bytes = "kernel-from-squashfs" },
+        .{ .path = "boot/initramfs-test.img", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = "initrd-from-squashfs".len, .bytes = "initrd-from-squashfs" },
+        .{ .path = "etc", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "etc/hostname", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = "live-rootfs-only\n".len, .bytes = "live-rootfs-only\n" },
+    });
+    defer allocator.free(nested_ext4_bytes);
+
+    const squashfs_bytes = try squashfs.buildSyntheticSquashfsImage(allocator, .{
+        .compression = .none,
+        .block_size = 1024 * 1024,
+        .file_bytes = nested_ext4_bytes,
+    });
+    defer allocator.free(squashfs_bytes);
+    try writeMinimalIsoWithBootPayloads(
+        allocator,
+        io,
+        iso_path,
+        "root.squashfs",
+        squashfs_bytes,
+        "vmlinuz-test",
+        "kernel-from-iso",
+        "initramfs-test.img",
+        "initrd-from-iso",
+    );
+
+    try createContainerRootfsOnlyBuildImageOciLayout(allocator, io, oci_root);
+
+    var report = try build(allocator, io, .{
+        .iso_path = iso_path,
+        .container_path = oci_root,
+        .output_path = output_path,
+        .output_format = .raw,
+        .generation = .gen2,
+        .size = 256 * mib,
+        .skip_iso_rootfs = true,
+    });
+    defer report.deinit(allocator);
+
+    var img = try Image.openPath(io, output_path);
+    defer img.close(io);
+
+    const root_partition = report.planned_partitions[1].planned;
+    const rootfs_scratch_path = try std.fmt.allocPrint(allocator, "{s}.test-rootfs.raw", .{output_path});
+    defer allocator.free(rootfs_scratch_path);
+    defer Io.Dir.cwd().deleteFile(io, rootfs_scratch_path) catch {};
+    try extractImageRegionToPath(allocator, io, &img, root_partition.offset_bytes, root_partition.length_bytes, rootfs_scratch_path);
+
+    const rootfs_scratch = try Io.Dir.cwd().openFile(io, rootfs_scratch_path, .{});
+    defer rootfs_scratch.close(io);
+    var root_reader = try ext4.open(io, rootfs_scratch, allocator, .{});
+    defer root_reader.deinit();
+
+    const kernel = try root_reader.readFileAlloc(io, allocator, "boot/vmlinuz-test");
+    defer allocator.free(kernel);
+    try std.testing.expectEqualStrings("kernel-from-squashfs", kernel);
+
+    const initrd = try root_reader.readFileAlloc(io, allocator, "boot/initramfs-test.img");
+    defer allocator.free(initrd);
+    try std.testing.expectEqualStrings("initrd-from-squashfs", initrd);
+
+    const app_file = try root_reader.readFileAlloc(io, allocator, "app/hello.txt");
+    defer allocator.free(app_file);
+    try std.testing.expectEqualStrings("hello from minimal container rootfs\n", app_file);
+
+    try std.testing.expectError(error.NotFound, root_reader.readFileAlloc(io, allocator, "etc/hostname"));
+}
+
+test "build-image retains architecture-matching UKI stub paths during skip-iso-rootfs pruning" {
+    try std.testing.expect(isRequiredBootAssetPath("boot/linuxx64.efi.stub", .x86_64, true));
+    try std.testing.expect(isRequiredBootAssetPath("usr/lib/systemd/boot/efi/systemd-stubx64.efi", .x86_64, true));
+    try std.testing.expect(isRequiredBootAssetPath("custom/stubx64.efi", .x86_64, true));
+
+    try std.testing.expect(isRequiredBootAssetPath("boot/linuxaa64.efi.stub", .aarch64, true));
+    try std.testing.expect(isRequiredBootAssetPath("usr/lib/systemd/boot/efi/systemd-stubaa64.efi", .aarch64, true));
+    try std.testing.expect(isRequiredBootAssetPath("custom/stubaa64.efi", .aarch64, true));
+
+    try std.testing.expect(!isRequiredBootAssetPath("boot/linuxx64.efi.stub", .x86_64, false));
+    try std.testing.expect(!isRequiredBootAssetPath("boot/linuxaa64.efi.stub", .x86_64, true));
+    try std.testing.expect(!isRequiredBootAssetPath("boot/linuxx64.efi.stub", .aarch64, true));
+}
+
+test "build-image can skip the ISO rootfs and still build a UKI from ISO-only stub assets" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const iso_path = "test-build-image-skip-iso-rootfs-uki.iso";
+    const oci_root = "test-build-image-skip-iso-rootfs-uki-oci";
+    const output_path = "test-build-image-skip-iso-rootfs-uki.raw";
+    const nested_ext4_path = "test-build-image-skip-iso-rootfs-uki-rootfs.img";
+    defer Io.Dir.cwd().deleteFile(io, iso_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, oci_root) catch {};
+    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, nested_ext4_path) catch {};
+
+    const nested_ext4_bytes = try buildNestedExt4ImageAlloc(allocator, io, nested_ext4_path, &[_]SyntheticNestedExt4Entry{
+        .{ .path = "boot", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "boot/vmlinuz-test", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = "kernel-from-squashfs".len, .bytes = "kernel-from-squashfs" },
+        .{ .path = "boot/initramfs-test.img", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = "initrd-from-squashfs".len, .bytes = "initrd-from-squashfs" },
+        .{ .path = "etc", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "etc/hostname", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = "live-rootfs-only\n".len, .bytes = "live-rootfs-only\n" },
+    });
+    defer allocator.free(nested_ext4_bytes);
+
+    const squashfs_bytes = try squashfs.buildSyntheticSquashfsImage(allocator, .{
+        .compression = .none,
+        .block_size = 1024 * 1024,
+        .file_bytes = nested_ext4_bytes,
+    });
+    defer allocator.free(squashfs_bytes);
+
+    const stub_bytes = try makeTestStubPe(allocator, 0x8664);
+    defer allocator.free(stub_bytes);
+
+    try writeMinimalIsoWithBootPayloads(
+        allocator,
+        io,
+        iso_path,
+        "root.squashfs",
+        squashfs_bytes,
+        "linuxx64.efi.stub",
+        stub_bytes,
+        "README.TXT",
+        "ignored\n",
+    );
+
+    try createContainerRootfsOnlyBuildImageOciLayout(allocator, io, oci_root);
+
+    var report = try build(allocator, io, .{
+        .iso_path = iso_path,
+        .container_path = oci_root,
+        .output_path = output_path,
+        .output_format = .raw,
+        .generation = .gen2,
+        .size = 512 * mib,
+        .skip_iso_rootfs = true,
+        .boot_mode = .uki_only,
+    });
+    defer report.deinit(allocator);
+
+    var img = try Image.openPath(io, output_path);
+    defer img.close(io);
+
+    const esp_partition = report.planned_partitions[0].planned;
+    var esp = try fat32.open(&img, io, .{ .offset = esp_partition.offset_bytes, .length = esp_partition.length_bytes });
+
+    const fallback_uki = try esp.readFileAlloc(io, allocator, "EFI/BOOT/BOOTX64.EFI");
+    defer allocator.free(fallback_uki);
+    try std.testing.expectEqualStrings("MZ", fallback_uki[0..2]);
+
+    const named_uki = try esp.readFileAlloc(io, allocator, "EFI/Linux/vmlinuz-test.efi");
+    defer allocator.free(named_uki);
+    try std.testing.expectEqualStrings("MZ", named_uki[0..2]);
+
+    try std.testing.expectError(error.PathNotFound, esp.readFileAlloc(io, allocator, "loader/loader.conf"));
+
+    const root_partition = report.planned_partitions[1].planned;
+    const rootfs_scratch_path = try std.fmt.allocPrint(allocator, "{s}.test-rootfs.raw", .{output_path});
+    defer allocator.free(rootfs_scratch_path);
+    defer Io.Dir.cwd().deleteFile(io, rootfs_scratch_path) catch {};
+    try extractImageRegionToPath(allocator, io, &img, root_partition.offset_bytes, root_partition.length_bytes, rootfs_scratch_path);
+
+    const rootfs_scratch = try Io.Dir.cwd().openFile(io, rootfs_scratch_path, .{});
+    defer rootfs_scratch.close(io);
+    var root_reader = try ext4.open(io, rootfs_scratch, allocator, .{});
+    defer root_reader.deinit();
+
+    const app_file = try root_reader.readFileAlloc(io, allocator, "app/hello.txt");
+    defer allocator.free(app_file);
+    try std.testing.expectEqualStrings("hello from minimal container rootfs\n", app_file);
+
+    try std.testing.expectError(error.NotFound, root_reader.readFileAlloc(io, allocator, "etc/hostname"));
+}
+
 test "build-image installs a Gen1 BIOS GRUB chain into the post-MBR gap" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -3131,6 +3416,58 @@ fn createEfiOnlyBuildImageOciLayout(
     try dir.createDirPath(io, "blobs/sha256");
 
     const layer_tar = try buildTarArchive(allocator, &.{
+        .{ .path = "EFI/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
+        .{ .path = "EFI/BOOT/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
+        .{ .path = "EFI/BOOT/BOOTX64.EFI", .mode = 0o644, .typeflag = '0', .content = "bootx64-from-oci", .link_name = null },
+        .{ .path = "EFI/Acme/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
+        .{ .path = "EFI/Acme/grubx64.efi", .mode = 0o644, .typeflag = '0', .content = "grubx64-from-oci", .link_name = null },
+    });
+    defer allocator.free(layer_tar);
+    const layer_gzip = try gzipBytes(allocator, layer_tar);
+    defer allocator.free(layer_gzip);
+
+    const config_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"architecture\":\"amd64\",\"os\":\"linux\",\"rootfs\":{{\"type\":\"layers\",\"diff_ids\":[]}}}}",
+        .{},
+    );
+    defer allocator.free(config_json);
+    const config_digest = try writeBlobAndDigest(allocator, io, dir, config_json);
+    defer allocator.free(config_digest);
+    const layer_digest = try writeBlobAndDigest(allocator, io, dir, layer_gzip);
+    defer allocator.free(layer_digest);
+    const manifest_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schemaVersion\":2,\"config\":{{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\"{s}\",\"size\":{d}}},\"layers\":[{{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
+        .{ config_digest, config_json.len, layer_digest, layer_gzip.len },
+    );
+    defer allocator.free(manifest_json);
+    const manifest_digest = try writeBlobAndDigest(allocator, io, dir, manifest_json);
+    defer allocator.free(manifest_digest);
+    const index_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
+        .{ manifest_digest, manifest_json.len },
+    );
+    defer allocator.free(index_json);
+
+    try dir.writeFile(io, .{ .sub_path = "oci-layout", .data = "{\"imageLayoutVersion\":\"1.0.0\"}" });
+    try dir.writeFile(io, .{ .sub_path = "index.json", .data = index_json });
+}
+
+fn createContainerRootfsOnlyBuildImageOciLayout(
+    allocator: std.mem.Allocator,
+    io: Io,
+    root: []const u8,
+) !void {
+    try Io.Dir.cwd().createDirPath(io, root);
+    var dir = try Io.Dir.cwd().openDir(io, root, .{});
+    defer dir.close(io);
+    try dir.createDirPath(io, "blobs/sha256");
+
+    const layer_tar = try buildTarArchive(allocator, &.{
+        .{ .path = "app/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
+        .{ .path = "app/hello.txt", .mode = 0o644, .typeflag = '0', .content = "hello from minimal container rootfs\n", .link_name = null },
         .{ .path = "EFI/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
         .{ .path = "EFI/BOOT/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
         .{ .path = "EFI/BOOT/BOOTX64.EFI", .mode = 0o644, .typeflag = '0', .content = "bootx64-from-oci", .link_name = null },

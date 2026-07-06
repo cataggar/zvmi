@@ -1491,6 +1491,10 @@ fn dupeSourceAsset(
     };
 }
 
+pub fn isUkiStubPath(path: []const u8, architecture: Architecture) bool {
+    return ukiStubScore(path, architecture) != null;
+}
+
 fn ukiStubScore(path: []const u8, architecture: Architecture) ?usize {
     const basename = baseName(path);
     const preferred_dir_bonus: usize = if (containsIgnoreCase(path, "systemd/boot/efi")) 0 else 10;
