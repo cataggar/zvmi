@@ -133,7 +133,12 @@ zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --
 `--skip-iso-rootfs` is useful with genuinely minimal base containers: it keeps
 the container as the effective root filesystem and carries over only the
 boot-critical assets from the ISO/squashfs (kernel, initramfs, EFI binaries,
-Secure Boot helpers, and BIOS GRUB stage images), instead of merging the
+Secure Boot helpers, BIOS GRUB stage images, and the installed rootfs's
+`/lib/modules/<kernel-version>` tree -- kept in full, since loadable drivers
+that aren't statically built into the kernel, e.g. Azure's Hyper-V
+`hv_netvsc`/Mellanox `mlx5` NIC drivers, otherwise fail to load on real
+hardware even though they work under local QEMU testing where `virtio_net`
+happens to be statically built in), instead of merging the
 entire live/installer rootfs into the final disk.
 
 For `--boot-mode uki` or `--boot-mode both`, the default 96 MiB ESP is sized
