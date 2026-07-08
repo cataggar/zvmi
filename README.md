@@ -79,6 +79,8 @@ zvmi/
         cosi.zig              # `zvmi cosi`
         build_image.zig       # `zvmi build-image`
         opts.zig              # shared `-o subformat=...` parsing
+  miniinit/                 # standalone minimal PID 1 for real-boot testing
+                              #   of --skip-iso-rootfs images (see miniinit/README.md)
 ```
 
 ## Requirements
