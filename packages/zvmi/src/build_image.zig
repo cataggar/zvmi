@@ -38,8 +38,11 @@ pub const BuildImageOptions = struct {
     rootfs_path_in_iso: ?[]const u8 = null,
     /// When set, the container image becomes the effective root filesystem and
     /// the ISO/squashfs contribute only the minimum boot-critical assets
-    /// (kernel, initramfs, EFI binaries, Secure Boot helpers, and BIOS GRUB
-    /// stage images). This keeps live/installer-only OS payload out of the
+    /// (kernel, initramfs, EFI binaries, Secure Boot helpers, BIOS GRUB
+    /// stage images, and the installed rootfs's `/lib/modules/<kernel-version>`
+    /// tree so loadable drivers that aren't statically built into the kernel,
+    /// e.g. Azure's `hv_netvsc`/`mlx5` NIC drivers, still load on real
+    /// hardware). This keeps live/installer-only OS payload out of the
     /// final root partition.
     skip_iso_rootfs: bool = false,
     esp_size: u64 = default_esp_size,
@@ -591,12 +594,28 @@ fn containsPathSegmentIgnoreCase(path: []const u8, segment: []const u8) bool {
     return false;
 }
 
+/// Loadable kernel modules (e.g. `hv_netvsc`/`mlx5` NIC drivers, `overlay`)
+/// live under `/lib/modules/<kernel-version>/` (or `/usr/lib/modules/...` on
+/// distros that merge `/usr`), alongside the `modules.dep`/`modules.alias`/
+/// `modules.builtin` metadata modprobe/udev need to resolve them. Drivers
+/// that happen to be statically built into the kernel (e.g. QEMU's
+/// `virtio_net`) work without this, which is why the gap this covers is
+/// invisible under local QEMU testing but breaks real hardware whose drivers
+/// are modules (see issue #88). Retain the whole per-kernel-version tree
+/// rather than a curated subset: there is no reliable way here to know which
+/// specific `.ko` files a given piece of hardware will need at boot.
+fn isKernelModulesPath(path: []const u8) bool {
+    return std.ascii.startsWithIgnoreCase(path, "lib/modules/") or
+        std.ascii.startsWithIgnoreCase(path, "usr/lib/modules/");
+}
+
 fn isRequiredBootAssetPath(
     path: []const u8,
     architecture: bootconfig.Architecture,
     retain_uki_assets: bool,
 ) bool {
     if (shouldPreferInstalledBootPayload(path)) return true;
+    if (isKernelModulesPath(path)) return true;
     if (retain_uki_assets and bootconfig.isUkiStubPath(path, architecture)) return true;
     if (std.ascii.eqlIgnoreCase(path, "boot/grub2/grub.cfg") or
         std.ascii.eqlIgnoreCase(path, "boot/grub/grub.cfg"))
@@ -1504,13 +1523,17 @@ fn collectIsoEntries(
                 try collectIsoEntries(allocator, io, pending, path_index, reader, child.index, full_path, rootfs_path_in_iso);
             },
             .file => {
-                // Prefer the installed rootfs's own /boot kernel+initramfs over
-                // duplicate copies shipped on the installation media. Live ISO
-                // boot payloads can legitimately differ from the installed
-                // system's /boot contents (e.g. missing dm-verity support in
-                // the initramfs), so the built image should keep the squashfs
-                // rootfs version when both provide the same path.
-                if (path_index.contains(full_path) and shouldPreferInstalledBootPayload(full_path)) {
+                // Prefer the installed rootfs's own /boot kernel+initramfs (and
+                // /lib/modules) over duplicate copies shipped on the
+                // installation media. Live ISO boot payloads can legitimately
+                // differ from the installed system's own contents (e.g.
+                // missing dm-verity support in the initramfs, or a different
+                // kernel/module version used only to run the installer), so
+                // the built image should keep the squashfs rootfs version
+                // when both provide the same path.
+                if (path_index.contains(full_path) and
+                    (shouldPreferInstalledBootPayload(full_path) or isKernelModulesPath(full_path)))
+                {
                     allocator.free(full_path);
                     continue;
                 }
@@ -1525,7 +1548,9 @@ fn collectIsoEntries(
                 });
             },
             .symlink => {
-                if (path_index.contains(full_path) and shouldPreferInstalledBootPayload(full_path)) {
+                if (path_index.contains(full_path) and
+                    (shouldPreferInstalledBootPayload(full_path) or isKernelModulesPath(full_path)))
+                {
                     allocator.free(full_path);
                     continue;
                 }
@@ -2724,6 +2749,121 @@ test "build-image can skip the ISO rootfs while retaining boot assets" {
     try std.testing.expectEqualStrings("hello from minimal container rootfs\n", app_file);
 
     try std.testing.expectError(error.NotFound, root_reader.readFileAlloc(io, allocator, "etc/hostname"));
+}
+
+test "build-image retains installed kernel modules during skip-iso-rootfs pruning" {
+    // Regression test for issue #88: --skip-iso-rootfs used to discard
+    // /lib/modules entirely, so any NIC/storage driver that isn't statically
+    // built into the kernel (e.g. Azure's hv_netvsc/mlx5, unlike QEMU's
+    // statically-built-in virtio_net) could never load on the built image.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const iso_path = "test-build-image-skip-iso-rootfs-modules.iso";
+    const oci_root = "test-build-image-skip-iso-rootfs-modules-oci";
+    const output_path = "test-build-image-skip-iso-rootfs-modules.raw";
+    const nested_ext4_path = "test-build-image-skip-iso-rootfs-modules-rootfs.img";
+    defer Io.Dir.cwd().deleteFile(io, iso_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, oci_root) catch {};
+    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, nested_ext4_path) catch {};
+
+    const nested_ext4_bytes = try buildNestedExt4ImageAlloc(allocator, io, nested_ext4_path, &[_]SyntheticNestedExt4Entry{
+        .{ .path = "boot", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "boot/vmlinuz-test", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = "kernel-from-squashfs".len, .bytes = "kernel-from-squashfs" },
+        .{ .path = "boot/initramfs-test.img", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = "initrd-from-squashfs".len, .bytes = "initrd-from-squashfs" },
+        .{ .path = "lib", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "lib/modules", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "lib/modules/6.6.0", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "lib/modules/6.6.0/modules.dep", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = "hv_netvsc.ko:".len, .bytes = "hv_netvsc.ko:" },
+        .{ .path = "lib/modules/6.6.0/kernel", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "lib/modules/6.6.0/kernel/drivers", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "lib/modules/6.6.0/kernel/drivers/net", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "lib/modules/6.6.0/kernel/drivers/net/hyperv", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "lib/modules/6.6.0/kernel/drivers/net/hyperv/hv_netvsc.ko", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = "hv-netvsc-module-bytes".len, .bytes = "hv-netvsc-module-bytes" },
+        .{ .path = "etc", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "etc/hostname", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = "live-rootfs-only\n".len, .bytes = "live-rootfs-only\n" },
+    });
+    defer allocator.free(nested_ext4_bytes);
+
+    const squashfs_bytes = try squashfs.buildSyntheticSquashfsImage(allocator, .{
+        .compression = .none,
+        .block_size = 1024 * 1024,
+        .file_bytes = nested_ext4_bytes,
+    });
+    defer allocator.free(squashfs_bytes);
+    try writeMinimalIsoWithBootPayloads(
+        allocator,
+        io,
+        iso_path,
+        "root.squashfs",
+        squashfs_bytes,
+        "vmlinuz-test",
+        "kernel-from-iso",
+        "initramfs-test.img",
+        "initrd-from-iso",
+    );
+
+    try createContainerRootfsOnlyBuildImageOciLayout(allocator, io, oci_root);
+
+    var report = try build(allocator, io, .{
+        .iso_path = iso_path,
+        .container_path = oci_root,
+        .output_path = output_path,
+        .output_format = .raw,
+        .generation = .gen2,
+        .size = 256 * mib,
+        .skip_iso_rootfs = true,
+    });
+    defer report.deinit(allocator);
+
+    var img = try Image.openPath(io, output_path);
+    defer img.close(io);
+
+    const root_partition = report.planned_partitions[1].planned;
+    const rootfs_scratch_path = try std.fmt.allocPrint(allocator, "{s}.test-rootfs.raw", .{output_path});
+    defer allocator.free(rootfs_scratch_path);
+    defer Io.Dir.cwd().deleteFile(io, rootfs_scratch_path) catch {};
+    try extractImageRegionToPath(allocator, io, &img, root_partition.offset_bytes, root_partition.length_bytes, rootfs_scratch_path);
+
+    const rootfs_scratch = try Io.Dir.cwd().openFile(io, rootfs_scratch_path, .{});
+    defer rootfs_scratch.close(io);
+    var root_reader = try ext4.open(io, rootfs_scratch, allocator, .{});
+    defer root_reader.deinit();
+
+    const module = try root_reader.readFileAlloc(io, allocator, "lib/modules/6.6.0/kernel/drivers/net/hyperv/hv_netvsc.ko");
+    defer allocator.free(module);
+    try std.testing.expectEqualStrings("hv-netvsc-module-bytes", module);
+
+    const modules_dep = try root_reader.readFileAlloc(io, allocator, "lib/modules/6.6.0/modules.dep");
+    defer allocator.free(modules_dep);
+    try std.testing.expectEqualStrings("hv_netvsc.ko:", modules_dep);
+
+    // Unrelated live-only paths are still pruned.
+    try std.testing.expectError(error.NotFound, root_reader.readFileAlloc(io, allocator, "etc/hostname"));
+}
+
+test "build-image retains kernel modules paths during skip-iso-rootfs pruning" {
+    // Loadable NIC/storage drivers (e.g. hv_netvsc, mlx5) and modprobe/udev
+    // metadata (modules.dep, modules.alias, modules.builtin) live under
+    // /lib/modules/<kernel-version>/ and must survive pruning even though
+    // they aren't in the EFI/GRUB/kernel/initramfs allowlist -- see issue #88.
+    try std.testing.expect(isRequiredBootAssetPath(
+        "lib/modules/6.6.0/kernel/drivers/net/hyperv/hv_netvsc.ko",
+        .x86_64,
+        false,
+    ));
+    try std.testing.expect(isRequiredBootAssetPath("lib/modules/6.6.0/modules.dep", .x86_64, false));
+    try std.testing.expect(isRequiredBootAssetPath("lib/modules/6.6.0/modules.alias", .x86_64, false));
+    try std.testing.expect(isRequiredBootAssetPath(
+        "usr/lib/modules/6.6.0-aarch64/kernel/fs/overlayfs/overlay.ko",
+        .aarch64,
+        false,
+    ));
+
+    try std.testing.expect(!isRequiredBootAssetPath("usr/lib/modules-load.d/virtio.conf", .x86_64, false));
+    try std.testing.expect(!isRequiredBootAssetPath("etc/modules-load.d/virtio.conf", .x86_64, false));
+    try std.testing.expect(!isRequiredBootAssetPath("var/lib/modules/state", .x86_64, false));
 }
 
 test "build-image retains architecture-matching UKI stub paths during skip-iso-rootfs pruning" {
