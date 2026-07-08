@@ -20,6 +20,14 @@ const help_text =
     \\  usually via the systemd-boot-unsigned package.
     \\  If the base OS image does not ship it, inject that package via an extra container
     \\  layer or point --stub-source-path at the non-standard path you added.
+    \\
+    \\--verity notes:
+    \\  The source initramfs (boot/initrd*/boot/initramfs* in the merged source tree)
+    \\  must already include dm-verity userspace tooling (systemd-veritysetup-generator,
+    \\  systemd-veritysetup, or veritysetup, e.g. built with dracut --add veritysetup).
+    \\  Without it, the built image will hang at boot waiting on /dev/mapper/root.
+    \\  build-image checks for this and fails fast when it can conclusively tell the
+    \\  tooling is missing.
 ;
 
 const BuildImageFailureContext = struct {
@@ -228,6 +236,10 @@ fn describeBuildImageFailure(
             u8,
             "build-image: failed: the ESP partition ran out of space while populating boot files.\nUKI mode stores large kernel/initrd payloads inside EFI binaries; try increasing --esp-size (512M is a good starting point for real distro images).",
         ),
+        error.InitramfsMissingVerityTooling => allocator.dupe(
+            u8,
+            "build-image: failed: --verity was requested, but the source initramfs (boot/initrd*/boot/initramfs* in the merged ISO/squashfs/container tree) does not include dm-verity userspace tooling (systemd-veritysetup-generator, systemd-veritysetup, or veritysetup).\nWithout it, systemd-veritysetup-generator never runs and the built image will hang at boot waiting on /dev/mapper/root (see https://github.com/cataggar/zvmi/issues/77).\nRebuild the initramfs with that tooling included (e.g. dracut --add veritysetup, or the equivalent module/package for the base OS's initramfs generator) before using --verity.",
+        ),
         else => std.fmt.allocPrint(allocator, "build-image: failed: {s}", .{@errorName(err)}),
     };
 }
@@ -260,4 +272,14 @@ test "describeBuildImageFailure explains small ESP for UKI artifacts" {
 
     try std.testing.expect(std.mem.indexOf(u8, message, "--esp-size") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "512M") != null);
+}
+
+test "describeBuildImageFailure explains missing initramfs verity tooling" {
+    const message = try describeBuildImageFailure(std.testing.allocator, error.InitramfsMissingVerityTooling, .{});
+    defer std.testing.allocator.free(message);
+
+    try std.testing.expect(std.mem.indexOf(u8, message, "--verity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "systemd-veritysetup-generator") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "dracut --add veritysetup") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "issues/77") != null);
 }
