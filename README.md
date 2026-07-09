@@ -48,6 +48,11 @@ zvmi/
                               #   assembly helpers
         verity.zig             # dm-verity SHA-256 hash-tree generation +
                               #   kernel cmdline metadata helpers
+        cpio.zig               # minimal read-only newc-format cpio archive
+                              #   reader (concatenated archives, e.g. dracut
+                              #   early-cpio + main)
+        initramfs.zig           # initramfs dm-verity userspace tooling
+                              #   detection for `--verity` (issue #77)
         layout.zig             # partition-layout planner (sizing math,
                               #   alignment, DPS type GUIDs)
         guid.zig               # mixed-endian GUID encoding + well-known
@@ -243,6 +248,22 @@ with `--verity`, wiring the resulting `roothash=`/`systemd.verity_root_*`
 parameters through the shared PARTUUID-based cmdline path. Gen1/MBR builds use
 Linux's synthesized MBR PARTUUID form (`<8-hex-disk-signature>-<2-hex-partition-number>`);
 the matching verity metadata is also exposed through `zvmi.cosi.writeWithOptions`.
+
+`zvmi build-image` never rebuilds the initramfs -- it copies whatever
+`boot/initramfs*`/`boot/initrd*` blob already exists in the merged
+ISO/squashfs/container source tree. Because of that, `--verity` only works
+end-to-end if that source initramfs already includes dm-verity userspace
+tooling (`systemd-veritysetup-generator`, `systemd-veritysetup`, or
+`veritysetup`, e.g. built with `dracut --add veritysetup`); without it,
+`systemd-veritysetup-generator` never runs at boot and the image hangs
+forever waiting on `/dev/mapper/root` (see
+[issue #77](https://github.com/cataggar/zvmi/issues/77) for the real-boot
+investigation that diagnosed this). `build-image --verity` inspects the
+selected initramfs (decompressing it as needed) and fails fast with a
+`--verity`-specific error when it can conclusively tell the tooling is
+missing, rather than silently producing an image that hangs at boot; if the
+initramfs can't be fully parsed (e.g. an unrecognized compression format),
+it instead prints a warning and proceeds.
 
 ## Notes on Zig 0.16
 

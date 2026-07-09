@@ -19,6 +19,7 @@ const qcow2 = @import("qcow2.zig");
 const vhdx = @import("vhdx.zig");
 const squashfs = @import("squashfs.zig");
 const verity = @import("verity.zig");
+const initramfs = @import("initramfs.zig");
 
 const mib: u64 = azure.one_mib;
 pub const default_esp_size: u64 = 96 * mib;
@@ -157,6 +158,18 @@ pub fn build(
             architecture,
             options.boot_mode != .bls_only,
         );
+    }
+
+    if (options.verity) {
+        logStep(options.verbose, "check initramfs for dm-verity tooling");
+        switch (try checkInitramfsVerityTooling(allocator, &source_tree.view)) {
+            .present => {},
+            .absent => return error.InitramfsMissingVerityTooling,
+            .inconclusive => std.debug.print(
+                "build-image: warning: could not conclusively verify that the source initramfs includes dm-verity userspace tooling (systemd-veritysetup-generator/systemd-veritysetup/veritysetup); --verity images built from an initramfs lacking this tooling will hang at boot waiting on /dev/mapper/root (see https://github.com/cataggar/zvmi/issues/77)\n",
+                .{},
+            ),
+        }
     }
 
     const raw_build_path = if (output_format == .raw)
@@ -1581,6 +1594,70 @@ fn shouldPreferInstalledBootPayload(path: []const u8) bool {
         std.ascii.eqlIgnoreCase(basename, "zImage") or
         std.ascii.startsWithIgnoreCase(basename, "initrd") or
         std.ascii.startsWithIgnoreCase(basename, "initramfs");
+}
+
+fn isInitramfsSourcePath(path: []const u8) bool {
+    const slash = std.mem.indexOfScalar(u8, path, '/') orelse return false;
+    if (!std.ascii.eqlIgnoreCase(path[0..slash], "boot")) return false;
+
+    const basename = path[slash + 1 ..];
+    return std.ascii.startsWithIgnoreCase(basename, "initrd") or
+        std.ascii.startsWithIgnoreCase(basename, "initramfs");
+}
+
+/// Reads every `boot/initrd*`/`boot/initramfs*` file in the merged source
+/// tree and checks each for dm-verity userspace tooling (see
+/// `initramfs.zig`), returning the most conservative combined status: any
+/// match anywhere is `.present`; otherwise `.absent` only if every candidate
+/// was fully and conclusively parsed with no match, and `.inconclusive`
+/// (including when no initramfs candidate was found at all) whenever any
+/// candidate couldn't be fully verified, since a false "absent" would fail a
+/// build that might actually boot fine.
+fn checkInitramfsVerityTooling(
+    allocator: std.mem.Allocator,
+    view: *ext4.FileTreeView,
+) !initramfs.VerityToolingStatus {
+    view.reset();
+
+    var found_any_candidate = false;
+    var saw_inconclusive = false;
+    var saw_absent = false;
+
+    while (try view.next()) |entry| {
+        if (entry.kind != .file or !isInitramfsSourcePath(entry.path)) continue;
+        const content = entry.content orelse continue;
+        found_any_candidate = true;
+
+        const bytes = try readViewFileAlloc(allocator, content, entry.size);
+        defer allocator.free(bytes);
+
+        switch (try initramfs.checkVerityTooling(allocator, bytes)) {
+            .present => return .present,
+            .absent => saw_absent = true,
+            .inconclusive => saw_inconclusive = true,
+        }
+    }
+
+    if (!found_any_candidate or saw_inconclusive) return .inconclusive;
+    return if (saw_absent) .absent else .inconclusive;
+}
+
+fn readViewFileAlloc(
+    allocator: std.mem.Allocator,
+    content: ext4.FileTreeView.ContentReader,
+    size: u64,
+) ![]u8 {
+    const len = std.math.cast(usize, size) orelse return error.FileTooLarge;
+    const out = try allocator.alloc(u8, len);
+    errdefer allocator.free(out);
+
+    var done: usize = 0;
+    while (done < out.len) {
+        const got = try content.readAt(out[done..], done);
+        if (got == 0) return error.UnexpectedSourceLength;
+        done += got;
+    }
+    return out;
 }
 
 fn collectOciEntries(
@@ -3186,6 +3263,83 @@ test "build-image can append a dm-verity tree for Gen1 builds and synthesize an 
     try std.testing.expect(std.mem.indexOf(u8, kernel_options, root_partuuid_text) != null);
 }
 
+test "build-image --verity fails fast when the initramfs lacks dm-verity tooling" {
+    // Regression test for issue #77: a `--verity` build must not silently
+    // produce an image that hangs at boot waiting on /dev/mapper/root just
+    // because the source initramfs never had systemd-veritysetup-generator/
+    // systemd-veritysetup/veritysetup in it. When the initramfs is a real,
+    // fully-parseable cpio archive containing none of those tools, `build()`
+    // should fail fast instead.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const iso_path = "test-build-image-verity-missing-tooling.iso";
+    const oci_root = "test-build-image-verity-missing-tooling-oci";
+    const output_path = "test-build-image-verity-missing-tooling.raw";
+    defer Io.Dir.cwd().deleteFile(io, iso_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, oci_root) catch {};
+    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
+
+    const squashfs_bytes = try squashfs.buildSyntheticSquashfsImage(allocator, .{ .compression = .xz });
+    defer allocator.free(squashfs_bytes);
+    try writeMinimalIsoWithFile(allocator, io, iso_path, "ROOT.SQUASHFS;1", squashfs_bytes);
+
+    const initrd_bytes = try makeSyntheticInitramfsCpio(allocator, "usr/bin/bash");
+    defer allocator.free(initrd_bytes);
+
+    var fixture = try createBuildImageOciFixtureWithOptions(allocator, io, oci_root, .{
+        .initrd_bytes = initrd_bytes,
+    });
+    defer fixture.deinit(allocator);
+
+    try std.testing.expectError(error.InitramfsMissingVerityTooling, build(allocator, io, .{
+        .iso_path = iso_path,
+        .container_path = oci_root,
+        .output_path = output_path,
+        .output_format = .raw,
+        .generation = .gen2,
+        .size = 256 * mib,
+        .verity = true,
+    }));
+}
+
+test "build-image --verity succeeds when the initramfs includes dm-verity tooling" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const iso_path = "test-build-image-verity-with-tooling.iso";
+    const oci_root = "test-build-image-verity-with-tooling-oci";
+    const output_path = "test-build-image-verity-with-tooling.raw";
+    defer Io.Dir.cwd().deleteFile(io, iso_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, oci_root) catch {};
+    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
+
+    const squashfs_bytes = try squashfs.buildSyntheticSquashfsImage(allocator, .{ .compression = .xz });
+    defer allocator.free(squashfs_bytes);
+    try writeMinimalIsoWithFile(allocator, io, iso_path, "ROOT.SQUASHFS;1", squashfs_bytes);
+
+    const initrd_bytes = try makeSyntheticInitramfsCpio(allocator, "usr/lib/systemd/systemd-veritysetup-generator");
+    defer allocator.free(initrd_bytes);
+
+    var fixture = try createBuildImageOciFixtureWithOptions(allocator, io, oci_root, .{
+        .initrd_bytes = initrd_bytes,
+    });
+    defer fixture.deinit(allocator);
+
+    var report = try build(allocator, io, .{
+        .iso_path = iso_path,
+        .container_path = oci_root,
+        .output_path = output_path,
+        .output_format = .raw,
+        .generation = .gen2,
+        .size = 256 * mib,
+        .verity = true,
+    });
+    defer report.deinit(allocator);
+
+    try std.testing.expect(report.verity != null);
+}
+
 test "build-image reports errors cleanly (no double-free) when squashfs open fails after partition planning" {
     // Regression test for a bug found via real-world testing against the real
     // Azure Linux 4.0 ISO (https://aka.ms/azurelinux-4.0-x86_64.iso), whose
@@ -3747,6 +3901,31 @@ fn makeSyntheticBiosCoreImg(allocator: std.mem.Allocator) ![]u8 {
     const bytes = try allocator.alloc(u8, 900);
     for (bytes, 0..) |*byte, index| byte.* = @intCast((index * 29 + 7) % 253);
     return bytes;
+}
+
+/// Builds a minimal newc-format cpio archive (see `cpio.zig`) containing a
+/// single entry followed by a `TRAILER!!!`, for exercising
+/// `initramfs.checkVerityTooling` end-to-end through `build()`'s
+/// `--verity` initramfs check (see issue #77).
+fn makeSyntheticInitramfsCpio(allocator: std.mem.Allocator, entry_path: []const u8) ![]u8 {
+    var list = std.array_list.Managed(u8).init(allocator);
+    errdefer list.deinit();
+    try appendCpioTestEntry(&list, entry_path, "elf-bytes");
+    try appendCpioTestEntry(&list, "TRAILER!!!", "");
+    return list.toOwnedSlice();
+}
+
+fn appendCpioTestEntry(list: *std.array_list.Managed(u8), name: []const u8, content: []const u8) !void {
+    var header: [110]u8 = undefined;
+    _ = try std.fmt.bufPrint(&header, "070701{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}", .{
+        0, @as(u32, 0o100644), 0, 0, 1, 0, content.len, 0, 0, 0, 0, name.len + 1, 0,
+    });
+    try list.appendSlice(&header);
+    try list.appendSlice(name);
+    try list.append(0);
+    while (list.items.len % 4 != 0) try list.append(0);
+    try list.appendSlice(content);
+    while (list.items.len % 4 != 0) try list.append(0);
 }
 
 fn appendU16Le(list: *std.array_list.Managed(u8), value: u16) !void {
