@@ -86,6 +86,8 @@ zvmi/
         opts.zig              # shared `-o subformat=...` parsing
   miniinit/                 # standalone minimal PID 1 for real-boot testing
                               #   of --skip-iso-rootfs images (see miniinit/README.md)
+  qmp/                      # standalone native Zig QEMU Machine Protocol
+                              #   (QMP) client, MIT licensed (see qmp/README.md)
 ```
 
 ## Requirements
