@@ -88,6 +88,8 @@ zvmi/
                               #   of --skip-iso-rootfs images (see miniinit/README.md)
   qmp/                      # standalone native Zig QEMU Machine Protocol
                               #   (QMP) client, MIT licensed (see qmp/README.md)
+  nbd/                      # standalone native Zig NBD client + reference
+                              #   server, MIT licensed (see nbd/README.md)
 ```
 
 ## Requirements
