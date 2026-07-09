@@ -3,8 +3,13 @@
 //! This module implements the format-1 (`salt || block`) SHA-256 Merkle tree
 //! layout used by modern dm-verity deployments. The emitted hash area omits the
 //! optional verity superblock (`superblock=0`) and stores hash blocks in the
-//! standard lowest-level-first order expected by `veritysetup`/systemd's
-//! `hash-offset=` handling: leaf hash blocks first, root block last.
+//! on-disk order the kernel's dm-verity target and `veritysetup` actually use:
+//! the level closest to the root is stored *first* (right at `hash-offset=`),
+//! and the leaf level (one hash per data block) is stored *last*. This
+//! matches `hash_levels()`/`VERITY_create_or_verify_hash()` in cryptsetup's
+//! `lib/verity/verity_hash.c`, which assigns on-disk positions to levels
+//! starting from the root-adjacent level and working down to the leaf level.
+//! See `buildTreeLevels`/`writeLevelsRootFirst` below.
 
 const std = @import("std");
 const Io = std.Io;
@@ -131,24 +136,19 @@ pub fn generateFromBytes(allocator: std.mem.Allocator, data: []const u8, options
     if (data.len != options.data_size) return error.InvalidDataSize;
 
     const data_blocks = options.data_size / options.data_block_size;
-    var current = try buildLeafLevelFromBytes(allocator, data, options);
-    defer allocator.free(current);
-
-    var tree = std.array_list.Managed(u8).init(allocator);
-    errdefer tree.deinit();
-
-    while (true) {
-        try tree.appendSlice(current);
-        if (current.len == options.hash_block_size) break;
-
-        const next = try buildParentLevel(allocator, current, options.hash_block_size, options.salt);
-        allocator.free(current);
-        current = next;
+    const leaf_level = try buildLeafLevelFromBytes(allocator, data, options);
+    const levels = try buildTreeLevels(allocator, leaf_level, options.hash_block_size, options.salt);
+    defer {
+        for (levels) |level| allocator.free(level);
+        allocator.free(levels);
     }
 
-    const tree_bytes = try tree.toOwnedSlice();
+    const tree_bytes = try writeLevelsRootFirst(allocator, levels);
+    errdefer allocator.free(tree_bytes);
+
     var root_hash: [digest_size]u8 = undefined;
-    hashBlock(current[0..options.hash_block_size], options.salt, &root_hash);
+    const root_level = levels[levels.len - 1];
+    hashBlock(root_level[0..options.hash_block_size], options.salt, &root_hash);
 
     return .{
         .info = .{
@@ -169,38 +169,89 @@ pub fn generateAndWrite(io: Io, file: Io.File, allocator: std.mem.Allocator, opt
     if (options.hash_offset < options.data_size) return error.HashAreaOverlapsData;
 
     const data_blocks = options.data_size / options.data_block_size;
-    var current = try buildLeafLevelFromFile(allocator, io, file, options);
-    defer allocator.free(current);
-
-    var tree = std.array_list.Managed(u8).init(allocator);
-    errdefer tree.deinit();
-
-    while (true) {
-        try tree.appendSlice(current);
-        if (current.len == options.hash_block_size) break;
-
-        const next = try buildParentLevel(allocator, current, options.hash_block_size, options.salt);
-        allocator.free(current);
-        current = next;
+    const leaf_level = try buildLeafLevelFromFile(allocator, io, file, options);
+    const levels = try buildTreeLevels(allocator, leaf_level, options.hash_block_size, options.salt);
+    defer {
+        for (levels) |level| allocator.free(level);
+        allocator.free(levels);
     }
 
-    const tree_bytes = try tree.toOwnedSlice();
-    defer allocator.free(tree_bytes);
-
     var root_hash: [digest_size]u8 = undefined;
-    hashBlock(current[0..options.hash_block_size], options.salt, &root_hash);
+    const root_level = levels[levels.len - 1];
+    hashBlock(root_level[0..options.hash_block_size], options.salt, &root_hash);
 
-    try file.writePositionalAll(io, tree_bytes, options.device_offset + options.hash_offset);
+    // On-disk order is root-adjacent level first, leaf level last (see the
+    // module doc comment), i.e. the reverse of `levels`, which is ordered
+    // leaf-first/root-last since that's the order each level can be built in.
+    var write_offset = options.device_offset + options.hash_offset;
+    var index = levels.len;
+    while (index > 0) {
+        index -= 1;
+        try file.writePositionalAll(io, levels[index], write_offset);
+        write_offset += levels[index].len;
+    }
+    const hash_tree_size = write_offset - (options.device_offset + options.hash_offset);
 
     return .{
         .dataBlockSize = options.data_block_size,
         .hashBlockSize = options.hash_block_size,
         .dataBlocks = data_blocks,
         .hashOffset = options.hash_offset,
-        .hashTreeSize = tree_bytes.len,
+        .hashTreeSize = hash_tree_size,
         .salt = options.salt,
         .rootHash = root_hash,
     };
+}
+
+/// Builds every level of the Merkle tree above `leaf_level` (which must
+/// already be caller-owned and is taken over by this function), returning an
+/// owned slice of owned level buffers ordered leaf-first, root-last (i.e. the
+/// order each level must be *built* in, since each parent level is derived
+/// from the previous one). `writeLevelsRootFirst` (or the direct file-write
+/// loop in `generateAndWrite`) is responsible for reversing this into the
+/// actual on-disk order.
+fn buildTreeLevels(
+    allocator: std.mem.Allocator,
+    leaf_level: []u8,
+    hash_block_size: u32,
+    salt: [salt_size]u8,
+) std.mem.Allocator.Error![][]u8 {
+    var levels = std.array_list.Managed([]u8).init(allocator);
+    errdefer {
+        for (levels.items) |level| allocator.free(level);
+        levels.deinit();
+    }
+
+    try levels.append(leaf_level);
+    var current = leaf_level;
+    while (current.len != hash_block_size) {
+        const next = try buildParentLevel(allocator, current, hash_block_size, salt);
+        try levels.append(next);
+        current = next;
+    }
+
+    return levels.toOwnedSlice();
+}
+
+/// Concatenates `levels` (ordered leaf-first, root-last, as returned by
+/// `buildTreeLevels`) into a single buffer in the on-disk order dm-verity
+/// actually expects: root-adjacent level first, leaf level last.
+fn writeLevelsRootFirst(allocator: std.mem.Allocator, levels: []const []const u8) std.mem.Allocator.Error![]u8 {
+    var total_len: usize = 0;
+    for (levels) |level| total_len += level.len;
+
+    const out = try allocator.alloc(u8, total_len);
+    errdefer allocator.free(out);
+
+    var offset: usize = 0;
+    var index = levels.len;
+    while (index > 0) {
+        index -= 1;
+        @memcpy(out[offset..][0..levels[index].len], levels[index]);
+        offset += levels[index].len;
+    }
+
+    return out;
 }
 
 pub fn hashTreeBlockCount(data_blocks: u64, hash_block_size: u32) u64 {
@@ -376,4 +427,69 @@ test "splitPartition reserves appended hash blocks after the protected data area
     try std.testing.expectEqual(layout.data_size, layout.hash_offset);
     try std.testing.expect(layout.hash_tree_size > 0);
     try std.testing.expect(layout.data_size + layout.hash_tree_size <= total);
+}
+
+test "generateFromBytes stores a multi-level tree root-first, leaf-last on disk" {
+    // Regression test for issue #77's real-boot investigation: with a tiny
+    // hash_block_size (64 bytes = 2 sha256 digests/block) and 3 data blocks,
+    // the leaf level needs 2 hash blocks (3 leaf hashes, 2 per block) and so
+    // requires a parent/root level combining them into a single block --
+    // the smallest case that can distinguish "leaf-first" from "root-first"
+    // on-disk ordering. Real dm-verity (see cryptsetup's
+    // `lib/verity/verity_hash.c` `hash_levels()`/`VERITY_create_or_verify_hash()`)
+    // stores the root-adjacent level first (right at the hash area's start)
+    // and the leaf level last.
+    const data_block_size: u32 = 16;
+    const hash_block_size: u32 = 64;
+
+    var data: [data_block_size * 3]u8 = undefined;
+    for (&data, 0..) |*byte, index| byte.* = @intCast(index);
+
+    var salt: [salt_size]u8 = undefined;
+    for (&salt, 0..) |*byte, index| byte.* = @intCast(index + 100);
+
+    var generated = try generateFromBytes(std.testing.allocator, &data, .{
+        .data_size = data.len,
+        .data_block_size = data_block_size,
+        .hash_block_size = hash_block_size,
+        .salt = salt,
+    });
+    defer generated.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u64, 3), generated.info.dataBlocks);
+    // leaf level: ceil(3/2) = 2 hash blocks; root level: ceil(2/2) = 1 hash block.
+    try std.testing.expectEqual(@as(u64, 3 * hash_block_size), generated.info.hashTreeSize);
+
+    var leaf0: [digest_size]u8 = undefined;
+    var leaf1: [digest_size]u8 = undefined;
+    var leaf2: [digest_size]u8 = undefined;
+    hashBlock(data[0 * data_block_size ..][0..data_block_size], salt, &leaf0);
+    hashBlock(data[1 * data_block_size ..][0..data_block_size], salt, &leaf1);
+    hashBlock(data[2 * data_block_size ..][0..data_block_size], salt, &leaf2);
+
+    var leaf_level: [2 * hash_block_size]u8 = undefined;
+    @memset(&leaf_level, 0);
+    std.mem.copyForwards(u8, leaf_level[0..digest_size], &leaf0);
+    std.mem.copyForwards(u8, leaf_level[digest_size .. 2 * digest_size], &leaf1);
+    std.mem.copyForwards(u8, leaf_level[hash_block_size .. hash_block_size + digest_size], &leaf2);
+
+    var root_of_leaf0: [digest_size]u8 = undefined;
+    var root_of_leaf1: [digest_size]u8 = undefined;
+    hashBlock(leaf_level[0..hash_block_size], salt, &root_of_leaf0);
+    hashBlock(leaf_level[hash_block_size .. 2 * hash_block_size], salt, &root_of_leaf1);
+
+    var root_level: [hash_block_size]u8 = undefined;
+    @memset(&root_level, 0);
+    std.mem.copyForwards(u8, root_level[0..digest_size], &root_of_leaf0);
+    std.mem.copyForwards(u8, root_level[digest_size .. 2 * digest_size], &root_of_leaf1);
+
+    var expected_tree: [3 * hash_block_size]u8 = undefined;
+    @memcpy(expected_tree[0..hash_block_size], &root_level);
+    @memcpy(expected_tree[hash_block_size..], &leaf_level);
+
+    try std.testing.expectEqualSlices(u8, &expected_tree, generated.tree_bytes);
+
+    var expected_root_hash: [digest_size]u8 = undefined;
+    hashBlock(&root_level, salt, &expected_root_hash);
+    try std.testing.expectEqualSlices(u8, &expected_root_hash, &generated.info.rootHash);
 }
