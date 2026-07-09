@@ -90,6 +90,11 @@ zvmi/
                               #   (QMP) client, MIT licensed (see qmp/README.md)
   nbd/                      # standalone native Zig NBD client + reference
                               #   server, MIT licensed (see nbd/README.md)
+  qcow2/                    # standalone native Zig qcow2 reader/writer, MIT
+                              #   licensed (see qcow2/README.md -- note this
+                              #   is a separate implementation from
+                              #   packages/zvmi/src/qcow2.zig; see that file's
+                              #   note and issue #96 for the overlap)
 ```
 
 ## Requirements

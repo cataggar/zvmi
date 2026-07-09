@@ -17,7 +17,9 @@
 //!    existing compressed clusters transparently inflate them into standard
 //!    data clusters. Emitting new compressed clusters is still deferred;
 //!    zstd-compressed clusters remain unsupported
-//!    (`error.UnsupportedCompressionType`).
+//!    (`error.UnsupportedCompressionType`) -- the standalone `qcow2/` package
+//!    at the repo root (a separate, independent qcow2 implementation) does
+//!    support zstd clusters; see issue #96 for the plan to reconcile the two.
 //!  - Internal snapshots can be enumerated with `listSnapshots()`, switched
 //!    for reads with `openSnapshot()`, and created with `createSnapshot()`.
 //!    Active-image writes/resizes honor snapshot refcounts with copy-on-write;
