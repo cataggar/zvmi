@@ -14,7 +14,7 @@
 # Usage: cross-validate.sh <qemu-build-dir> <qcow2-cli>
 #   <qemu-build-dir>  directory containing the qemu-img and qemu-io binaries
 #                      (e.g. build-zig, built via scripts/build-with-zig-cc.sh)
-#   <qcow2-cli>        path to the zig/qcow2 CLI binary (zig-out/bin/qcow2)
+#   <qcow2-cli>        path to the qcow2 CLI binary (zig-out/bin/qcow2)
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then

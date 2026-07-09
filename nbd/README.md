@@ -25,14 +25,15 @@ Part of the Zig-on-QEMU experiment (see issue #4). MIT licensed.
 
 ## Build & test
 
-Requires Zig 0.16.
+Requires Zig 0.16. Built as part of the repo-root build graph (there's no
+separate `nbd/build.zig`), so run these from the repo root:
 
 ```sh
-zig build test        # run unit tests (pure protocol framing + a real
-                       # Client <-> server test over a Unix socket -- no
-                       # qemu-nbd needed)
-zig build             # build the CLI into zig-out/bin/nbd
-zig build run -- info unix:/tmp/nbd.sock disk
+zig build test              # run all tests, including nbd's (pure protocol
+                             #   framing + a real Client <-> server test over
+                             #   a Unix socket -- no qemu-nbd needed)
+zig build                   # build everything, including zig-out/bin/nbd
+./zig-out/bin/nbd info unix:/tmp/nbd.sock disk
 ```
 
 ## CLI

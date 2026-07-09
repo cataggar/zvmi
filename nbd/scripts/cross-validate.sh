@@ -26,7 +26,7 @@
 #   <qemu-build-dir>  directory containing the qemu-nbd, qemu-img, and
 #                      qemu-io binaries (e.g. build-zig, built via
 #                      scripts/build-with-zig-cc.sh)
-#   <nbd-cli>          path to the zig/nbd CLI binary (zig-out/bin/nbd)
+#   <nbd-cli>          path to the nbd CLI binary (zig-out/bin/nbd)
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then

@@ -84,15 +84,15 @@ zvmi/
         cosi.zig              # `zvmi cosi`
         build_image.zig       # `zvmi build-image`
         opts.zig              # shared `-o subformat=...` parsing
-  miniinit/                 # standalone minimal PID 1 for real-boot testing
-                              #   of --skip-iso-rootfs images (see miniinit/README.md)
-  qmp/                      # standalone native Zig QEMU Machine Protocol
-                              #   (QMP) client, MIT licensed (see qmp/README.md)
-  nbd/                      # standalone native Zig NBD client + reference
-                              #   server, MIT licensed (see nbd/README.md)
-  qcow2/                    # standalone native Zig qcow2 reader/writer, MIT
-                              #   licensed (see qcow2/README.md -- note this
-                              #   is a separate implementation from
+  miniinit/                 # minimal PID 1 for real-boot testing of
+                              #   --skip-iso-rootfs images (see miniinit/README.md)
+  qmp/                      # native Zig QEMU Machine Protocol (QMP) client,
+                              #   MIT licensed (see qmp/README.md)
+  nbd/                      # native Zig NBD client + reference server, MIT
+                              #   licensed (see nbd/README.md)
+  qcow2/                    # native Zig qcow2 reader/writer, MIT licensed
+                              #   (see qcow2/README.md -- note this is a
+                              #   separate implementation from
                               #   packages/zvmi/src/qcow2.zig; see that file's
                               #   note and issue #96 for the overlap)
 ```

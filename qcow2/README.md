@@ -21,12 +21,13 @@ Part of the Zig-on-QEMU experiment (see issue #2). MIT licensed.
 
 ## Build & test
 
-Requires Zig 0.16.
+Requires Zig 0.16. Built as part of the repo-root build graph (there's no
+separate `qcow2/build.zig`), so run these from the repo root:
 
 ```sh
-zig build test        # run unit tests
-zig build             # build the CLI into zig-out/bin/qcow2
-zig build run -- info disk.qcow2
+zig build test              # run all tests, including qcow2's
+zig build                   # build everything, including zig-out/bin/qcow2
+./zig-out/bin/qcow2 info disk.qcow2
 ```
 
 ## CLI
