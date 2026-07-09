@@ -331,3 +331,7 @@ This codebase targets Zig 0.16's new `std.Io` interface: every filesystem,
 clock, and randomness operation takes an explicit `io: std.Io` parameter
 (via `std.process.Init.io` in the CLI, or `std.testing.io` in tests) rather
 than relying on implicit global state.
+
+## License
+
+MIT -- see [LICENSE](LICENSE).
