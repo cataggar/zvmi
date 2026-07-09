@@ -43,8 +43,10 @@ reference for what a from-scratch container-image init needs to do.
 
 ## Building
 
+Built as part of the repo-root build graph (there's no separate
+`miniinit/build.zig`):
+
 ```
-cd miniinit
 zig build
 ```
 

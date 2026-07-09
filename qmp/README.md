@@ -22,12 +22,14 @@ Part of the Zig-on-QEMU experiment (see issue #3). MIT licensed.
 
 ## Build & test
 
-Requires Zig 0.16.
+Requires Zig 0.16. Built as part of the repo-root build graph (there's no
+separate `qmp/build.zig`), so run these from the repo root:
 
 ```sh
-zig build test        # run unit tests (pure protocol framing, no socket needed)
-zig build             # build the qmp CLI and qapi-codegen into zig-out/bin/
-zig build run -- greeting /tmp/qmp.sock
+zig build test              # run all tests, including qmp's (pure protocol
+                             #   framing, no socket needed)
+zig build                   # build everything, including zig-out/bin/{qmp,qapi-codegen}
+./zig-out/bin/qmp greeting /tmp/qmp.sock
 ```
 
 ## CLI
@@ -108,11 +110,11 @@ types and typed wrapper functions for QMP commands (`qmp.qapi.queryStatus`,
 
 This is a **best-effort, offline generator**, not a build-time dependency of
 the `qmp` module — run it manually against a QEMU checkout and commit the
-result:
+result (from the repo root):
 
 ```sh
-zig build qapi-codegen -- /path/to/qemu/qapi/qapi-schema.json src/qapi_generated.zig
-zig fmt src/qapi_generated.zig
+zig build qapi-codegen -- /path/to/qemu/qapi/qapi-schema.json qmp/src/qapi_generated.zig
+zig fmt qmp/src/qapi_generated.zig
 ```
 
 Known limitations (all degrade gracefully to a `std.json.Value` field/type

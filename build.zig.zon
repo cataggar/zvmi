@@ -11,6 +11,11 @@
         "build.zig.zon",
         "packages",
         "cli",
+        "qmp",
+        "nbd",
+        "qcow2",
+        "miniinit",
         "README.md",
+        "LICENSE",
     },
 }

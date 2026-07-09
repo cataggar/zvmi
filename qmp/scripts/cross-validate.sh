@@ -12,7 +12,7 @@
 # Usage: cross-validate.sh <qemu-build-dir> <qmp-cli>
 #   <qemu-build-dir>  directory containing the qemu-system-x86_64 binary
 #                      (e.g. build-zig, built via scripts/build-with-zig-cc.sh)
-#   <qmp-cli>          path to the zig/qmp CLI binary (zig-out/bin/qmp)
+#   <qmp-cli>          path to the qmp CLI binary (zig-out/bin/qmp)
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
