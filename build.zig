@@ -92,6 +92,22 @@ pub fn build(b: *std.Build) void {
     }) });
     const run_qmp_schema_tests = b.addRunArtifact(qmp_schema_tests);
 
+    // ---- tests/boot_smoke.zig: opportunistic real-QEMU boot verification,
+    // driving zvmi.build_image.build() output with qmp. Lives outside
+    // packages/zvmi since it needs both zvmi and qmp -- see issue #99. ----
+    const boot_smoke_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("tests/boot_smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zvmi", .module = zvmi_mod },
+            .{ .name = "qmp", .module = qmp_mod },
+        },
+    }) });
+    const run_boot_smoke_tests = b.addRunArtifact(boot_smoke_tests);
+    const boot_smoke_step = b.step("test-boot-smoke", "Run opportunistic real-QEMU boot-smoke tests");
+    boot_smoke_step.dependOn(&run_boot_smoke_tests.step);
+
     // ---- nbd: native Zig NBD client + reference server ----
     const nbd_mod = b.addModule("nbd", .{
         .root_source_file = b.path("nbd/src/nbd.zig"),
@@ -178,6 +194,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_qmp_exe_tests.step);
     test_step.dependOn(&run_qmp_codegen_tests.step);
     test_step.dependOn(&run_qmp_schema_tests.step);
+    test_step.dependOn(&run_boot_smoke_tests.step);
     test_step.dependOn(&run_nbd_mod_tests.step);
     test_step.dependOn(&run_nbd_exe_tests.step);
     test_step.dependOn(&run_nbd_server_tests.step);
