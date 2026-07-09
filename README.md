@@ -265,6 +265,57 @@ missing, rather than silently producing an image that hangs at boot; if the
 initramfs can't be fully parsed (e.g. an unrecognized compression format),
 it instead prints a warning and proceeds.
 
+### Producing a verity-capable initramfs (e.g. for Azure Linux)
+
+Live/installer media (such as the Azure Linux ISO) typically ships an
+initramfs built for the installer environment itself, which has no need for
+dm-verity and so is usually missing the pieces above even when the installed
+system's own root filesystem has them (`systemd-udev`'s
+`systemd-veritysetup-generator`/`systemd-veritysetup`, and
+`cryptsetup`/`veritysetup`'s `libcryptsetup`, plus the `dm-verity`/`dm-mod`
+kernel modules). Regenerate the initramfs with `dracut --add veritysetup`
+against a rootfs that has these installed, then supply the result as a
+`--container` layer at the *same* `boot/initramfs-<kver>.img` path already
+used by the ISO/squashfs rootfs -- OCI container layers always take
+precedence over ISO/squashfs entries at the same path, so no `zvmi` flag is
+needed to use it in place of the stock copy.
+
+On a matching-architecture build host (or inside a container/chroot for that
+architecture), this is a normal, native `dracut` invocation:
+
+```bash
+dracut --add veritysetup --force --kver <kernel-version> /path/to/initramfs-verity.img
+```
+
+Building this cross-architecture (e.g. generating an x86_64 initramfs on an
+aarch64 build host, via `qemu-user`/`binfmt_misc` emulation) additionally
+needs:
+
+- `dracut --sysroot <mounted-or-extracted-rootfs> --no-hostonly --add
+  veritysetup --force --kver <kernel-version> -o <output>`, with
+  `DRACUT_ARCH=<target-arch>` and `QEMU_LD_PREFIX=<sysroot>` exported so the
+  emulated target-arch helper binaries (e.g. `dracut-install`) can find their
+  own shared libraries.
+- A working cross-arch `ldd` on `PATH`: dracut-install invokes the plain
+  `ldd` command by name to resolve each installed binary's shared-library
+  dependencies, but a host system's own `ldd` script typically refuses
+  foreign-architecture binaries outright (printing `not a dynamic
+  executable`) rather than actually resolving them, which silently drops
+  every shared library (including the dynamic loader itself) from the
+  generated initramfs -- producing an initramfs that panics at boot with
+  `Failed to execute /init`. Shadow `ldd` on `PATH` with a small wrapper that
+  invokes the target's own dynamic linker in list mode instead, e.g.:
+  ```bash
+  #!/bin/bash
+  # save as e.g. /tmp/fakebin/ldd (with /tmp/fakebin first on PATH)
+  exec qemu-x86_64 -L "$QEMU_LD_PREFIX" "$QEMU_LD_PREFIX/lib64/ld-linux-x86-64.so.2" --list "$1"
+  ```
+
+This was verified end-to-end with a real QEMU + OVMF boot of a Gen2 +
+`--verity` Azure Linux 4.0 image built this way: the image reaches a real
+login prompt and root shell with `veritysetup.target` active.
+
+
 ## Notes on Zig 0.16
 
 This codebase targets Zig 0.16's new `std.Io` interface: every filesystem,
