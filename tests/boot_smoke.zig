@@ -34,13 +34,22 @@ const OvmfFirmwarePair = struct {
 
 const QemuBootSmokePrereqs = struct {
     qemu_path: []u8,
-    ovmf: OvmfFirmwarePair,
     iso_path: []u8,
     oci_path: []u8,
 
     fn deinit(self: *QemuBootSmokePrereqs, allocator: std.mem.Allocator) void {
         allocator.free(self.qemu_path);
-        self.ovmf.deinit(allocator);
+        allocator.free(self.iso_path);
+        allocator.free(self.oci_path);
+        self.* = undefined;
+    }
+};
+
+const IsoOciFixtures = struct {
+    iso_path: []u8,
+    oci_path: []u8,
+
+    fn deinit(self: *IsoOciFixtures, allocator: std.mem.Allocator) void {
         allocator.free(self.iso_path);
         allocator.free(self.oci_path);
         self.* = undefined;
@@ -109,6 +118,31 @@ fn requireProvisionedBootTestPathAlloc(
             .{ key, path },
         );
         return error.SkipZigTest;
+    }
+
+    return path;
+}
+
+/// Like `requireProvisionedBootTestPathAlloc`, but returns `null` instead of
+/// `error.SkipZigTest` when the env var isn't set at all -- for optional
+/// fixtures (e.g. a verity-capable container) that most dev/CI setups won't
+/// have provisioned, where the calling test should skip just that one case
+/// rather than the whole test.
+fn optionalProvisionedBootTestPathAlloc(
+    allocator: std.mem.Allocator,
+    io: Io,
+    comptime key: []const u8,
+) !?[]u8 {
+    const path = try getOptionalTestEnvPathAlloc(allocator, key) orelse return null;
+    errdefer allocator.free(path);
+
+    if (!try pathAccessible(io, path, .{ .read = true })) {
+        std.debug.print(
+            "skipping: {s} points to an unreadable path: {s}\n",
+            .{ key, path },
+        );
+        allocator.free(path);
+        return null;
     }
 
     return path;
@@ -194,25 +228,10 @@ fn requireOvmfFirmwarePairAlloc(
     return error.SkipZigTest;
 }
 
-fn requireQemuBootSmokePrereqs(
+fn requireIsoOciFixturesAlloc(
     allocator: std.mem.Allocator,
     io: Io,
-) !QemuBootSmokePrereqs {
-    const qemu_path = try findExecutableInPathAlloc(allocator, io, "qemu-system-x86_64") orelse {
-        std.debug.print(
-            "skipping build-image QEMU boot smoke test: qemu-system-x86_64 not found on PATH\n",
-            .{},
-        );
-        return error.SkipZigTest;
-    };
-    errdefer allocator.free(qemu_path);
-
-    const ovmf = try requireOvmfFirmwarePairAlloc(allocator, io);
-    errdefer {
-        var ovmf_to_free = ovmf;
-        ovmf_to_free.deinit(allocator);
-    }
-
+) !IsoOciFixtures {
     const iso_path = try requireProvisionedBootTestPathAlloc(
         allocator,
         io,
@@ -230,10 +249,31 @@ fn requireQemuBootSmokePrereqs(
     errdefer allocator.free(oci_path);
 
     return .{
-        .qemu_path = qemu_path,
-        .ovmf = ovmf,
         .iso_path = iso_path,
         .oci_path = oci_path,
+    };
+}
+
+fn requireQemuBootSmokePrereqs(
+    allocator: std.mem.Allocator,
+    io: Io,
+) !QemuBootSmokePrereqs {
+    const qemu_path = try findExecutableInPathAlloc(allocator, io, "qemu-system-x86_64") orelse {
+        std.debug.print(
+            "skipping build-image QEMU boot smoke test: qemu-system-x86_64 not found on PATH\n",
+            .{},
+        );
+        return error.SkipZigTest;
+    };
+    errdefer allocator.free(qemu_path);
+
+    var fixtures = try requireIsoOciFixturesAlloc(allocator, io);
+    errdefer fixtures.deinit(allocator);
+
+    return .{
+        .qemu_path = qemu_path,
+        .iso_path = fixtures.iso_path,
+        .oci_path = fixtures.oci_path,
     };
 }
 
@@ -249,31 +289,29 @@ fn copyFileToPath(
 }
 
 /// Polling interval while waiting for the guest to reach the expected serial
-/// output or for QEMU to stop running (see `runGen2QemuBootSmoke`).
+/// output or for QEMU to stop running (see `runQemuBootSmoke`).
 const qemu_boot_smoke_poll_interval_ms: u64 = 200;
 
-fn runGen2QemuBootSmoke(
+/// Drives a QEMU boot over its QMP control socket (see issue #99): polls the
+/// serial log for the expected kernel-boot marker *and* `query-status`
+/// (bailing out early if QEMU stops running, e.g. a crash or guest
+/// triple-fault) instead of a single blocking call with a fixed timeout, and
+/// quits cleanly once the guest reaches the expected serial output.
+///
+/// `ovmf` is `null` for a Gen1/BIOS boot (SeaBIOS, no `-drive if=pflash`
+/// entries at all -- the raw MBR disk's embedded GRUB boots directly); pass
+/// a firmware pair (with `ovmf_vars_copy_path` pointing at a *writable copy*
+/// of its vars file) for a Gen2/UEFI boot.
+fn runQemuBootSmoke(
     allocator: std.mem.Allocator,
     io: Io,
-    prereqs: QemuBootSmokePrereqs,
+    qemu_path: []const u8,
+    ovmf: ?struct { firmware: OvmfFirmwarePair, vars_copy_path: []const u8 },
     image_path: []const u8,
-    ovmf_vars_copy_path: []const u8,
     serial_output_path: []const u8,
 ) !QemuBootSmokeResult {
     const serial_arg = try std.fmt.allocPrint(allocator, "file:{s}", .{serial_output_path});
     defer allocator.free(serial_arg);
-    const ovmf_code_drive = try std.fmt.allocPrint(
-        allocator,
-        "if=pflash,format=raw,readonly=on,file={s}",
-        .{prereqs.ovmf.code_path},
-    );
-    defer allocator.free(ovmf_code_drive);
-    const ovmf_vars_drive = try std.fmt.allocPrint(
-        allocator,
-        "if=pflash,format=raw,file={s}",
-        .{ovmf_vars_copy_path},
-    );
-    defer allocator.free(ovmf_vars_drive);
     const image_drive = try std.fmt.allocPrint(
         allocator,
         "file={s},format=raw,if=virtio",
@@ -281,26 +319,41 @@ fn runGen2QemuBootSmoke(
     );
     defer allocator.free(image_drive);
 
-    // Drive QEMU over its QMP control socket (via `qmp.spawnAndConnect`)
-    // instead of a single blocking `std.process.run(...).timeout`: this lets
-    // us poll for the guest reaching the expected serial output *or* QEMU
-    // itself stopping running (crash/triple-fault), and quit cleanly on
-    // success, rather than always waiting out a fixed timeout regardless of
-    // how quickly the guest actually finished booting (see issue #99).
+    var ovmf_code_drive: ?[]u8 = null;
+    defer if (ovmf_code_drive) |d| allocator.free(d);
+    var ovmf_vars_drive: ?[]u8 = null;
+    defer if (ovmf_vars_drive) |d| allocator.free(d);
+    if (ovmf) |firmware_pair| {
+        ovmf_code_drive = try std.fmt.allocPrint(
+            allocator,
+            "if=pflash,format=raw,readonly=on,file={s}",
+            .{firmware_pair.firmware.code_path},
+        );
+        ovmf_vars_drive = try std.fmt.allocPrint(
+            allocator,
+            "if=pflash,format=raw,file={s}",
+            .{firmware_pair.vars_copy_path},
+        );
+    }
+
+    var args = std.array_list.Managed([]const u8).init(allocator);
+    defer args.deinit();
+    try args.appendSlice(&.{
+        "-M",         "q35",
+        "-accel",     "tcg",
+        "-m",         "2048",
+        "-display",   "none",
+        "-no-reboot", "-monitor",
+        "none",       "-serial",
+        serial_arg,
+    });
+    if (ovmf_code_drive) |d| try args.appendSlice(&.{ "-drive", d });
+    if (ovmf_vars_drive) |d| try args.appendSlice(&.{ "-drive", d });
+    try args.appendSlice(&.{ "-drive", image_drive });
+
     var spawned = try qmp.spawnAndConnect(allocator, io, .{
-        .binary = prereqs.qemu_path,
-        .extra_args = &.{
-            "-M",            "q35",
-            "-accel",        "tcg",
-            "-m",            "2048",
-            "-display",      "none",
-            "-no-reboot",    "-monitor",
-            "none",          "-serial",
-            serial_arg,      "-drive",
-            ovmf_code_drive, "-drive",
-            ovmf_vars_drive, "-drive",
-            image_drive,
-        },
+        .binary = qemu_path,
+        .extra_args = args.items,
         .stdout = .ignore,
         .stderr = .ignore,
     });
@@ -371,6 +424,8 @@ test "build-image opportunistically boot-smokes a provisioned Gen2 raw image und
 
     var prereqs = try requireQemuBootSmokePrereqs(allocator, io);
     defer prereqs.deinit(allocator);
+    var ovmf = try requireOvmfFirmwarePairAlloc(allocator, io);
+    defer ovmf.deinit(allocator);
 
     const output_path = "test-build-image-qemu-gen2.raw";
     const ovmf_vars_copy_path = "test-build-image-qemu-gen2.OVMF_VARS.fd";
@@ -379,10 +434,6 @@ test "build-image opportunistically boot-smokes a provisioned Gen2 raw image und
     defer Io.Dir.cwd().deleteFile(io, ovmf_vars_copy_path) catch {};
     defer Io.Dir.cwd().deleteFile(io, serial_output_path) catch {};
 
-    // The in-tree synthetic build-image fixture intentionally uses placeholder
-    // EFI, GRUB, kernel, and initramfs bytes, so real QEMU smoke coverage has
-    // to consume provisioned local artifacts. Expand this to Gen1, verity, and
-    // UKI cases once a smaller real-media fixture story exists (see #59 / #51).
     var report = try zvmi.build_image.build(allocator, io, .{
         .iso_path = prereqs.iso_path,
         .container_path = prereqs.oci_path,
@@ -394,14 +445,14 @@ test "build-image opportunistically boot-smokes a provisioned Gen2 raw image und
     });
     defer report.deinit(allocator);
 
-    try copyFileToPath(allocator, io, prereqs.ovmf.vars_path, ovmf_vars_copy_path);
+    try copyFileToPath(allocator, io, ovmf.vars_path, ovmf_vars_copy_path);
 
-    var qemu = try runGen2QemuBootSmoke(
+    var qemu = try runQemuBootSmoke(
         allocator,
         io,
-        prereqs,
+        prereqs.qemu_path,
+        .{ .firmware = ovmf, .vars_copy_path = ovmf_vars_copy_path },
         output_path,
-        ovmf_vars_copy_path,
         serial_output_path,
     );
     defer qemu.deinit(allocator);
@@ -413,4 +464,245 @@ test "build-image opportunistically boot-smokes a provisioned Gen2 raw image und
         );
     }
     try std.testing.expect(serialOutputShowsKernelBoot(qemu.serial_output));
+}
+
+test "build-image opportunistically boot-smokes a provisioned Gen1 BIOS raw image under QEMU" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var prereqs = try requireQemuBootSmokePrereqs(allocator, io);
+    defer prereqs.deinit(allocator);
+
+    const output_path = "test-build-image-qemu-gen1.raw";
+    const serial_output_path = "test-build-image-qemu-gen1.serial.log";
+    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, serial_output_path) catch {};
+
+    // Gen1/BIOS: MBR-partitioned, GRUB embedded in the post-MBR gap. No OVMF
+    // needed -- QEMU's built-in SeaBIOS boots the raw disk's embedded GRUB
+    // directly (see PR #82/#83 for the structural coverage this complements).
+    var report = try zvmi.build_image.build(allocator, io, .{
+        .iso_path = prereqs.iso_path,
+        .container_path = prereqs.oci_path,
+        .output_path = output_path,
+        .output_format = .raw,
+        .generation = .gen1,
+        .size = qemu_boot_smoke_disk_size,
+        .extra_kernel_options = "console=tty0 console=ttyS0,115200n8",
+    });
+    defer report.deinit(allocator);
+
+    var qemu = try runQemuBootSmoke(
+        allocator,
+        io,
+        prereqs.qemu_path,
+        null,
+        output_path,
+        serial_output_path,
+    );
+    defer qemu.deinit(allocator);
+
+    if (!serialOutputShowsKernelBoot(qemu.serial_output)) {
+        std.debug.print(
+            "Gen1 QEMU boot smoke test did not reach kernel serial output (timed_out={}, quit_acknowledged={})\nserial output:\n{s}\n",
+            .{ qemu.timed_out, qemu.quit_acknowledged, qemu.serial_output },
+        );
+    }
+    try std.testing.expect(serialOutputShowsKernelBoot(qemu.serial_output));
+}
+
+test "build-image --boot-mode uki fails fast against a provisioned real ISO/OCI lacking a systemd EFI stub" {
+    // Like --verity (see the test below), stock installer media -- including
+    // the real Azure Linux 4.0 ISO this repo's own boot-smoke fixtures use --
+    // typically doesn't ship the systemd-boot-unsigned package (or
+    // equivalent) that provides the systemd EFI stub UKI generation needs,
+    // so `build-image --boot-mode uki` fails fast with
+    // `error.MissingUkiStub` against such media rather than silently
+    // producing a broken image. No QEMU needed.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var fixtures = try requireIsoOciFixturesAlloc(allocator, io);
+    defer fixtures.deinit(allocator);
+
+    const output_path = "test-build-image-uki-real-media.raw";
+    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
+
+    try std.testing.expectError(error.MissingUkiStub, zvmi.build_image.build(allocator, io, .{
+        .iso_path = fixtures.iso_path,
+        .container_path = fixtures.oci_path,
+        .output_path = output_path,
+        .output_format = .raw,
+        .generation = .gen2,
+        .esp_size = 512 * zvmi.azure.one_mib,
+        .size = qemu_boot_smoke_disk_size + 512 * zvmi.azure.one_mib,
+        .boot_mode = .uki_only,
+    }));
+}
+
+test "build-image --boot-mode uki opportunistically boot-smokes a provisioned stub-providing container under QEMU" {
+    // Like the --verity positive case below, this needs an *extra*,
+    // separately-provisioned fixture beyond the base ISO/OCI: a container
+    // that adds a systemd EFI stub (e.g. linuxx64.efi.stub from the
+    // systemd-boot-unsigned package) into the merged source tree. Skips
+    // (not fails) when ZVMI_BOOT_TEST_UKI_OCI isn't set.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var prereqs = try requireQemuBootSmokePrereqs(allocator, io);
+    defer prereqs.deinit(allocator);
+    var ovmf = try requireOvmfFirmwarePairAlloc(allocator, io);
+    defer ovmf.deinit(allocator);
+
+    const uki_oci_path = try optionalProvisionedBootTestPathAlloc(allocator, io, "ZVMI_BOOT_TEST_UKI_OCI") orelse {
+        std.debug.print(
+            "skipping build-image --boot-mode uki QEMU boot smoke test: set ZVMI_BOOT_TEST_UKI_OCI to an OCI layout providing a systemd EFI stub\n",
+            .{},
+        );
+        return error.SkipZigTest;
+    };
+    defer allocator.free(uki_oci_path);
+
+    const output_path = "test-build-image-qemu-uki.raw";
+    const ovmf_vars_copy_path = "test-build-image-qemu-uki.OVMF_VARS.fd";
+    const serial_output_path = "test-build-image-qemu-uki.serial.log";
+    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, ovmf_vars_copy_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, serial_output_path) catch {};
+
+    var report = try zvmi.build_image.build(allocator, io, .{
+        .iso_path = prereqs.iso_path,
+        .container_path = uki_oci_path,
+        .output_path = output_path,
+        .output_format = .raw,
+        .generation = .gen2,
+        // UKI mode stores the kernel/initrd inside the EFI binary itself, so
+        // it needs a bigger ESP than BLS/GRUB mode -- see README.md's
+        // `--esp-size` note.
+        .esp_size = 512 * zvmi.azure.one_mib,
+        .size = qemu_boot_smoke_disk_size + 512 * zvmi.azure.one_mib,
+        .boot_mode = .uki_only,
+        .extra_kernel_options = "console=tty0 console=ttyS0,115200n8",
+    });
+    defer report.deinit(allocator);
+
+    try copyFileToPath(allocator, io, ovmf.vars_path, ovmf_vars_copy_path);
+
+    var qemu = try runQemuBootSmoke(
+        allocator,
+        io,
+        prereqs.qemu_path,
+        .{ .firmware = ovmf, .vars_copy_path = ovmf_vars_copy_path },
+        output_path,
+        serial_output_path,
+    );
+    defer qemu.deinit(allocator);
+
+    if (!serialOutputShowsKernelBoot(qemu.serial_output)) {
+        std.debug.print(
+            "UKI QEMU boot smoke test did not reach kernel serial output (timed_out={}, quit_acknowledged={})\nserial output:\n{s}\n",
+            .{ qemu.timed_out, qemu.quit_acknowledged, qemu.serial_output },
+        );
+    }
+    try std.testing.expect(serialOutputShowsKernelBoot(qemu.serial_output));
+}
+
+test "build-image --verity fails fast against a provisioned real ISO/OCI whose initramfs lacks verity tooling" {
+    // Regression coverage for issue #77/#91: stock installer media
+    // (including the real Azure Linux 4.0 ISO this repo's own boot-smoke
+    // fixtures use) ships an initramfs built for the *installer*
+    // environment, which has no need for -- and so typically lacks --
+    // dm-verity userspace tooling. `build-image --verity` should fail fast
+    // with `error.InitramfsMissingVerityTooling` against such media instead
+    // of silently producing an image that hangs at boot. No QEMU needed:
+    // this only exercises `zvmi.build_image.build()` itself.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var fixtures = try requireIsoOciFixturesAlloc(allocator, io);
+    defer fixtures.deinit(allocator);
+
+    const output_path = "test-build-image-verity-real-media.raw";
+    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
+
+    try std.testing.expectError(error.InitramfsMissingVerityTooling, zvmi.build_image.build(allocator, io, .{
+        .iso_path = fixtures.iso_path,
+        .container_path = fixtures.oci_path,
+        .output_path = output_path,
+        .output_format = .raw,
+        .generation = .gen2,
+        .size = qemu_boot_smoke_disk_size,
+        .verity = true,
+    }));
+}
+
+test "build-image --verity opportunistically boot-smokes a provisioned verity-capable container under QEMU" {
+    // Unlike the other tests in this file, this one needs an *extra*,
+    // separately-provisioned fixture: an OCI container that overlays a
+    // regenerated initramfs (built with e.g. `dracut --add veritysetup`)
+    // at the same boot/initramfs-<kver>.img path the base ISO/squashfs
+    // rootfs uses -- see README.md's "Producing a verity-capable
+    // initramfs" section. Most dev/CI setups won't have this provisioned,
+    // so this skips (not fails) when ZVMI_BOOT_TEST_VERITY_OCI isn't set,
+    // on top of the usual QEMU/OVMF/ISO prerequisites.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var prereqs = try requireQemuBootSmokePrereqs(allocator, io);
+    defer prereqs.deinit(allocator);
+    var ovmf = try requireOvmfFirmwarePairAlloc(allocator, io);
+    defer ovmf.deinit(allocator);
+
+    const verity_oci_path = try optionalProvisionedBootTestPathAlloc(allocator, io, "ZVMI_BOOT_TEST_VERITY_OCI") orelse {
+        std.debug.print(
+            "skipping build-image --verity QEMU boot smoke test: set ZVMI_BOOT_TEST_VERITY_OCI to an OCI layout overlaying a verity-capable initramfs\n",
+            .{},
+        );
+        return error.SkipZigTest;
+    };
+    defer allocator.free(verity_oci_path);
+
+    const output_path = "test-build-image-qemu-verity.raw";
+    const ovmf_vars_copy_path = "test-build-image-qemu-verity.OVMF_VARS.fd";
+    const serial_output_path = "test-build-image-qemu-verity.serial.log";
+    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, ovmf_vars_copy_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, serial_output_path) catch {};
+
+    var report = try zvmi.build_image.build(allocator, io, .{
+        .iso_path = prereqs.iso_path,
+        .container_path = verity_oci_path,
+        .output_path = output_path,
+        .output_format = .raw,
+        .generation = .gen2,
+        .size = qemu_boot_smoke_disk_size,
+        .verity = true,
+        .extra_kernel_options = "console=tty0 console=ttyS0,115200n8",
+    });
+    defer report.deinit(allocator);
+
+    try copyFileToPath(allocator, io, ovmf.vars_path, ovmf_vars_copy_path);
+
+    var qemu = try runQemuBootSmoke(
+        allocator,
+        io,
+        prereqs.qemu_path,
+        .{ .firmware = ovmf, .vars_copy_path = ovmf_vars_copy_path },
+        output_path,
+        serial_output_path,
+    );
+    defer qemu.deinit(allocator);
+
+    // "Reached target veritysetup.target" is systemd's own confirmation
+    // that the dm-verity root device was set up and mounted (see the real
+    // boot log captured investigating #77); a kernel-boot-only check
+    // wouldn't distinguish a hung/corrupted verity mount from success.
+    const reached_verity_target = std.mem.indexOf(u8, qemu.serial_output, "Reached target veritysetup.target") != null;
+    if (!reached_verity_target) {
+        std.debug.print(
+            "--verity QEMU boot smoke test did not reach veritysetup.target (timed_out={}, quit_acknowledged={})\nserial output:\n{s}\n",
+            .{ qemu.timed_out, qemu.quit_acknowledged, qemu.serial_output },
+        );
+    }
+    try std.testing.expect(reached_verity_target);
 }
