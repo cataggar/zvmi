@@ -207,6 +207,9 @@ fn requireOvmfFirmwarePairAlloc(
 
     const candidates = [_]struct { code: []const u8, vars: []const u8 }{
         .{ .code = "/usr/share/OVMF/OVMF_CODE.fd", .vars = "/usr/share/OVMF/OVMF_VARS.fd" },
+        // Ubuntu's `ovmf` package (e.g. 24.04 "noble") ships only the 4M
+        // variants under these names -- no plain OVMF_CODE.fd/OVMF_VARS.fd.
+        .{ .code = "/usr/share/OVMF/OVMF_CODE_4M.fd", .vars = "/usr/share/OVMF/OVMF_VARS_4M.fd" },
         .{ .code = "/usr/share/edk2/ovmf/OVMF_CODE.fd", .vars = "/usr/share/edk2/ovmf/OVMF_VARS.fd" },
         .{ .code = "/usr/share/edk2/x64/OVMF_CODE.fd", .vars = "/usr/share/edk2/x64/OVMF_VARS.fd" },
     };
