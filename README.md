@@ -91,10 +91,11 @@ zvmi/
   nbd/                      # native Zig NBD client + reference server, MIT
                               #   licensed (see nbd/README.md)
   qcow2/                    # native Zig qcow2 reader/writer, MIT licensed
-                              #   (see qcow2/README.md -- note this is a
-                              #   separate implementation from
-                              #   packages/zvmi/src/qcow2.zig; see that file's
-                              #   note and issue #96 for the overlap)
+                              #   (see qcow2/README.md -- a separate,
+                              #   standalone implementation from
+                              #   packages/zvmi/src/qcow2.zig, kept for its
+                              #   CLI + qemu-img cross-validation
+                              #   methodology; see issue #96)
   tests/
     boot_smoke.zig          # opportunistic real-QEMU boot verification for
                               #   build-image output (Gen1/Gen2, --verity,

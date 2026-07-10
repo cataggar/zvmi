@@ -1,6 +1,6 @@
 //! qcow2 (QEMU copy-on-write v2/v3) support for standalone images, including
-//! backing-file chains, internal snapshot reads, deflate-compressed clusters,
-//! extended L2 entries, and external data files.
+//! backing-file chains, internal snapshot reads, deflate/zstd-compressed
+//! clusters, extended L2 entries, and external data files.
 //!
 //! The on-disk header layout, feature bits, refcount structures, and two-level
 //! L1/L2 guest-cluster mapping implemented here are transcribed from QEMU's
@@ -13,13 +13,12 @@
 //!    `Image.openPath()` so relative paths can be resolved against the qcow2
 //!    file's directory), and writes copy backing-visible cluster contents into
 //!    newly allocated active clusters before applying guest changes.
-//!  - Deflate-compressed clusters are supported for reads, and writes to
-//!    existing compressed clusters transparently inflate them into standard
-//!    data clusters. Emitting new compressed clusters is still deferred;
-//!    zstd-compressed clusters remain unsupported
-//!    (`error.UnsupportedCompressionType`) -- the standalone `qcow2/` package
-//!    at the repo root (a separate, independent qcow2 implementation) does
-//!    support zstd clusters; see issue #96 for the plan to reconcile the two.
+//!  - Deflate- and zstd-compressed clusters (`compression_type` 0 and 1) are
+//!    both supported for reads, and writes to existing compressed clusters
+//!    transparently decompress them into standard data clusters. Emitting new
+//!    compressed clusters of either kind is still deferred. Other
+//!    `compression_type` values are rejected with
+//!    `error.UnsupportedCompressionType`.
 //!  - Internal snapshots can be enumerated with `listSnapshots()`, switched
 //!    for reads with `openSnapshot()`, and created with `createSnapshot()`.
 //!    Active-image writes/resizes honor snapshot refcounts with copy-on-write;
@@ -101,6 +100,7 @@ pub const LookupError = error{
 
 pub const PreadError = LookupError || std.mem.Allocator.Error || Io.File.OpenError || error{
     InvalidCompressedCluster,
+    UnsupportedCompressionType,
 };
 
 pub const CheckError = LookupError || error{
@@ -132,6 +132,7 @@ pub const PwriteError = LookupError || error{
     MissingRefcountBlock,
     RefcountTableTooSmall,
     InvalidCompressedCluster,
+    UnsupportedCompressionType,
 } || std.mem.Allocator.Error || Io.File.OpenError || Io.File.ReadPositionalError || Io.File.WritePositionalError || Io.File.SetLengthError;
 
 pub const ResizeError = error{
@@ -395,7 +396,7 @@ fn parseLayer(file: Io.File, io: Io) OpenError!ParsedLayer {
     if (incompatible_features & ~incompatible_known_mask != 0) {
         return error.UnsupportedIncompatibleFeature;
     }
-    if (incompatible_features & incompatible_compression != 0 or compression_type != 0) {
+    if (compression_type > 1) {
         return error.UnsupportedCompressionType;
     }
     if (incompatible_features & incompatible_extl2 != 0 and cluster_bits < 14) {
@@ -563,7 +564,7 @@ fn preadLayer(
                 if (got < chunk) @memset(buffer[total + got ..][0 .. chunk - got], 0);
             },
             .compressed => {
-                try readCompressedClusterChunk(file, io, info.cluster_size, mapping, buffer[total..][0..chunk], in_cluster_offset);
+                try readCompressedClusterChunk(file, io, info.cluster_size, info.compression_type, mapping, buffer[total..][0..chunk], in_cluster_offset);
             },
             .backing => {
                 if (backing_chain.len == 0) {
@@ -588,6 +589,7 @@ fn readCompressedClusterChunk(
     file: Io.File,
     io: Io,
     cluster_size: u64,
+    compression_type: u8,
     mapping: ClusterMapping,
     out: []u8,
     in_cluster_offset: u32,
@@ -597,14 +599,36 @@ fn readCompressedClusterChunk(
     _ = try file.readPositionalAll(io, compressed, mapping.host_offset.?);
 
     var input = Io.Reader.fixed(compressed);
-    var window: [std.compress.flate.max_window_len]u8 = undefined;
-    var decompressor: std.compress.flate.Decompress = .init(&input, .raw, &window);
     const full_cluster = try std.heap.page_allocator.alloc(u8, @intCast(cluster_size));
     defer std.heap.page_allocator.free(full_cluster);
-    var writer = Io.Writer.fixed(full_cluster);
-    decompressor.reader.streamExact(&writer, @intCast(cluster_size)) catch |err| switch (err) {
-        else => return error.InvalidCompressedCluster,
-    };
+
+    switch (compression_type) {
+        0 => {
+            // Raw deflate (no zlib header). It stops at its end-of-block
+            // marker, so streaming exactly one cluster's worth out is safe
+            // and ignores the trailing sector padding.
+            var window: [std.compress.flate.max_window_len]u8 = undefined;
+            var decompressor: std.compress.flate.Decompress = .init(&input, .raw, &window);
+            var writer = Io.Writer.fixed(full_cluster);
+            decompressor.reader.streamExact(&writer, @intCast(cluster_size)) catch |err| switch (err) {
+                else => return error.InvalidCompressedCluster,
+            };
+        },
+        1 => {
+            // Indirect mode: give the decoder a window buffer sized to the
+            // cluster, then read exactly one cluster out. We must NOT drain
+            // the input, since qcow2 pads the compressed payload to a sector
+            // boundary and reading past the frame would misparse the
+            // trailing padding as a second zstd frame.
+            const wlen: u32 = @intCast(@max(cluster_size, 1));
+            const zbuf = try std.heap.page_allocator.alloc(u8, @as(usize, wlen) + std.compress.zstd.block_size_max);
+            defer std.heap.page_allocator.free(zbuf);
+            var decompressor: std.compress.zstd.Decompress = .init(&input, zbuf, .{ .window_len = wlen });
+            const produced = decompressor.reader.readSliceShort(full_cluster) catch return error.InvalidCompressedCluster;
+            if (produced < full_cluster.len) @memset(full_cluster[produced..], 0);
+        },
+        else => return error.UnsupportedCompressionType,
+    }
     @memcpy(out, full_cluster[in_cluster_offset..][0..out.len]);
 }
 
@@ -2019,6 +2043,69 @@ test "pwrite inflates compressed clusters into standard data clusters" {
     try std.testing.expectEqualSlices(u8, &expected, &buf);
 }
 
+test "pread decompresses zstd-compressed clusters" {
+    const io = std.testing.io;
+    const path = "test-qcow2-zstd-compressed.qcow2";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const cluster_size = try writeZstdCompressedFixture(io, path);
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer file.close(io);
+
+    const info = try open(io, file);
+    try std.testing.expectEqual(@as(u8, 1), info.compression_type);
+    const mapping = try lookupGuestCluster(file, io, info, 0);
+    try std.testing.expectEqual(ClusterKind.compressed, mapping.kind);
+
+    var buf: [256]u8 = undefined;
+    _ = try pread(file, io, info, &buf, 512);
+    try std.testing.expectEqualSlices(u8, &([_]u8{'A'} ** 256), &buf);
+
+    var tail: [64]u8 = undefined;
+    _ = try pread(file, io, info, &tail, cluster_size - tail.len);
+    try std.testing.expectEqualSlices(u8, &([_]u8{'A'} ** 64), &tail);
+}
+
+test "pwrite decompresses zstd-compressed clusters into standard data clusters" {
+    const io = std.testing.io;
+    const path = "test-qcow2-zstd-compressed-write.qcow2";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    _ = try writeZstdCompressedFixture(io, path);
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer file.close(io);
+
+    var info = try open(io, file);
+    try pwrite(file, io, &info, "BLOB", 1024);
+
+    const mapping = try lookupGuestCluster(file, io, info, 0);
+    try std.testing.expectEqual(ClusterKind.standard, mapping.kind);
+
+    var buf: [16]u8 = undefined;
+    _ = try pread(file, io, info, &buf, 1016);
+    var expected = [_]u8{'A'} ** 16;
+    @memcpy(expected[8..12], "BLOB");
+    try std.testing.expectEqualSlices(u8, &expected, &buf);
+}
+
+test "open() rejects an unknown compression_type" {
+    const io = std.testing.io;
+    const path = "test-qcow2-unknown-compression-type.qcow2";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    // Reuse the zstd fixture layout, but with an unrecognized compression
+    // algorithm ID (2) instead of zstd (1). The data doesn't matter since
+    // open() should reject this before any cluster is ever decompressed.
+    const uncompressed = [_]u8{'A'} ** 4096;
+    const compressed = try zstdCompress(std.testing.allocator, &uncompressed);
+    defer std.testing.allocator.free(compressed);
+    _ = try writeCompressedClusterFixture(io, path, 2, compressed);
+
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer file.close(io);
+    try std.testing.expectError(error.UnsupportedCompressionType, open(io, file));
+}
+
 test "listSnapshots enumerates qcow2 snapshot table entries" {
     const io = std.testing.io;
     const path = "test-qcow2-snapshots.qcow2";
@@ -2532,15 +2619,6 @@ fn writeSingleClusterFixture(io: Io, path: []const u8, options: SingleClusterFix
 }
 
 fn writeCompressedFixture(io: Io, path: []const u8) !u64 {
-    const cluster_bits: u32 = 12;
-    const cluster_size: u64 = 1 << cluster_bits;
-    const refcount_table_offset: u64 = 1 * cluster_size;
-    const refcount_block_offset: u64 = 2 * cluster_size;
-    const l1_table_offset: u64 = 3 * cluster_size;
-    const l2_table_offset: u64 = 4 * cluster_size;
-    const data_offset: u64 = 5 * cluster_size;
-    const virtual_size: u64 = cluster_size;
-
     const uncompressed = [_]u8{'A'} ** 4096;
     var out = try std.Io.Writer.Allocating.initCapacity(std.testing.allocator, 128);
     defer out.deinit();
@@ -2550,6 +2628,40 @@ fn writeCompressedFixture(io: Io, path: []const u8) !u64 {
     try compressor.finish();
     const compressed = try out.toOwnedSlice();
     defer std.testing.allocator.free(compressed);
+
+    return writeCompressedClusterFixture(io, path, 0, compressed);
+}
+
+/// Builds a minimal valid zstd frame decompressing to `bytes`, using this
+/// repo's small built-in zstd encoder (`zstd.zig`, already used by
+/// `squashfs.zig`/`cosi.zig` test fixtures for the same reason: Zig's
+/// standard library only ships a zstd *decoder*
+/// (`std.compress.zstd.Decompress`), not an encoder).
+fn zstdCompress(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    const zstd_enc = @import("zstd.zig");
+    var out = try std.Io.Writer.Allocating.initCapacity(allocator, @max(@as(usize, 64), bytes.len));
+    errdefer out.deinit();
+    try zstd_enc.writeFrameForSlice(&out.writer, bytes, null);
+    return out.toOwnedSlice();
+}
+
+fn writeZstdCompressedFixture(io: Io, path: []const u8) !u64 {
+    const uncompressed = [_]u8{'A'} ** 4096;
+    const compressed = try zstdCompress(std.testing.allocator, &uncompressed);
+    defer std.testing.allocator.free(compressed);
+
+    return writeCompressedClusterFixture(io, path, 1, compressed);
+}
+
+fn writeCompressedClusterFixture(io: Io, path: []const u8, compression_type: u8, compressed: []const u8) !u64 {
+    const cluster_bits: u32 = 12;
+    const cluster_size: u64 = 1 << cluster_bits;
+    const refcount_table_offset: u64 = 1 * cluster_size;
+    const refcount_block_offset: u64 = 2 * cluster_size;
+    const l1_table_offset: u64 = 3 * cluster_size;
+    const l2_table_offset: u64 = 4 * cluster_size;
+    const data_offset: u64 = 5 * cluster_size;
+    const virtual_size: u64 = cluster_size;
 
     const stored_bytes = std.mem.alignForward(usize, compressed.len, 512);
     std.debug.assert(stored_bytes <= cluster_size);
@@ -2567,8 +2679,16 @@ fn writeCompressedFixture(io: Io, path: []const u8) !u64 {
     std.mem.writeInt(u64, header[40..48], l1_table_offset, .big);
     std.mem.writeInt(u64, header[48..56], refcount_table_offset, .big);
     std.mem.writeInt(u32, header[56..60], 1, .big);
+    if (compression_type != 0) {
+        std.mem.writeInt(u64, header[72..80], incompatible_compression, .big);
+    }
     std.mem.writeInt(u32, header[96..100], 4, .big);
-    std.mem.writeInt(u32, header[100..104], header_length_v3, .big);
+    if (compression_type != 0) {
+        std.mem.writeInt(u32, header[100..104], header_length_v3 + 1, .big);
+        header[104] = compression_type;
+    } else {
+        std.mem.writeInt(u32, header[100..104], header_length_v3, .big);
+    }
     try file.writePositionalAll(io, &header, 0);
 
     var refcount_table: [4096]u8 = [_]u8{0} ** 4096;
