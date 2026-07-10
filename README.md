@@ -95,6 +95,22 @@ zvmi/
                               #   separate implementation from
                               #   packages/zvmi/src/qcow2.zig; see that file's
                               #   note and issue #96 for the overlap)
+  tests/
+    boot_smoke.zig          # opportunistic real-QEMU boot verification for
+                              #   build-image output (Gen1/Gen2, --verity,
+                              #   --boot-mode uki); driven by qmp, skips
+                              #   gracefully when qemu-system-x86_64, OVMF, or
+                              #   the ZVMI_BOOT_TEST_* fixture env vars aren't
+                              #   available
+  scripts/
+    ci/
+      make-minimal-oci-fixture.py   # builds a tiny from-scratch OCI layout
+                              #   used as the boot-smoke tests' --container
+                              #   fixture in CI
+  .github/
+    workflows/
+      ci.yml                 # build + test (required) and a best-effort
+                              #   real-QEMU boot-smoke job
 ```
 
 ## Requirements
@@ -105,9 +121,23 @@ zvmi/
 
 ```
 zig build            # build the library + the zvmi CLI
-zig build test       # run all tests
+zig build test       # run all tests (boot-smoke tests skip gracefully
+                      #   without qemu-system-x86_64/OVMF/fixtures)
+zig build test-boot-smoke  # run just the real-QEMU boot-smoke tests
 zig build run -- <args>   # run the CLI, e.g. `zig build run -- info foo.vhd`
 ```
+
+## CI
+
+`.github/workflows/ci.yml` runs on every push/PR:
+
+- **`test`** (required): `zig fmt --check`, `zig build`, `zig build test`.
+- **`boot-smoke`** (best-effort, `continue-on-error: true`): installs
+  `qemu-system-x86`/`ovmf` via `apt`, downloads the
+  [Azure Linux 4.0 ISO](https://aka.ms/azurelinux-4.0-x86_64.iso) (cached
+  across runs), builds a minimal OCI fixture with
+  `scripts/ci/make-minimal-oci-fixture.py`, and runs
+  `zig build test-boot-smoke`.
 
 ## Status (Milestone 7)
 

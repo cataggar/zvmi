@@ -1845,10 +1845,6 @@ test "snapshots(): no snapshots returns an empty slice" {
     try std.testing.expectEqual(@as(usize, 0), snaps.len);
 }
 
-
-
-
-
 test "openSnapshot(): reads distinct data from active vs. snapshot L1 tables" {
     const io = std.testing.io;
     const a = std.testing.allocator;
