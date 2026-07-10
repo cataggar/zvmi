@@ -45,7 +45,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
             var writer = std.Io.Writer.fixed(&buf);
             std.json.Stringify.value(.{
                 .filename = file_path,
-                .@"format" = stat.format.displayName(),
+                .format = stat.format.displayName(),
                 .@"virtual-size" = stat.virtual_size,
                 .@"actual-size" = stat.file_size,
                 .subformat = if (stat.subformat) |sf| (if (sf == .fixed) "fixed" else "dynamic") else null,
