@@ -2,8 +2,8 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const initramfs_mod = b.addModule("initramfs", .{
-        .root_source_file = b.path("../../../packages/zvmi/src/initramfs.zig"),
+    const cpio_mod = b.addModule("cpio", .{
+        .root_source_file = b.path("../../../packages/zvmi/src/cpio.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -13,7 +13,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("main.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "initramfs", .module = initramfs_mod }},
+            .imports = &.{.{ .name = "cpio", .module = cpio_mod }},
         }),
     });
     b.installArtifact(exe);
