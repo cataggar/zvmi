@@ -312,6 +312,7 @@ fn runQemuBootSmoke(
     ovmf: ?struct { firmware: OvmfFirmwarePair, vars_copy_path: []const u8 },
     image_path: []const u8,
     serial_output_path: []const u8,
+    extra_wait_marker: ?[]const u8,
 ) !QemuBootSmokeResult {
     const serial_arg = try std.fmt.allocPrint(allocator, "file:{s}", .{serial_output_path});
     defer allocator.free(serial_arg);
@@ -367,7 +368,13 @@ fn runQemuBootSmoke(
 
     while (Io.Clock.awake.now(io).nanoseconds < deadline.nanoseconds) {
         const serial_output = try readOptionalFileAlloc(allocator, io, serial_output_path, qemu_boot_smoke_serial_limit);
-        const reached_boot = serialOutputShowsKernelBoot(serial_output);
+        // The kernel starting to boot is enough for most callers, but a few
+        // (e.g. the --verity real-boot test) need to keep polling until a
+        // later milestone (e.g. "Reached target veritysetup.target") shows
+        // up too -- otherwise this would quit QEMU the instant the kernel
+        // starts printing, long before systemd/dm-verity ever run.
+        const reached_boot = serialOutputShowsKernelBoot(serial_output) and
+            (extra_wait_marker == null or std.mem.indexOf(u8, serial_output, extra_wait_marker.?) != null);
         allocator.free(serial_output);
 
         if (reached_boot) {
@@ -457,6 +464,7 @@ test "build-image opportunistically boot-smokes a provisioned Gen2 raw image und
         .{ .firmware = ovmf, .vars_copy_path = ovmf_vars_copy_path },
         output_path,
         serial_output_path,
+        null,
     );
     defer qemu.deinit(allocator);
 
@@ -502,6 +510,7 @@ test "build-image opportunistically boot-smokes a provisioned Gen1 BIOS raw imag
         null,
         output_path,
         serial_output_path,
+        null,
     );
     defer qemu.deinit(allocator);
 
@@ -598,6 +607,7 @@ test "build-image --boot-mode uki opportunistically boot-smokes a provisioned st
         .{ .firmware = ovmf, .vars_copy_path = ovmf_vars_copy_path },
         output_path,
         serial_output_path,
+        null,
     );
     defer qemu.deinit(allocator);
 
@@ -704,6 +714,7 @@ test "build-image --verity opportunistically boot-smokes a provisioned verity-ca
         .{ .firmware = ovmf, .vars_copy_path = ovmf_vars_copy_path },
         output_path,
         serial_output_path,
+        "Reached target veritysetup.target",
     );
     defer qemu.deinit(allocator);
 
