@@ -83,14 +83,17 @@ sudo chroot "$work/rootfs" /usr/bin/tdnf install -y dracut veritysetup systemd
 # 102-13.azl3 and this ISO's 4.0 107-9.azl4): `dracut --list-modules` only
 # ever lists `systemd-veritysetup` (see modules.d/01systemd-veritysetup).
 echo "running dracut --add systemd-veritysetup for kernel $kver"
-# --no-hostonly is essential here: dracut (seeing the *invoking host's* real
-# hardware via the bind-mounted /proc/sys, not the eventual QEMU boot-smoke
-# guest's virtual hardware) would otherwise default to including only
-# drivers relevant to the CI runner itself, silently dropping storage/
-# console drivers the QEMU guest actually needs and hanging very early at
-# boot -- the same reason README.md's cross-architecture recipe already
-# uses --no-hostonly.
-sudo chroot "$work/rootfs" /usr/bin/dracut --no-hostonly --add systemd-veritysetup --force --kver "$kver" "/tmp/initramfs-verity.img"
+# --force-drivers is essential here: dracut (seeing the *invoking host's*
+# real hardware via the bind-mounted /proc/sys, not the eventual QEMU
+# boot-smoke guest's virtio-blk/virtio-pci virtual hardware) would otherwise
+# hostonly-detect only drivers relevant to the CI runner itself, silently
+# dropping the storage driver the QEMU guest actually needs and hanging
+# very early at boot before the root device is even found. Explicitly
+# forcing in the small set of virtio drivers QEMU emulates (rather than
+# --no-hostonly, which pulls in every available driver and produces a
+# ~70+ MiB initramfs that trips oci.zig's 64 MiB max_blob_size guard) keeps
+# the initramfs close to its original, hostonly-trimmed size.
+sudo chroot "$work/rootfs" /usr/bin/dracut --force-drivers "virtio_pci virtio_blk virtio_scsi" --add systemd-veritysetup --force --kver "$kver" "/tmp/initramfs-verity.img"
 
 mkdir -p "$(dirname "$out_initramfs")"
 sudo cp "$work/rootfs/tmp/initramfs-verity.img" "$out_initramfs"
