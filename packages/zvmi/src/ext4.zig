@@ -1001,6 +1001,19 @@ const EditGroupState = struct {
     used_dir_count: u32,
     block_bitmap_block: u32,
     inode_bitmap_block: u32,
+    /// `bg_itable_unused`, preserved byte-for-byte from the original image.
+    /// This counts inode-table slots at the *tail* of the group that have
+    /// never been written at all (letting e2fsck skip scanning them) --
+    /// it is only ever correct to compute fresh from
+    /// `inodes_per_group - used_inode_count` when usage is guaranteed
+    /// contiguous from index 0, which is only true for a brand-new
+    /// populate()/resize() layout. Editor only ever deletes/overwrites
+    /// existing entries (never allocates a new inode), so this count can
+    /// never legitimately change during an edit session and must be
+    /// carried through unmodified -- recomputing it from the live
+    /// (post-deletion, holey) used_inode_count would make e2fsck treat
+    /// still-valid inodes in the middle of the range as uninitialized.
+    itable_unused: u16,
 };
 
 fn bitTest(bitmap: []const u8, index: u32) bool {
@@ -1095,6 +1108,7 @@ pub const Editor = struct {
             const free_blocks = readInt(u16, gdt[desc_base + 12 .. desc_base + 14]);
             const free_inodes = readInt(u16, gdt[desc_base + 14 .. desc_base + 16]);
             const used_dirs = readInt(u16, gdt[desc_base + 16 .. desc_base + 18]);
+            const itable_unused = readInt(u16, gdt[desc_base + 0x1C .. desc_base + 0x1E]);
             const data_capacity = block_count - reserved_block_count;
 
             block_bitmaps[group_index] = try allocator.alloc(u8, reader.block_size);
@@ -1112,6 +1126,7 @@ pub const Editor = struct {
                 .used_dir_count = used_dirs,
                 .block_bitmap_block = rgroup.block_bitmap_block,
                 .inode_bitmap_block = rgroup.inode_bitmap_block,
+                .itable_unused = itable_unused,
             };
         }
 
@@ -1172,7 +1187,9 @@ pub const Editor = struct {
                 writeInt(u16, desc[16..18], @intCast(group.used_dir_count));
                 writeInt(u16, desc[0x18..0x1A], @truncate(bitmapChecksum(self.reader.uuid, self.block_bitmaps[index], default_blocks_per_group / 8)));
                 writeInt(u16, desc[0x1A..0x1C], @truncate(bitmapChecksum(self.reader.uuid, self.inode_bitmaps[index], self.reader.inodes_per_group / 8)));
-                writeInt(u16, desc[0x1C..0x1E], @intCast(self.reader.inodes_per_group - group.used_inode_count));
+                // Deliberately *not* recomputed from used_inode_count -- see
+                // EditGroupState.itable_unused's doc comment.
+                writeInt(u16, desc[0x1C..0x1E], group.itable_unused);
                 writeInt(u16, desc[0x1E..0x20], 0);
                 var group_le = std.mem.nativeToLittle(u32, @as(u32, @intCast(index)));
                 writeInt(u16, desc[0x1E..0x20], @truncate(ext4Crc32c(&.{
@@ -4526,6 +4543,138 @@ test "Editor.flush keeps sparse-super backup superblocks and GDT copies in sync 
     const kept = try reader.readFileAlloc(io, std.testing.allocator, "b.txt");
     defer std.testing.allocator.free(kept);
     try std.testing.expectEqualSlices(u8, "B", kept);
+}
+
+/// Runs `e2fsck -f -n` against a real on-disk image, trying a few common
+/// install locations since e2fsprogs's sbin binaries often aren't on an
+/// unprivileged user's PATH even when installed (this repo's CI runs on
+/// ubuntu-latest, which ships e2fsprogs by default). Returns `null`
+/// (rather than failing) when it truly can't be found anywhere, so this
+/// opportunistic external-tool check is skipped gracefully instead of
+/// breaking builds/dev machines that lack it -- matching the pattern
+/// `tests/boot_smoke.zig` uses for qemu-system-x86_64.
+fn runE2fsck(allocator: std.mem.Allocator, path: []const u8) !?std.process.RunResult {
+    const candidates = [_][]const u8{ "e2fsck", "/sbin/e2fsck", "/usr/sbin/e2fsck" };
+    for (candidates) |bin| {
+        const result = std.process.run(allocator, std.testing.io, .{
+            .argv = &.{ bin, "-f", "-n", path },
+            .cwd = .{ .path = "." },
+        }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        return result;
+    }
+    return null;
+}
+
+test "Editor edits (deletes, recursive tree removal, and overwrite) pass a real e2fsck -f check" {
+    const io = std.testing.io;
+    const path = "test-ext4-editor-e2fsck.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var entries = std.array_list.Managed(InMemoryEntry).init(std.testing.allocator);
+    defer entries.deinit();
+    try entries.append(.{ .path = "etc", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 });
+    try entries.append(.{
+        .path = "etc/keep.conf",
+        .kind = .file,
+        .mode = 0o644,
+        .uid = 0,
+        .gid = 0,
+        .size = 4,
+        .bytes = "keep",
+    });
+    try entries.append(.{ .path = "etc/remove.conf", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 6, .bytes = "remove" });
+    try entries.append(.{ .path = "var", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 });
+    try entries.append(.{ .path = "var/log", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 });
+    try entries.append(.{ .path = "var/log/app.log", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 3, .bytes = "log" });
+    try entries.append(.{ .path = "doomed", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 });
+    try entries.append(.{ .path = "doomed/nested", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 });
+    try entries.append(.{ .path = "doomed/nested/file.txt", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 4, .bytes = "data" });
+    try entries.append(.{ .path = "doomed/link", .kind = .symlink, .mode = 0o777, .uid = 0, .gid = 0, .size = 4, .bytes = "keep" });
+    // Multi-extent (2 extents, crossing one group boundary) but deliberately
+    // *not* deep enough to need an extent-tree index block (issue #115
+    // tracks a separate, pre-existing populate() bug in the interior extent
+    // block checksum for depth > 0 trees, unrelated to editing).
+    try entries.append(.{ .path = "big.bin", .kind = .file, .mode = 0o600, .uid = 42, .gid = 24, .size = 150 * 1024 * 1024, .generator = .pattern });
+    try entries.append(.{ .path = "many", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 });
+    var names: [300][20]u8 = undefined;
+    var name_index: usize = 0;
+    while (name_index < 300) : (name_index += 1) {
+        const name = try std.fmt.bufPrint(&names[name_index], "many/file-{d:0>3}", .{name_index});
+        try entries.append(.{ .path = name, .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 0 });
+    }
+
+    var tree = InMemoryTree.init(entries.items);
+    tree.bind();
+
+    const fs_size: u64 = 900 * 1024 * 1024;
+    {
+        const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+        defer file.close(io);
+        _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = fs_size, .uuid = [_]u8{0x60} ** 16 });
+
+        var editor = try Editor.open(io, file, std.testing.allocator, .{});
+        defer editor.deinit();
+
+        try editor.deleteFile(io, "etc/remove.conf");
+        try editor.deleteTree(io, "doomed");
+
+        var remove_index: usize = 1;
+        while (remove_index < 300) : (remove_index += 2) {
+            var buf: [20]u8 = undefined;
+            const name = try std.fmt.bufPrint(&buf, "many/file-{d:0>3}", .{remove_index});
+            try editor.deleteFile(io, name);
+        }
+
+        var grown: [10 * 1024]u8 = undefined;
+        fillPattern(&grown, 0);
+        try editor.writeFile(io, "etc/keep.conf", &grown);
+
+        try editor.flush(io);
+    }
+
+    const maybe_result = try runE2fsck(std.testing.allocator, path);
+    const result = maybe_result orelse {
+        std.debug.print("skipping e2fsck validation: e2fsck not found (tried PATH, /sbin, /usr/sbin)\n", .{});
+        return error.SkipZigTest;
+    };
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    switch (result.term) {
+        .exited => |code| {
+            if (code != 0) {
+                std.debug.print("e2fsck -f -n reported problems (exit {d}):\nstdout:\n{s}\nstderr:\n{s}\n", .{ code, result.stdout, result.stderr });
+            }
+            try std.testing.expectEqual(@as(u8, 0), code);
+        },
+        else => {
+            std.debug.print("e2fsck did not exit normally:\nstdout:\n{s}\nstderr:\n{s}\n", .{ result.stdout, result.stderr });
+            return error.TestUnexpectedResult;
+        },
+    }
+
+    // Also confirm the edits themselves are still correct from zvmi's own
+    // Reader, independent of e2fsck's own verdict.
+    const reopened_file = try Io.Dir.cwd().openFile(io, path, .{});
+    defer reopened_file.close(io);
+    var reader = try open(io, reopened_file, std.testing.allocator, .{});
+    defer reader.deinit();
+
+    try std.testing.expectError(error.NotFound, reader.statPath(io, "etc/remove.conf"));
+    try std.testing.expectError(error.NotFound, reader.statPath(io, "doomed"));
+
+    const kept = try reader.readFileAlloc(io, std.testing.allocator, "etc/keep.conf");
+    defer std.testing.allocator.free(kept);
+    var expected_kept: [10 * 1024]u8 = undefined;
+    fillPattern(&expected_kept, 0);
+    try std.testing.expectEqualSlices(u8, &expected_kept, kept);
+
+    const remaining = try reader.listDir(io, std.testing.allocator, "many");
+    defer freeDirEntries(std.testing.allocator, remaining);
+    try std.testing.expectEqual(@as(usize, 150), remaining.len);
 }
 
 const InMemoryEntry = struct {
