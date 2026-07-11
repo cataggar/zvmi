@@ -104,13 +104,6 @@ jobs:
             echo "::warning::build-verity-initramfs-fixture.sh failed; ZVMI_BOOT_TEST_VERITY_OCI won't be set, so the --verity boot-smoke test will skip"
           fi
 
-      # TEMPORARY debugging aid for issue #105 -- remove before merging.
-      - name: DEBUG check verity tooling detection
-        continue-on-error: true
-        run: |
-          cd scripts/ci/.debug-verity-check
-          zig build run -- "${GITHUB_WORKSPACE}/fixtures/verity-initramfs.img"
-
       - name: zig build test-boot-smoke
         env:
           ZVMI_BOOT_TEST_ISO: ${{ github.workspace }}/fixtures/azurelinux-4.0-x86_64.iso

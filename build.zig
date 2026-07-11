@@ -95,18 +95,15 @@ pub fn build(b: *std.Build) void {
     // ---- tests/boot_smoke.zig: opportunistic real-QEMU boot verification,
     // driving zvmi.build_image.build() output with qmp. Lives outside
     // packages/zvmi since it needs both zvmi and qmp -- see issue #99. ----
-    const boot_smoke_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/boot_smoke.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "zvmi", .module = zvmi_mod },
-                .{ .name = "qmp", .module = qmp_mod },
-            },
-        }),
-        .filters = &.{"opportunistically boot-smokes a provisioned verity-capable container"},
-    });
+    const boot_smoke_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("tests/boot_smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zvmi", .module = zvmi_mod },
+            .{ .name = "qmp", .module = qmp_mod },
+        },
+    }) });
     const run_boot_smoke_tests = b.addRunArtifact(boot_smoke_tests);
     const boot_smoke_step = b.step("test-boot-smoke", "Run opportunistic real-QEMU boot-smoke tests");
     boot_smoke_step.dependOn(&run_boot_smoke_tests.step);

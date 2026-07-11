@@ -682,27 +682,24 @@ test "build-image --verity opportunistically boot-smokes a provisioned verity-ca
     defer Io.Dir.cwd().deleteFile(io, ovmf_vars_copy_path) catch {};
     defer Io.Dir.cwd().deleteFile(io, serial_output_path) catch {};
 
-    var report = zvmi.build_image.build(allocator, io, .{
+    var report = try zvmi.build_image.build(allocator, io, .{
         .iso_path = prereqs.iso_path,
         .container_path = verity_oci_path,
         .output_path = output_path,
         .output_format = .raw,
         .generation = .gen2,
-        // A --no-hostonly-regenerated verity-capable initramfs (see
-        // scripts/ci/build-verity-initramfs-fixture.sh) is much bigger than
-        // the stock one -- --no-hostonly deliberately includes a broad,
-        // hardware-independent driver set rather than just what the build
-        // host itself needs, so it reliably boots on whatever virtual
-        // hardware QEMU emulates for this test. The default 96 MiB ESP
-        // (sized for a hostonly-trimmed initramfs) isn't big enough for it.
+        // The --force-drivers-regenerated verity-capable initramfs (see
+        // scripts/ci/build-verity-initramfs-fixture.sh) is a bit bigger
+        // than the stock one (it force-includes virtio storage + dm-verity
+        // driver modules dracut's hostonly detection would otherwise miss,
+        // seeing the CI runner's own hardware instead of the eventual QEMU
+        // boot-smoke guest's). The default 96 MiB ESP has margin to spare
+        // but this keeps it comfortably sized regardless.
         .esp_size = 512 * zvmi.azure.one_mib,
         .size = qemu_boot_smoke_disk_size + 512 * zvmi.azure.one_mib,
         .verity = true,
         .extra_kernel_options = "console=tty0 console=ttyS0,115200n8",
-    }) catch |err| {
-        std.debug.print("DEBUG build_image.build error: {s}\n", .{@errorName(err)});
-        return err;
-    };
+    });
     defer report.deinit(allocator);
 
     try copyFileToPath(allocator, io, ovmf.vars_path, ovmf_vars_copy_path);
