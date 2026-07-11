@@ -40,8 +40,9 @@ zvmi/
                               #   compressed blocks)
         oci.zig                # local OCI/docker-save image ingestion
                               #   (layer extraction + whiteout-aware merge)
-        ext4.zig              # minimal native ext4 writer + readback helper
-                              #   (no journal, linear dirs, inline extents)
+        ext4.zig              # native ext4 writer + readback helper (htree
+                              #   dirs, metadata checksums, extent trees,
+                              #   offline resize; no journal)
         bootconfig.zig         # ESP bootloader population (copy EFI binaries
                               #   + Secure Boot MOK/UKI orchestration)
         uki.zig                # low-level UKI/systemd-stub PE section
@@ -228,7 +229,7 @@ layout, CRC-32C checksums, the BAT chunk-ratio interleaving formula, and the
 create-path metadata layout) plus writable round-trip tests exercised through
 both `zvmi.vhdx` and the full `Image` API in the test suite.
 
-Phase-1 ext4 lives at `zvmi.ext4`. The writer entry point is:
+ext4 support lives at `zvmi.ext4`. The writer entry point is:
 
 ```zig
 try zvmi.ext4.populate(io, file, allocator, &tree, .{
@@ -243,10 +244,16 @@ try zvmi.ext4.populate(io, file, allocator, &tree, .{
 `next()` yields a relative path plus `{ kind, mode, uid, gid, size }` and an
 optional `content.readAt(buffer, offset)` callback for regular files and
 symlinks. Paths are relative to the ext4 root; the root directory itself is
-implicit. The phase-1 writer emits no journal, no dir_index/htree, and no
-metadata checksums; it writes linear directory blocks plus inline extents in
-each inode. The paired reader API can `statPath`, `listDir`, `preadPath`,
-`readExtents`, and `readLinkAlloc` for round-trip verification.
+implicit. The writer emits `DIR_INDEX` htree directories (with interior
+index nodes once a directory outgrows a single root index block),
+`METADATA_CSUM` crc32c checksums on bitmaps/GDTs/superblocks/inodes/
+directory leaf blocks/xattr blocks, and extent trees (inline for small
+files, spilling into real extent/index blocks up to depth 4 for larger or
+fragmented ones); it deliberately ships without a journal or quota files,
+since the target image-build flow creates filesystems offline and writes
+them atomically. `resize()` supports offline, in-place growth. The paired
+reader API can `statPath`, `listDir`, `preadPath`, `readExtents`, and
+`readLinkAlloc` for round-trip verification.
 
 Bootloader population lives at `zvmi.bootconfig`. It reuses the exact same
 `FileTreeView` shape as `zvmi.ext4`, so future orchestration can drive rootfs
