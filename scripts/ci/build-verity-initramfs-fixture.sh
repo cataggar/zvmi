@@ -53,7 +53,10 @@ bsdtar -C "$work" -xf "$iso_path" LiveOS/squashfs.img
 # image (LiveOS/rootfs.img); mount it to pull that image out, since we need
 # a writable copy for tdnf/dracut to operate on.
 sudo mount -o loop,ro "$work/LiveOS/squashfs.img" "$work/squash"
-cp --sparse=always "$work/squash/LiveOS/rootfs.img" "$work/rootfs.img"
+# The nested image is root-only readable (mode 0600) inside the squashfs,
+# so plain `cp` as the invoking (non-root) user fails with EACCES.
+sudo cp --sparse=always "$work/squash/LiveOS/rootfs.img" "$work/rootfs.img"
+sudo chown "$(id -u):$(id -g)" "$work/rootfs.img"
 sudo umount "$work/squash"
 
 sudo mount -o loop "$work/rootfs.img" "$work/rootfs"
