@@ -667,6 +667,10 @@ pub const Reader = struct {
     pub fn listDir(self: Reader, io: Io, allocator: std.mem.Allocator, path: []const u8) ReadError![]DirEntry {
         const inode_number = try self.lookupPath(io, path);
         const inode = try self.readInode(io, inode_number);
+        return self.listDirByInode(io, allocator, inode);
+    }
+
+    fn listDirByInode(self: Reader, io: Io, allocator: std.mem.Allocator, inode: ParsedInode) ReadError![]DirEntry {
         if (inode.kind != .directory) return error.NotDirectory;
 
         const data = try self.readInodeDataAlloc(io, allocator, inode);
@@ -986,6 +990,7 @@ const ParsedInode = struct {
     generation: u32,
     flags: u32,
     file_acl_block: u32,
+    link_count: u16,
     block_bytes: [60]u8,
 
     fn fromBytes(inode_number: u32, buf: []const u8) ReadError!ParsedInode {
@@ -1003,6 +1008,7 @@ const ParsedInode = struct {
             .generation = readInt(u32, buf[100..104]),
             .flags = readInt(u32, buf[32..36]),
             .file_acl_block = readInt(u32, buf[104..108]),
+            .link_count = readInt(u16, buf[26..28]),
             .block_bytes = block_bytes,
         };
     }
@@ -2941,6 +2947,42 @@ test "reader rejects missing paths and wrong node kinds" {
     try std.testing.expectError(error.NotFound, reader.statPath(io, "missing"));
     try std.testing.expectError(error.NotDirectory, reader.listDir(io, std.testing.allocator, "dir/file"));
     try std.testing.expectError(error.NotFile, reader.readFileAlloc(io, std.testing.allocator, "dir"));
+}
+
+test "reader exposes inode link counts" {
+    const io = std.testing.io;
+    const path = "test-ext4-link-count.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "empty-dir", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "parent", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "parent/child", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "file", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 4, .bytes = "test" },
+    });
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = 8 * 1024 * 1024 });
+
+    var reader = try open(io, file, std.testing.allocator, .{});
+    defer reader.deinit();
+
+    // A regular file always has link_count == 1 (this writer never creates hardlinks).
+    const file_inode_number = try reader.lookupPath(io, "file");
+    const file_inode = try reader.readInode(io, file_inode_number);
+    try std.testing.expectEqual(@as(u16, 1), file_inode.link_count);
+
+    // A directory with no subdirectories has link_count == 2 (its own "." plus the parent's entry).
+    const empty_dir_number = try reader.lookupPath(io, "empty-dir");
+    const empty_dir_inode = try reader.readInode(io, empty_dir_number);
+    try std.testing.expectEqual(@as(u16, 2), empty_dir_inode.link_count);
+
+    // A directory with one subdirectory gains one extra link from that child's "..".
+    const parent_number = try reader.lookupPath(io, "parent");
+    const parent_inode = try reader.readInode(io, parent_number);
+    try std.testing.expectEqual(@as(u16, 3), parent_inode.link_count);
 }
 
 test "reader opens read-only-safe 64-byte group descriptor ext4 images" {
