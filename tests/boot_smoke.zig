@@ -678,7 +678,15 @@ test "build-image --verity opportunistically boot-smokes a provisioned verity-ca
         .output_path = output_path,
         .output_format = .raw,
         .generation = .gen2,
-        .size = qemu_boot_smoke_disk_size,
+        // A --no-hostonly-regenerated verity-capable initramfs (see
+        // scripts/ci/build-verity-initramfs-fixture.sh) is much bigger than
+        // the stock one -- --no-hostonly deliberately includes a broad,
+        // hardware-independent driver set rather than just what the build
+        // host itself needs, so it reliably boots on whatever virtual
+        // hardware QEMU emulates for this test. The default 96 MiB ESP
+        // (sized for a hostonly-trimmed initramfs) isn't big enough for it.
+        .esp_size = 512 * zvmi.azure.one_mib,
+        .size = qemu_boot_smoke_disk_size + 512 * zvmi.azure.one_mib,
         .verity = true,
         .extra_kernel_options = "console=tty0 console=ttyS0,115200n8",
     });
