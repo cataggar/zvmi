@@ -93,7 +93,17 @@ echo "running dracut --add systemd-veritysetup for kernel $kver"
 # --no-hostonly, which pulls in every available driver and produces a
 # ~70+ MiB initramfs that trips oci.zig's 64 MiB max_blob_size guard) keeps
 # the initramfs close to its original, hostonly-trimmed size.
-sudo chroot "$work/rootfs" /usr/bin/dracut --force-drivers "virtio_pci virtio_blk virtio_scsi" --add systemd-veritysetup --force --kver "$kver" "/tmp/initramfs-verity.img"
+#
+# dm-verity also needs forcing in for the same hostonly-detection reason:
+# the systemd-veritysetup dracut module only pulls in the actual dm-verity
+# *target* kernel module (dm-verity, registering the "verity" device-mapper
+# target type) when hostonly mode also detects real dm-verity usage on the
+# *build host* -- which it never will here, since the CI runner obviously
+# isn't itself booted with --verity. Without it, device-mapper's core still
+# loads fine (dm_mod), but `systemd-veritysetup@root.service` fails with
+# "verity: unknown target type" / "error adding target to table" the moment
+# it tries to actually create the verity-protected root device.
+sudo chroot "$work/rootfs" /usr/bin/dracut --force-drivers "virtio_pci virtio_blk virtio_scsi dm-verity" --add systemd-veritysetup --force --kver "$kver" "/tmp/initramfs-verity.img"
 
 mkdir -p "$(dirname "$out_initramfs")"
 sudo cp "$work/rootfs/tmp/initramfs-verity.img" "$out_initramfs"
