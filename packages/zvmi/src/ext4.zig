@@ -1216,6 +1216,170 @@ pub const Editor = struct {
         try self.flush(io);
         self.deinit();
     }
+
+    /// Marks one physical data block free in its group's live bitmap, if it
+    /// was actually marked used. Safe to call more than once for the same
+    /// block (a double-free is a silent no-op rather than an error, since
+    /// callers may legitimately re-encounter a block while walking an
+    /// extent tree that happens to alias metadata, e.g. a reused xattr
+    /// block referenced from more than one place is not something this
+    /// writer ever produces, but this keeps the mutator defensive).
+    fn freeBlock(self: *Editor, physical_block: u64) void {
+        const group_index: usize = @intCast(physical_block / self.reader.blocks_per_group);
+        const group = &self.groups[group_index];
+        const bit_index: u32 = @intCast(physical_block - group.start_block);
+        const bitmap = self.block_bitmaps[group_index];
+        if (bitTest(bitmap, bit_index)) {
+            bitClear(bitmap, bit_index);
+            group.used_data_blocks -= 1;
+            self.group_dirty[group_index] = true;
+            self.sb_dirty = true;
+        }
+    }
+
+    /// Allocates `block_count` data blocks, greedily preferring contiguous
+    /// runs within a group to minimize the resulting extent count (mirrors
+    /// the populate-time `BlockAllocator`, but scans a live bitmap with
+    /// holes instead of bump-allocating from an empty group). On
+    /// `error.NotEnoughSpace`, any blocks already claimed by this call are
+    /// rolled back before returning.
+    fn allocateExtents(self: *Editor, allocator: std.mem.Allocator, block_count: u32) EditError![]Extent {
+        var extents = std.array_list.Managed(Extent).init(allocator);
+        errdefer extents.deinit();
+        var remaining = block_count;
+        var logical: u32 = 0;
+
+        for (self.groups, 0..) |*group, group_index| {
+            if (remaining == 0) break;
+            if (group.used_data_blocks >= group.data_capacity) continue;
+
+            const bitmap = self.block_bitmaps[group_index];
+            var bit_index: u32 = 0;
+            while (bit_index < group.block_count and remaining > 0) {
+                if (bitTest(bitmap, bit_index)) {
+                    bit_index += 1;
+                    continue;
+                }
+                const run_start = bit_index;
+                var run_len: u32 = 0;
+                while (bit_index < group.block_count and run_len < remaining and !bitTest(bitmap, bit_index)) : (bit_index += 1) {
+                    run_len += 1;
+                }
+                var i = run_start;
+                while (i < run_start + run_len) : (i += 1) setBitmapBit(bitmap, i);
+                group.used_data_blocks += run_len;
+                self.group_dirty[group_index] = true;
+                self.sb_dirty = true;
+                try extents.append(.{
+                    .logical_block = logical,
+                    .start_block = group.start_block + run_start,
+                    .block_count = @intCast(run_len),
+                });
+                logical += run_len;
+                remaining -= run_len;
+            }
+        }
+
+        if (remaining > 0) {
+            for (extents.items) |extent| {
+                var n: u16 = 0;
+                while (n < extent.block_count) : (n += 1) self.freeBlock(extent.start_block + n);
+            }
+            extents.deinit();
+            return error.NotEnoughSpace;
+        }
+        return extents.toOwnedSlice();
+    }
+
+    /// Marks one inode free in its group's live inode bitmap, if it was
+    /// actually marked used, and decrements the group's directory count too
+    /// when `is_dir` is set.
+    fn freeInodeBit(self: *Editor, inode_number: u32, is_dir: bool) void {
+        const group_index: usize = (inode_number - 1) / self.reader.inodes_per_group;
+        const index_in_group: u32 = @intCast((inode_number - 1) % self.reader.inodes_per_group);
+        const group = &self.groups[group_index];
+        const bitmap = self.inode_bitmaps[group_index];
+        if (bitTest(bitmap, index_in_group)) {
+            bitClear(bitmap, index_in_group);
+            group.used_inode_count -= 1;
+            if (is_dir and group.used_dir_count > 0) group.used_dir_count -= 1;
+            self.group_dirty[group_index] = true;
+            self.sb_dirty = true;
+        }
+    }
+
+    /// Recursively walks an extent tree exactly like the Reader's
+    /// `appendExtentTreeEntries`, but collects both the leaf extents' data
+    /// blocks *and* every interior/index node's own physical block number,
+    /// since deleting or truncating an inode must free the extent-tree
+    /// metadata blocks too, not just the data they describe.
+    fn collectExtentTreeBlocks(
+        self: *Editor,
+        io: Io,
+        node_bytes: []const u8,
+        node_capacity: usize,
+        expected_depth: ?u16,
+        leaf_extents: *std.array_list.Managed(Extent),
+        index_blocks: *std.array_list.Managed(u64),
+    ) EditError!void {
+        const header = try parseExtentHeader(node_bytes[0..extent_header_size]);
+        if (expected_depth) |depth| {
+            if (header.depth != depth) return error.UnsupportedInodeLayout;
+        }
+        if (header.depth > max_supported_extent_depth) return error.UnsupportedExtentDepth;
+        if (header.entries > header.max or header.max > node_capacity) return error.UnsupportedInodeLayout;
+
+        var entry_index: usize = 0;
+        if (header.depth == 0) {
+            while (entry_index < header.entries) : (entry_index += 1) {
+                const base = extent_header_size + entry_index * extent_entry_size;
+                try leaf_extents.append(decodeExtent(node_bytes[base .. base + extent_entry_size]));
+            }
+            return;
+        }
+
+        var child_block: [default_block_size]u8 = undefined;
+        while (entry_index < header.entries) : (entry_index += 1) {
+            const base = extent_header_size + entry_index * extent_entry_size;
+            const child = decodeExtentIndex(node_bytes[base .. base + extent_entry_size]);
+            try index_blocks.append(child.leaf_block);
+            _ = try self.reader.file.readPositionalAll(io, &child_block, self.reader.blockOffset(child.leaf_block));
+            try self.collectExtentTreeBlocks(
+                io,
+                child_block[0..],
+                extentEntriesPerBlock(self.reader.block_size),
+                header.depth - 1,
+                leaf_extents,
+                index_blocks,
+            );
+        }
+    }
+
+    /// Frees every block backing an inode's content: all extent-tree leaf
+    /// (data) blocks, all interior/index extent-tree blocks, and (when
+    /// `free_xattr` is set) the external xattr block. Fast symlinks store
+    /// their target inline in `i_block` and own no separate blocks at all,
+    /// so they are a deliberate no-op here.
+    fn freeInodeAllocations(self: *Editor, io: Io, inode: ParsedInode, free_xattr: bool) EditError!void {
+        if (inode.kind == .symlink and inode.isFastSymlink()) {
+            if (free_xattr and inode.file_acl_block != 0) self.freeBlock(inode.file_acl_block);
+            return;
+        }
+        if ((inode.flags & inode_flag_extents) == 0) return error.UnsupportedInodeLayout;
+
+        var leaf_extents = std.array_list.Managed(Extent).init(self.allocator);
+        defer leaf_extents.deinit();
+        var index_blocks = std.array_list.Managed(u64).init(self.allocator);
+        defer index_blocks.deinit();
+        try self.collectExtentTreeBlocks(io, inode.block_bytes[0..], max_inline_extents, null, &leaf_extents, &index_blocks);
+
+        for (leaf_extents.items) |extent| {
+            var n: u16 = 0;
+            while (n < extent.block_count) : (n += 1) self.freeBlock(extent.start_block + n);
+        }
+        for (index_blocks.items) |block_number| self.freeBlock(block_number);
+        if (free_xattr and inode.file_acl_block != 0) self.freeBlock(inode.file_acl_block);
+    }
 };
 
 const ReaderGroup = struct {
@@ -3625,6 +3789,64 @@ test "Editor.open rejects images with a foreign group descriptor layout" {
     try file.writePositionalAll(io, &sb, superblock_offset);
 
     try std.testing.expectError(error.UnsupportedEditLayout, Editor.open(io, file, std.testing.allocator, .{}));
+}
+
+test "Editor frees an inode's extent-tree blocks (leaf, index, and xattr) and reuses them" {
+    const io = std.testing.io;
+    const path = "test-ext4-editor-free-extents.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    // Large enough to force real extent index blocks (see "populate round-trips
+    // files that require extent index blocks"), so freeing exercises the
+    // interior-node path, not just leaf extents.
+    const fs_size: u64 = 768 * 1024 * 1024;
+    const big_size: u64 = 544 * 1024 * 1024;
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "big.bin", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = big_size, .generator = .pattern },
+        .{ .path = "small.txt", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 5, .bytes = "hello", .xattrs = &.{.{ .name = "user.tag", .value = "v" }} },
+    });
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    const info = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = fs_size, .uuid = [_]u8{0x30} ** 16 });
+
+    var editor = try Editor.open(io, file, std.testing.allocator, .{});
+    defer editor.deinit();
+
+    var free_before: u32 = 0;
+    for (editor.groups) |group| free_before += group.data_capacity - group.used_data_blocks;
+    try std.testing.expectEqual(info.free_block_count, free_before);
+
+    const big_inode_number = try editor.reader.lookupPath(io, "big.bin");
+    const big_inode = try editor.reader.readInode(io, big_inode_number);
+    try std.testing.expect((big_inode.flags & inode_flag_extents) != 0);
+
+    // Confirm this file really does have extent index blocks, so freeing it
+    // exercises the interior-node collection path, not just leaf extents.
+    const root_header = try parseExtentHeader(big_inode.block_bytes[0..extent_header_size]);
+    try std.testing.expect(root_header.depth > 0);
+
+    const small_inode_number = try editor.reader.lookupPath(io, "small.txt");
+    const small_inode = try editor.reader.readInode(io, small_inode_number);
+    try std.testing.expect(small_inode.file_acl_block != 0);
+
+    try editor.freeInodeAllocations(io, big_inode, true);
+    try editor.freeInodeAllocations(io, small_inode, true);
+
+    var free_after: u32 = 0;
+    for (editor.groups) |group| free_after += group.data_capacity - group.used_data_blocks;
+    try std.testing.expect(free_after > free_before);
+
+    // The freed space must be immediately reusable within the same session.
+    const reclaimed = try editor.allocateExtents(std.testing.allocator, free_after);
+    defer std.testing.allocator.free(reclaimed);
+    var reclaimed_total: u32 = 0;
+    for (reclaimed) |extent| reclaimed_total += extent.block_count;
+    try std.testing.expectEqual(free_after, reclaimed_total);
+
+    try std.testing.expectError(error.NotEnoughSpace, editor.allocateExtents(std.testing.allocator, 1));
 }
 
 const InMemoryEntry = struct {
