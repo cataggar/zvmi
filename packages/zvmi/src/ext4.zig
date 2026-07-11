@@ -1451,6 +1451,116 @@ pub const Editor = struct {
         const found = try self.findDirEntry(io, parent_inode, name);
         try self.spliceDirEntry(io, found, parent_inode_number);
     }
+
+    fn inodeLocation(self: Editor, inode_number: u32) u64 {
+        const group_index = (inode_number - 1) / self.reader.inodes_per_group;
+        const index_in_group = (inode_number - 1) % self.reader.inodes_per_group;
+        const rgroup = self.reader.groups[group_index];
+        return self.reader.blockOffset(rgroup.inode_table_block) + @as(u64, index_in_group) * self.reader.inode_size;
+    }
+
+    fn readInodeRaw(self: Editor, io: Io, inode_number: u32) EditError![inode_size]u8 {
+        var buf: [inode_size]u8 = undefined;
+        _ = try self.reader.file.readPositionalAll(io, &buf, self.inodeLocation(inode_number));
+        return buf;
+    }
+
+    fn writeInodeRaw(self: Editor, io: Io, inode_number: u32, buf: *const [inode_size]u8) EditError!void {
+        try self.reader.file.writePositionalAll(io, buf, self.inodeLocation(inode_number));
+    }
+
+    /// Decrements a regular file's or symlink's `i_links_count`. This
+    /// writer never creates hardlinked regular files (`FileTreeView` has no
+    /// hardlink concept), so in practice `link_count` is always 1 and this
+    /// always frees the inode -- but decrementing rather than
+    /// force-freeing handles a hand-crafted or externally-hardlinked image
+    /// correctly too, only retiring the inode once its last reference is
+    /// gone.
+    fn decrementLinkCountAndMaybeFree(self: *Editor, io: Io, inode_number: u32, kind: Kind) EditError!void {
+        var buf = try self.readInodeRaw(io, inode_number);
+        const link_count = readInt(u16, buf[26..28]);
+        if (link_count == 0) return;
+        if (link_count == 1) {
+            const parsed = try ParsedInode.fromBytes(inode_number, &buf);
+            try self.freeInodeAllocations(io, parsed, true);
+            @memset(&buf, 0);
+            try self.writeInodeRaw(io, inode_number, &buf);
+            self.freeInodeBit(inode_number, kind == .directory);
+        } else {
+            writeInt(u16, buf[26..28], link_count - 1);
+            setInodeChecksum(&buf, self.reader.uuid, inode_number);
+            try self.writeInodeRaw(io, inode_number, &buf);
+        }
+    }
+
+    /// Directories can never be hardlinked in POSIX/ext4 -- any link count
+    /// above 1 is purely structural (its own "." plus one per subdirectory
+    /// child's ".."), never a "real" extra reference -- so a directory
+    /// being fully removed is always safe to force-retire outright, unlike
+    /// the decrement-and-maybe-free handling regular files need.
+    fn forceRetireDirectory(self: *Editor, io: Io, inode_number: u32) EditError!void {
+        var buf = try self.readInodeRaw(io, inode_number);
+        const parsed = try ParsedInode.fromBytes(inode_number, &buf);
+        try self.freeInodeAllocations(io, parsed, true);
+        @memset(&buf, 0);
+        try self.writeInodeRaw(io, inode_number, &buf);
+        self.freeInodeBit(inode_number, true);
+    }
+
+    fn decrementParentLinkCount(self: *Editor, io: Io, parent_inode_number: u32) EditError!void {
+        var buf = try self.readInodeRaw(io, parent_inode_number);
+        const link_count = readInt(u16, buf[26..28]);
+        if (link_count > 0) {
+            writeInt(u16, buf[26..28], link_count - 1);
+            setInodeChecksum(&buf, self.reader.uuid, parent_inode_number);
+            try self.writeInodeRaw(io, parent_inode_number, &buf);
+        }
+    }
+
+    /// Recursively retires an inode and everything beneath it (for
+    /// directories), freeing every block and inode along the way, but
+    /// without touching any directory entries -- the caller is responsible
+    /// for splicing the top-level entry out of its parent, since every
+    /// entry *within* a subtree being fully destroyed is irrelevant (the
+    /// whole subtree's blocks/inodes are being freed regardless of their
+    /// logical occupancy).
+    fn retireRecursively(self: *Editor, io: Io, inode_number: u32) EditError!void {
+        const inode = try self.reader.readInode(io, inode_number);
+        if (inode.kind == .directory) {
+            const children = try self.reader.listDirByInode(io, self.allocator, inode);
+            defer freeDirEntries(self.allocator, children);
+            for (children) |entry| try self.retireRecursively(io, entry.inode);
+            try self.forceRetireDirectory(io, inode_number);
+        } else {
+            try self.decrementLinkCountAndMaybeFree(io, inode_number, inode.kind);
+        }
+    }
+
+    /// Deletes an existing regular file or symlink at `path`. Use
+    /// `deleteTree` for directories.
+    pub fn deleteFile(self: *Editor, io: Io, path: []const u8) EditError!void {
+        const split = try splitParentAndName(path);
+        const parent_inode_number = try self.reader.lookupPath(io, split.parent);
+        const child_inode_number = try self.reader.lookupChild(io, parent_inode_number, split.name);
+        const child_inode = try self.reader.readInode(io, child_inode_number);
+        if (child_inode.kind == .directory) return error.IsDirectory;
+        try self.decrementLinkCountAndMaybeFree(io, child_inode_number, child_inode.kind);
+        try self.removeDirEntryFromParent(io, parent_inode_number, split.name);
+    }
+
+    /// Recursively deletes an existing path -- a single file/symlink, or a
+    /// directory and everything beneath it. Creating a brand-new path that
+    /// doesn't already exist remains out of scope; only deleting or
+    /// overwriting existing entries is supported.
+    pub fn deleteTree(self: *Editor, io: Io, path: []const u8) EditError!void {
+        const split = try splitParentAndName(path);
+        const parent_inode_number = try self.reader.lookupPath(io, split.parent);
+        const child_inode_number = try self.reader.lookupChild(io, parent_inode_number, split.name);
+        const child_inode = try self.reader.readInode(io, child_inode_number);
+        try self.retireRecursively(io, child_inode_number);
+        try self.removeDirEntryFromParent(io, parent_inode_number, split.name);
+        if (child_inode.kind == .directory) try self.decrementParentLinkCount(io, parent_inode_number);
+    }
 };
 
 const FoundDirEntry = struct {
@@ -4017,6 +4127,132 @@ test "Editor removes directory entries by splicing, across a large htree-indexed
     _ = try reader.statPath(io, "big/file-001");
     _ = try reader.statPath(io, "big/file-128");
     _ = try reader.statPath(io, "big/file-298");
+}
+
+test "Editor.deleteFile removes a regular file, frees its inode/blocks, and leaves siblings intact" {
+    const io = std.testing.io;
+    const path = "test-ext4-editor-deletefile.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const big_size: u64 = 544 * 1024 * 1024;
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "etc", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "etc/keep.txt", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 4, .bytes = "keep" },
+        .{ .path = "etc/remove.txt", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 6, .bytes = "remove" },
+        .{ .path = "big.bin", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = big_size, .generator = .pattern },
+        .{ .path = "link", .kind = .symlink, .mode = 0o777, .uid = 0, .gid = 0, .size = 4, .bytes = "keep" },
+    });
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = 768 * 1024 * 1024, .uuid = [_]u8{0x40} ** 16 });
+
+    var editor = try Editor.open(io, file, std.testing.allocator, .{});
+    defer editor.deinit();
+
+    var free_blocks_before: u32 = 0;
+    var free_inodes_before: u32 = 0;
+    for (editor.groups) |group| {
+        free_blocks_before += group.data_capacity - group.used_data_blocks;
+        free_inodes_before += editor.reader.inodes_per_group - group.used_inode_count;
+    }
+
+    // Deleting a large multi-extent-block file must free its interior
+    // extent-tree index blocks too, not just its leaf data blocks.
+    try editor.deleteFile(io, "big.bin");
+    try editor.deleteFile(io, "etc/remove.txt");
+    try std.testing.expectError(error.IsDirectory, editor.deleteFile(io, "etc"));
+    try std.testing.expectError(error.NotFound, editor.deleteFile(io, "etc/remove.txt"));
+    try std.testing.expectError(error.NotFound, editor.deleteFile(io, "missing"));
+
+    var free_blocks_after: u32 = 0;
+    var free_inodes_after: u32 = 0;
+    for (editor.groups) |group| {
+        free_blocks_after += group.data_capacity - group.used_data_blocks;
+        free_inodes_after += editor.reader.inodes_per_group - group.used_inode_count;
+    }
+    try std.testing.expect(free_blocks_after > free_blocks_before);
+    try std.testing.expectEqual(free_inodes_before + 2, free_inodes_after);
+
+    try editor.flush(io);
+
+    var reader = try open(io, file, std.testing.allocator, .{});
+    defer reader.deinit();
+    try std.testing.expectError(error.NotFound, reader.statPath(io, "big.bin"));
+    try std.testing.expectError(error.NotFound, reader.statPath(io, "etc/remove.txt"));
+
+    const kept = try reader.readFileAlloc(io, std.testing.allocator, "etc/keep.txt");
+    defer std.testing.allocator.free(kept);
+    try std.testing.expectEqualSlices(u8, "keep", kept);
+
+    // The symlink is untouched -- deleteFile only removes the exact path
+    // requested, never anything else that merely shares its content.
+    const link_target = try reader.readLinkAlloc(io, std.testing.allocator, "link");
+    defer std.testing.allocator.free(link_target);
+    try std.testing.expectEqualSlices(u8, "keep", link_target);
+
+    const dir_entries = try reader.listDir(io, std.testing.allocator, "etc");
+    defer freeDirEntries(std.testing.allocator, dir_entries);
+    try expectDirNames(dir_entries, &.{"keep.txt"});
+}
+
+test "Editor.deleteTree recursively removes a directory and adjusts the parent's link count" {
+    const io = std.testing.io;
+    const path = "test-ext4-editor-deletetree.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "keep", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "keep/file.txt", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 4, .bytes = "keep" },
+        .{ .path = "doomed", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "doomed/a.txt", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 1, .bytes = "A" },
+        .{ .path = "doomed/nested", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "doomed/nested/b.txt", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 1, .bytes = "B" },
+        .{ .path = "doomed/nested/link", .kind = .symlink, .mode = 0o777, .uid = 0, .gid = 0, .size = 5, .bytes = "b.txt" },
+    });
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = 16 * 1024 * 1024, .uuid = [_]u8{0x41} ** 16 });
+
+    const root_link_count_before = blk: {
+        var reader = try open(io, file, std.testing.allocator, .{});
+        defer reader.deinit();
+        break :blk (try reader.readInode(io, root_inode)).link_count;
+    };
+
+    var editor = try Editor.open(io, file, std.testing.allocator, .{});
+    defer editor.deinit();
+
+    try editor.deleteTree(io, "doomed");
+    try std.testing.expectError(error.NotFound, editor.deleteTree(io, "doomed"));
+    try std.testing.expectError(error.RootPathForbidden, editor.deleteTree(io, "/"));
+    try std.testing.expectError(error.RootPathForbidden, editor.deleteTree(io, ""));
+
+    try editor.flush(io);
+
+    var reader = try open(io, file, std.testing.allocator, .{});
+    defer reader.deinit();
+    try std.testing.expectError(error.NotFound, reader.statPath(io, "doomed"));
+    try std.testing.expectError(error.NotFound, reader.statPath(io, "doomed/a.txt"));
+    try std.testing.expectError(error.NotFound, reader.statPath(io, "doomed/nested"));
+    try std.testing.expectError(error.NotFound, reader.statPath(io, "doomed/nested/b.txt"));
+
+    const root_entries = try reader.listDir(io, std.testing.allocator, "");
+    defer freeDirEntries(std.testing.allocator, root_entries);
+    try expectDirNames(root_entries, &.{"keep"});
+
+    const kept = try reader.readFileAlloc(io, std.testing.allocator, "keep/file.txt");
+    defer std.testing.allocator.free(kept);
+    try std.testing.expectEqualSlices(u8, "keep", kept);
+
+    // Removing "doomed" (which itself had one subdirectory, "nested") must
+    // drop the root's link count by exactly one, for "doomed"'s own ".."
+    // reference going away.
+    const root_inode_after = try reader.readInode(io, root_inode);
+    try std.testing.expectEqual(root_link_count_before - 1, root_inode_after.link_count);
 }
 
 const InMemoryEntry = struct {
