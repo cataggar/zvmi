@@ -4464,6 +4464,70 @@ test "Editor.writeFile rolls back and reports TooManyExtents when free space is 
     try std.testing.expectEqualSlices(u8, &expected, bytes);
 }
 
+test "Editor.flush keeps sparse-super backup superblocks and GDT copies in sync with the primary" {
+    const io = std.testing.io;
+    const path = "test-ext4-editor-flush-backups.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    // >= 3 groups (each default_blocks_per_group is 128 MiB), so group 1 has
+    // a real sparse-super backup copy distinct from the primary in group 0.
+    const fs_size: u64 = 400 * 1024 * 1024;
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "a.txt", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 1, .bytes = "A" },
+        .{ .path = "b.txt", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 1, .bytes = "B" },
+    });
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = fs_size, .uuid = [_]u8{0x50} ** 16 });
+
+    var editor = try Editor.open(io, file, std.testing.allocator, .{});
+    defer editor.deinit();
+    try std.testing.expect(editor.groups.len >= 3);
+
+    // Force both a group-bitmap/GDT change and a superblock free-count
+    // change, so flush() has real work to mirror into the backups.
+    try editor.deleteFile(io, "a.txt");
+    try editor.flush(io);
+
+    var primary_sb: [superblock_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &primary_sb, superblock_offset);
+
+    const backup_group_start_block = editor.groups[1].start_block;
+    var backup_sb: [superblock_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &backup_sb, backup_group_start_block * default_block_size);
+
+    // Backups are byte-for-byte identical to the primary except for their
+    // own s_block_group_nr field (and the checksum that covers it).
+    try std.testing.expectEqualSlices(u8, primary_sb[0..0x5A], backup_sb[0..0x5A]);
+    try std.testing.expectEqual(@as(u16, 0), readInt(u16, primary_sb[0x5A..0x5C]));
+    try std.testing.expectEqual(@as(u16, 1), readInt(u16, backup_sb[0x5A..0x5C]));
+    try std.testing.expectEqualSlices(u8, primary_sb[0x5C..0x3FC], backup_sb[0x5C..0x3FC]);
+
+    var recomputed_backup_sb = backup_sb;
+    setSuperblockChecksum(&recomputed_backup_sb);
+    try std.testing.expectEqualSlices(u8, &recomputed_backup_sb, &backup_sb);
+
+    const gdt_blocks = @max(@as(u32, 1), blocksForBytes(@as(u64, editor.groups.len) * group_desc_size, default_block_size));
+    const gdt_bytes_len = @as(usize, gdt_blocks) * default_block_size;
+    const primary_gdt = try std.testing.allocator.alloc(u8, gdt_bytes_len);
+    defer std.testing.allocator.free(primary_gdt);
+    _ = try file.readPositionalAll(io, primary_gdt, default_block_size);
+    const backup_gdt = try std.testing.allocator.alloc(u8, gdt_bytes_len);
+    defer std.testing.allocator.free(backup_gdt);
+    _ = try file.readPositionalAll(io, backup_gdt, (backup_group_start_block + 1) * default_block_size);
+    try std.testing.expectEqualSlices(u8, primary_gdt, backup_gdt);
+
+    var reader = try open(io, file, std.testing.allocator, .{});
+    defer reader.deinit();
+    try std.testing.expectError(error.NotFound, reader.statPath(io, "a.txt"));
+    const kept = try reader.readFileAlloc(io, std.testing.allocator, "b.txt");
+    defer std.testing.allocator.free(kept);
+    try std.testing.expectEqualSlices(u8, "B", kept);
+}
+
 const InMemoryEntry = struct {
     path: []const u8,
     kind: Kind,
