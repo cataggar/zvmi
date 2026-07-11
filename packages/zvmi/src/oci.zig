@@ -452,7 +452,16 @@ fn decompressGzip(allocator: Allocator, bytes: []const u8, max_size: usize) Load
 
 fn decompressZstd(allocator: Allocator, bytes: []const u8, max_size: usize) LoadError![]u8 {
     var input = Io.Reader.fixed(bytes);
-    var decompressor = std.compress.zstd.Decompress.init(&input, &.{}, .{});
+    // Indirect mode with an explicitly-sized window buffer -- the empty-
+    // buffer "direct" mode used previously silently produced truncated/
+    // corrupted output for some real, large zstd-compressed layers (see
+    // packages/zvmi/src/initramfs.zig's decompressZstd, where the identical
+    // pattern was found to misparse a real ~50+ MiB dracut-produced
+    // initramfs while appearing to succeed).
+    const window_len = std.compress.zstd.default_window_len;
+    const window_buf = try allocator.alloc(u8, window_len + std.compress.zstd.block_size_max);
+    defer allocator.free(window_buf);
+    var decompressor = std.compress.zstd.Decompress.init(&input, window_buf, .{ .window_len = window_len });
     return decompressor.reader.allocRemaining(allocator, .limited(max_size)) catch |err| switch (err) {
         error.ReadFailed => error.LayerDecompressionFailed,
         error.StreamTooLong => error.LayerTooLarge,

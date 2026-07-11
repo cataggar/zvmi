@@ -1120,7 +1120,15 @@ fn test86MsByte(value: u8) bool {
 
 fn decompressZstdAlloc(allocator: std.mem.Allocator, bytes: []const u8, max_size: usize) BlockDecompressionError![]u8 {
     var input = Io.Reader.fixed(bytes);
-    var decompressor = std.compress.zstd.Decompress.init(&input, &.{}, .{});
+    // Indirect mode with an explicitly-sized window buffer -- see
+    // packages/zvmi/src/initramfs.zig's decompressZstd for why the empty-
+    // buffer "direct" mode used previously is unsafe for arbitrary input
+    // sizes (it happened to work for squashfs's typically-small
+    // independently-compressed blocks, but relied on a fragile invariant).
+    const window_len = std.compress.zstd.default_window_len;
+    const window_buf = try allocator.alloc(u8, window_len + std.compress.zstd.block_size_max);
+    defer allocator.free(window_buf);
+    var decompressor = std.compress.zstd.Decompress.init(&input, window_buf, .{ .window_len = window_len });
     const limit = std.math.add(usize, max_size, 1) catch max_size;
 
     const out = decompressor.reader.allocRemaining(allocator, .limited(limit)) catch |err| switch (err) {

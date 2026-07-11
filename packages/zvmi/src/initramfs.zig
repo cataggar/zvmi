@@ -158,7 +158,22 @@ fn decompressGzip(allocator: std.mem.Allocator, bytes: []const u8) DecompressErr
 
 fn decompressZstd(allocator: std.mem.Allocator, bytes: []const u8) DecompressError![]u8 {
     var input = std.Io.Reader.fixed(bytes);
-    var decompressor = std.compress.zstd.Decompress.init(&input, &.{}, .{});
+    // Use "indirect" mode with an explicitly-sized window buffer rather than
+    // the empty-buffer "direct" mode used previously: direct mode requires
+    // the destination `Writer`'s own buffer to already satisfy
+    // `window_len + block_size_max` capacity on each read, an invariant
+    // `allocRemaining`'s incrementally-growing destination buffer doesn't
+    // guarantee. That produced correct output for small synthetic test
+    // archives (and even some real initramfs images), but silently returned
+    // truncated/corrupted data for other real, large (~50+ MiB decompressed)
+    // dracut-produced initramfs images -- discovered via issue #105's
+    // real-boot verity fixture, where this function misreported an
+    // initramfs as lacking `systemd-veritysetup` when it was genuinely
+    // present.
+    const window_len = std.compress.zstd.default_window_len;
+    const window_buf = try allocator.alloc(u8, window_len + std.compress.zstd.block_size_max);
+    defer allocator.free(window_buf);
+    var decompressor = std.compress.zstd.Decompress.init(&input, window_buf, .{ .window_len = window_len });
     return decompressor.reader.allocRemaining(allocator, .limited(max_decompressed_size)) catch |err| switch (err) {
         error.ReadFailed => error.Invalid,
         error.StreamTooLong => error.StreamTooLong,

@@ -294,7 +294,7 @@ the matching verity metadata is also exposed through `zvmi.cosi.writeWithOptions
 ISO/squashfs/container source tree. Because of that, `--verity` only works
 end-to-end if that source initramfs already includes dm-verity userspace
 tooling (`systemd-veritysetup-generator`, `systemd-veritysetup`, or
-`veritysetup`, e.g. built with `dracut --add veritysetup`); without it,
+`veritysetup`, e.g. built with `dracut --add systemd-veritysetup`); without it,
 `systemd-veritysetup-generator` never runs at boot and the image hangs
 forever waiting on `/dev/mapper/root` (see
 [issue #77](https://github.com/cataggar/zvmi/issues/77) for the real-boot
@@ -313,7 +313,7 @@ dm-verity and so is usually missing the pieces above even when the installed
 system's own root filesystem has them (`systemd-udev`'s
 `systemd-veritysetup-generator`/`systemd-veritysetup`, and
 `cryptsetup`/`veritysetup`'s `libcryptsetup`, plus the `dm-verity`/`dm-mod`
-kernel modules). Regenerate the initramfs with `dracut --add veritysetup`
+kernel modules). Regenerate the initramfs with `dracut --add systemd-veritysetup`
 against a rootfs that has these installed, then supply the result as a
 `--container` layer at the *same* `boot/initramfs-<kver>.img` path already
 used by the ISO/squashfs rootfs -- OCI container layers always take
@@ -324,7 +324,7 @@ On a matching-architecture build host (or inside a container/chroot for that
 architecture), this is a normal, native `dracut` invocation:
 
 ```bash
-dracut --add veritysetup --force --kver <kernel-version> /path/to/initramfs-verity.img
+dracut --add systemd-veritysetup --force --kver <kernel-version> /path/to/initramfs-verity.img
 ```
 
 Building this cross-architecture (e.g. generating an x86_64 initramfs on an
@@ -332,7 +332,9 @@ aarch64 build host, via `qemu-user`/`binfmt_misc` emulation) additionally
 needs:
 
 - `dracut --sysroot <mounted-or-extracted-rootfs> --no-hostonly --add
-  veritysetup --force --kver <kernel-version> -o <output>`, with
+  systemd-veritysetup --force --kver <kernel-version> <output>` (`<output>`
+  is a positional argument -- dracut's `-o`/`--omit` flag means something
+  else entirely: a list of dracut modules to omit), with
   `DRACUT_ARCH=<target-arch>` and `QEMU_LD_PREFIX=<sysroot>` exported so the
   emulated target-arch helper binaries (e.g. `dracut-install`) can find their
   own shared libraries.
