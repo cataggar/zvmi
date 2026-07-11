@@ -83,7 +83,14 @@ sudo chroot "$work/rootfs" /usr/bin/tdnf install -y dracut veritysetup systemd
 # 102-13.azl3 and this ISO's 4.0 107-9.azl4): `dracut --list-modules` only
 # ever lists `systemd-veritysetup` (see modules.d/01systemd-veritysetup).
 echo "running dracut --add systemd-veritysetup for kernel $kver"
-sudo chroot "$work/rootfs" /usr/bin/dracut --add systemd-veritysetup --force --kver "$kver" "/tmp/initramfs-verity.img"
+# --no-hostonly is essential here: dracut (seeing the *invoking host's* real
+# hardware via the bind-mounted /proc/sys, not the eventual QEMU boot-smoke
+# guest's virtual hardware) would otherwise default to including only
+# drivers relevant to the CI runner itself, silently dropping storage/
+# console drivers the QEMU guest actually needs and hanging very early at
+# boot -- the same reason README.md's cross-architecture recipe already
+# uses --no-hostonly.
+sudo chroot "$work/rootfs" /usr/bin/dracut --no-hostonly --add systemd-veritysetup --force --kver "$kver" "/tmp/initramfs-verity.img"
 
 mkdir -p "$(dirname "$out_initramfs")"
 sudo cp "$work/rootfs/tmp/initramfs-verity.img" "$out_initramfs"
