@@ -672,7 +672,7 @@ test "build-image --verity opportunistically boot-smokes a provisioned verity-ca
     defer Io.Dir.cwd().deleteFile(io, ovmf_vars_copy_path) catch {};
     defer Io.Dir.cwd().deleteFile(io, serial_output_path) catch {};
 
-    var report = try zvmi.build_image.build(allocator, io, .{
+    var report = zvmi.build_image.build(allocator, io, .{
         .iso_path = prereqs.iso_path,
         .container_path = verity_oci_path,
         .output_path = output_path,
@@ -689,7 +689,10 @@ test "build-image --verity opportunistically boot-smokes a provisioned verity-ca
         .size = qemu_boot_smoke_disk_size + 512 * zvmi.azure.one_mib,
         .verity = true,
         .extra_kernel_options = "console=tty0 console=ttyS0,115200n8",
-    });
+    }) catch |err| {
+        std.debug.print("DEBUG build_image.build error: {s}\n", .{@errorName(err)});
+        return err;
+    };
     defer report.deinit(allocator);
 
     try copyFileToPath(allocator, io, ovmf.vars_path, ovmf_vars_copy_path);
