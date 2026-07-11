@@ -1380,7 +1380,100 @@ pub const Editor = struct {
         for (index_blocks.items) |block_number| self.freeBlock(block_number);
         if (free_xattr and inode.file_acl_block != 0) self.freeBlock(inode.file_acl_block);
     }
+
+    /// Scans a directory's data block-by-block (never the flattened,
+    /// whole-directory buffer `listDirByInode` uses) to find exactly which
+    /// physical block holds a named entry, since directory-leaf checksums
+    /// are computed per block and only that one block needs to be rewritten
+    /// to splice an entry out.
+    fn findDirEntry(self: *Editor, io: Io, dir_inode: ParsedInode, name: []const u8) EditError!FoundDirEntry {
+        const extents = try self.reader.readInodeExtentsAlloc(io, self.allocator, dir_inode);
+        defer self.allocator.free(extents);
+
+        for (extents) |extent| {
+            var block_in_extent: u16 = 0;
+            while (block_in_extent < extent.block_count) : (block_in_extent += 1) {
+                const physical_block = extent.start_block + block_in_extent;
+                var block: [default_block_size]u8 = undefined;
+                _ = try self.reader.file.readPositionalAll(io, &block, self.reader.blockOffset(physical_block));
+
+                var offset: usize = 0;
+                var prev_offset: ?usize = null;
+                while (offset + 8 <= block.len) {
+                    const child_inode = readInt(u32, block[offset .. offset + 4]);
+                    const rec_len = readInt(u16, block[offset + 4 .. offset + 6]);
+                    const name_len = block[offset + 6];
+                    if (rec_len < 8 or offset + rec_len > block.len) return error.BadDirectoryEntry;
+                    if (name_len > rec_len - 8) return error.BadDirectoryEntry;
+                    if (child_inode != 0 and name_len == name.len and std.mem.eql(u8, block[offset + 8 .. offset + 8 + name_len], name)) {
+                        return .{
+                            .physical_block = physical_block,
+                            .block = block,
+                            .entry_offset = offset,
+                            .prev_offset = prev_offset,
+                            .inode = child_inode,
+                        };
+                    }
+                    prev_offset = offset;
+                    offset += rec_len;
+                }
+            }
+        }
+        return error.NotFound;
+    }
+
+    /// Splices a directory entry out of its containing block: merges its
+    /// `rec_len` into the immediately preceding entry in the same block
+    /// (the standard ext4 `ext4_delete_entry()` technique -- no data
+    /// movement needed, since `rec_len` simply grows to span the freed
+    /// space), or if it was the first entry in the block, just zeroes its
+    /// inode field (already tolerated everywhere this codebase scans
+    /// directory entries, exactly like htree index blocks that
+    /// "masquerade as unused directory entries"). Recomputes and writes
+    /// back only that one block.
+    fn spliceDirEntry(self: *Editor, io: Io, found: FoundDirEntry, dir_inode_number: u32) EditError!void {
+        var block = found.block;
+        const rec_len = readInt(u16, block[found.entry_offset + 4 .. found.entry_offset + 6]);
+        if (found.prev_offset) |prev_off| {
+            const prev_rec_len = readInt(u16, block[prev_off + 4 .. prev_off + 6]);
+            writeInt(u16, block[prev_off + 4 .. prev_off + 6], prev_rec_len + rec_len);
+        } else {
+            writeInt(u32, block[found.entry_offset .. found.entry_offset + 4], 0);
+        }
+        setDirectoryLeafChecksum(&block, self.reader.uuid, dir_inode_number, 0);
+        try self.reader.file.writePositionalAll(io, &block, self.reader.blockOffset(found.physical_block));
+    }
+
+    /// Removes `name`'s directory entry from `parent_inode_number`'s data.
+    fn removeDirEntryFromParent(self: *Editor, io: Io, parent_inode_number: u32, name: []const u8) EditError!void {
+        const parent_inode = try self.reader.readInode(io, parent_inode_number);
+        if (parent_inode.kind != .directory) return error.NotDirectory;
+        const found = try self.findDirEntry(io, parent_inode, name);
+        try self.spliceDirEntry(io, found, parent_inode_number);
+    }
 };
+
+const FoundDirEntry = struct {
+    physical_block: u64,
+    block: [default_block_size]u8,
+    entry_offset: usize,
+    prev_offset: ?usize,
+    inode: u32,
+};
+
+/// Splits a path into its parent directory and final component, matching
+/// `Reader.lookupPath`'s own root/trailing-slash tolerance. Returns
+/// `error.RootPathForbidden` for `""`/`"/"`, since delete/overwrite always
+/// need an existing named entry to act on.
+fn splitParentAndName(path: []const u8) EditError!struct { parent: []const u8, name: []const u8 } {
+    var trimmed = path;
+    while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') trimmed = trimmed[0 .. trimmed.len - 1];
+    if (trimmed.len == 0) return error.RootPathForbidden;
+    if (std.mem.lastIndexOfScalar(u8, trimmed, '/')) |index| {
+        return .{ .parent = trimmed[0..index], .name = trimmed[index + 1 ..] };
+    }
+    return .{ .parent = "", .name = trimmed };
+}
 
 const ReaderGroup = struct {
     block_bitmap_block: u32,
@@ -3847,6 +3940,83 @@ test "Editor frees an inode's extent-tree blocks (leaf, index, and xattr) and re
     try std.testing.expectEqual(free_after, reclaimed_total);
 
     try std.testing.expectError(error.NotEnoughSpace, editor.allocateExtents(std.testing.allocator, 1));
+}
+
+test "splitParentAndName splits paths and rejects the root" {
+    {
+        const split = try splitParentAndName("etc/hostname");
+        try std.testing.expectEqualStrings("etc", split.parent);
+        try std.testing.expectEqualStrings("hostname", split.name);
+    }
+    {
+        const split = try splitParentAndName("hostname");
+        try std.testing.expectEqualStrings("", split.parent);
+        try std.testing.expectEqualStrings("hostname", split.name);
+    }
+    {
+        const split = try splitParentAndName("etc/hostname/");
+        try std.testing.expectEqualStrings("etc", split.parent);
+        try std.testing.expectEqualStrings("hostname", split.name);
+    }
+    try std.testing.expectError(error.RootPathForbidden, splitParentAndName(""));
+    try std.testing.expectError(error.RootPathForbidden, splitParentAndName("/"));
+}
+
+test "Editor removes directory entries by splicing, across a large htree-indexed directory" {
+    const io = std.testing.io;
+    const path = "test-ext4-editor-unlink-htree.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var entries = std.array_list.Managed(InMemoryEntry).init(std.testing.allocator);
+    defer entries.deinit();
+    try entries.append(.{ .path = "big", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 });
+    var names: [300][16]u8 = undefined;
+    var index: usize = 0;
+    while (index < 300) : (index += 1) {
+        const name = try std.fmt.bufPrint(&names[index], "big/file-{d:0>3}", .{index});
+        try entries.append(.{ .path = name, .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 0 });
+    }
+
+    var tree = InMemoryTree.init(entries.items);
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{
+        .length = 32 * 1024 * 1024,
+        .uuid = [_]u8{0x25} ** 16,
+    });
+
+    var editor = try Editor.open(io, file, std.testing.allocator, .{});
+    defer editor.deinit();
+    const dir_inode_number = try editor.reader.lookupPath(io, "big");
+
+    // Spread across the whole directory (start/middle/end) so this
+    // implicitly exercises both splice branches -- some of these names will
+    // land as the first entry within their particular htree leaf block
+    // (splice zeroes the inode field in place), others will have a real
+    // preceding sibling in the same block (splice merges rec_len into it) --
+    // without needing to know in advance which is which.
+    const to_remove = [_][]const u8{ "file-000", "file-050", "file-127", "file-299" };
+    for (to_remove) |name| try editor.removeDirEntryFromParent(io, dir_inode_number, name);
+    try std.testing.expectError(error.NotFound, editor.removeDirEntryFromParent(io, dir_inode_number, "file-000"));
+
+    try editor.flush(io);
+
+    var reader = try open(io, file, std.testing.allocator, .{});
+    defer reader.deinit();
+    const dir_entries = try reader.listDir(io, std.testing.allocator, "big");
+    defer freeDirEntries(std.testing.allocator, dir_entries);
+    try std.testing.expectEqual(@as(usize, 300 - to_remove.len), dir_entries.len);
+
+    for (to_remove) |name| {
+        var buf: [32]u8 = undefined;
+        const full = try std.fmt.bufPrint(&buf, "big/{s}", .{name});
+        try std.testing.expectError(error.NotFound, reader.statPath(io, full));
+    }
+    _ = try reader.statPath(io, "big/file-001");
+    _ = try reader.statPath(io, "big/file-128");
+    _ = try reader.statPath(io, "big/file-298");
 }
 
 const InMemoryEntry = struct {
