@@ -1561,6 +1561,83 @@ pub const Editor = struct {
         try self.removeDirEntryFromParent(io, parent_inode_number, split.name);
         if (child_inode.kind == .directory) try self.decrementParentLinkCount(io, parent_inode_number);
     }
+
+    /// Overwrites the content of an existing regular file. Extended
+    /// attributes are preserved (only the data content is replaced); this
+    /// is not a general truncate/rewrite -- it always replaces the whole
+    /// file. Fragmentation is bounded: the new content is allocated as
+    /// contiguous runs greedily, and if that still needs more than
+    /// `max_inline_extents` (4) extents, the allocation is rolled back and
+    /// `error.TooManyExtents` is returned rather than building a deeper
+    /// extent tree (a deliberate v1 scope limit -- see issue #109). The new
+    /// content is always written to freshly allocated blocks *before* the
+    /// old content is freed (needing up to `new_block_count` blocks of
+    /// headroom beyond the old file's own size), so a failed overwrite
+    /// never leaves the original file half-freed with nothing valid in its
+    /// place.
+    pub fn writeFile(self: *Editor, io: Io, path: []const u8, content: []const u8) EditError!void {
+        const split = try splitParentAndName(path);
+        const parent_inode_number = try self.reader.lookupPath(io, split.parent);
+        const child_inode_number = try self.reader.lookupChild(io, parent_inode_number, split.name);
+        const child_inode = try self.reader.readInode(io, child_inode_number);
+        if (child_inode.kind != .file) return error.NotFile;
+
+        const block_size = self.reader.block_size;
+        const new_block_count: u32 = if (content.len == 0) 0 else @intCast(divCeil(@as(u64, content.len), block_size));
+
+        var new_extents: []Extent = &.{};
+        if (new_block_count > 0) new_extents = try self.allocateExtents(self.allocator, new_block_count);
+        defer if (new_block_count > 0) self.allocator.free(new_extents);
+
+        if (new_extents.len > max_inline_extents) {
+            for (new_extents) |extent| {
+                var n: u16 = 0;
+                while (n < extent.block_count) : (n += 1) self.freeBlock(extent.start_block + n);
+            }
+            return error.TooManyExtents;
+        }
+
+        // Only now that the new content's space is fully secured, release
+        // the file's old content.
+        try self.freeInodeAllocations(io, child_inode, false);
+
+        var scratch: [default_block_size]u8 = undefined;
+        var written: u64 = 0;
+        for (new_extents) |extent| {
+            var block_in_extent: u16 = 0;
+            while (block_in_extent < extent.block_count) : (block_in_extent += 1) {
+                @memset(&scratch, 0);
+                const remaining = content.len - written;
+                const want: usize = @intCast(@min(@as(u64, block_size), remaining));
+                if (want > 0) @memcpy(scratch[0..want], content[written .. written + want]);
+                const physical_block = extent.start_block + block_in_extent;
+                try self.reader.file.writePositionalAll(io, &scratch, self.reader.blockOffset(physical_block));
+                written += want;
+            }
+        }
+
+        var buf = try self.readInodeRaw(io, child_inode_number);
+        writeInt(u32, buf[4..8], @truncate(content.len));
+        writeInt(u32, buf[108..112], @as(u32, @truncate(@as(u64, content.len) >> 32)));
+        writeInt(u32, buf[28..32], new_block_count * sectors_per_block);
+        var extent_root: [60]u8 = [_]u8{0} ** 60;
+        encodeExtentLeafNode(extent_root[0..], max_inline_extents, new_extents);
+        @memcpy(buf[40..100], &extent_root);
+        writeInt(u32, buf[32..36], readInt(u32, buf[32..36]) | inode_flag_extents);
+        setInodeChecksum(&buf, self.reader.uuid, child_inode_number);
+        try self.writeInodeRaw(io, child_inode_number, &buf);
+
+        // Match populate()'s own convention of setting the large-file
+        // ro_compat bit once any file exceeds 2 GiB, for consistency with
+        // images this writer creates from scratch.
+        if (content.len >= 2 * 1024 * 1024 * 1024) {
+            const ro_compat = readInt(u32, self.sb[0x64..0x68]);
+            if (ro_compat & feature_ro_compat_large_file == 0) {
+                writeInt(u32, self.sb[0x64..0x68], ro_compat | feature_ro_compat_large_file);
+                self.sb_dirty = true;
+            }
+        }
+    }
 };
 
 const FoundDirEntry = struct {
@@ -4253,6 +4330,138 @@ test "Editor.deleteTree recursively removes a directory and adjusts the parent's
     // reference going away.
     const root_inode_after = try reader.readInode(io, root_inode);
     try std.testing.expectEqual(root_link_count_before - 1, root_inode_after.link_count);
+}
+
+test "Editor.writeFile overwrites content, preserves xattrs, and handles growth/shrink" {
+    const io = std.testing.io;
+    const path = "test-ext4-editor-writefile.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "etc", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{
+            .path = "etc/config.txt",
+            .kind = .file,
+            .mode = 0o644,
+            .uid = 0,
+            .gid = 0,
+            .size = 5,
+            .bytes = "hello",
+            .xattrs = &.{.{ .name = "user.tag", .value = "original" }},
+        },
+        .{ .path = "etc/dir-not-a-file", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+    });
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = 16 * 1024 * 1024, .uuid = [_]u8{0x42} ** 16 });
+
+    var editor = try Editor.open(io, file, std.testing.allocator, .{});
+    defer editor.deinit();
+
+    // Shrink: smaller than the original 5-byte content.
+    try editor.writeFile(io, "etc/config.txt", "hi");
+    try std.testing.expectError(error.NotFound, editor.writeFile(io, "etc/missing.txt", "x"));
+    try std.testing.expectError(error.NotFile, editor.writeFile(io, "etc/dir-not-a-file", "x"));
+    try editor.flush(io);
+
+    {
+        var reader = try open(io, file, std.testing.allocator, .{});
+        defer reader.deinit();
+        const bytes = try reader.readFileAlloc(io, std.testing.allocator, "etc/config.txt");
+        defer std.testing.allocator.free(bytes);
+        try std.testing.expectEqualSlices(u8, "hi", bytes);
+        const tag = try reader.readXattrAlloc(io, std.testing.allocator, "etc/config.txt", "user.tag");
+        defer std.testing.allocator.free(tag);
+        try std.testing.expectEqualSlices(u8, "original", tag);
+    }
+
+    // Grow: large enough to require multiple full 4 KiB blocks.
+    var big_content: [10 * 1024]u8 = undefined;
+    fillPattern(&big_content, 0);
+    try editor.writeFile(io, "etc/config.txt", &big_content);
+    try editor.flush(io);
+
+    {
+        var reader = try open(io, file, std.testing.allocator, .{});
+        defer reader.deinit();
+        const bytes = try reader.readFileAlloc(io, std.testing.allocator, "etc/config.txt");
+        defer std.testing.allocator.free(bytes);
+        try std.testing.expectEqualSlices(u8, &big_content, bytes);
+        const tag = try reader.readXattrAlloc(io, std.testing.allocator, "etc/config.txt", "user.tag");
+        defer std.testing.allocator.free(tag);
+        try std.testing.expectEqualSlices(u8, "original", tag);
+    }
+
+    // Empty content is a valid, well-formed zero-block file.
+    try editor.writeFile(io, "etc/config.txt", "");
+    try editor.flush(io);
+    {
+        var reader = try open(io, file, std.testing.allocator, .{});
+        defer reader.deinit();
+        const stat = try reader.statPath(io, "etc/config.txt");
+        try std.testing.expectEqual(@as(u64, 0), stat.size);
+    }
+}
+
+test "Editor.writeFile rolls back and reports TooManyExtents when free space is too fragmented" {
+    const io = std.testing.io;
+    const path = "test-ext4-editor-writefile-fragmented.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var entries = std.array_list.Managed(InMemoryEntry).init(std.testing.allocator);
+    defer entries.deinit();
+    try entries.append(.{ .path = "d", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 });
+    var names: [20][16]u8 = undefined;
+    var index: usize = 0;
+    while (index < 20) : (index += 1) {
+        const name = try std.fmt.bufPrint(&names[index], "d/f{d:0>2}", .{index});
+        try entries.append(.{ .path = name, .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = default_block_size, .generator = .pattern });
+    }
+
+    var tree = InMemoryTree.init(entries.items);
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = 16 * 1024 * 1024, .uuid = [_]u8{0x43} ** 16 });
+
+    var editor = try Editor.open(io, file, std.testing.allocator, .{});
+    defer editor.deinit();
+
+    // Delete every other single-block file, leaving isolated one-block
+    // holes interleaved with still-used blocks -- the worst case for
+    // contiguous-run allocation.
+    index = 1;
+    while (index < 20) : (index += 2) {
+        var name_buf: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "d/f{d:0>2}", .{index});
+        try editor.deleteFile(io, name);
+    }
+
+    var free_blocks_before: u32 = 0;
+    for (editor.groups) |group| free_blocks_before += group.data_capacity - group.used_data_blocks;
+
+    // 8 blocks of new content cannot fit in <= 4 single-block-run extents.
+    var content: [8 * default_block_size]u8 = undefined;
+    fillPattern(&content, 0);
+    try std.testing.expectError(error.TooManyExtents, editor.writeFile(io, "d/f00", &content));
+
+    // A failed overwrite must not leak the space it provisionally claimed,
+    // nor touch the target file's original content.
+    var free_blocks_after: u32 = 0;
+    for (editor.groups) |group| free_blocks_after += group.data_capacity - group.used_data_blocks;
+    try std.testing.expectEqual(free_blocks_before, free_blocks_after);
+
+    try editor.flush(io);
+    var reader = try open(io, file, std.testing.allocator, .{});
+    defer reader.deinit();
+    const bytes = try reader.readFileAlloc(io, std.testing.allocator, "d/f00");
+    defer std.testing.allocator.free(bytes);
+    var expected: [default_block_size]u8 = undefined;
+    fillPattern(&expected, 0);
+    try std.testing.expectEqualSlices(u8, &expected, bytes);
 }
 
 const InMemoryEntry = struct {
