@@ -974,6 +974,250 @@ pub fn open(io: Io, file: Io.File, allocator: std.mem.Allocator, options: OpenOp
     return Reader.open(io, file, allocator, options);
 }
 
+pub const EditOptions = struct {
+    offset: u64 = 0,
+};
+
+pub const EditError = ReadError || OpenError || Io.File.WritePositionalError || std.mem.Allocator.Error || error{
+    NotEnoughSpace,
+    TooManyExtents,
+    RootPathForbidden,
+    IsDirectory,
+    UnsupportedEditLayout,
+};
+
+/// Live per-group free-space bookkeeping used by `Editor`. Unlike the
+/// populate-time `GroupLayout` (which is only ever derived from a
+/// from-scratch allocation plan), this mirrors the *actual* on-disk bitmap
+/// bytes so blocks/inodes freed by earlier edits in the same session can be
+/// reused, and so freeing never has to touch bits outside the group's real
+/// data/inode region.
+const EditGroupState = struct {
+    start_block: u64,
+    block_count: u32,
+    data_capacity: u32,
+    used_data_blocks: u32,
+    used_inode_count: u32,
+    used_dir_count: u32,
+    block_bitmap_block: u32,
+    inode_bitmap_block: u32,
+};
+
+fn bitTest(bitmap: []const u8, index: u32) bool {
+    return (bitmap[index / 8] & (@as(u8, 1) << @intCast(index % 8))) != 0;
+}
+
+fn bitClear(bitmap: []u8, index: u32) void {
+    bitmap[index / 8] &= ~(@as(u8, 1) << @intCast(index % 8));
+}
+
+/// Targeted, in-place editor for images produced by this module's own
+/// `populate()`/`resize()`. Supports deleting or overwriting *existing*
+/// paths only -- creating a brand-new path that doesn't already exist is
+/// out of scope (see issue #109). Deliberately restricted to the exact
+/// on-disk shape this writer always emits (32-byte group descriptors,
+/// 128-byte inodes, 4096-byte blocks): `open()` rejects anything else with
+/// `error.UnsupportedEditLayout` rather than risk silently mis-editing a
+/// layout it doesn't fully understand.
+pub const Editor = struct {
+    reader: Reader,
+    allocator: std.mem.Allocator,
+    groups: []EditGroupState,
+    block_bitmaps: [][]u8,
+    inode_bitmaps: [][]u8,
+    group_dirty: []bool,
+    sb: [superblock_size]u8,
+    sb_dirty: bool,
+
+    pub fn open(io: Io, file: Io.File, allocator: std.mem.Allocator, options: EditOptions) EditError!Editor {
+        var reader = try Reader.open(io, file, allocator, .{ .offset = options.offset });
+        errdefer reader.deinit();
+
+        if (reader.inode_size != inode_size) return error.UnsupportedEditLayout;
+        if (reader.blocks_per_group != default_blocks_per_group) return error.UnsupportedEditLayout;
+        if (reader.feature_compat & ~writer_feature_compat != 0) return error.UnsupportedEditLayout;
+        if (reader.feature_incompat != writer_feature_incompat) return error.UnsupportedEditLayout;
+        if (reader.feature_ro_compat & ~(writer_feature_ro_compat_base | feature_ro_compat_large_file) != 0) return error.UnsupportedEditLayout;
+
+        var sb: [superblock_size]u8 = undefined;
+        _ = try file.readPositionalAll(io, &sb, options.offset + superblock_offset);
+        const desc_size = blk: {
+            const raw = readInt(u16, sb[0xFE..0x100]);
+            break :blk if (raw == 0) @as(u16, 32) else raw;
+        };
+        if (desc_size != group_desc_size) return error.UnsupportedEditLayout;
+
+        const group_count = reader.groups.len;
+        const gdt_blocks = @max(@as(u32, 1), blocksForBytes(@as(u64, group_count) * group_desc_size, reader.block_size));
+        const gdt_storage_bytes = @as(usize, gdt_blocks) * reader.block_size;
+        const gdt = try allocator.alloc(u8, gdt_storage_bytes);
+        defer allocator.free(gdt);
+        @memset(gdt, 0);
+        _ = try file.readPositionalAll(io, gdt, options.offset + @as(u64, reader.block_size));
+
+        const groups = try allocator.alloc(EditGroupState, group_count);
+        errdefer allocator.free(groups);
+        const block_bitmaps = try allocator.alloc([]u8, group_count);
+        errdefer allocator.free(block_bitmaps);
+        const inode_bitmaps = try allocator.alloc([]u8, group_count);
+        errdefer allocator.free(inode_bitmaps);
+        const group_dirty = try allocator.alloc(bool, group_count);
+        errdefer allocator.free(group_dirty);
+        @memset(group_dirty, false);
+
+        var loaded: usize = 0;
+        errdefer {
+            var i: usize = 0;
+            while (i < loaded) : (i += 1) {
+                allocator.free(block_bitmaps[i]);
+                allocator.free(inode_bitmaps[i]);
+            }
+        }
+
+        var group_index: usize = 0;
+        while (group_index < group_count) : (group_index += 1) {
+            const start_block = @as(u64, group_index) * reader.blocks_per_group;
+            const block_count: u32 = @intCast(@min(@as(u64, reader.blocks_per_group), reader.total_blocks - start_block));
+            const has_super_copy = group_index == 0 or isSparseSuperGroup(@intCast(group_index));
+            const super_gdt_blocks: u32 = if (has_super_copy) 1 + gdt_blocks else 0;
+            const reserved_block_count = super_gdt_blocks + 2 + divCeil(reader.inodes_per_group * @as(u32, reader.inode_size), reader.block_size);
+            if (reserved_block_count >= block_count) return error.UnsupportedEditLayout;
+
+            const rgroup = reader.groups[group_index];
+            if (rgroup.block_bitmap_block != @as(u32, @intCast(start_block + super_gdt_blocks)) or
+                rgroup.inode_bitmap_block != @as(u32, @intCast(start_block + super_gdt_blocks + 1)) or
+                rgroup.inode_table_block != @as(u32, @intCast(start_block + super_gdt_blocks + 2)))
+            {
+                return error.UnsupportedEditLayout;
+            }
+
+            const desc_base = group_index * group_desc_size;
+            const free_blocks = readInt(u16, gdt[desc_base + 12 .. desc_base + 14]);
+            const free_inodes = readInt(u16, gdt[desc_base + 14 .. desc_base + 16]);
+            const used_dirs = readInt(u16, gdt[desc_base + 16 .. desc_base + 18]);
+            const data_capacity = block_count - reserved_block_count;
+
+            block_bitmaps[group_index] = try allocator.alloc(u8, reader.block_size);
+            _ = try file.readPositionalAll(io, block_bitmaps[group_index], reader.blockOffset(rgroup.block_bitmap_block));
+            inode_bitmaps[group_index] = try allocator.alloc(u8, reader.block_size);
+            _ = try file.readPositionalAll(io, inode_bitmaps[group_index], reader.blockOffset(rgroup.inode_bitmap_block));
+            loaded += 1;
+
+            groups[group_index] = .{
+                .start_block = start_block,
+                .block_count = block_count,
+                .data_capacity = data_capacity,
+                .used_data_blocks = data_capacity - free_blocks,
+                .used_inode_count = reader.inodes_per_group - free_inodes,
+                .used_dir_count = used_dirs,
+                .block_bitmap_block = rgroup.block_bitmap_block,
+                .inode_bitmap_block = rgroup.inode_bitmap_block,
+            };
+        }
+
+        return .{
+            .reader = reader,
+            .allocator = allocator,
+            .groups = groups,
+            .block_bitmaps = block_bitmaps,
+            .inode_bitmaps = inode_bitmaps,
+            .group_dirty = group_dirty,
+            .sb = sb,
+            .sb_dirty = false,
+        };
+    }
+
+    /// Frees in-memory state without writing anything back. Call `flush()`
+    /// first if pending edits should be persisted.
+    pub fn deinit(self: *Editor) void {
+        for (self.block_bitmaps) |bitmap| self.allocator.free(bitmap);
+        for (self.inode_bitmaps) |bitmap| self.allocator.free(bitmap);
+        self.allocator.free(self.block_bitmaps);
+        self.allocator.free(self.inode_bitmaps);
+        self.allocator.free(self.groups);
+        self.allocator.free(self.group_dirty);
+        self.reader.deinit();
+        self.* = undefined;
+    }
+
+    /// Writes every group whose bitmaps/descriptor changed since `open()`,
+    /// plus the superblock's global free-space counters, to the primary
+    /// superblock and every sparse-super backup copy -- mirroring the
+    /// existing `resize()` write pattern.
+    pub fn flush(self: *Editor, io: Io) EditError!void {
+        var any_group_dirty = false;
+        for (self.group_dirty) |dirty| {
+            if (dirty) any_group_dirty = true;
+        }
+        if (!any_group_dirty and !self.sb_dirty) return;
+
+        if (any_group_dirty) {
+            const group_count = self.groups.len;
+            const gdt_blocks = @max(@as(u32, 1), blocksForBytes(@as(u64, group_count) * group_desc_size, self.reader.block_size));
+            const gdt_storage_bytes = @as(usize, gdt_blocks) * self.reader.block_size;
+            const gdt = try self.allocator.alloc(u8, gdt_storage_bytes);
+            defer self.allocator.free(gdt);
+            @memset(gdt, 0);
+            _ = try self.reader.file.readPositionalAll(io, gdt, self.reader.offset + @as(u64, self.reader.block_size));
+
+            for (self.groups, 0..) |group, index| {
+                if (!self.group_dirty[index]) continue;
+                try self.reader.file.writePositionalAll(io, self.block_bitmaps[index], self.reader.blockOffset(group.block_bitmap_block));
+                try self.reader.file.writePositionalAll(io, self.inode_bitmaps[index], self.reader.blockOffset(group.inode_bitmap_block));
+
+                const desc_base = index * group_desc_size;
+                const desc = gdt[desc_base .. desc_base + group_desc_size];
+                writeInt(u16, desc[12..14], @intCast(group.data_capacity - group.used_data_blocks));
+                writeInt(u16, desc[14..16], @intCast(self.reader.inodes_per_group - group.used_inode_count));
+                writeInt(u16, desc[16..18], @intCast(group.used_dir_count));
+                writeInt(u16, desc[0x18..0x1A], @truncate(bitmapChecksum(self.reader.uuid, self.block_bitmaps[index], default_blocks_per_group / 8)));
+                writeInt(u16, desc[0x1A..0x1C], @truncate(bitmapChecksum(self.reader.uuid, self.inode_bitmaps[index], self.reader.inodes_per_group / 8)));
+                writeInt(u16, desc[0x1C..0x1E], @intCast(self.reader.inodes_per_group - group.used_inode_count));
+                writeInt(u16, desc[0x1E..0x20], 0);
+                var group_le = std.mem.nativeToLittle(u32, @as(u32, @intCast(index)));
+                writeInt(u16, desc[0x1E..0x20], @truncate(ext4Crc32c(&.{
+                    &self.reader.uuid,
+                    std.mem.asBytes(&group_le),
+                    desc,
+                })));
+            }
+
+            try self.reader.file.writePositionalAll(io, gdt, self.reader.offset + @as(u64, self.reader.block_size));
+            for (self.groups, 0..) |group, index| {
+                if (index == 0 or !isSparseSuperGroup(@intCast(index))) continue;
+                try self.reader.file.writePositionalAll(io, gdt, self.reader.offset + (group.start_block + 1) * self.reader.block_size);
+            }
+        }
+
+        var free_blocks: u32 = 0;
+        var free_inodes: u32 = 0;
+        for (self.groups) |group| {
+            free_blocks += group.data_capacity - group.used_data_blocks;
+            free_inodes += self.reader.inodes_per_group - group.used_inode_count;
+        }
+        writeInt(u32, self.sb[0x0C..0x10], free_blocks);
+        writeInt(u32, self.sb[0x10..0x14], free_inodes);
+        writeInt(u16, self.sb[0x5A..0x5C], 0);
+        setSuperblockChecksum(&self.sb);
+        try self.reader.file.writePositionalAll(io, &self.sb, self.reader.offset + superblock_offset);
+        for (self.groups, 0..) |group, index| {
+            if (index == 0 or !isSparseSuperGroup(@intCast(index))) continue;
+            writeInt(u16, self.sb[0x5A..0x5C], @intCast(index));
+            setSuperblockChecksum(&self.sb);
+            try self.reader.file.writePositionalAll(io, &self.sb, self.reader.offset + group.start_block * self.reader.block_size);
+        }
+
+        self.sb_dirty = false;
+        @memset(self.group_dirty, false);
+    }
+
+    /// Flushes pending edits (if any) and frees in-memory state.
+    pub fn close(self: *Editor, io: Io) EditError!void {
+        try self.flush(io);
+        self.deinit();
+    }
+};
+
 const ReaderGroup = struct {
     block_bitmap_block: u32,
     inode_bitmap_block: u32,
@@ -3307,6 +3551,80 @@ test "resize grows ext4 filesystems in place" {
     const bytes = try reader.readFileAlloc(io, std.testing.allocator, "etc/os-release");
     defer std.testing.allocator.free(bytes);
     try std.testing.expectEqualSlices(u8, "NAME=zvmi", bytes);
+}
+
+test "Editor.open loads live free-space state and a no-op flush leaves the image untouched" {
+    const io = std.testing.io;
+    const path = "test-ext4-editor-open.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "etc", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "etc/os-release", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 9, .bytes = "NAME=zvmi" },
+        .{ .path = "var", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+    });
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+
+    const fs_size: u64 = 16 * 1024 * 1024;
+    const info = try populate(io, file, std.testing.allocator, &tree.view, .{
+        .length = fs_size,
+        .uuid = [_]u8{0x21} ** 16,
+        .timestamp = 1_717_171_717,
+    });
+
+    const before = try std.testing.allocator.alloc(u8, fs_size);
+    defer std.testing.allocator.free(before);
+    _ = try file.readPositionalAll(io, before, 0);
+
+    var editor = try Editor.open(io, file, std.testing.allocator, .{});
+    defer editor.deinit();
+
+    var total_free_blocks: u32 = 0;
+    var total_used_inodes: u32 = 0;
+    for (editor.groups) |group| {
+        total_free_blocks += group.data_capacity - group.used_data_blocks;
+        total_used_inodes += group.used_inode_count;
+    }
+    try std.testing.expectEqual(info.free_block_count, total_free_blocks);
+    try std.testing.expectEqual(info.inode_count - info.free_inode_count, total_used_inodes);
+
+    try editor.flush(io);
+
+    const after = try std.testing.allocator.alloc(u8, fs_size);
+    defer std.testing.allocator.free(after);
+    _ = try file.readPositionalAll(io, after, 0);
+    try std.testing.expectEqualSlices(u8, before, after);
+}
+
+test "Editor.open rejects images with a foreign group descriptor layout" {
+    const io = std.testing.io;
+    const path = "test-ext4-editor-reject.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "etc", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+    });
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = 8 * 1024 * 1024 });
+
+    // Widen the on-disk group descriptor size to 64 bytes, a layout Editor
+    // deliberately does not support (it only ever exists on images this
+    // writer produces itself, which always use 32-byte descriptors).
+    var desc_size_bytes: [2]u8 = undefined;
+    writeInt(u16, &desc_size_bytes, 64);
+    try file.writePositionalAll(io, &desc_size_bytes, superblock_offset + 0xFE);
+    var sb: [superblock_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &sb, superblock_offset);
+    setSuperblockChecksum(&sb);
+    try file.writePositionalAll(io, &sb, superblock_offset);
+
+    try std.testing.expectError(error.UnsupportedEditLayout, Editor.open(io, file, std.testing.allocator, .{}));
 }
 
 const InMemoryEntry = struct {
