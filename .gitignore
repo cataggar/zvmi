@@ -4,3 +4,4 @@ zig-out/
 *.img
 *.vhdx
 *.qcow2
+__pycache__/
