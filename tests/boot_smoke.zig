@@ -370,9 +370,9 @@ fn runQemuBootSmoke(
         const serial_output = try readOptionalFileAlloc(allocator, io, serial_output_path, qemu_boot_smoke_serial_limit);
         // The kernel starting to boot is enough for most callers, but a few
         // (e.g. the --verity real-boot test) need to keep polling until a
-        // later milestone (e.g. "Reached target veritysetup.target") shows
-        // up too -- otherwise this would quit QEMU the instant the kernel
-        // starts printing, long before systemd/dm-verity ever run.
+        // later milestone shows up too -- otherwise this would quit QEMU
+        // the instant the kernel starts printing, long before systemd/
+        // dm-verity ever run.
         const reached_boot = serialOutputShowsKernelBoot(serial_output) and
             (extra_wait_marker == null or std.mem.indexOf(u8, serial_output, extra_wait_marker.?) != null);
         allocator.free(serial_output);
@@ -714,15 +714,26 @@ test "build-image --verity opportunistically boot-smokes a provisioned verity-ca
         .{ .firmware = ovmf, .vars_copy_path = ovmf_vars_copy_path },
         output_path,
         serial_output_path,
-        "Reached target veritysetup.target",
+        "Local Verity Protected Volumes",
     );
     defer qemu.deinit(allocator);
 
-    // "Reached target veritysetup.target" is systemd's own confirmation
-    // that the dm-verity root device was set up and mounted (see the real
-    // boot log captured investigating #77); a kernel-boot-only check
-    // wouldn't distinguish a hung/corrupted verity mount from success.
-    const reached_verity_target = std.mem.indexOf(u8, qemu.serial_output, "Reached target veritysetup.target") != null;
+    // Reaching veritysetup.target (systemd's confirmation that the
+    // dm-verity root device was set up and mounted -- see the real boot log
+    // captured investigating #77; a kernel-boot-only check wouldn't
+    // distinguish a hung/corrupted verity mount from success) is checked via
+    // its unit description, "Local Verity Protected Volumes", rather than
+    // the unit name itself, for two reasons: systemd's colorized
+    // interactive status line renders the name as e.g. "Reached target
+    // \x1b[0;1;39mveritysetup.target\x1b[0m - Local Verity Protected
+    // Volumes.", with an ANSI escape sequence splitting "target" from
+    // "veritysetup.target" so "Reached target veritysetup.target" never
+    // appears as one contiguous substring; and plain "veritysetup.target"
+    // alone would false-positive on the unrelated, always-reached
+    // "remote-veritysetup.target" ("Remote Verity Protected Volumes"),
+    // which is wanted by initrd-root-device.target regardless of whether
+    // this image actually uses local dm-verity.
+    const reached_verity_target = std.mem.indexOf(u8, qemu.serial_output, "Local Verity Protected Volumes") != null;
     if (!reached_verity_target) {
         std.debug.print(
             "--verity QEMU boot smoke test did not reach veritysetup.target (timed_out={}, quit_acknowledged={})\nserial output:\n{s}\n",
