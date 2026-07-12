@@ -1,14 +1,20 @@
 //! `zvmi azure fixup --generation 1|2 <file>`
+//! `zvmi azure deprovision [--user <username>] <file>`
 
 const std = @import("std");
 const zvmi = @import("zvmi");
 
 pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
-    if (args.len < 1 or !std.mem.eql(u8, args[0], "fixup")) {
-        return fail("usage: zvmi azure fixup --generation 1|2 <file>", .{});
-    }
-    const rest = args[1..];
+    if (args.len < 1) return fail(usage, .{});
+    if (std.mem.eql(u8, args[0], "fixup")) return runFixup(gpa, io, args[1..]);
+    if (std.mem.eql(u8, args[0], "deprovision")) return runDeprovision(gpa, io, args[1..]);
+    return fail(usage, .{});
+}
 
+const usage = "usage: zvmi azure fixup --generation 1|2 <file>\n" ++
+    "       zvmi azure deprovision [--user <username>] <file>";
+
+fn runFixup(gpa: std.mem.Allocator, io: std.Io, rest: []const []const u8) u8 {
     var generation: ?zvmi.azure.Generation = null;
     var path: ?[]const u8 = null;
 
@@ -60,6 +66,44 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     }
     std.debug.print("Partition style check FAILED for {s}: {s}\n", .{ gen_name, report.message });
     return 2;
+}
+
+fn runDeprovision(gpa: std.mem.Allocator, io: std.Io, rest: []const []const u8) u8 {
+    var username: ?[]const u8 = null;
+    var path: ?[]const u8 = null;
+
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        const a = rest[i];
+        if (std.mem.eql(u8, a, "--user")) {
+            i += 1;
+            if (i >= rest.len) return fail("azure deprovision: --user requires an argument", .{});
+            username = rest[i];
+        } else if (path == null) {
+            path = a;
+        } else {
+            return fail("azure deprovision: unexpected argument '{s}'", .{a});
+        }
+    }
+
+    const file_path = path orelse return fail("usage: zvmi azure deprovision [--user <username>] <file>", .{});
+
+    var img = zvmi.Image.openPath(io, file_path) catch |err|
+        return fail("azure deprovision: failed to open '{s}': {s}", .{ file_path, @errorName(err) });
+    defer img.close(io);
+
+    const offset = zvmi.deprovision.findRootExt4Offset(gpa, img, io) catch |err|
+        return fail("azure deprovision: failed to locate the root ext4 filesystem: {s}", .{@errorName(err)});
+
+    zvmi.deprovision.deprovision(gpa, img, io, offset, .{ .username = username }) catch |err|
+        return fail("azure deprovision: failed: {s}", .{@errorName(err)});
+
+    if (username) |u| {
+        std.debug.print("Deprovisioned '{s}' (hostname reset, SSH host keys/machine-id/DHCP state cleared, user '{s}' removed).\n", .{ file_path, u });
+    } else {
+        std.debug.print("Deprovisioned '{s}' (hostname reset, SSH host keys/machine-id/DHCP state cleared).\n", .{file_path});
+    }
+    return 0;
 }
 
 fn fail(comptime format: []const u8, args: anytype) u8 {
