@@ -26,6 +26,7 @@ const usage =
     \\  check <file>
     \\  map [--output=human|json] <file>
     \\  azure fixup --generation 1|2 <file>
+    \\  azure deprovision [--user <username>] <file>
     \\  cosi <disk-image> -o <output.cosi>
     \\  build-image --iso <file.iso> --container <oci-layout> --generation 1|2 --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}> [--skip-iso-rootfs] [--esp-size <size>] [--boot-mode bls|uki|both] [--stub-source-path <path>] [--verity]
     \\

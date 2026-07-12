@@ -64,6 +64,11 @@ zvmi/
                               #   (CRC-32, spec-verified layout)
         azure.zig              # 1 MiB alignment + Gen1/Gen2 partition-style
                               #   checks (backs `zvmi azure fixup`)
+        deprovision.zig        # offline image generalization: resets
+                              #   hostname/SSH host keys/machine-id/DHCP
+                              #   state (+ optional user removal) directly
+                              #   via ext4.Editor (backs
+                              #   `zvmi azure deprovision`; issue #110)
         tar.zig                # minimal private USTAR reader/writer shared by
                               #   OCI layer ingestion and COSI packaging
         zstd.zig               # minimal private raw-block zstd codec for COSI
@@ -81,7 +86,7 @@ zvmi/
         resize.zig            # `zvmi resize`
         check.zig             # `zvmi check`
         map.zig               # `zvmi map`
-        azure.zig             # `zvmi azure fixup`
+        azure.zig             # `zvmi azure fixup`, `zvmi azure deprovision`
         cosi.zig              # `zvmi cosi`
         build_image.zig       # `zvmi build-image`
         opts.zig              # shared `-o subformat=...` parsing
@@ -193,6 +198,8 @@ zvmi resize disk.vhd +4G
 zvmi check disk.vhd
 zvmi map disk.vhd
 zvmi azure fixup --generation 1|2 disk.vhd  # pads to 1 MiB, checks MBR/GPT
+zvmi azure deprovision disk.vhd                    # generalize: reset hostname/SSH host keys/machine-id/DHCP state
+zvmi azure deprovision --user azureuser disk.vhd   # also removes that user account + its home directory
 zvmi cosi disk.img -o disk.cosi              # tar + metadata.json + per-partition raw.zst
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G -o output.vhd
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G -o output.raw -O raw
