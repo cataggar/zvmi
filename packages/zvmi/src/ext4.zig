@@ -667,6 +667,10 @@ pub const Reader = struct {
     pub fn listDir(self: Reader, io: Io, allocator: std.mem.Allocator, path: []const u8) ReadError![]DirEntry {
         const inode_number = try self.lookupPath(io, path);
         const inode = try self.readInode(io, inode_number);
+        return self.listDirByInode(io, allocator, inode);
+    }
+
+    fn listDirByInode(self: Reader, io: Io, allocator: std.mem.Allocator, inode: ParsedInode) ReadError![]DirEntry {
         if (inode.kind != .directory) return error.NotDirectory;
 
         const data = try self.readInodeDataAlloc(io, allocator, inode);
@@ -970,6 +974,711 @@ pub fn open(io: Io, file: Io.File, allocator: std.mem.Allocator, options: OpenOp
     return Reader.open(io, file, allocator, options);
 }
 
+pub const EditOptions = struct {
+    offset: u64 = 0,
+};
+
+pub const EditError = ReadError || OpenError || Io.File.WritePositionalError || std.mem.Allocator.Error || error{
+    NotEnoughSpace,
+    TooManyExtents,
+    RootPathForbidden,
+    IsDirectory,
+    UnsupportedEditLayout,
+};
+
+/// Live per-group free-space bookkeeping used by `Editor`. Unlike the
+/// populate-time `GroupLayout` (which is only ever derived from a
+/// from-scratch allocation plan), this mirrors the *actual* on-disk bitmap
+/// bytes so blocks/inodes freed by earlier edits in the same session can be
+/// reused, and so freeing never has to touch bits outside the group's real
+/// data/inode region.
+const EditGroupState = struct {
+    start_block: u64,
+    block_count: u32,
+    data_capacity: u32,
+    used_data_blocks: u32,
+    used_inode_count: u32,
+    used_dir_count: u32,
+    block_bitmap_block: u32,
+    inode_bitmap_block: u32,
+    /// `bg_itable_unused`, preserved byte-for-byte from the original image.
+    /// This counts inode-table slots at the *tail* of the group that have
+    /// never been written at all (letting e2fsck skip scanning them) --
+    /// it is only ever correct to compute fresh from
+    /// `inodes_per_group - used_inode_count` when usage is guaranteed
+    /// contiguous from index 0, which is only true for a brand-new
+    /// populate()/resize() layout. Editor only ever deletes/overwrites
+    /// existing entries (never allocates a new inode), so this count can
+    /// never legitimately change during an edit session and must be
+    /// carried through unmodified -- recomputing it from the live
+    /// (post-deletion, holey) used_inode_count would make e2fsck treat
+    /// still-valid inodes in the middle of the range as uninitialized.
+    itable_unused: u16,
+};
+
+fn bitTest(bitmap: []const u8, index: u32) bool {
+    return (bitmap[index / 8] & (@as(u8, 1) << @intCast(index % 8))) != 0;
+}
+
+fn bitClear(bitmap: []u8, index: u32) void {
+    bitmap[index / 8] &= ~(@as(u8, 1) << @intCast(index % 8));
+}
+
+/// Targeted, in-place editor for images produced by this module's own
+/// `populate()`/`resize()`. Supports deleting or overwriting *existing*
+/// paths only -- creating a brand-new path that doesn't already exist is
+/// out of scope (see issue #109). Deliberately restricted to the exact
+/// on-disk shape this writer always emits (32-byte group descriptors,
+/// 128-byte inodes, 4096-byte blocks): `open()` rejects anything else with
+/// `error.UnsupportedEditLayout` rather than risk silently mis-editing a
+/// layout it doesn't fully understand.
+pub const Editor = struct {
+    reader: Reader,
+    allocator: std.mem.Allocator,
+    groups: []EditGroupState,
+    block_bitmaps: [][]u8,
+    inode_bitmaps: [][]u8,
+    group_dirty: []bool,
+    sb: [superblock_size]u8,
+    sb_dirty: bool,
+
+    pub fn open(io: Io, file: Io.File, allocator: std.mem.Allocator, options: EditOptions) EditError!Editor {
+        var reader = try Reader.open(io, file, allocator, .{ .offset = options.offset });
+        errdefer reader.deinit();
+
+        if (reader.inode_size != inode_size) return error.UnsupportedEditLayout;
+        if (reader.blocks_per_group != default_blocks_per_group) return error.UnsupportedEditLayout;
+        if (reader.feature_compat & ~writer_feature_compat != 0) return error.UnsupportedEditLayout;
+        if (reader.feature_incompat != writer_feature_incompat) return error.UnsupportedEditLayout;
+        if (reader.feature_ro_compat & ~(writer_feature_ro_compat_base | feature_ro_compat_large_file) != 0) return error.UnsupportedEditLayout;
+
+        var sb: [superblock_size]u8 = undefined;
+        _ = try file.readPositionalAll(io, &sb, options.offset + superblock_offset);
+        const desc_size = blk: {
+            const raw = readInt(u16, sb[0xFE..0x100]);
+            break :blk if (raw == 0) @as(u16, 32) else raw;
+        };
+        if (desc_size != group_desc_size) return error.UnsupportedEditLayout;
+
+        const group_count = reader.groups.len;
+        const gdt_blocks = @max(@as(u32, 1), blocksForBytes(@as(u64, group_count) * group_desc_size, reader.block_size));
+        const gdt_storage_bytes = @as(usize, gdt_blocks) * reader.block_size;
+        const gdt = try allocator.alloc(u8, gdt_storage_bytes);
+        defer allocator.free(gdt);
+        @memset(gdt, 0);
+        _ = try file.readPositionalAll(io, gdt, options.offset + @as(u64, reader.block_size));
+
+        const groups = try allocator.alloc(EditGroupState, group_count);
+        errdefer allocator.free(groups);
+        const block_bitmaps = try allocator.alloc([]u8, group_count);
+        errdefer allocator.free(block_bitmaps);
+        const inode_bitmaps = try allocator.alloc([]u8, group_count);
+        errdefer allocator.free(inode_bitmaps);
+        const group_dirty = try allocator.alloc(bool, group_count);
+        errdefer allocator.free(group_dirty);
+        @memset(group_dirty, false);
+
+        var loaded: usize = 0;
+        errdefer {
+            var i: usize = 0;
+            while (i < loaded) : (i += 1) {
+                allocator.free(block_bitmaps[i]);
+                allocator.free(inode_bitmaps[i]);
+            }
+        }
+
+        var group_index: usize = 0;
+        while (group_index < group_count) : (group_index += 1) {
+            const start_block = @as(u64, group_index) * reader.blocks_per_group;
+            const block_count: u32 = @intCast(@min(@as(u64, reader.blocks_per_group), reader.total_blocks - start_block));
+            const has_super_copy = group_index == 0 or isSparseSuperGroup(@intCast(group_index));
+            const super_gdt_blocks: u32 = if (has_super_copy) 1 + gdt_blocks else 0;
+            const reserved_block_count = super_gdt_blocks + 2 + divCeil(reader.inodes_per_group * @as(u32, reader.inode_size), reader.block_size);
+            if (reserved_block_count >= block_count) return error.UnsupportedEditLayout;
+
+            const rgroup = reader.groups[group_index];
+            if (rgroup.block_bitmap_block != @as(u32, @intCast(start_block + super_gdt_blocks)) or
+                rgroup.inode_bitmap_block != @as(u32, @intCast(start_block + super_gdt_blocks + 1)) or
+                rgroup.inode_table_block != @as(u32, @intCast(start_block + super_gdt_blocks + 2)))
+            {
+                return error.UnsupportedEditLayout;
+            }
+
+            const desc_base = group_index * group_desc_size;
+            const free_blocks = readInt(u16, gdt[desc_base + 12 .. desc_base + 14]);
+            const free_inodes = readInt(u16, gdt[desc_base + 14 .. desc_base + 16]);
+            const used_dirs = readInt(u16, gdt[desc_base + 16 .. desc_base + 18]);
+            const itable_unused = readInt(u16, gdt[desc_base + 0x1C .. desc_base + 0x1E]);
+            const data_capacity = block_count - reserved_block_count;
+
+            block_bitmaps[group_index] = try allocator.alloc(u8, reader.block_size);
+            _ = try file.readPositionalAll(io, block_bitmaps[group_index], reader.blockOffset(rgroup.block_bitmap_block));
+            inode_bitmaps[group_index] = try allocator.alloc(u8, reader.block_size);
+            _ = try file.readPositionalAll(io, inode_bitmaps[group_index], reader.blockOffset(rgroup.inode_bitmap_block));
+            loaded += 1;
+
+            groups[group_index] = .{
+                .start_block = start_block,
+                .block_count = block_count,
+                .data_capacity = data_capacity,
+                .used_data_blocks = data_capacity - free_blocks,
+                .used_inode_count = reader.inodes_per_group - free_inodes,
+                .used_dir_count = used_dirs,
+                .block_bitmap_block = rgroup.block_bitmap_block,
+                .inode_bitmap_block = rgroup.inode_bitmap_block,
+                .itable_unused = itable_unused,
+            };
+        }
+
+        return .{
+            .reader = reader,
+            .allocator = allocator,
+            .groups = groups,
+            .block_bitmaps = block_bitmaps,
+            .inode_bitmaps = inode_bitmaps,
+            .group_dirty = group_dirty,
+            .sb = sb,
+            .sb_dirty = false,
+        };
+    }
+
+    /// Frees in-memory state without writing anything back. Call `flush()`
+    /// first if pending edits should be persisted.
+    pub fn deinit(self: *Editor) void {
+        for (self.block_bitmaps) |bitmap| self.allocator.free(bitmap);
+        for (self.inode_bitmaps) |bitmap| self.allocator.free(bitmap);
+        self.allocator.free(self.block_bitmaps);
+        self.allocator.free(self.inode_bitmaps);
+        self.allocator.free(self.groups);
+        self.allocator.free(self.group_dirty);
+        self.reader.deinit();
+        self.* = undefined;
+    }
+
+    /// Writes every group whose bitmaps/descriptor changed since `open()`,
+    /// plus the superblock's global free-space counters, to the primary
+    /// superblock and every sparse-super backup copy -- mirroring the
+    /// existing `resize()` write pattern.
+    pub fn flush(self: *Editor, io: Io) EditError!void {
+        var any_group_dirty = false;
+        for (self.group_dirty) |dirty| {
+            if (dirty) any_group_dirty = true;
+        }
+        if (!any_group_dirty and !self.sb_dirty) return;
+
+        if (any_group_dirty) {
+            const group_count = self.groups.len;
+            const gdt_blocks = @max(@as(u32, 1), blocksForBytes(@as(u64, group_count) * group_desc_size, self.reader.block_size));
+            const gdt_storage_bytes = @as(usize, gdt_blocks) * self.reader.block_size;
+            const gdt = try self.allocator.alloc(u8, gdt_storage_bytes);
+            defer self.allocator.free(gdt);
+            @memset(gdt, 0);
+            _ = try self.reader.file.readPositionalAll(io, gdt, self.reader.offset + @as(u64, self.reader.block_size));
+
+            for (self.groups, 0..) |group, index| {
+                if (!self.group_dirty[index]) continue;
+                try self.reader.file.writePositionalAll(io, self.block_bitmaps[index], self.reader.blockOffset(group.block_bitmap_block));
+                try self.reader.file.writePositionalAll(io, self.inode_bitmaps[index], self.reader.blockOffset(group.inode_bitmap_block));
+
+                const desc_base = index * group_desc_size;
+                const desc = gdt[desc_base .. desc_base + group_desc_size];
+                writeInt(u16, desc[12..14], @intCast(group.data_capacity - group.used_data_blocks));
+                writeInt(u16, desc[14..16], @intCast(self.reader.inodes_per_group - group.used_inode_count));
+                writeInt(u16, desc[16..18], @intCast(group.used_dir_count));
+                writeInt(u16, desc[0x18..0x1A], @truncate(bitmapChecksum(self.reader.uuid, self.block_bitmaps[index], default_blocks_per_group / 8)));
+                writeInt(u16, desc[0x1A..0x1C], @truncate(bitmapChecksum(self.reader.uuid, self.inode_bitmaps[index], self.reader.inodes_per_group / 8)));
+                // Deliberately *not* recomputed from used_inode_count -- see
+                // EditGroupState.itable_unused's doc comment.
+                writeInt(u16, desc[0x1C..0x1E], group.itable_unused);
+                writeInt(u16, desc[0x1E..0x20], 0);
+                var group_le = std.mem.nativeToLittle(u32, @as(u32, @intCast(index)));
+                writeInt(u16, desc[0x1E..0x20], @truncate(ext4Crc32c(&.{
+                    &self.reader.uuid,
+                    std.mem.asBytes(&group_le),
+                    desc,
+                })));
+            }
+
+            try self.reader.file.writePositionalAll(io, gdt, self.reader.offset + @as(u64, self.reader.block_size));
+            for (self.groups, 0..) |group, index| {
+                if (index == 0 or !isSparseSuperGroup(@intCast(index))) continue;
+                try self.reader.file.writePositionalAll(io, gdt, self.reader.offset + (group.start_block + 1) * self.reader.block_size);
+            }
+        }
+
+        var free_blocks: u32 = 0;
+        var free_inodes: u32 = 0;
+        for (self.groups) |group| {
+            free_blocks += group.data_capacity - group.used_data_blocks;
+            free_inodes += self.reader.inodes_per_group - group.used_inode_count;
+        }
+        writeInt(u32, self.sb[0x0C..0x10], free_blocks);
+        writeInt(u32, self.sb[0x10..0x14], free_inodes);
+        writeInt(u16, self.sb[0x5A..0x5C], 0);
+        setSuperblockChecksum(&self.sb);
+        try self.reader.file.writePositionalAll(io, &self.sb, self.reader.offset + superblock_offset);
+        for (self.groups, 0..) |group, index| {
+            if (index == 0 or !isSparseSuperGroup(@intCast(index))) continue;
+            writeInt(u16, self.sb[0x5A..0x5C], @intCast(index));
+            setSuperblockChecksum(&self.sb);
+            try self.reader.file.writePositionalAll(io, &self.sb, self.reader.offset + group.start_block * self.reader.block_size);
+        }
+
+        self.sb_dirty = false;
+        @memset(self.group_dirty, false);
+    }
+
+    /// Flushes pending edits (if any) and frees in-memory state.
+    pub fn close(self: *Editor, io: Io) EditError!void {
+        try self.flush(io);
+        self.deinit();
+    }
+
+    /// Marks one physical data block free in its group's live bitmap, if it
+    /// was actually marked used. Safe to call more than once for the same
+    /// block (a double-free is a silent no-op rather than an error, since
+    /// callers may legitimately re-encounter a block while walking an
+    /// extent tree that happens to alias metadata, e.g. a reused xattr
+    /// block referenced from more than one place is not something this
+    /// writer ever produces, but this keeps the mutator defensive).
+    fn freeBlock(self: *Editor, physical_block: u64) void {
+        const group_index: usize = @intCast(physical_block / self.reader.blocks_per_group);
+        const group = &self.groups[group_index];
+        const bit_index: u32 = @intCast(physical_block - group.start_block);
+        const bitmap = self.block_bitmaps[group_index];
+        if (bitTest(bitmap, bit_index)) {
+            bitClear(bitmap, bit_index);
+            group.used_data_blocks -= 1;
+            self.group_dirty[group_index] = true;
+            self.sb_dirty = true;
+        }
+    }
+
+    /// Allocates `block_count` data blocks, greedily preferring contiguous
+    /// runs within a group to minimize the resulting extent count (mirrors
+    /// the populate-time `BlockAllocator`, but scans a live bitmap with
+    /// holes instead of bump-allocating from an empty group). On
+    /// `error.NotEnoughSpace`, any blocks already claimed by this call are
+    /// rolled back before returning.
+    fn allocateExtents(self: *Editor, allocator: std.mem.Allocator, block_count: u32) EditError![]Extent {
+        var extents = std.array_list.Managed(Extent).init(allocator);
+        errdefer extents.deinit();
+        var remaining = block_count;
+        var logical: u32 = 0;
+
+        for (self.groups, 0..) |*group, group_index| {
+            if (remaining == 0) break;
+            if (group.used_data_blocks >= group.data_capacity) continue;
+
+            const bitmap = self.block_bitmaps[group_index];
+            var bit_index: u32 = 0;
+            while (bit_index < group.block_count and remaining > 0) {
+                if (bitTest(bitmap, bit_index)) {
+                    bit_index += 1;
+                    continue;
+                }
+                const run_start = bit_index;
+                var run_len: u32 = 0;
+                while (bit_index < group.block_count and run_len < remaining and !bitTest(bitmap, bit_index)) : (bit_index += 1) {
+                    run_len += 1;
+                }
+                var i = run_start;
+                while (i < run_start + run_len) : (i += 1) setBitmapBit(bitmap, i);
+                group.used_data_blocks += run_len;
+                self.group_dirty[group_index] = true;
+                self.sb_dirty = true;
+                try extents.append(.{
+                    .logical_block = logical,
+                    .start_block = group.start_block + run_start,
+                    .block_count = @intCast(run_len),
+                });
+                logical += run_len;
+                remaining -= run_len;
+            }
+        }
+
+        if (remaining > 0) {
+            for (extents.items) |extent| {
+                var n: u16 = 0;
+                while (n < extent.block_count) : (n += 1) self.freeBlock(extent.start_block + n);
+            }
+            extents.deinit();
+            return error.NotEnoughSpace;
+        }
+        return extents.toOwnedSlice();
+    }
+
+    /// Marks one inode free in its group's live inode bitmap, if it was
+    /// actually marked used, and decrements the group's directory count too
+    /// when `is_dir` is set.
+    fn freeInodeBit(self: *Editor, inode_number: u32, is_dir: bool) void {
+        const group_index: usize = (inode_number - 1) / self.reader.inodes_per_group;
+        const index_in_group: u32 = @intCast((inode_number - 1) % self.reader.inodes_per_group);
+        const group = &self.groups[group_index];
+        const bitmap = self.inode_bitmaps[group_index];
+        if (bitTest(bitmap, index_in_group)) {
+            bitClear(bitmap, index_in_group);
+            group.used_inode_count -= 1;
+            if (is_dir and group.used_dir_count > 0) group.used_dir_count -= 1;
+            self.group_dirty[group_index] = true;
+            self.sb_dirty = true;
+        }
+    }
+
+    /// Recursively walks an extent tree exactly like the Reader's
+    /// `appendExtentTreeEntries`, but collects both the leaf extents' data
+    /// blocks *and* every interior/index node's own physical block number,
+    /// since deleting or truncating an inode must free the extent-tree
+    /// metadata blocks too, not just the data they describe.
+    fn collectExtentTreeBlocks(
+        self: *Editor,
+        io: Io,
+        node_bytes: []const u8,
+        node_capacity: usize,
+        expected_depth: ?u16,
+        leaf_extents: *std.array_list.Managed(Extent),
+        index_blocks: *std.array_list.Managed(u64),
+    ) EditError!void {
+        const header = try parseExtentHeader(node_bytes[0..extent_header_size]);
+        if (expected_depth) |depth| {
+            if (header.depth != depth) return error.UnsupportedInodeLayout;
+        }
+        if (header.depth > max_supported_extent_depth) return error.UnsupportedExtentDepth;
+        if (header.entries > header.max or header.max > node_capacity) return error.UnsupportedInodeLayout;
+
+        var entry_index: usize = 0;
+        if (header.depth == 0) {
+            while (entry_index < header.entries) : (entry_index += 1) {
+                const base = extent_header_size + entry_index * extent_entry_size;
+                try leaf_extents.append(decodeExtent(node_bytes[base .. base + extent_entry_size]));
+            }
+            return;
+        }
+
+        var child_block: [default_block_size]u8 = undefined;
+        while (entry_index < header.entries) : (entry_index += 1) {
+            const base = extent_header_size + entry_index * extent_entry_size;
+            const child = decodeExtentIndex(node_bytes[base .. base + extent_entry_size]);
+            try index_blocks.append(child.leaf_block);
+            _ = try self.reader.file.readPositionalAll(io, &child_block, self.reader.blockOffset(child.leaf_block));
+            try self.collectExtentTreeBlocks(
+                io,
+                child_block[0..],
+                extentEntriesPerBlock(self.reader.block_size),
+                header.depth - 1,
+                leaf_extents,
+                index_blocks,
+            );
+        }
+    }
+
+    /// Frees every block backing an inode's content: all extent-tree leaf
+    /// (data) blocks, all interior/index extent-tree blocks, and (when
+    /// `free_xattr` is set) the external xattr block. Fast symlinks store
+    /// their target inline in `i_block` and own no separate blocks at all,
+    /// so they are a deliberate no-op here.
+    fn freeInodeAllocations(self: *Editor, io: Io, inode: ParsedInode, free_xattr: bool) EditError!void {
+        if (inode.kind == .symlink and inode.isFastSymlink()) {
+            if (free_xattr and inode.file_acl_block != 0) self.freeBlock(inode.file_acl_block);
+            return;
+        }
+        if ((inode.flags & inode_flag_extents) == 0) return error.UnsupportedInodeLayout;
+
+        var leaf_extents = std.array_list.Managed(Extent).init(self.allocator);
+        defer leaf_extents.deinit();
+        var index_blocks = std.array_list.Managed(u64).init(self.allocator);
+        defer index_blocks.deinit();
+        try self.collectExtentTreeBlocks(io, inode.block_bytes[0..], max_inline_extents, null, &leaf_extents, &index_blocks);
+
+        for (leaf_extents.items) |extent| {
+            var n: u16 = 0;
+            while (n < extent.block_count) : (n += 1) self.freeBlock(extent.start_block + n);
+        }
+        for (index_blocks.items) |block_number| self.freeBlock(block_number);
+        if (free_xattr and inode.file_acl_block != 0) self.freeBlock(inode.file_acl_block);
+    }
+
+    /// Scans a directory's data block-by-block (never the flattened,
+    /// whole-directory buffer `listDirByInode` uses) to find exactly which
+    /// physical block holds a named entry, since directory-leaf checksums
+    /// are computed per block and only that one block needs to be rewritten
+    /// to splice an entry out.
+    fn findDirEntry(self: *Editor, io: Io, dir_inode: ParsedInode, name: []const u8) EditError!FoundDirEntry {
+        const extents = try self.reader.readInodeExtentsAlloc(io, self.allocator, dir_inode);
+        defer self.allocator.free(extents);
+
+        for (extents) |extent| {
+            var block_in_extent: u16 = 0;
+            while (block_in_extent < extent.block_count) : (block_in_extent += 1) {
+                const physical_block = extent.start_block + block_in_extent;
+                var block: [default_block_size]u8 = undefined;
+                _ = try self.reader.file.readPositionalAll(io, &block, self.reader.blockOffset(physical_block));
+
+                var offset: usize = 0;
+                var prev_offset: ?usize = null;
+                while (offset + 8 <= block.len) {
+                    const child_inode = readInt(u32, block[offset .. offset + 4]);
+                    const rec_len = readInt(u16, block[offset + 4 .. offset + 6]);
+                    const name_len = block[offset + 6];
+                    if (rec_len < 8 or offset + rec_len > block.len) return error.BadDirectoryEntry;
+                    if (name_len > rec_len - 8) return error.BadDirectoryEntry;
+                    if (child_inode != 0 and name_len == name.len and std.mem.eql(u8, block[offset + 8 .. offset + 8 + name_len], name)) {
+                        return .{
+                            .physical_block = physical_block,
+                            .block = block,
+                            .entry_offset = offset,
+                            .prev_offset = prev_offset,
+                            .inode = child_inode,
+                        };
+                    }
+                    prev_offset = offset;
+                    offset += rec_len;
+                }
+            }
+        }
+        return error.NotFound;
+    }
+
+    /// Splices a directory entry out of its containing block: merges its
+    /// `rec_len` into the immediately preceding entry in the same block
+    /// (the standard ext4 `ext4_delete_entry()` technique -- no data
+    /// movement needed, since `rec_len` simply grows to span the freed
+    /// space), or if it was the first entry in the block, just zeroes its
+    /// inode field (already tolerated everywhere this codebase scans
+    /// directory entries, exactly like htree index blocks that
+    /// "masquerade as unused directory entries"). Recomputes and writes
+    /// back only that one block.
+    fn spliceDirEntry(self: *Editor, io: Io, found: FoundDirEntry, dir_inode_number: u32) EditError!void {
+        var block = found.block;
+        const rec_len = readInt(u16, block[found.entry_offset + 4 .. found.entry_offset + 6]);
+        if (found.prev_offset) |prev_off| {
+            const prev_rec_len = readInt(u16, block[prev_off + 4 .. prev_off + 6]);
+            writeInt(u16, block[prev_off + 4 .. prev_off + 6], prev_rec_len + rec_len);
+        } else {
+            writeInt(u32, block[found.entry_offset .. found.entry_offset + 4], 0);
+        }
+        setDirectoryLeafChecksum(&block, self.reader.uuid, dir_inode_number, 0);
+        try self.reader.file.writePositionalAll(io, &block, self.reader.blockOffset(found.physical_block));
+    }
+
+    /// Removes `name`'s directory entry from `parent_inode_number`'s data.
+    fn removeDirEntryFromParent(self: *Editor, io: Io, parent_inode_number: u32, name: []const u8) EditError!void {
+        const parent_inode = try self.reader.readInode(io, parent_inode_number);
+        if (parent_inode.kind != .directory) return error.NotDirectory;
+        const found = try self.findDirEntry(io, parent_inode, name);
+        try self.spliceDirEntry(io, found, parent_inode_number);
+    }
+
+    fn inodeLocation(self: Editor, inode_number: u32) u64 {
+        const group_index = (inode_number - 1) / self.reader.inodes_per_group;
+        const index_in_group = (inode_number - 1) % self.reader.inodes_per_group;
+        const rgroup = self.reader.groups[group_index];
+        return self.reader.blockOffset(rgroup.inode_table_block) + @as(u64, index_in_group) * self.reader.inode_size;
+    }
+
+    fn readInodeRaw(self: Editor, io: Io, inode_number: u32) EditError![inode_size]u8 {
+        var buf: [inode_size]u8 = undefined;
+        _ = try self.reader.file.readPositionalAll(io, &buf, self.inodeLocation(inode_number));
+        return buf;
+    }
+
+    fn writeInodeRaw(self: Editor, io: Io, inode_number: u32, buf: *const [inode_size]u8) EditError!void {
+        try self.reader.file.writePositionalAll(io, buf, self.inodeLocation(inode_number));
+    }
+
+    /// Decrements a regular file's or symlink's `i_links_count`. This
+    /// writer never creates hardlinked regular files (`FileTreeView` has no
+    /// hardlink concept), so in practice `link_count` is always 1 and this
+    /// always frees the inode -- but decrementing rather than
+    /// force-freeing handles a hand-crafted or externally-hardlinked image
+    /// correctly too, only retiring the inode once its last reference is
+    /// gone.
+    fn decrementLinkCountAndMaybeFree(self: *Editor, io: Io, inode_number: u32, kind: Kind) EditError!void {
+        var buf = try self.readInodeRaw(io, inode_number);
+        const link_count = readInt(u16, buf[26..28]);
+        if (link_count == 0) return;
+        if (link_count == 1) {
+            const parsed = try ParsedInode.fromBytes(inode_number, &buf);
+            try self.freeInodeAllocations(io, parsed, true);
+            @memset(&buf, 0);
+            try self.writeInodeRaw(io, inode_number, &buf);
+            self.freeInodeBit(inode_number, kind == .directory);
+        } else {
+            writeInt(u16, buf[26..28], link_count - 1);
+            setInodeChecksum(&buf, self.reader.uuid, inode_number);
+            try self.writeInodeRaw(io, inode_number, &buf);
+        }
+    }
+
+    /// Directories can never be hardlinked in POSIX/ext4 -- any link count
+    /// above 1 is purely structural (its own "." plus one per subdirectory
+    /// child's ".."), never a "real" extra reference -- so a directory
+    /// being fully removed is always safe to force-retire outright, unlike
+    /// the decrement-and-maybe-free handling regular files need.
+    fn forceRetireDirectory(self: *Editor, io: Io, inode_number: u32) EditError!void {
+        var buf = try self.readInodeRaw(io, inode_number);
+        const parsed = try ParsedInode.fromBytes(inode_number, &buf);
+        try self.freeInodeAllocations(io, parsed, true);
+        @memset(&buf, 0);
+        try self.writeInodeRaw(io, inode_number, &buf);
+        self.freeInodeBit(inode_number, true);
+    }
+
+    fn decrementParentLinkCount(self: *Editor, io: Io, parent_inode_number: u32) EditError!void {
+        var buf = try self.readInodeRaw(io, parent_inode_number);
+        const link_count = readInt(u16, buf[26..28]);
+        if (link_count > 0) {
+            writeInt(u16, buf[26..28], link_count - 1);
+            setInodeChecksum(&buf, self.reader.uuid, parent_inode_number);
+            try self.writeInodeRaw(io, parent_inode_number, &buf);
+        }
+    }
+
+    /// Recursively retires an inode and everything beneath it (for
+    /// directories), freeing every block and inode along the way, but
+    /// without touching any directory entries -- the caller is responsible
+    /// for splicing the top-level entry out of its parent, since every
+    /// entry *within* a subtree being fully destroyed is irrelevant (the
+    /// whole subtree's blocks/inodes are being freed regardless of their
+    /// logical occupancy).
+    fn retireRecursively(self: *Editor, io: Io, inode_number: u32) EditError!void {
+        const inode = try self.reader.readInode(io, inode_number);
+        if (inode.kind == .directory) {
+            const children = try self.reader.listDirByInode(io, self.allocator, inode);
+            defer freeDirEntries(self.allocator, children);
+            for (children) |entry| try self.retireRecursively(io, entry.inode);
+            try self.forceRetireDirectory(io, inode_number);
+        } else {
+            try self.decrementLinkCountAndMaybeFree(io, inode_number, inode.kind);
+        }
+    }
+
+    /// Deletes an existing regular file or symlink at `path`. Use
+    /// `deleteTree` for directories.
+    pub fn deleteFile(self: *Editor, io: Io, path: []const u8) EditError!void {
+        const split = try splitParentAndName(path);
+        const parent_inode_number = try self.reader.lookupPath(io, split.parent);
+        const child_inode_number = try self.reader.lookupChild(io, parent_inode_number, split.name);
+        const child_inode = try self.reader.readInode(io, child_inode_number);
+        if (child_inode.kind == .directory) return error.IsDirectory;
+        try self.decrementLinkCountAndMaybeFree(io, child_inode_number, child_inode.kind);
+        try self.removeDirEntryFromParent(io, parent_inode_number, split.name);
+    }
+
+    /// Recursively deletes an existing path -- a single file/symlink, or a
+    /// directory and everything beneath it. Creating a brand-new path that
+    /// doesn't already exist remains out of scope; only deleting or
+    /// overwriting existing entries is supported.
+    pub fn deleteTree(self: *Editor, io: Io, path: []const u8) EditError!void {
+        const split = try splitParentAndName(path);
+        const parent_inode_number = try self.reader.lookupPath(io, split.parent);
+        const child_inode_number = try self.reader.lookupChild(io, parent_inode_number, split.name);
+        const child_inode = try self.reader.readInode(io, child_inode_number);
+        try self.retireRecursively(io, child_inode_number);
+        try self.removeDirEntryFromParent(io, parent_inode_number, split.name);
+        if (child_inode.kind == .directory) try self.decrementParentLinkCount(io, parent_inode_number);
+    }
+
+    /// Overwrites the content of an existing regular file. Extended
+    /// attributes are preserved (only the data content is replaced); this
+    /// is not a general truncate/rewrite -- it always replaces the whole
+    /// file. Fragmentation is bounded: the new content is allocated as
+    /// contiguous runs greedily, and if that still needs more than
+    /// `max_inline_extents` (4) extents, the allocation is rolled back and
+    /// `error.TooManyExtents` is returned rather than building a deeper
+    /// extent tree (a deliberate v1 scope limit -- see issue #109). The new
+    /// content is always written to freshly allocated blocks *before* the
+    /// old content is freed (needing up to `new_block_count` blocks of
+    /// headroom beyond the old file's own size), so a failed overwrite
+    /// never leaves the original file half-freed with nothing valid in its
+    /// place.
+    pub fn writeFile(self: *Editor, io: Io, path: []const u8, content: []const u8) EditError!void {
+        const split = try splitParentAndName(path);
+        const parent_inode_number = try self.reader.lookupPath(io, split.parent);
+        const child_inode_number = try self.reader.lookupChild(io, parent_inode_number, split.name);
+        const child_inode = try self.reader.readInode(io, child_inode_number);
+        if (child_inode.kind != .file) return error.NotFile;
+
+        const block_size = self.reader.block_size;
+        const new_block_count: u32 = if (content.len == 0) 0 else @intCast(divCeil(@as(u64, content.len), block_size));
+
+        var new_extents: []Extent = &.{};
+        if (new_block_count > 0) new_extents = try self.allocateExtents(self.allocator, new_block_count);
+        defer if (new_block_count > 0) self.allocator.free(new_extents);
+
+        if (new_extents.len > max_inline_extents) {
+            for (new_extents) |extent| {
+                var n: u16 = 0;
+                while (n < extent.block_count) : (n += 1) self.freeBlock(extent.start_block + n);
+            }
+            return error.TooManyExtents;
+        }
+
+        // Only now that the new content's space is fully secured, release
+        // the file's old content.
+        try self.freeInodeAllocations(io, child_inode, false);
+
+        var scratch: [default_block_size]u8 = undefined;
+        var written: u64 = 0;
+        for (new_extents) |extent| {
+            var block_in_extent: u16 = 0;
+            while (block_in_extent < extent.block_count) : (block_in_extent += 1) {
+                @memset(&scratch, 0);
+                const remaining = content.len - written;
+                const want: usize = @intCast(@min(@as(u64, block_size), remaining));
+                if (want > 0) @memcpy(scratch[0..want], content[written .. written + want]);
+                const physical_block = extent.start_block + block_in_extent;
+                try self.reader.file.writePositionalAll(io, &scratch, self.reader.blockOffset(physical_block));
+                written += want;
+            }
+        }
+
+        var buf = try self.readInodeRaw(io, child_inode_number);
+        writeInt(u32, buf[4..8], @truncate(content.len));
+        writeInt(u32, buf[108..112], @as(u32, @truncate(@as(u64, content.len) >> 32)));
+        writeInt(u32, buf[28..32], new_block_count * sectors_per_block);
+        var extent_root: [60]u8 = [_]u8{0} ** 60;
+        encodeExtentLeafNode(extent_root[0..], max_inline_extents, new_extents);
+        @memcpy(buf[40..100], &extent_root);
+        writeInt(u32, buf[32..36], readInt(u32, buf[32..36]) | inode_flag_extents);
+        setInodeChecksum(&buf, self.reader.uuid, child_inode_number);
+        try self.writeInodeRaw(io, child_inode_number, &buf);
+
+        // Match populate()'s own convention of setting the large-file
+        // ro_compat bit once any file exceeds 2 GiB, for consistency with
+        // images this writer creates from scratch.
+        if (content.len >= 2 * 1024 * 1024 * 1024) {
+            const ro_compat = readInt(u32, self.sb[0x64..0x68]);
+            if (ro_compat & feature_ro_compat_large_file == 0) {
+                writeInt(u32, self.sb[0x64..0x68], ro_compat | feature_ro_compat_large_file);
+                self.sb_dirty = true;
+            }
+        }
+    }
+};
+
+const FoundDirEntry = struct {
+    physical_block: u64,
+    block: [default_block_size]u8,
+    entry_offset: usize,
+    prev_offset: ?usize,
+    inode: u32,
+};
+
+/// Splits a path into its parent directory and final component, matching
+/// `Reader.lookupPath`'s own root/trailing-slash tolerance. Returns
+/// `error.RootPathForbidden` for `""`/`"/"`, since delete/overwrite always
+/// need an existing named entry to act on.
+fn splitParentAndName(path: []const u8) EditError!struct { parent: []const u8, name: []const u8 } {
+    var trimmed = path;
+    while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') trimmed = trimmed[0 .. trimmed.len - 1];
+    if (trimmed.len == 0) return error.RootPathForbidden;
+    if (std.mem.lastIndexOfScalar(u8, trimmed, '/')) |index| {
+        return .{ .parent = trimmed[0..index], .name = trimmed[index + 1 ..] };
+    }
+    return .{ .parent = "", .name = trimmed };
+}
+
 const ReaderGroup = struct {
     block_bitmap_block: u32,
     inode_bitmap_block: u32,
@@ -986,6 +1695,7 @@ const ParsedInode = struct {
     generation: u32,
     flags: u32,
     file_acl_block: u32,
+    link_count: u16,
     block_bytes: [60]u8,
 
     fn fromBytes(inode_number: u32, buf: []const u8) ReadError!ParsedInode {
@@ -1003,6 +1713,7 @@ const ParsedInode = struct {
             .generation = readInt(u32, buf[100..104]),
             .flags = readInt(u32, buf[32..36]),
             .file_acl_block = readInt(u32, buf[104..108]),
+            .link_count = readInt(u16, buf[26..28]),
             .block_bytes = block_bytes,
         };
     }
@@ -2943,6 +3654,42 @@ test "reader rejects missing paths and wrong node kinds" {
     try std.testing.expectError(error.NotFile, reader.readFileAlloc(io, std.testing.allocator, "dir"));
 }
 
+test "reader exposes inode link counts" {
+    const io = std.testing.io;
+    const path = "test-ext4-link-count.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "empty-dir", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "parent", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "parent/child", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "file", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 4, .bytes = "test" },
+    });
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = 8 * 1024 * 1024 });
+
+    var reader = try open(io, file, std.testing.allocator, .{});
+    defer reader.deinit();
+
+    // A regular file always has link_count == 1 (this writer never creates hardlinks).
+    const file_inode_number = try reader.lookupPath(io, "file");
+    const file_inode = try reader.readInode(io, file_inode_number);
+    try std.testing.expectEqual(@as(u16, 1), file_inode.link_count);
+
+    // A directory with no subdirectories has link_count == 2 (its own "." plus the parent's entry).
+    const empty_dir_number = try reader.lookupPath(io, "empty-dir");
+    const empty_dir_inode = try reader.readInode(io, empty_dir_number);
+    try std.testing.expectEqual(@as(u16, 2), empty_dir_inode.link_count);
+
+    // A directory with one subdirectory gains one extra link from that child's "..".
+    const parent_number = try reader.lookupPath(io, "parent");
+    const parent_inode = try reader.readInode(io, parent_number);
+    try std.testing.expectEqual(@as(u16, 3), parent_inode.link_count);
+}
+
 test "reader opens read-only-safe 64-byte group descriptor ext4 images" {
     const io = std.testing.io;
     const path = "test-ext4-reader-64byte-gdt.img";
@@ -3265,6 +4012,669 @@ test "resize grows ext4 filesystems in place" {
     const bytes = try reader.readFileAlloc(io, std.testing.allocator, "etc/os-release");
     defer std.testing.allocator.free(bytes);
     try std.testing.expectEqualSlices(u8, "NAME=zvmi", bytes);
+}
+
+test "Editor.open loads live free-space state and a no-op flush leaves the image untouched" {
+    const io = std.testing.io;
+    const path = "test-ext4-editor-open.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "etc", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "etc/os-release", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 9, .bytes = "NAME=zvmi" },
+        .{ .path = "var", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+    });
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+
+    const fs_size: u64 = 16 * 1024 * 1024;
+    const info = try populate(io, file, std.testing.allocator, &tree.view, .{
+        .length = fs_size,
+        .uuid = [_]u8{0x21} ** 16,
+        .timestamp = 1_717_171_717,
+    });
+
+    const before = try std.testing.allocator.alloc(u8, fs_size);
+    defer std.testing.allocator.free(before);
+    _ = try file.readPositionalAll(io, before, 0);
+
+    var editor = try Editor.open(io, file, std.testing.allocator, .{});
+    defer editor.deinit();
+
+    var total_free_blocks: u32 = 0;
+    var total_used_inodes: u32 = 0;
+    for (editor.groups) |group| {
+        total_free_blocks += group.data_capacity - group.used_data_blocks;
+        total_used_inodes += group.used_inode_count;
+    }
+    try std.testing.expectEqual(info.free_block_count, total_free_blocks);
+    try std.testing.expectEqual(info.inode_count - info.free_inode_count, total_used_inodes);
+
+    try editor.flush(io);
+
+    const after = try std.testing.allocator.alloc(u8, fs_size);
+    defer std.testing.allocator.free(after);
+    _ = try file.readPositionalAll(io, after, 0);
+    try std.testing.expectEqualSlices(u8, before, after);
+}
+
+test "Editor.open rejects images with a foreign group descriptor layout" {
+    const io = std.testing.io;
+    const path = "test-ext4-editor-reject.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "etc", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+    });
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = 8 * 1024 * 1024 });
+
+    // Widen the on-disk group descriptor size to 64 bytes, a layout Editor
+    // deliberately does not support (it only ever exists on images this
+    // writer produces itself, which always use 32-byte descriptors).
+    var desc_size_bytes: [2]u8 = undefined;
+    writeInt(u16, &desc_size_bytes, 64);
+    try file.writePositionalAll(io, &desc_size_bytes, superblock_offset + 0xFE);
+    var sb: [superblock_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &sb, superblock_offset);
+    setSuperblockChecksum(&sb);
+    try file.writePositionalAll(io, &sb, superblock_offset);
+
+    try std.testing.expectError(error.UnsupportedEditLayout, Editor.open(io, file, std.testing.allocator, .{}));
+}
+
+test "Editor frees an inode's extent-tree blocks (leaf, index, and xattr) and reuses them" {
+    const io = std.testing.io;
+    const path = "test-ext4-editor-free-extents.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    // Large enough to force real extent index blocks (see "populate round-trips
+    // files that require extent index blocks"), so freeing exercises the
+    // interior-node path, not just leaf extents.
+    const fs_size: u64 = 768 * 1024 * 1024;
+    const big_size: u64 = 544 * 1024 * 1024;
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "big.bin", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = big_size, .generator = .pattern },
+        .{ .path = "small.txt", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 5, .bytes = "hello", .xattrs = &.{.{ .name = "user.tag", .value = "v" }} },
+    });
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    const info = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = fs_size, .uuid = [_]u8{0x30} ** 16 });
+
+    var editor = try Editor.open(io, file, std.testing.allocator, .{});
+    defer editor.deinit();
+
+    var free_before: u32 = 0;
+    for (editor.groups) |group| free_before += group.data_capacity - group.used_data_blocks;
+    try std.testing.expectEqual(info.free_block_count, free_before);
+
+    const big_inode_number = try editor.reader.lookupPath(io, "big.bin");
+    const big_inode = try editor.reader.readInode(io, big_inode_number);
+    try std.testing.expect((big_inode.flags & inode_flag_extents) != 0);
+
+    // Confirm this file really does have extent index blocks, so freeing it
+    // exercises the interior-node collection path, not just leaf extents.
+    const root_header = try parseExtentHeader(big_inode.block_bytes[0..extent_header_size]);
+    try std.testing.expect(root_header.depth > 0);
+
+    const small_inode_number = try editor.reader.lookupPath(io, "small.txt");
+    const small_inode = try editor.reader.readInode(io, small_inode_number);
+    try std.testing.expect(small_inode.file_acl_block != 0);
+
+    try editor.freeInodeAllocations(io, big_inode, true);
+    try editor.freeInodeAllocations(io, small_inode, true);
+
+    var free_after: u32 = 0;
+    for (editor.groups) |group| free_after += group.data_capacity - group.used_data_blocks;
+    try std.testing.expect(free_after > free_before);
+
+    // The freed space must be immediately reusable within the same session.
+    const reclaimed = try editor.allocateExtents(std.testing.allocator, free_after);
+    defer std.testing.allocator.free(reclaimed);
+    var reclaimed_total: u32 = 0;
+    for (reclaimed) |extent| reclaimed_total += extent.block_count;
+    try std.testing.expectEqual(free_after, reclaimed_total);
+
+    try std.testing.expectError(error.NotEnoughSpace, editor.allocateExtents(std.testing.allocator, 1));
+}
+
+test "splitParentAndName splits paths and rejects the root" {
+    {
+        const split = try splitParentAndName("etc/hostname");
+        try std.testing.expectEqualStrings("etc", split.parent);
+        try std.testing.expectEqualStrings("hostname", split.name);
+    }
+    {
+        const split = try splitParentAndName("hostname");
+        try std.testing.expectEqualStrings("", split.parent);
+        try std.testing.expectEqualStrings("hostname", split.name);
+    }
+    {
+        const split = try splitParentAndName("etc/hostname/");
+        try std.testing.expectEqualStrings("etc", split.parent);
+        try std.testing.expectEqualStrings("hostname", split.name);
+    }
+    try std.testing.expectError(error.RootPathForbidden, splitParentAndName(""));
+    try std.testing.expectError(error.RootPathForbidden, splitParentAndName("/"));
+}
+
+test "Editor removes directory entries by splicing, across a large htree-indexed directory" {
+    const io = std.testing.io;
+    const path = "test-ext4-editor-unlink-htree.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var entries = std.array_list.Managed(InMemoryEntry).init(std.testing.allocator);
+    defer entries.deinit();
+    try entries.append(.{ .path = "big", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 });
+    var names: [300][16]u8 = undefined;
+    var index: usize = 0;
+    while (index < 300) : (index += 1) {
+        const name = try std.fmt.bufPrint(&names[index], "big/file-{d:0>3}", .{index});
+        try entries.append(.{ .path = name, .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 0 });
+    }
+
+    var tree = InMemoryTree.init(entries.items);
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{
+        .length = 32 * 1024 * 1024,
+        .uuid = [_]u8{0x25} ** 16,
+    });
+
+    var editor = try Editor.open(io, file, std.testing.allocator, .{});
+    defer editor.deinit();
+    const dir_inode_number = try editor.reader.lookupPath(io, "big");
+
+    // Spread across the whole directory (start/middle/end) so this
+    // implicitly exercises both splice branches -- some of these names will
+    // land as the first entry within their particular htree leaf block
+    // (splice zeroes the inode field in place), others will have a real
+    // preceding sibling in the same block (splice merges rec_len into it) --
+    // without needing to know in advance which is which.
+    const to_remove = [_][]const u8{ "file-000", "file-050", "file-127", "file-299" };
+    for (to_remove) |name| try editor.removeDirEntryFromParent(io, dir_inode_number, name);
+    try std.testing.expectError(error.NotFound, editor.removeDirEntryFromParent(io, dir_inode_number, "file-000"));
+
+    try editor.flush(io);
+
+    var reader = try open(io, file, std.testing.allocator, .{});
+    defer reader.deinit();
+    const dir_entries = try reader.listDir(io, std.testing.allocator, "big");
+    defer freeDirEntries(std.testing.allocator, dir_entries);
+    try std.testing.expectEqual(@as(usize, 300 - to_remove.len), dir_entries.len);
+
+    for (to_remove) |name| {
+        var buf: [32]u8 = undefined;
+        const full = try std.fmt.bufPrint(&buf, "big/{s}", .{name});
+        try std.testing.expectError(error.NotFound, reader.statPath(io, full));
+    }
+    _ = try reader.statPath(io, "big/file-001");
+    _ = try reader.statPath(io, "big/file-128");
+    _ = try reader.statPath(io, "big/file-298");
+}
+
+test "Editor.deleteFile removes a regular file, frees its inode/blocks, and leaves siblings intact" {
+    const io = std.testing.io;
+    const path = "test-ext4-editor-deletefile.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const big_size: u64 = 544 * 1024 * 1024;
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "etc", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "etc/keep.txt", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 4, .bytes = "keep" },
+        .{ .path = "etc/remove.txt", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 6, .bytes = "remove" },
+        .{ .path = "big.bin", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = big_size, .generator = .pattern },
+        .{ .path = "link", .kind = .symlink, .mode = 0o777, .uid = 0, .gid = 0, .size = 4, .bytes = "keep" },
+    });
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = 768 * 1024 * 1024, .uuid = [_]u8{0x40} ** 16 });
+
+    var editor = try Editor.open(io, file, std.testing.allocator, .{});
+    defer editor.deinit();
+
+    var free_blocks_before: u32 = 0;
+    var free_inodes_before: u32 = 0;
+    for (editor.groups) |group| {
+        free_blocks_before += group.data_capacity - group.used_data_blocks;
+        free_inodes_before += editor.reader.inodes_per_group - group.used_inode_count;
+    }
+
+    // Deleting a large multi-extent-block file must free its interior
+    // extent-tree index blocks too, not just its leaf data blocks.
+    try editor.deleteFile(io, "big.bin");
+    try editor.deleteFile(io, "etc/remove.txt");
+    try std.testing.expectError(error.IsDirectory, editor.deleteFile(io, "etc"));
+    try std.testing.expectError(error.NotFound, editor.deleteFile(io, "etc/remove.txt"));
+    try std.testing.expectError(error.NotFound, editor.deleteFile(io, "missing"));
+
+    var free_blocks_after: u32 = 0;
+    var free_inodes_after: u32 = 0;
+    for (editor.groups) |group| {
+        free_blocks_after += group.data_capacity - group.used_data_blocks;
+        free_inodes_after += editor.reader.inodes_per_group - group.used_inode_count;
+    }
+    try std.testing.expect(free_blocks_after > free_blocks_before);
+    try std.testing.expectEqual(free_inodes_before + 2, free_inodes_after);
+
+    try editor.flush(io);
+
+    var reader = try open(io, file, std.testing.allocator, .{});
+    defer reader.deinit();
+    try std.testing.expectError(error.NotFound, reader.statPath(io, "big.bin"));
+    try std.testing.expectError(error.NotFound, reader.statPath(io, "etc/remove.txt"));
+
+    const kept = try reader.readFileAlloc(io, std.testing.allocator, "etc/keep.txt");
+    defer std.testing.allocator.free(kept);
+    try std.testing.expectEqualSlices(u8, "keep", kept);
+
+    // The symlink is untouched -- deleteFile only removes the exact path
+    // requested, never anything else that merely shares its content.
+    const link_target = try reader.readLinkAlloc(io, std.testing.allocator, "link");
+    defer std.testing.allocator.free(link_target);
+    try std.testing.expectEqualSlices(u8, "keep", link_target);
+
+    const dir_entries = try reader.listDir(io, std.testing.allocator, "etc");
+    defer freeDirEntries(std.testing.allocator, dir_entries);
+    try expectDirNames(dir_entries, &.{"keep.txt"});
+}
+
+test "Editor.deleteTree recursively removes a directory and adjusts the parent's link count" {
+    const io = std.testing.io;
+    const path = "test-ext4-editor-deletetree.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "keep", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "keep/file.txt", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 4, .bytes = "keep" },
+        .{ .path = "doomed", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "doomed/a.txt", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 1, .bytes = "A" },
+        .{ .path = "doomed/nested", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "doomed/nested/b.txt", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 1, .bytes = "B" },
+        .{ .path = "doomed/nested/link", .kind = .symlink, .mode = 0o777, .uid = 0, .gid = 0, .size = 5, .bytes = "b.txt" },
+    });
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = 16 * 1024 * 1024, .uuid = [_]u8{0x41} ** 16 });
+
+    const root_link_count_before = blk: {
+        var reader = try open(io, file, std.testing.allocator, .{});
+        defer reader.deinit();
+        break :blk (try reader.readInode(io, root_inode)).link_count;
+    };
+
+    var editor = try Editor.open(io, file, std.testing.allocator, .{});
+    defer editor.deinit();
+
+    try editor.deleteTree(io, "doomed");
+    try std.testing.expectError(error.NotFound, editor.deleteTree(io, "doomed"));
+    try std.testing.expectError(error.RootPathForbidden, editor.deleteTree(io, "/"));
+    try std.testing.expectError(error.RootPathForbidden, editor.deleteTree(io, ""));
+
+    try editor.flush(io);
+
+    var reader = try open(io, file, std.testing.allocator, .{});
+    defer reader.deinit();
+    try std.testing.expectError(error.NotFound, reader.statPath(io, "doomed"));
+    try std.testing.expectError(error.NotFound, reader.statPath(io, "doomed/a.txt"));
+    try std.testing.expectError(error.NotFound, reader.statPath(io, "doomed/nested"));
+    try std.testing.expectError(error.NotFound, reader.statPath(io, "doomed/nested/b.txt"));
+
+    const root_entries = try reader.listDir(io, std.testing.allocator, "");
+    defer freeDirEntries(std.testing.allocator, root_entries);
+    try expectDirNames(root_entries, &.{"keep"});
+
+    const kept = try reader.readFileAlloc(io, std.testing.allocator, "keep/file.txt");
+    defer std.testing.allocator.free(kept);
+    try std.testing.expectEqualSlices(u8, "keep", kept);
+
+    // Removing "doomed" (which itself had one subdirectory, "nested") must
+    // drop the root's link count by exactly one, for "doomed"'s own ".."
+    // reference going away.
+    const root_inode_after = try reader.readInode(io, root_inode);
+    try std.testing.expectEqual(root_link_count_before - 1, root_inode_after.link_count);
+}
+
+test "Editor.writeFile overwrites content, preserves xattrs, and handles growth/shrink" {
+    const io = std.testing.io;
+    const path = "test-ext4-editor-writefile.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "etc", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{
+            .path = "etc/config.txt",
+            .kind = .file,
+            .mode = 0o644,
+            .uid = 0,
+            .gid = 0,
+            .size = 5,
+            .bytes = "hello",
+            .xattrs = &.{.{ .name = "user.tag", .value = "original" }},
+        },
+        .{ .path = "etc/dir-not-a-file", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+    });
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = 16 * 1024 * 1024, .uuid = [_]u8{0x42} ** 16 });
+
+    var editor = try Editor.open(io, file, std.testing.allocator, .{});
+    defer editor.deinit();
+
+    // Shrink: smaller than the original 5-byte content.
+    try editor.writeFile(io, "etc/config.txt", "hi");
+    try std.testing.expectError(error.NotFound, editor.writeFile(io, "etc/missing.txt", "x"));
+    try std.testing.expectError(error.NotFile, editor.writeFile(io, "etc/dir-not-a-file", "x"));
+    try editor.flush(io);
+
+    {
+        var reader = try open(io, file, std.testing.allocator, .{});
+        defer reader.deinit();
+        const bytes = try reader.readFileAlloc(io, std.testing.allocator, "etc/config.txt");
+        defer std.testing.allocator.free(bytes);
+        try std.testing.expectEqualSlices(u8, "hi", bytes);
+        const tag = try reader.readXattrAlloc(io, std.testing.allocator, "etc/config.txt", "user.tag");
+        defer std.testing.allocator.free(tag);
+        try std.testing.expectEqualSlices(u8, "original", tag);
+    }
+
+    // Grow: large enough to require multiple full 4 KiB blocks.
+    var big_content: [10 * 1024]u8 = undefined;
+    fillPattern(&big_content, 0);
+    try editor.writeFile(io, "etc/config.txt", &big_content);
+    try editor.flush(io);
+
+    {
+        var reader = try open(io, file, std.testing.allocator, .{});
+        defer reader.deinit();
+        const bytes = try reader.readFileAlloc(io, std.testing.allocator, "etc/config.txt");
+        defer std.testing.allocator.free(bytes);
+        try std.testing.expectEqualSlices(u8, &big_content, bytes);
+        const tag = try reader.readXattrAlloc(io, std.testing.allocator, "etc/config.txt", "user.tag");
+        defer std.testing.allocator.free(tag);
+        try std.testing.expectEqualSlices(u8, "original", tag);
+    }
+
+    // Empty content is a valid, well-formed zero-block file.
+    try editor.writeFile(io, "etc/config.txt", "");
+    try editor.flush(io);
+    {
+        var reader = try open(io, file, std.testing.allocator, .{});
+        defer reader.deinit();
+        const stat = try reader.statPath(io, "etc/config.txt");
+        try std.testing.expectEqual(@as(u64, 0), stat.size);
+    }
+}
+
+test "Editor.writeFile rolls back and reports TooManyExtents when free space is too fragmented" {
+    const io = std.testing.io;
+    const path = "test-ext4-editor-writefile-fragmented.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var entries = std.array_list.Managed(InMemoryEntry).init(std.testing.allocator);
+    defer entries.deinit();
+    try entries.append(.{ .path = "d", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 });
+    var names: [20][16]u8 = undefined;
+    var index: usize = 0;
+    while (index < 20) : (index += 1) {
+        const name = try std.fmt.bufPrint(&names[index], "d/f{d:0>2}", .{index});
+        try entries.append(.{ .path = name, .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = default_block_size, .generator = .pattern });
+    }
+
+    var tree = InMemoryTree.init(entries.items);
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = 16 * 1024 * 1024, .uuid = [_]u8{0x43} ** 16 });
+
+    var editor = try Editor.open(io, file, std.testing.allocator, .{});
+    defer editor.deinit();
+
+    // Delete every other single-block file, leaving isolated one-block
+    // holes interleaved with still-used blocks -- the worst case for
+    // contiguous-run allocation.
+    index = 1;
+    while (index < 20) : (index += 2) {
+        var name_buf: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "d/f{d:0>2}", .{index});
+        try editor.deleteFile(io, name);
+    }
+
+    var free_blocks_before: u32 = 0;
+    for (editor.groups) |group| free_blocks_before += group.data_capacity - group.used_data_blocks;
+
+    // 8 blocks of new content cannot fit in <= 4 single-block-run extents.
+    var content: [8 * default_block_size]u8 = undefined;
+    fillPattern(&content, 0);
+    try std.testing.expectError(error.TooManyExtents, editor.writeFile(io, "d/f00", &content));
+
+    // A failed overwrite must not leak the space it provisionally claimed,
+    // nor touch the target file's original content.
+    var free_blocks_after: u32 = 0;
+    for (editor.groups) |group| free_blocks_after += group.data_capacity - group.used_data_blocks;
+    try std.testing.expectEqual(free_blocks_before, free_blocks_after);
+
+    try editor.flush(io);
+    var reader = try open(io, file, std.testing.allocator, .{});
+    defer reader.deinit();
+    const bytes = try reader.readFileAlloc(io, std.testing.allocator, "d/f00");
+    defer std.testing.allocator.free(bytes);
+    var expected: [default_block_size]u8 = undefined;
+    fillPattern(&expected, 0);
+    try std.testing.expectEqualSlices(u8, &expected, bytes);
+}
+
+test "Editor.flush keeps sparse-super backup superblocks and GDT copies in sync with the primary" {
+    const io = std.testing.io;
+    const path = "test-ext4-editor-flush-backups.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    // >= 3 groups (each default_blocks_per_group is 128 MiB), so group 1 has
+    // a real sparse-super backup copy distinct from the primary in group 0.
+    const fs_size: u64 = 400 * 1024 * 1024;
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "a.txt", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 1, .bytes = "A" },
+        .{ .path = "b.txt", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 1, .bytes = "B" },
+    });
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = fs_size, .uuid = [_]u8{0x50} ** 16 });
+
+    var editor = try Editor.open(io, file, std.testing.allocator, .{});
+    defer editor.deinit();
+    try std.testing.expect(editor.groups.len >= 3);
+
+    // Force both a group-bitmap/GDT change and a superblock free-count
+    // change, so flush() has real work to mirror into the backups.
+    try editor.deleteFile(io, "a.txt");
+    try editor.flush(io);
+
+    var primary_sb: [superblock_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &primary_sb, superblock_offset);
+
+    const backup_group_start_block = editor.groups[1].start_block;
+    var backup_sb: [superblock_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &backup_sb, backup_group_start_block * default_block_size);
+
+    // Backups are byte-for-byte identical to the primary except for their
+    // own s_block_group_nr field (and the checksum that covers it).
+    try std.testing.expectEqualSlices(u8, primary_sb[0..0x5A], backup_sb[0..0x5A]);
+    try std.testing.expectEqual(@as(u16, 0), readInt(u16, primary_sb[0x5A..0x5C]));
+    try std.testing.expectEqual(@as(u16, 1), readInt(u16, backup_sb[0x5A..0x5C]));
+    try std.testing.expectEqualSlices(u8, primary_sb[0x5C..0x3FC], backup_sb[0x5C..0x3FC]);
+
+    var recomputed_backup_sb = backup_sb;
+    setSuperblockChecksum(&recomputed_backup_sb);
+    try std.testing.expectEqualSlices(u8, &recomputed_backup_sb, &backup_sb);
+
+    const gdt_blocks = @max(@as(u32, 1), blocksForBytes(@as(u64, editor.groups.len) * group_desc_size, default_block_size));
+    const gdt_bytes_len = @as(usize, gdt_blocks) * default_block_size;
+    const primary_gdt = try std.testing.allocator.alloc(u8, gdt_bytes_len);
+    defer std.testing.allocator.free(primary_gdt);
+    _ = try file.readPositionalAll(io, primary_gdt, default_block_size);
+    const backup_gdt = try std.testing.allocator.alloc(u8, gdt_bytes_len);
+    defer std.testing.allocator.free(backup_gdt);
+    _ = try file.readPositionalAll(io, backup_gdt, (backup_group_start_block + 1) * default_block_size);
+    try std.testing.expectEqualSlices(u8, primary_gdt, backup_gdt);
+
+    var reader = try open(io, file, std.testing.allocator, .{});
+    defer reader.deinit();
+    try std.testing.expectError(error.NotFound, reader.statPath(io, "a.txt"));
+    const kept = try reader.readFileAlloc(io, std.testing.allocator, "b.txt");
+    defer std.testing.allocator.free(kept);
+    try std.testing.expectEqualSlices(u8, "B", kept);
+}
+
+/// Runs `e2fsck -f -n` against a real on-disk image, trying a few common
+/// install locations since e2fsprogs's sbin binaries often aren't on an
+/// unprivileged user's PATH even when installed (this repo's CI runs on
+/// ubuntu-latest, which ships e2fsprogs by default). Returns `null`
+/// (rather than failing) when it truly can't be found anywhere, so this
+/// opportunistic external-tool check is skipped gracefully instead of
+/// breaking builds/dev machines that lack it -- matching the pattern
+/// `tests/boot_smoke.zig` uses for qemu-system-x86_64.
+fn runE2fsck(allocator: std.mem.Allocator, path: []const u8) !?std.process.RunResult {
+    const candidates = [_][]const u8{ "e2fsck", "/sbin/e2fsck", "/usr/sbin/e2fsck" };
+    for (candidates) |bin| {
+        const result = std.process.run(allocator, std.testing.io, .{
+            .argv = &.{ bin, "-f", "-n", path },
+            .cwd = .{ .path = "." },
+        }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        return result;
+    }
+    return null;
+}
+
+test "Editor edits (deletes, recursive tree removal, and overwrite) pass a real e2fsck -f check" {
+    const io = std.testing.io;
+    const path = "test-ext4-editor-e2fsck.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var entries = std.array_list.Managed(InMemoryEntry).init(std.testing.allocator);
+    defer entries.deinit();
+    try entries.append(.{ .path = "etc", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 });
+    try entries.append(.{
+        .path = "etc/keep.conf",
+        .kind = .file,
+        .mode = 0o644,
+        .uid = 0,
+        .gid = 0,
+        .size = 4,
+        .bytes = "keep",
+    });
+    try entries.append(.{ .path = "etc/remove.conf", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 6, .bytes = "remove" });
+    try entries.append(.{ .path = "var", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 });
+    try entries.append(.{ .path = "var/log", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 });
+    try entries.append(.{ .path = "var/log/app.log", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 3, .bytes = "log" });
+    try entries.append(.{ .path = "doomed", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 });
+    try entries.append(.{ .path = "doomed/nested", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 });
+    try entries.append(.{ .path = "doomed/nested/file.txt", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 4, .bytes = "data" });
+    try entries.append(.{ .path = "doomed/link", .kind = .symlink, .mode = 0o777, .uid = 0, .gid = 0, .size = 4, .bytes = "keep" });
+    // Multi-extent (2 extents, crossing one group boundary) but deliberately
+    // *not* deep enough to need an extent-tree index block (issue #115
+    // tracks a separate, pre-existing populate() bug in the interior extent
+    // block checksum for depth > 0 trees, unrelated to editing).
+    try entries.append(.{ .path = "big.bin", .kind = .file, .mode = 0o600, .uid = 42, .gid = 24, .size = 150 * 1024 * 1024, .generator = .pattern });
+    try entries.append(.{ .path = "many", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 });
+    var names: [300][20]u8 = undefined;
+    var name_index: usize = 0;
+    while (name_index < 300) : (name_index += 1) {
+        const name = try std.fmt.bufPrint(&names[name_index], "many/file-{d:0>3}", .{name_index});
+        try entries.append(.{ .path = name, .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 0 });
+    }
+
+    var tree = InMemoryTree.init(entries.items);
+    tree.bind();
+
+    const fs_size: u64 = 900 * 1024 * 1024;
+    {
+        const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+        defer file.close(io);
+        _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = fs_size, .uuid = [_]u8{0x60} ** 16 });
+
+        var editor = try Editor.open(io, file, std.testing.allocator, .{});
+        defer editor.deinit();
+
+        try editor.deleteFile(io, "etc/remove.conf");
+        try editor.deleteTree(io, "doomed");
+
+        var remove_index: usize = 1;
+        while (remove_index < 300) : (remove_index += 2) {
+            var buf: [20]u8 = undefined;
+            const name = try std.fmt.bufPrint(&buf, "many/file-{d:0>3}", .{remove_index});
+            try editor.deleteFile(io, name);
+        }
+
+        var grown: [10 * 1024]u8 = undefined;
+        fillPattern(&grown, 0);
+        try editor.writeFile(io, "etc/keep.conf", &grown);
+
+        try editor.flush(io);
+    }
+
+    const maybe_result = try runE2fsck(std.testing.allocator, path);
+    const result = maybe_result orelse {
+        std.debug.print("skipping e2fsck validation: e2fsck not found (tried PATH, /sbin, /usr/sbin)\n", .{});
+        return error.SkipZigTest;
+    };
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    switch (result.term) {
+        .exited => |code| {
+            if (code != 0) {
+                std.debug.print("e2fsck -f -n reported problems (exit {d}):\nstdout:\n{s}\nstderr:\n{s}\n", .{ code, result.stdout, result.stderr });
+            }
+            try std.testing.expectEqual(@as(u8, 0), code);
+        },
+        else => {
+            std.debug.print("e2fsck did not exit normally:\nstdout:\n{s}\nstderr:\n{s}\n", .{ result.stdout, result.stderr });
+            return error.TestUnexpectedResult;
+        },
+    }
+
+    // Also confirm the edits themselves are still correct from zvmi's own
+    // Reader, independent of e2fsck's own verdict.
+    const reopened_file = try Io.Dir.cwd().openFile(io, path, .{});
+    defer reopened_file.close(io);
+    var reader = try open(io, reopened_file, std.testing.allocator, .{});
+    defer reader.deinit();
+
+    try std.testing.expectError(error.NotFound, reader.statPath(io, "etc/remove.conf"));
+    try std.testing.expectError(error.NotFound, reader.statPath(io, "doomed"));
+
+    const kept = try reader.readFileAlloc(io, std.testing.allocator, "etc/keep.conf");
+    defer std.testing.allocator.free(kept);
+    var expected_kept: [10 * 1024]u8 = undefined;
+    fillPattern(&expected_kept, 0);
+    try std.testing.expectEqualSlices(u8, &expected_kept, kept);
+
+    const remaining = try reader.listDir(io, std.testing.allocator, "many");
+    defer freeDirEntries(std.testing.allocator, remaining);
+    try std.testing.expectEqual(@as(usize, 150), remaining.len);
 }
 
 const InMemoryEntry = struct {
