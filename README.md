@@ -85,7 +85,6 @@ zvmi/
         cosi.zig              # `zvmi cosi`
         build_image.zig       # `zvmi build-image`
         opts.zig              # shared `-o subformat=...` parsing
-<<<<<<< HEAD
   miniinit/                 # minimal PID 1 for real-boot testing of
                               #   --skip-iso-rootfs images (see miniinit/README.md)
   qmp/                      # native Zig QEMU Machine Protocol (QMP) client,
@@ -107,6 +106,22 @@ zvmi/
                               #   provisioning executable (issue #112)
     xml.zig                   # minimal hand-rolled XML parser sufficient for
                               #   the concrete goal-state/health-report shapes
+  azagent/                  # minimal guest provisioning agent for first-boot
+                              #   Azure VM setup (issue #112); statically
+                              #   linked, imports wireserver
+    main.zig                  # entry point + provision() orchestration
+    ovf.zig                   # ovf-env.xml parser (hostname/username/ssh keys)
+    cdrom.zig                  # locates/mounts/reads ovf-env.xml off the
+                              #   provisioning CD-ROM/DVD
+    hostname.zig                # sethostname(2) + /etc/hostname
+    passwd.zig                  # direct /etc/passwd,shadow,group editing
+                              #   (useradd/usermod -L equivalent) + root
+                              #   password lock
+    sudoers.zig                 # /etc/sudoers.d/azagent NOPASSWD drop-in
+    ssh_keys.zig                 # ~/.ssh/authorized_keys deployment + SSH
+                              #   host key regeneration (ssh-keygen -A)
+    sentinel.zig                # /var/lib/azagent/provisioned first-boot
+                              #   sentinel
   tests/
     boot_smoke.zig          # opportunistic real-QEMU boot verification for
                               #   build-image output (Gen1/Gen2, --verity,

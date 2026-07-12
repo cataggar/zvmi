@@ -27,6 +27,32 @@ pub fn build(b: *std.Build) void {
     const wireserver_tests = b.addTest(.{ .root_module = wireserver_mod });
     const run_wireserver_tests = b.addRunArtifact(wireserver_tests);
 
+    // ---- azagent: minimal guest provisioning agent for first-boot Azure
+    // VM setup (issue #112). Statically linked for self-containment
+    // (matching miniinit's philosophy), but -- unlike miniinit, which is
+    // pinned to a single real-boot x86_64 QEMU test fixture -- built for
+    // the standard target/optimize so it stays portable across whatever
+    // architecture a given image targets (Azure supports Arm64 VMs too)
+    // and remains natively testable via `zig build test` on any host. ----
+    const azagent_mod = b.createModule(.{
+        .root_source_file = b.path("azagent/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "wireserver", .module = wireserver_mod },
+        },
+    });
+
+    const azagent_exe = b.addExecutable(.{
+        .name = "azagent",
+        .root_module = azagent_mod,
+        .linkage = .static,
+    });
+    b.installArtifact(azagent_exe);
+
+    const azagent_tests = b.addTest(.{ .root_module = azagent_mod });
+    const run_azagent_tests = b.addRunArtifact(azagent_tests);
+
     // ---- cli: the `zvmi` executable ----
     const cli_exe = b.addExecutable(.{
         .name = "zvmi",
@@ -203,6 +229,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_zvmi_tests.step);
     test_step.dependOn(&run_wireserver_tests.step);
+    test_step.dependOn(&run_azagent_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_qmp_mod_tests.step);
     test_step.dependOn(&run_qmp_exe_tests.step);
