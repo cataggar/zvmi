@@ -1025,6 +1025,12 @@ fn bitClear(bitmap: []u8, index: u32) void {
     bitmap[index / 8] &= ~(@as(u8, 1) << @intCast(index % 8));
 }
 
+fn inodeBlockSectors(data_block_count: u32, has_external_xattr_block: bool) u32 {
+    var block_count = data_block_count;
+    if (has_external_xattr_block) block_count += 1;
+    return block_count * sectors_per_block;
+}
+
 /// Targeted, in-place editor for images produced by this module's own
 /// `populate()`/`resize()`. Supports deleting or overwriting *existing*
 /// paths only -- creating a brand-new path that doesn't already exist is
@@ -1637,7 +1643,7 @@ pub const Editor = struct {
         var buf = try self.readInodeRaw(io, child_inode_number);
         writeInt(u32, buf[4..8], @truncate(content.len));
         writeInt(u32, buf[108..112], @as(u32, @truncate(@as(u64, content.len) >> 32)));
-        writeInt(u32, buf[28..32], new_block_count * sectors_per_block);
+        writeInt(u32, buf[28..32], inodeBlockSectors(new_block_count, child_inode.file_acl_block != 0));
         var extent_root: [60]u8 = [_]u8{0} ** 60;
         encodeExtentLeafNode(extent_root[0..], max_inline_extents, new_extents);
         @memcpy(buf[40..100], &extent_root);
@@ -2777,7 +2783,8 @@ fn inodeMode(node: Node) u16 {
 
 fn inodeSectorCount(node: Node) u32 {
     const extent_tree_block_count: u32 = @intCast(node.extent_tree_blocks.len);
-    return (node.data_block_count + extent_tree_block_count) * sectors_per_block;
+    const xattr_block_count: u32 = if (node.xattr_block != null) 1 else 0;
+    return (node.data_block_count + extent_tree_block_count + xattr_block_count) * sectors_per_block;
 }
 
 fn encodeExtentHeader(buf: []u8, entries: usize, max_entries: usize, depth: u16) void {
@@ -3864,34 +3871,42 @@ test "populate round-trips xattrs and metadata checksums" {
     });
     tree.bind();
 
-    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
-    defer file.close(io);
+    {
+        const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+        defer file.close(io);
 
-    const info = try populate(io, file, std.testing.allocator, &tree.view, .{
-        .length = 16 * 1024 * 1024,
-        .uuid = [_]u8{0x42} ** 16,
-        .timestamp = 1_717_171_717,
-    });
-    try std.testing.expectEqual(writer_feature_compat, info.feature_compat);
-    try std.testing.expect(info.feature_ro_compat & feature_ro_compat_metadata_csum != 0);
+        const info = try populate(io, file, std.testing.allocator, &tree.view, .{
+            .length = 16 * 1024 * 1024,
+            .uuid = [_]u8{0x42} ** 16,
+            .timestamp = 1_717_171_717,
+        });
+        try std.testing.expectEqual(writer_feature_compat, info.feature_compat);
+        try std.testing.expect(info.feature_ro_compat & feature_ro_compat_metadata_csum != 0);
 
-    var reader = try open(io, file, std.testing.allocator, .{});
-    defer reader.deinit();
+        var reader = try open(io, file, std.testing.allocator, .{});
+        defer reader.deinit();
 
-    const file_xattrs = try reader.readXattrsAlloc(io, std.testing.allocator, "etc/hostname");
-    defer freeXattrs(std.testing.allocator, file_xattrs);
-    try expectXattrValue(file_xattrs, "security.selinux", "system_u:object_r:bin_t:s0");
-    try expectXattrValue(file_xattrs, "user.comment", "hello-from-zvmi");
+        const file_xattrs = try reader.readXattrsAlloc(io, std.testing.allocator, "etc/hostname");
+        defer freeXattrs(std.testing.allocator, file_xattrs);
+        try expectXattrValue(file_xattrs, "security.selinux", "system_u:object_r:bin_t:s0");
+        try expectXattrValue(file_xattrs, "user.comment", "hello-from-zvmi");
 
-    const dir_entries = try reader.listDir(io, std.testing.allocator, "etc");
-    defer freeDirEntries(std.testing.allocator, dir_entries);
-    try expectDirNames(dir_entries, &.{"hostname"});
+        const dir_entries = try reader.listDir(io, std.testing.allocator, "etc");
+        defer freeDirEntries(std.testing.allocator, dir_entries);
+        try expectDirNames(dir_entries, &.{"hostname"});
 
-    const dir_attrs = try reader.readXattrsAlloc(io, std.testing.allocator, "etc");
-    defer freeXattrs(std.testing.allocator, dir_attrs);
-    try expectXattrValue(dir_attrs, "user.label", "config-dir");
+        const dir_attrs = try reader.readXattrsAlloc(io, std.testing.allocator, "etc");
+        defer freeXattrs(std.testing.allocator, dir_attrs);
+        try expectXattrValue(dir_attrs, "user.label", "config-dir");
 
-    try expectMetadataChecksumsValid(io, file, 0, "etc/hostname", "etc");
+        const raw_hostname_inode = try readRawInodeForPath(io, file, &reader, "etc/hostname");
+        try std.testing.expect(readInt(u32, raw_hostname_inode.bytes[104..108]) != 0);
+        try std.testing.expectEqual(@as(u32, 2 * sectors_per_block), readInt(u32, raw_hostname_inode.bytes[28..32]));
+
+        try expectMetadataChecksumsValid(io, file, 0, "etc/hostname", "etc");
+    }
+
+    try expectE2fsckClean(path);
 }
 
 test "large directories use htree indexing" {
@@ -4446,6 +4461,7 @@ test "Editor.writeFile overwrites content, preserves xattrs, and handles growth/
         const tag = try reader.readXattrAlloc(io, std.testing.allocator, "etc/config.txt", "user.tag");
         defer std.testing.allocator.free(tag);
         try std.testing.expectEqualSlices(u8, "original", tag);
+        try expectInodeBlocksForPath(io, file, &reader, "etc/config.txt", 2 * sectors_per_block);
     }
 
     // Grow: large enough to require multiple full 4 KiB blocks.
@@ -4463,6 +4479,7 @@ test "Editor.writeFile overwrites content, preserves xattrs, and handles growth/
         const tag = try reader.readXattrAlloc(io, std.testing.allocator, "etc/config.txt", "user.tag");
         defer std.testing.allocator.free(tag);
         try std.testing.expectEqualSlices(u8, "original", tag);
+        try expectInodeBlocksForPath(io, file, &reader, "etc/config.txt", 4 * sectors_per_block);
     }
 
     // Empty content is a valid, well-formed zero-block file.
@@ -4473,6 +4490,7 @@ test "Editor.writeFile overwrites content, preserves xattrs, and handles growth/
         defer reader.deinit();
         const stat = try reader.statPath(io, "etc/config.txt");
         try std.testing.expectEqual(@as(u64, 0), stat.size);
+        try expectInodeBlocksForPath(io, file, &reader, "etc/config.txt", sectors_per_block);
     }
 }
 
@@ -4622,6 +4640,29 @@ fn runE2fsck(allocator: std.mem.Allocator, path: []const u8) !?std.process.RunRe
     return null;
 }
 
+fn expectE2fsckClean(path: []const u8) !void {
+    const maybe_result = try runE2fsck(std.testing.allocator, path);
+    const result = maybe_result orelse {
+        std.debug.print("skipping e2fsck validation: e2fsck not found (tried PATH, /sbin, /usr/sbin)\n", .{});
+        return error.SkipZigTest;
+    };
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    switch (result.term) {
+        .exited => |code| {
+            if (code != 0) {
+                std.debug.print("e2fsck -f -n reported problems (exit {d}):\nstdout:\n{s}\nstderr:\n{s}\n", .{ code, result.stdout, result.stderr });
+            }
+            try std.testing.expectEqual(@as(u8, 0), code);
+        },
+        else => {
+            std.debug.print("e2fsck did not exit normally:\nstdout:\n{s}\nstderr:\n{s}\n", .{ result.stdout, result.stderr });
+            return error.TestUnexpectedResult;
+        },
+    }
+}
+
 test "Editor edits (deletes, recursive tree removal, and overwrite) pass a real e2fsck -f check" {
     const io = std.testing.io;
     const path = "test-ext4-editor-e2fsck.img";
@@ -4638,6 +4679,7 @@ test "Editor edits (deletes, recursive tree removal, and overwrite) pass a real 
         .gid = 0,
         .size = 4,
         .bytes = "keep",
+        .xattrs = &.{.{ .name = "user.tag", .value = "original" }},
     });
     try entries.append(.{ .path = "etc/remove.conf", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 6, .bytes = "remove" });
     try entries.append(.{ .path = "var", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 });
@@ -4688,26 +4730,7 @@ test "Editor edits (deletes, recursive tree removal, and overwrite) pass a real 
         try editor.flush(io);
     }
 
-    const maybe_result = try runE2fsck(std.testing.allocator, path);
-    const result = maybe_result orelse {
-        std.debug.print("skipping e2fsck validation: e2fsck not found (tried PATH, /sbin, /usr/sbin)\n", .{});
-        return error.SkipZigTest;
-    };
-    defer std.testing.allocator.free(result.stdout);
-    defer std.testing.allocator.free(result.stderr);
-
-    switch (result.term) {
-        .exited => |code| {
-            if (code != 0) {
-                std.debug.print("e2fsck -f -n reported problems (exit {d}):\nstdout:\n{s}\nstderr:\n{s}\n", .{ code, result.stdout, result.stderr });
-            }
-            try std.testing.expectEqual(@as(u8, 0), code);
-        },
-        else => {
-            std.debug.print("e2fsck did not exit normally:\nstdout:\n{s}\nstderr:\n{s}\n", .{ result.stdout, result.stderr });
-            return error.TestUnexpectedResult;
-        },
-    }
+    try expectE2fsckClean(path);
 
     // Also confirm the edits themselves are still correct from zvmi's own
     // Reader, independent of e2fsck's own verdict.
@@ -4724,6 +4747,9 @@ test "Editor edits (deletes, recursive tree removal, and overwrite) pass a real 
     var expected_kept: [10 * 1024]u8 = undefined;
     fillPattern(&expected_kept, 0);
     try std.testing.expectEqualSlices(u8, &expected_kept, kept);
+    const kept_tag = try reader.readXattrAlloc(io, std.testing.allocator, "etc/keep.conf", "user.tag");
+    defer std.testing.allocator.free(kept_tag);
+    try std.testing.expectEqualSlices(u8, "original", kept_tag);
 
     const remaining = try reader.listDir(io, std.testing.allocator, "many");
     defer freeDirEntries(std.testing.allocator, remaining);
@@ -4887,6 +4913,28 @@ fn expectXattrValue(xattrs: []const OwnedXattr, name: []const u8, value: []const
     return error.TestUnexpectedResult;
 }
 
+const RawInodeForPath = struct {
+    inode_number: u32,
+    bytes: [inode_size]u8,
+};
+
+fn readRawInodeForPath(io: Io, file: Io.File, reader: *const Reader, path: []const u8) !RawInodeForPath {
+    const inode_number = try reader.lookupPath(io, path);
+    const group = (inode_number - 1) / reader.inodes_per_group;
+    const index = (inode_number - 1) % reader.inodes_per_group;
+    var bytes: [inode_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &bytes, reader.blockOffset(reader.groups[group].inode_table_block) + @as(u64, index) * inode_size);
+    return .{
+        .inode_number = inode_number,
+        .bytes = bytes,
+    };
+}
+
+fn expectInodeBlocksForPath(io: Io, file: Io.File, reader: *const Reader, path: []const u8, expected_i_blocks: u32) !void {
+    const raw_inode = try readRawInodeForPath(io, file, reader, path);
+    try std.testing.expectEqual(expected_i_blocks, readInt(u32, raw_inode.bytes[28..32]));
+}
+
 fn expectMetadataChecksumsValid(io: Io, file: Io.File, offset: u64, file_path: []const u8, dir_path: []const u8) !void {
     var sb: [superblock_size]u8 = undefined;
     _ = try file.readPositionalAll(io, &sb, offset + superblock_offset);
@@ -4934,17 +4982,13 @@ fn expectMetadataChecksumsValid(io: Io, file: Io.File, offset: u64, file_path: [
     var reader = try open(io, file, std.testing.allocator, .{ .offset = offset });
     defer reader.deinit();
 
-    const file_inode_number = try reader.lookupPath(io, file_path);
-    const file_group = (file_inode_number - 1) / reader.inodes_per_group;
-    const file_index = (file_inode_number - 1) % reader.inodes_per_group;
-    var raw_inode: [inode_size]u8 = undefined;
-    _ = try file.readPositionalAll(io, &raw_inode, offset + @as(u64, reader.groups[file_group].inode_table_block) * default_block_size + @as(u64, file_index) * inode_size);
-    const stored_inode_checksum = readInt(u16, raw_inode[124..126]);
-    var inode_copy = raw_inode;
-    setInodeChecksum(&inode_copy, uuid, file_inode_number);
+    const raw_inode = try readRawInodeForPath(io, file, &reader, file_path);
+    const stored_inode_checksum = readInt(u16, raw_inode.bytes[124..126]);
+    var inode_copy = raw_inode.bytes;
+    setInodeChecksum(&inode_copy, uuid, raw_inode.inode_number);
     try std.testing.expectEqual(stored_inode_checksum, readInt(u16, inode_copy[124..126]));
 
-    const parsed_inode = try reader.readInode(io, file_inode_number);
+    const parsed_inode = try reader.readInode(io, raw_inode.inode_number);
     if (parsed_inode.file_acl_block != 0) {
         var xattr_block: [default_block_size]u8 = undefined;
         _ = try file.readPositionalAll(io, &xattr_block, offset + @as(u64, parsed_inode.file_acl_block) * default_block_size);
