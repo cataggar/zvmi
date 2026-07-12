@@ -85,6 +85,7 @@ zvmi/
         cosi.zig              # `zvmi cosi`
         build_image.zig       # `zvmi build-image`
         opts.zig              # shared `-o subformat=...` parsing
+<<<<<<< HEAD
   miniinit/                 # minimal PID 1 for real-boot testing of
                               #   --skip-iso-rootfs images (see miniinit/README.md)
   qmp/                      # native Zig QEMU Machine Protocol (QMP) client,
@@ -97,6 +98,15 @@ zvmi/
                               #   packages/zvmi/src/qcow2.zig, kept for its
                               #   CLI + qemu-img cross-validation
                               #   methodology; see issue #96)
+  wireserver/
+    wireserver.zig            # native Zig client for the Azure WireServer
+                              #   goal-state protocol (minimal provisioning
+                              #   subset): version negotiation, goal-state
+                              #   fetch, health reporting -- a building
+                              #   block for the future `azagent` guest
+                              #   provisioning executable (issue #112)
+    xml.zig                   # minimal hand-rolled XML parser sufficient for
+                              #   the concrete goal-state/health-report shapes
   tests/
     boot_smoke.zig          # opportunistic real-QEMU boot verification for
                               #   build-image output (Gen1/Gen2, --verity,
