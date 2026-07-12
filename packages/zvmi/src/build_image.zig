@@ -172,6 +172,20 @@ pub fn build(
         }
     }
 
+    if (!options.skip_iso_rootfs) {
+        // Only for the full-rootfs path: the merged tree there always
+        // brings its own systemd (from the distro ISO/squashfs), so a
+        // systemd unit is guaranteed to actually be usable. A
+        // --skip-iso-rootfs image's rootfs *is* the given container --
+        // there's no guarantee it has systemd at all (its PID 1 is
+        // whatever /sbin/init the container provides, e.g. miniinit),
+        // so wiring in a systemd unit there wouldn't do anything; it's
+        // that from-scratch init's own job to invoke azagent if it wants
+        // to (see miniinit/README.md).
+        logStep(options.verbose, "install azagent systemd unit if present in the source tree");
+        try installAzagentSystemdUnitIfPresent(allocator, &source_tree);
+    }
+
     const raw_build_path = if (output_format == .raw)
         options.output_path
     else
@@ -1013,6 +1027,60 @@ fn sortMergedEntries(entries: []MergedSourceTree.MergedEntry) void {
             return std.mem.lessThan(u8, a.path, b.path);
         }
     }.lessThan);
+}
+
+/// Well-known path (within the merged source tree, no leading `/`) where
+/// `azagent` is expected if the caller wants it wired up -- add it via an
+/// extra container layer, matching how `--stub-source-path` already
+/// expects the UKI systemd EFI stub to already be present in the merged
+/// tree rather than being injected by `zvmi` itself.
+pub const azagent_binary_path = "usr/sbin/azagent";
+
+const azagent_unit_path = "usr/lib/systemd/system/azagent.service";
+const azagent_unit_enable_path = "usr/lib/systemd/system/multi-user.target.wants/azagent.service";
+
+const azagent_unit_content =
+    \\[Unit]
+    \\Description=azagent first-boot Azure VM provisioning
+    \\After=network-online.target
+    \\Wants=network-online.target
+    \\ConditionPathExists=!/var/lib/azagent/provisioned
+    \\
+    \\[Service]
+    \\Type=oneshot
+    \\ExecStart=/usr/sbin/azagent
+    \\RemainAfterExit=yes
+    \\StandardOutput=journal+console
+    \\
+    \\[Install]
+    \\WantedBy=multi-user.target
+    \\
+;
+
+/// If `azagent_binary_path` is present in `source_tree` (added by the
+/// caller via an extra container layer -- see the doc comment on
+/// `azagent_binary_path`), installs and enables a oneshot systemd unit
+/// that runs it once at first boot, mirroring real `waagent.service`.
+/// A no-op if the binary isn't present -- most `build-image` output
+/// doesn't set out to be an Azure-provisioned VM at all, so this must
+/// never be a hard requirement.
+///
+/// The `[Install]` "enablement" is done by writing the *same* unit
+/// content directly into `<target>.wants/`, rather than a symlink:
+/// functionally equivalent for systemd's unit-loading purposes (it scans
+/// each unit directory for files by name; a real file works exactly like
+/// a symlink there), and `MergedSourceTree` has no symlink-upsert
+/// primitive today.
+fn installAzagentSystemdUnitIfPresent(allocator: std.mem.Allocator, source_tree: *MergedSourceTree) !void {
+    if (source_tree.findEntryIndex(azagent_binary_path) == null) return;
+
+    const unit_path = try allocator.dupe(u8, azagent_unit_path);
+    const unit_bytes = try allocator.dupe(u8, azagent_unit_content);
+    try source_tree.upsertOwnedFile(allocator, unit_path, unit_bytes);
+
+    const enable_path = try allocator.dupe(u8, azagent_unit_enable_path);
+    const enable_bytes = try allocator.dupe(u8, azagent_unit_content);
+    try source_tree.upsertOwnedFile(allocator, enable_path, enable_bytes);
 }
 
 const NestedFilesystemKind = enum {
@@ -3081,6 +3149,104 @@ test "build-image wraps ESP NoSpaceLeft as EspTooSmallForBootArtifacts for UKI m
     }));
 }
 
+test "build-image installs and enables an azagent systemd unit when azagent is present in the source tree" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const iso_path = "test-build-image-azagent-unit.iso";
+    const oci_root = "test-build-image-azagent-unit-oci";
+    const output_path = "test-build-image-azagent-unit.raw";
+    defer Io.Dir.cwd().deleteFile(io, iso_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, oci_root) catch {};
+    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
+
+    const squashfs_bytes = try squashfs.buildSyntheticSquashfsImage(allocator, .{ .compression = .xz });
+    defer allocator.free(squashfs_bytes);
+    try writeMinimalIsoWithFile(allocator, io, iso_path, "ROOT.SQUASHFS;1", squashfs_bytes);
+
+    var fixture = try createBuildImageOciFixtureWithOptions(allocator, io, oci_root, .{ .include_azagent = true });
+    defer fixture.deinit(allocator);
+
+    var report = try build(allocator, io, .{
+        .iso_path = iso_path,
+        .container_path = oci_root,
+        .output_path = output_path,
+        .output_format = .raw,
+        .generation = .gen2,
+        .size = 256 * mib,
+    });
+    defer report.deinit(allocator);
+
+    var img = try Image.openPath(io, output_path);
+    defer img.close(io);
+    const root_partition = report.planned_partitions[1].planned;
+    const rootfs_scratch_path = try std.fmt.allocPrint(allocator, "{s}.test-rootfs.raw", .{output_path});
+    defer allocator.free(rootfs_scratch_path);
+    defer Io.Dir.cwd().deleteFile(io, rootfs_scratch_path) catch {};
+    try extractImageRegionToPath(allocator, io, &img, root_partition.offset_bytes, root_partition.length_bytes, rootfs_scratch_path);
+
+    const rootfs_scratch = try Io.Dir.cwd().openFile(io, rootfs_scratch_path, .{});
+    defer rootfs_scratch.close(io);
+    var root_reader = try ext4.open(io, rootfs_scratch, allocator, .{});
+    defer root_reader.deinit();
+
+    const azagent_bytes = try root_reader.readFileAlloc(io, allocator, azagent_binary_path);
+    defer allocator.free(azagent_bytes);
+    try std.testing.expectEqualStrings("azagent-binary-bytes", azagent_bytes);
+
+    const unit = try root_reader.readFileAlloc(io, allocator, azagent_unit_path);
+    defer allocator.free(unit);
+    try std.testing.expectEqualStrings(azagent_unit_content, unit);
+
+    const enabled_unit = try root_reader.readFileAlloc(io, allocator, azagent_unit_enable_path);
+    defer allocator.free(enabled_unit);
+    try std.testing.expectEqualStrings(azagent_unit_content, enabled_unit);
+}
+
+test "build-image does not install an azagent systemd unit when azagent is absent" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const iso_path = "test-build-image-no-azagent-unit.iso";
+    const oci_root = "test-build-image-no-azagent-unit-oci";
+    const output_path = "test-build-image-no-azagent-unit.raw";
+    defer Io.Dir.cwd().deleteFile(io, iso_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, oci_root) catch {};
+    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
+
+    const squashfs_bytes = try squashfs.buildSyntheticSquashfsImage(allocator, .{ .compression = .xz });
+    defer allocator.free(squashfs_bytes);
+    try writeMinimalIsoWithFile(allocator, io, iso_path, "ROOT.SQUASHFS;1", squashfs_bytes);
+
+    var fixture = try createBuildImageOciFixture(allocator, io, oci_root);
+    defer fixture.deinit(allocator);
+
+    var report = try build(allocator, io, .{
+        .iso_path = iso_path,
+        .container_path = oci_root,
+        .output_path = output_path,
+        .output_format = .raw,
+        .generation = .gen2,
+        .size = 256 * mib,
+    });
+    defer report.deinit(allocator);
+
+    var img = try Image.openPath(io, output_path);
+    defer img.close(io);
+    const root_partition = report.planned_partitions[1].planned;
+    const rootfs_scratch_path = try std.fmt.allocPrint(allocator, "{s}.test-rootfs.raw", .{output_path});
+    defer allocator.free(rootfs_scratch_path);
+    defer Io.Dir.cwd().deleteFile(io, rootfs_scratch_path) catch {};
+    try extractImageRegionToPath(allocator, io, &img, root_partition.offset_bytes, root_partition.length_bytes, rootfs_scratch_path);
+
+    const rootfs_scratch = try Io.Dir.cwd().openFile(io, rootfs_scratch_path, .{});
+    defer rootfs_scratch.close(io);
+    var root_reader = try ext4.open(io, rootfs_scratch, allocator, .{});
+    defer root_reader.deinit();
+
+    try std.testing.expectError(error.NotFound, root_reader.readFileAlloc(io, allocator, azagent_unit_path));
+}
+
 fn makeTestStubPe(allocator: std.mem.Allocator, machine: u16) ![]u8 {
     const file_alignment: u32 = 0x200;
     const section_alignment: u32 = 0x1000;
@@ -3153,6 +3319,9 @@ const BuildImageOciFixtureOptions = struct {
     initrd_bytes: []const u8 = "initrd-from-oci",
     uki_stub_path: ?[]const u8 = null,
     uki_stub_bytes: []const u8 = "",
+    /// If set, adds a `usr/sbin/azagent` entry to the container so tests
+    /// can exercise `installAzagentSystemdUnitIfPresent`'s detection path.
+    include_azagent: bool = false,
 };
 
 const BuildImageOciFixture = struct {
@@ -3259,6 +3428,12 @@ fn createBuildImageOciFixtureWithOptions(
             .typeflag = '0',
             .content = options.uki_stub_bytes,
             .link_name = null,
+        });
+    }
+    if (options.include_azagent) {
+        try layer1_specs.appendSlice(&.{
+            .{ .path = "usr/sbin/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
+            .{ .path = "usr/sbin/azagent", .mode = 0o755, .typeflag = '0', .content = "azagent-binary-bytes", .link_name = null },
         });
     }
     const layer1_tar = try buildTarArchive(allocator, layer1_specs.items);
