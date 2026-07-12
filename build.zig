@@ -14,6 +14,19 @@ pub fn build(b: *std.Build) void {
     const zvmi_tests = b.addTest(.{ .root_module = zvmi_mod });
     const run_zvmi_tests = b.addRunArtifact(zvmi_tests);
 
+    // ---- wireserver: native Zig client for the Azure WireServer
+    // goal-state protocol (minimal provisioning subset). A self-contained
+    // module with no standalone build.zig of its own; consumed by the
+    // future `azagent` guest provisioning executable (issue #112). ----
+    const wireserver_mod = b.addModule("wireserver", .{
+        .root_source_file = b.path("wireserver/wireserver.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const wireserver_tests = b.addTest(.{ .root_module = wireserver_mod });
+    const run_wireserver_tests = b.addRunArtifact(wireserver_tests);
+
     // ---- cli: the `zvmi` executable ----
     const cli_exe = b.addExecutable(.{
         .name = "zvmi",
@@ -189,6 +202,7 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_zvmi_tests.step);
+    test_step.dependOn(&run_wireserver_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_qmp_mod_tests.step);
     test_step.dependOn(&run_qmp_exe_tests.step);
