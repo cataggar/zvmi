@@ -46,6 +46,7 @@ const dir_entry_alignment: usize = 4;
 const sectors_per_block: u32 = default_block_size / 512;
 const extent_header_size: usize = 12;
 const extent_entry_size: usize = 12;
+const extent_tail_size: usize = 4;
 
 const super_magic: u16 = 0xEF53;
 const state_clean: u16 = 0x0001;
@@ -2026,6 +2027,7 @@ const BlockAllocator = struct {
 
 fn writeNodeData(io: Io, file: Io.File, nodes: []Node, options: PopulateOptions) PopulateError!void {
     var scratch: [default_block_size]u8 = [_]u8{0} ** default_block_size;
+    const block_len: usize = @intCast(options.block_size);
     const uuid = options.uuid orelse [_]u8{0} ** 16;
     for (nodes) |node| {
         switch (node.kind) {
@@ -2080,7 +2082,9 @@ fn writeNodeData(io: Io, file: Io.File, nodes: []Node, options: PopulateOptions)
             },
         }
         for (node.extent_tree_blocks) |block| {
-            try file.writePositionalAll(io, &block.bytes, options.offset + block.block_number * options.block_size);
+            var extent_block = block.bytes;
+            setExtentBlockChecksum(extent_block[0..block_len], uuid, node.inode, 0);
+            try file.writePositionalAll(io, extent_block[0..block_len], options.offset + block.block_number * options.block_size);
         }
         if (node.xattr_block_bytes) |xattr_block| {
             const block_number = node.xattr_block orelse unreachable;
@@ -2148,7 +2152,7 @@ fn writeInodes(io: Io, file: Io.File, nodes: []Node, layout: Layout, options: Po
         writeInt(u32, buf[16..20], options.timestamp);
         writeInt(u16, buf[24..26], @truncate(node.gid));
         writeInt(u16, buf[26..28], node.link_count);
-        writeInt(u32, buf[28..32], node.data_block_count * sectors_per_block);
+        writeInt(u32, buf[28..32], inodeSectorCount(node));
         var inode_flags: u32 = if (node.uses_fast_symlink) 0 else inode_flag_extents;
         if (node.uses_hashed_directory) inode_flags |= inode_flag_index;
         writeInt(u32, buf[32..36], inode_flags);
@@ -2771,6 +2775,11 @@ fn inodeMode(node: Node) u16 {
     return kindToModeBits(node.kind) | (node.mode & 0x0FFF);
 }
 
+fn inodeSectorCount(node: Node) u32 {
+    const extent_tree_block_count: u32 = @intCast(node.extent_tree_blocks.len);
+    return (node.data_block_count + extent_tree_block_count) * sectors_per_block;
+}
+
 fn encodeExtentHeader(buf: []u8, entries: usize, max_entries: usize, depth: u16) void {
     @memset(buf, 0);
     writeInt(u16, buf[0..2], extent_magic);
@@ -2802,8 +2811,15 @@ fn encodeExtentIndexNode(buf: []u8, max_entries: usize, depth: u16, children: []
     }
 }
 
+fn extentTailOffset(max_entries: usize) usize {
+    return extent_header_size + max_entries * extent_entry_size;
+}
+
 fn extentEntriesPerBlock(block_size: u32) usize {
-    return (block_size - extent_header_size) / extent_entry_size;
+    const max_entries: usize = @intCast((block_size - extent_header_size) / extent_entry_size);
+    const block_len: usize = @intCast(block_size);
+    std.debug.assert(extentTailOffset(max_entries) + extent_tail_size <= block_len);
+    return max_entries;
 }
 
 fn extentTreeShape(extent_count: usize, block_size: u32) PopulateError!struct { depth: u16, block_count: usize } {
@@ -3186,6 +3202,21 @@ fn setDirectoryLeafChecksum(block: []u8, uuid: [16]u8, inode_number: u32, inode_
     }));
 }
 
+fn setExtentBlockChecksum(block: []u8, uuid: [16]u8, inode_number: u32, inode_generation: u32) void {
+    std.debug.assert(readInt(u16, block[0..2]) == extent_magic);
+    const tail_offset = extentTailOffset(@intCast(readInt(u16, block[4..6])));
+    std.debug.assert(tail_offset + extent_tail_size <= block.len);
+
+    var inode_le = std.mem.nativeToLittle(u32, inode_number);
+    var generation_le = std.mem.nativeToLittle(u32, inode_generation);
+    writeInt(u32, block[tail_offset .. tail_offset + extent_tail_size], ext4Crc32c(&.{
+        &uuid,
+        std.mem.asBytes(&inode_le),
+        std.mem.asBytes(&generation_le),
+        block[0..tail_offset],
+    }));
+}
+
 fn setDxChecksum(block: []u8, count_offset: usize, count: usize, limit: usize, uuid: [16]u8, inode_number: u32, inode_generation: u32) void {
     var inode_le = std.mem.nativeToLittle(u32, inode_number);
     var generation_le = std.mem.nativeToLittle(u32, inode_generation);
@@ -3536,36 +3567,59 @@ test "populate round-trips files that require extent index blocks" {
     });
     tree.bind();
 
-    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
-    defer file.close(io);
-    _ = try populate(io, file, std.testing.allocator, &tree.view, .{
-        .length = fs_size,
-        .uuid = [_]u8{0x33} ** 16,
-        .timestamp = 1_717_171_717,
-    });
+    {
+        const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+        defer file.close(io);
+        _ = try populate(io, file, std.testing.allocator, &tree.view, .{
+            .length = fs_size,
+            .uuid = [_]u8{0x33} ** 16,
+            .timestamp = 1_717_171_717,
+        });
 
-    var reader = try open(io, file, std.testing.allocator, .{});
-    defer reader.deinit();
+        var reader = try open(io, file, std.testing.allocator, .{});
+        defer reader.deinit();
 
-    const inode_number = try reader.lookupPath(io, "boot/rootfs.img");
-    const inode = try reader.readInode(io, inode_number);
-    const root_header = try parseExtentHeader(inode.block_bytes[0..extent_header_size]);
-    try std.testing.expectEqual(@as(u16, 1), root_header.depth);
+        const inode_number = try reader.lookupPath(io, "boot/rootfs.img");
+        const inode = try reader.readInode(io, inode_number);
+        const root_header = try parseExtentHeader(inode.block_bytes[0..extent_header_size]);
+        try std.testing.expectEqual(@as(u16, 1), root_header.depth);
 
-    const extents = try reader.readExtents(io, std.testing.allocator, "boot/rootfs.img");
-    defer std.testing.allocator.free(extents);
-    try std.testing.expect(extents.len > max_inline_extents);
+        const extents = try reader.readExtents(io, std.testing.allocator, "boot/rootfs.img");
+        defer std.testing.allocator.free(extents);
+        try std.testing.expect(extents.len > max_inline_extents);
 
-    var offset: u64 = 0;
-    var buf: [1024 * 1024]u8 = undefined;
-    var expected: [1024 * 1024]u8 = undefined;
-    while (offset < big_size) {
-        const chunk = @min(buf.len, @as(usize, @intCast(big_size - offset)));
-        const got = try reader.preadPath(io, "boot/rootfs.img", buf[0..chunk], offset);
-        try std.testing.expectEqual(chunk, got);
-        fillPattern(expected[0..chunk], offset);
-        try std.testing.expectEqualSlices(u8, expected[0..chunk], buf[0..chunk]);
-        offset += chunk;
+        var offset: u64 = 0;
+        var buf: [1024 * 1024]u8 = undefined;
+        var expected: [1024 * 1024]u8 = undefined;
+        while (offset < big_size) {
+            const chunk = @min(buf.len, @as(usize, @intCast(big_size - offset)));
+            const got = try reader.preadPath(io, "boot/rootfs.img", buf[0..chunk], offset);
+            try std.testing.expectEqual(chunk, got);
+            fillPattern(expected[0..chunk], offset);
+            try std.testing.expectEqualSlices(u8, expected[0..chunk], buf[0..chunk]);
+            offset += chunk;
+        }
+    }
+
+    const maybe_result = try runE2fsck(std.testing.allocator, path);
+    const result = maybe_result orelse {
+        std.debug.print("skipping e2fsck validation: e2fsck not found (tried PATH, /sbin, /usr/sbin)\n", .{});
+        return error.SkipZigTest;
+    };
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    switch (result.term) {
+        .exited => |code| {
+            if (code != 0) {
+                std.debug.print("e2fsck -f -n reported problems (exit {d}):\nstdout:\n{s}\nstderr:\n{s}\n", .{ code, result.stdout, result.stderr });
+            }
+            try std.testing.expectEqual(@as(u8, 0), code);
+        },
+        else => {
+            std.debug.print("e2fsck did not exit normally:\nstdout:\n{s}\nstderr:\n{s}\n", .{ result.stdout, result.stderr });
+            return error.TestUnexpectedResult;
+        },
     }
 }
 
@@ -4594,9 +4648,8 @@ test "Editor edits (deletes, recursive tree removal, and overwrite) pass a real 
     try entries.append(.{ .path = "doomed/nested/file.txt", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 4, .bytes = "data" });
     try entries.append(.{ .path = "doomed/link", .kind = .symlink, .mode = 0o777, .uid = 0, .gid = 0, .size = 4, .bytes = "keep" });
     // Multi-extent (2 extents, crossing one group boundary) but deliberately
-    // *not* deep enough to need an extent-tree index block (issue #115
-    // tracks a separate, pre-existing populate() bug in the interior extent
-    // block checksum for depth > 0 trees, unrelated to editing).
+    // *not* deep enough to need an extent-tree index block, so this test
+    // stays focused on editor behavior rather than deeper extent-tree shape.
     try entries.append(.{ .path = "big.bin", .kind = .file, .mode = 0o600, .uid = 42, .gid = 24, .size = 150 * 1024 * 1024, .generator = .pattern });
     try entries.append(.{ .path = "many", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 });
     var names: [300][20]u8 = undefined;
