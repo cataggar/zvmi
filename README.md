@@ -233,6 +233,19 @@ base OS image does not ship it, inject that package via an extra container
 layer or point `--stub-source-path` at the non-standard in-tree path where you
 added the stub.
 
+If `usr/sbin/azagent` (the guest provisioning agent -- see `azagent/` above,
+issue #112) is present anywhere in the merged ISO/squashfs/container source
+tree, `build-image` automatically installs and enables a oneshot
+`azagent.service` systemd unit that runs it once at first boot, mirroring
+real `waagent.service`. As with the UKI stub, `zvmi` never builds or injects
+the `azagent` binary itself -- add it via an extra container layer,
+cross-compiled for the image's target architecture. This only applies to a
+full (non-`--skip-iso-rootfs`) image, since its systemd comes from the
+merged distro content; a `--skip-iso-rootfs` image's `/sbin/init` (e.g.
+`miniinit`, or your own) is responsible for invoking `azagent` itself if it
+wants first-boot provisioning, since there's no guarantee of systemd being
+present at all in that minimal path.
+
 `convert` skips all-zero chunks (aligned to the destination's block size for
 sparse block formats such as dynamic vhd and vhdx), so converting a
 mostly-empty raw image into a sparse image stays sparse instead of eagerly

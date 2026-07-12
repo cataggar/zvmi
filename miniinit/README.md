@@ -41,6 +41,16 @@ reference for what a from-scratch container-image init needs to do.
   if it ever exits (PID 1 exiting panics the kernel), and reaping all other
   zombie children along the way.
 
+Deliberately does *not* invoke `azagent` (the guest provisioning agent, see
+`azagent/`, issue #112): `zvmi build-image`'s automatic systemd-unit wiring
+for `azagent` (see the root README's build-image section) only applies to
+full images, since a `--skip-iso-rootfs` image's `/sbin/init` has no
+guaranteed systemd to hook into. A from-scratch init that wants first-boot
+Azure provisioning should `exec`/fork+exec `/usr/sbin/azagent` itself (e.g.
+after DHCP is up, alongside the hostname/network setup this file already
+does) -- this file is a reference for that kind of init, not a one-size-
+fits-all default.
+
 ## Building
 
 Built as part of the repo-root build graph (there's no separate
