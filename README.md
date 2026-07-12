@@ -241,10 +241,10 @@ real `waagent.service`. As with the UKI stub, `zvmi` never builds or injects
 the `azagent` binary itself -- add it via an extra container layer,
 cross-compiled for the image's target architecture. This only applies to a
 full (non-`--skip-iso-rootfs`) image, since its systemd comes from the
-merged distro content; a `--skip-iso-rootfs` image's `/sbin/init` (e.g.
-`miniinit`, or your own) is responsible for invoking `azagent` itself if it
-wants first-boot provisioning, since there's no guarantee of systemd being
-present at all in that minimal path.
+merged distro content; a `--skip-iso-rootfs` image's `/sbin/init` is
+responsible for invoking `azagent` itself if it wants first-boot
+provisioning, since there's no guarantee of systemd being present at all in
+that minimal path (`miniinit` does this -- see `miniinit/README.md`).
 
 `convert` skips all-zero chunks (aligned to the destination's block size for
 sparse block formats such as dynamic vhd and vhdx), so converting a
