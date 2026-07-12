@@ -722,6 +722,50 @@ fn setupNetworking() void {
     writeStr(ok_msg);
 }
 
+// ============================== azagent invocation ==============================
+// If /usr/sbin/azagent exists (added via an extra container layer -- see
+// zvmi build-image's automatic systemd-unit wiring for the full-image
+// equivalent, and the root README's build-image section), fork+exec it
+// once so this from-scratch init supports first-boot Azure provisioning
+// too, serving as a reference for what any --skip-iso-rootfs init needs
+// to do to actually reach a usable, provisioned login. Tolerant of it
+// being entirely absent (most miniinit-based test images don't have it)
+// and of it failing/exiting non-zero (e.g. no provisioning CD-ROM
+// attached yet, or no network route to the WireServer) -- a provisioning
+// failure should never prevent reaching the fallback shell.
+const azagent_path = "/usr/sbin/azagent";
+
+fn runAzagentIfPresent() void {
+    const access_rc = linux.access(azagent_path, linux.F_OK);
+    if (linux.errno(access_rc) != .SUCCESS) return;
+
+    writeStr("[miniinit] running azagent...\r\n");
+
+    const pid: i32 = @intCast(linux.fork());
+    if (pid == 0) {
+        const argv = [_:null]?[*:0]const u8{ azagent_path, null };
+        const envp = [_:null]?[*:0]const u8{
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            null,
+        };
+        _ = linux.execve(azagent_path, &argv, &envp);
+        writeStr("[miniinit] execve(azagent) failed\r\n");
+        linux.exit(127);
+    }
+    if (pid < 0) {
+        writeStr("[miniinit] fork() for azagent failed\r\n");
+        return;
+    }
+
+    var status: u32 = 0;
+    _ = linux.waitpid(pid, &status, 0);
+    if (linux.W.IFEXITED(status) and linux.W.EXITSTATUS(status) == 0) {
+        writeStr("[miniinit] azagent completed successfully\r\n");
+    } else {
+        writeStr("[miniinit] azagent exited non-zero (continuing anyway)\r\n");
+    }
+}
+
 // ============================== main loop ==============================
 
 fn shellLoop() noreturn {
@@ -798,6 +842,8 @@ pub fn main(init: std.process.Init.Minimal) noreturn {
 
     writeStr("\r\n[miniinit] base mounts ready; configuring network...\r\n");
     setupNetworking();
+
+    runAzagentIfPresent();
 
     writeStr("[miniinit] spawning shell on ttyS0\r\n");
     shellLoop();

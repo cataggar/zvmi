@@ -40,16 +40,18 @@ reference for what a from-scratch container-image init needs to do.
 - Loops forever spawning an interactive shell on `/dev/ttyS0`, respawning it
   if it ever exits (PID 1 exiting panics the kernel), and reaping all other
   zombie children along the way.
-
-Deliberately does *not* invoke `azagent` (the guest provisioning agent, see
-`azagent/`, issue #112): `zvmi build-image`'s automatic systemd-unit wiring
-for `azagent` (see the root README's build-image section) only applies to
-full images, since a `--skip-iso-rootfs` image's `/sbin/init` has no
-guaranteed systemd to hook into. A from-scratch init that wants first-boot
-Azure provisioning should `exec`/fork+exec `/usr/sbin/azagent` itself (e.g.
-after DHCP is up, alongside the hostname/network setup this file already
-does) -- this file is a reference for that kind of init, not a one-size-
-fits-all default.
+- If `/usr/sbin/azagent` (the guest provisioning agent, see `azagent/`,
+  issue #112) is present, fork+execs it once after networking is up, so a
+  `--skip-iso-rootfs` image can reach an actually-provisioned login (real
+  hostname, a user account, SSH access) instead of just a bare shell.
+  Entirely optional: a no-op if `azagent` isn't present (most miniinit-based
+  test images don't have it), and tolerant of it failing or exiting non-zero
+  (e.g. no provisioning CD-ROM attached, or no route to the WireServer yet)
+  -- a provisioning failure never blocks reaching the fallback shell. This
+  is `zvmi build-image`'s automatic systemd-unit wiring's counterpart for
+  the `--skip-iso-rootfs` path, which has no guaranteed systemd to hook a
+  unit into (see the root README's build-image section); any other
+  from-scratch init wanting the same behavior should do the equivalent.
 
 ## Building
 
