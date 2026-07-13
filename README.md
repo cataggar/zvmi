@@ -127,6 +127,10 @@ zvmi/
                               #   host key regeneration (ssh-keygen -A)
     sentinel.zig                # /var/lib/azagent/provisioned first-boot
                               #   sentinel
+    waagent_conf.zig             # minimal /etc/waagent.conf reader (issue
+                              #   #125): parses the real format, but only
+                              #   honors a small explicit key whitelist --
+                              #   not full waagent.conf compatibility
   tests/
     boot_smoke.zig          # opportunistic real-QEMU boot verification for
                               #   build-image output (Gen1/Gen2, --verity,
