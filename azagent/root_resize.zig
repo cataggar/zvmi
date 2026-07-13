@@ -20,12 +20,11 @@
 //! already reach the disk's current real size.
 //!
 //! The partition table (GPT/MBR) is grown by writing directly to the
-//! whole-disk block device -- safe regardless of mount state, since a
-//! partition table isn't something the kernel caches/owns the way a
-//! mounted filesystem's metadata is. The root ext4 filesystem itself,
-//! though, is *always* mounted while this runs (that's how it's found at
-//! all, via `/proc/mounts`), so it's grown live via the kernel's own
-//! `EXT4_IOC_RESIZE_FS` ioctl (matching what `resize2fs` itself does
+//! whole-disk block device, then the kernel's cached size for the mounted
+//! root partition is updated with `BLKPG_RESIZE_PARTITION`. The root ext4
+//! filesystem itself is *always* mounted while this runs (that's how it's
+//! found at all, via `/proc/mounts`), so it's grown live via the kernel's
+//! own `EXT4_IOC_RESIZE_FS` ioctl (matching what `resize2fs` itself does
 //! against a mounted filesystem) rather than this package's own
 //! `ext4.resize()`, which writes new metadata directly to the backing
 //! block device and is only safe when a filesystem is *not* currently
@@ -127,13 +126,26 @@ fn readProcMounts(allocator: Allocator) ![]u8 {
     return try list.toOwnedSlice();
 }
 
+const PartitionExtent = struct {
+    start_bytes: u64,
+    length_bytes: u64,
+
+    fn fromLbaRange(first_lba: u64, last_lba: u64) !PartitionExtent {
+        if (last_lba < first_lba) return error.InvalidPartitionExtent;
+        const sector_count = try std.math.add(u64, try std.math.sub(u64, last_lba, first_lba), 1);
+        return .{
+            .start_bytes = try std.math.mul(u64, first_lba, mbr.sector_size),
+            .length_bytes = try std.math.mul(u64, sector_count, mbr.sector_size),
+        };
+    }
+};
+
 /// Grows the GPT root partition (identified as the *last* entry in the
 /// table, matching both zvmi-built images and real Azure Linux images) to
-/// the disk's new, larger end. Returns whether anything actually changed:
-/// `false` (a clean no-op) if the disk hasn't actually grown since the
-/// table was last written -- the common case on every boot after the
-/// first successful grow.
-fn growGptRoot(allocator: Allocator, io: std.Io, img: *Image, root: RootDevice) !bool {
+/// the disk's new, larger end. Always returns the resulting partition
+/// extent, including when the table was already grown, so callers can
+/// retry the kernel and filesystem resize steps after an earlier failure.
+fn growGptRoot(allocator: Allocator, io: std.Io, img: *Image, partition_number: u32) !PartitionExtent {
     const parsed = try gpt.readGpt(img.*, io, allocator);
     defer allocator.free(parsed.partitions);
     if (parsed.partitions.len == 0) return error.RootPartitionNotFound;
@@ -142,30 +154,116 @@ fn growGptRoot(allocator: Allocator, io: std.Io, img: *Image, root: RootDevice) 
     // number should match its position in the table. Fail loudly rather
     // than silently growing the wrong partition if this ever doesn't
     // hold.
-    if (root.partition_number != parsed.partitions.len) return error.RootPartitionPositionMismatch;
+    if (partition_number != parsed.partitions.len) return error.RootPartitionPositionMismatch;
 
     gpt.growLastPartition(img, io, parsed.header.disk_guid, parsed.partitions) catch |err| switch (err) {
-        error.NotEnoughSpace => return false,
+        error.NotEnoughSpace => {},
         else => return err,
     };
-    return true;
+
+    const root_partition = parsed.partitions[parsed.partitions.len - 1];
+    return PartitionExtent.fromLbaRange(root_partition.first_lba, root_partition.last_lba);
 }
 
-/// Grows the MBR (Gen1) root partition in place. Same no-op-on-
-/// `NotEnoughSpace` contract as `growGptRoot`.
-fn growMbrRoot(io: std.Io, img: *Image, decoded: mbr.Mbr, root: RootDevice) !bool {
-    if (root.partition_number == 0 or root.partition_number > mbr.max_entries) return error.RootPartitionPositionMismatch;
+/// Grows the MBR (Gen1) root partition in place while preserving the BIOS
+/// bootstrap code in sector 0. Like `growGptRoot`, it returns the resulting
+/// extent even when the table was already grown.
+fn growMbrRoot(io: std.Io, img: *Image, sector0: *[mbr.sector_size]u8, decoded: mbr.Mbr, partition_number: u32) !PartitionExtent {
+    if (partition_number == 0 or partition_number > mbr.max_entries) return error.RootPartitionPositionMismatch;
 
     var table = decoded;
+    const partition_index = partition_number - 1;
     const total_sectors = img.virtual_size / mbr.sector_size;
-    mbr.growPartition(&table, root.partition_number - 1, total_sectors) catch |err| switch (err) {
-        error.NotEnoughSpace => return false,
-        else => return err,
+    const table_grown = blk: {
+        mbr.growPartition(&table, partition_index, total_sectors) catch |err| switch (err) {
+            error.NotEnoughSpace => break :blk false,
+            else => return err,
+        };
+        break :blk true;
     };
 
-    const encoded = table.encode();
-    try img.pwrite(io, &encoded, 0);
-    return true;
+    if (table_grown) {
+        table.encodePartitionTableInto(sector0);
+        try img.pwrite(io, sector0, 0);
+    }
+
+    const root_partition = table.entries[partition_index];
+    if (root_partition.sector_count == 0) return error.RootPartitionNotFound;
+    const last_lba = try std.math.sub(
+        u64,
+        try std.math.add(u64, root_partition.first_lba, root_partition.sector_count),
+        1,
+    );
+    return PartitionExtent.fromLbaRange(root_partition.first_lba, last_lba);
+}
+
+/// Linux `BLKPG` request (`_IO(0x12, 105)`) and
+/// `BLKPG_RESIZE_PARTITION` operation. Unlike `BLKRRPART`, this updates one
+/// partition in place and works while that partition is mounted.
+const blkpg: u32 = 0x1269;
+const blkpg_resize_partition: c_int = 3;
+const blkpg_name_len = 64;
+
+const BlkpgPartition = extern struct {
+    start: i64,
+    length: i64,
+    pno: c_int,
+    devname: [blkpg_name_len]u8,
+    volname: [blkpg_name_len]u8,
+};
+
+const BlkpgIoctlArg = extern struct {
+    op: c_int,
+    flags: c_int,
+    datalen: c_int,
+    data: *anyopaque,
+};
+
+fn resizeKernelPartition(disk_file: std.Io.File, partition_number: u32, extent: PartitionExtent) !void {
+    var partition = BlkpgPartition{
+        .start = std.math.cast(i64, extent.start_bytes) orelse return error.PartitionExtentTooLarge,
+        .length = std.math.cast(i64, extent.length_bytes) orelse return error.PartitionExtentTooLarge,
+        .pno = std.math.cast(c_int, partition_number) orelse return error.PartitionNumberTooLarge,
+        .devname = [_]u8{0} ** blkpg_name_len,
+        .volname = [_]u8{0} ** blkpg_name_len,
+    };
+    var arg = BlkpgIoctlArg{
+        .op = blkpg_resize_partition,
+        .flags = 0,
+        .datalen = @intCast(@sizeOf(BlkpgPartition)),
+        .data = @ptrCast(&partition),
+    };
+
+    const rc = linux.ioctl(disk_file.handle, blkpg, @intFromPtr(&arg));
+    if (linux.errno(rc) != .SUCCESS) return error.KernelPartitionResizeFailed;
+}
+
+fn partitionSizeBytes(io: std.Io, part_path: [:0]const u8) !u64 {
+    var part_file = try std.Io.Dir.cwd().openFile(io, part_path, .{ .mode = .read_only });
+    defer part_file.close(io);
+    return resource_disk.blockDeviceSizeBytes(part_file);
+}
+
+fn partitionNeedsKernelResize(current_size: u64, target_size: u64) !bool {
+    if (current_size > target_size) return error.KernelPartitionLargerThanTable;
+    return current_size < target_size;
+}
+
+fn updateKernelPartition(
+    io: std.Io,
+    disk_file: std.Io.File,
+    part_path: [:0]const u8,
+    partition_number: u32,
+    extent: PartitionExtent,
+) !u64 {
+    const current_size = try partitionSizeBytes(io, part_path);
+    if (try partitionNeedsKernelResize(current_size, extent.length_bytes)) {
+        try resizeKernelPartition(disk_file, partition_number, extent);
+    }
+
+    const updated_size = try partitionSizeBytes(io, part_path);
+    if (updated_size != extent.length_bytes) return error.KernelPartitionResizeNotVisible;
+    return updated_size;
 }
 
 /// Linux `EXT4_IOC_RESIZE_FS` ioctl request code (`_IOW('f', 16, __u64)`),
@@ -201,15 +299,12 @@ fn onlineResizeExt4(mount_point_path: [:0]const u8, new_block_count: u64) !void 
     if (linux.errno(rc) != .SUCCESS) return error.Ext4OnlineResizeFailed;
 }
 
-/// Grows the root partition table entry and, if that changed anything,
-/// the mounted-live root ext4 filesystem within it to match (via the
-/// kernel's own `EXT4_IOC_RESIZE_FS` ioctl -- see `onlineResizeExt4`).
+/// Grows the root partition table entry, updates the kernel's live view of
+/// that mounted partition, and grows the mounted ext4 filesystem to match.
+/// The latter two steps run even when the on-disk table was already grown,
+/// so an interrupted or failed earlier attempt is retried on the next boot.
 /// `disk_file` must be an already-open, read-write handle to the *whole
-/// disk* device node (e.g. `/dev/sda`), not the partition node --
-/// partition-table growth must go through the whole-disk node, while
-/// reading the partition's post-grow real size (to compute the new block
-/// count) goes through the *partition* node (`part_path`, e.g.
-/// `/dev/sda2`); mixing these two up is an easy, silent bug to introduce.
+/// disk* device node (e.g. `/dev/sda`), not the partition node.
 fn growRoot(io: std.Io, allocator: Allocator, disk_file: std.Io.File, part_path: [:0]const u8, root: RootDevice) !void {
     const real_size = try resource_disk.blockDeviceSizeBytes(disk_file);
     var img = Image{ .file = disk_file, .format = .raw, .data_offset = 0, .virtual_size = real_size };
@@ -218,21 +313,13 @@ fn growRoot(io: std.Io, allocator: Allocator, disk_file: std.Io.File, part_path:
     _ = try img.pread(io, &sector0, 0);
     const decoded_mbr = mbr.Mbr.decode(&sector0) catch return error.UnrecognizedPartitionTable;
 
-    const grown = switch (decoded_mbr.entries[0].partition_type) {
-        .gpt_protective => try growGptRoot(allocator, io, &img, root),
-        .linux => try growMbrRoot(io, &img, decoded_mbr, root),
+    const extent = switch (decoded_mbr.entries[0].partition_type) {
+        .gpt_protective => try growGptRoot(allocator, io, &img, root.partition_number),
+        .linux => try growMbrRoot(io, &img, &sector0, decoded_mbr, root.partition_number),
         else => return error.UnrecognizedPartitionTable,
     };
-    if (!grown) return;
 
-    // The kernel's view of the partition device node's size is stale
-    // until the partition table is re-read.
-    resource_disk.reReadPartitionTable(disk_file);
-
-    var part_file = try std.Io.Dir.cwd().openFile(io, part_path, .{ .mode = .read_only });
-    defer part_file.close(io);
-
-    const part_size_bytes = try resource_disk.blockDeviceSizeBytes(part_file);
+    const part_size_bytes = try updateKernelPartition(io, disk_file, part_path, root.partition_number, extent);
     // The partition's real size need not be an exact multiple of the
     // 4096-byte ext4 block size; round down to be safe.
     const aligned_length = part_size_bytes - (part_size_bytes % ext4.default_block_size);
@@ -296,6 +383,38 @@ test "rootPartitionNameFromMounts handles nvme-style partition names" {
 test "rootPartitionNameFromMounts returns an error when nothing is mounted at /" {
     const content = "tmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n";
     try std.testing.expectError(error.RootMountNotFound, rootPartitionNameFromMounts(content));
+}
+
+test "growMbrRoot preserves BIOS bootstrap code and returns an extent on retry" {
+    const io = std.testing.io;
+    const path = "test-root-resize-mbr.img";
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const disk_size: u64 = 16 * 1024 * 1024;
+    const first_lba: u32 = 2048;
+    var img = try Image.create(io, path, .raw, disk_size, .{});
+    defer img.close(io);
+
+    var sector0 = mbr.singleLinuxPartitionMbr(first_lba, 4096).encode();
+    @memset(sector0[0..0x1B8], 0xA5);
+    try img.pwrite(io, &sector0, 0);
+
+    const first_extent = try growMbrRoot(io, &img, &sector0, try mbr.Mbr.decode(&sector0), 1);
+    try std.testing.expectEqual(@as(u64, first_lba) * mbr.sector_size, first_extent.start_bytes);
+    try std.testing.expectEqual(disk_size - first_extent.start_bytes, first_extent.length_bytes);
+
+    var after_sector0: [mbr.sector_size]u8 = undefined;
+    _ = try img.pread(io, &after_sector0, 0);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0xA5} ** 0x1B8), after_sector0[0..0x1B8]);
+
+    const retry_extent = try growMbrRoot(io, &img, &after_sector0, try mbr.Mbr.decode(&after_sector0), 1);
+    try std.testing.expectEqual(first_extent, retry_extent);
+}
+
+test "kernel partition resize is required only when its cached size is smaller" {
+    try std.testing.expect(try partitionNeedsKernelResize(8 * 1024, 16 * 1024));
+    try std.testing.expect(!try partitionNeedsKernelResize(16 * 1024, 16 * 1024));
+    try std.testing.expectError(error.KernelPartitionLargerThanTable, partitionNeedsKernelResize(32 * 1024, 16 * 1024));
 }
 
 test "findRootDevice resolves disk name and partition number via a synthetic /sys/class/block tree" {

@@ -66,6 +66,13 @@ pub const Mbr = struct {
         // this codec only produces partition *tables*, not boot code.
         // Higher-level callers such as `build_image` may later overlay BIOS
         // stage-1 bytes here while preserving the table/signature tail.
+        self.encodePartitionTableInto(&buf);
+        return buf;
+    }
+
+    /// Updates only the disk-signature/partition-table tail of an existing
+    /// sector 0, preserving any BIOS bootstrap code in bytes 0..0x1B8.
+    pub fn encodePartitionTableInto(self: Mbr, buf: *[sector_size]u8) void {
         std.mem.writeInt(u32, buf[0x1B8..0x1BC], self.disk_signature, .little);
 
         for (self.entries, 0..) |entry, i| {
@@ -73,7 +80,6 @@ pub const Mbr = struct {
             entry.encode(buf[off..][0..entry_size]);
         }
         buf[510..512].* = boot_signature;
-        return buf;
     }
 
     pub const DecodeError = error{BadBootSignature};
@@ -241,6 +247,17 @@ test "singleLinuxPartitionMbr encode/decode round-trip" {
     try std.testing.expect(decoded.entries[0].bootable);
     try std.testing.expectEqual(@as(u32, 2048), decoded.entries[0].first_lba);
     try std.testing.expectEqual(@as(u32, 1 * 1024 * 1024), decoded.entries[0].sector_count);
+}
+
+test "encodePartitionTableInto preserves BIOS bootstrap code" {
+    var sector0 = [_]u8{0xA5} ** sector_size;
+    const mb = singleLinuxPartitionMbr(2048, 1 * 1024 * 1024);
+
+    mb.encodePartitionTableInto(&sector0);
+
+    try std.testing.expectEqualSlices(u8, &([_]u8{0xA5} ** 0x1B8), sector0[0..0x1B8]);
+    const decoded = try Mbr.decode(&sector0);
+    try std.testing.expectEqual(mb.entries[0], decoded.entries[0]);
 }
 
 test "Mbr.decode rejects a bad boot signature" {

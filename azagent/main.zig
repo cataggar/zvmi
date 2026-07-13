@@ -61,10 +61,7 @@ pub const Deps = struct {
 /// itself idempotent (see each module's doc comments), so re-running
 /// `provision` (e.g. if the sentinel were ever lost) is safe.
 pub fn provision(deps: Deps) !void {
-    if (try sentinel.readSentinel(deps.allocator, deps.var_dir, deps.io)) |existing| {
-        deps.allocator.free(existing);
-        return;
-    }
+    if (try isProvisioned(deps.allocator, deps.var_dir, deps.io)) return;
 
     const env = try ovf.OvfEnv.parse(deps.ovf_env_xml);
 
@@ -103,6 +100,14 @@ pub fn provision(deps: Deps) !void {
     try sentinel.writeSentinel(deps.var_dir, deps.io, env.hostname);
 }
 
+fn isProvisioned(allocator: std.mem.Allocator, var_dir: std.Io.Dir, io: std.Io) !bool {
+    if (try sentinel.readSentinel(allocator, var_dir, io)) |existing| {
+        allocator.free(existing);
+        return true;
+    }
+    return false;
+}
+
 /// Fetches the goal state and reports "Ready" health back to the
 /// WireServer. Deliberately best-effort (logs and continues on failure,
 /// rather than failing provisioning): unlike the local account-setup
@@ -138,43 +143,45 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     }
 
-    const ovf_env_xml = cdrom.readOvfEnv(gpa, io) catch |err| {
-        std.debug.print("azagent: failed to read ovf-env.xml from the provisioning media: {t}\n", .{err});
-        std.process.exit(1);
-    };
-    defer gpa.free(ovf_env_xml);
-
     var etc_dir = try std.Io.Dir.cwd().openDir(io, "/etc", .{});
     defer etc_dir.close(io);
-    var home_parent_dir = try std.Io.Dir.cwd().openDir(io, "/home", .{});
-    defer home_parent_dir.close(io);
     var var_dir = try std.Io.Dir.cwd().openDir(io, "/var", .{});
     defer var_dir.close(io);
-    var ssh_dir = try etc_dir.openDir(io, "ssh", .{ .iterate = true });
-    defer ssh_dir.close(io);
 
     const waagent_conf_content = try waagent_conf.readWaagentConf(gpa, etc_dir, io);
     defer if (waagent_conf_content) |c| gpa.free(c);
     const parsed_waagent_conf = if (waagent_conf_content) |c| waagent_conf.WaagentConf.parse(c) else waagent_conf.WaagentConf{};
 
-    var client: wireserver.Client = .init(gpa, io);
-    defer client.deinit();
-
     const now = std.Io.Clock.real.now(io);
     const now_unix_seconds: i64 = @intCast(@divTrunc(now.nanoseconds, 1_000_000_000));
 
-    try provision(.{
-        .allocator = gpa,
-        .io = io,
-        .etc_dir = etc_dir,
-        .home_parent_dir = home_parent_dir,
-        .var_dir = var_dir,
-        .ovf_env_xml = ovf_env_xml,
-        .now_unix_seconds = now_unix_seconds,
-        .wireserver_client = &client,
-        .ssh_dir = ssh_dir,
-        .waagent_conf = parsed_waagent_conf,
-    });
+    if (!try isProvisioned(gpa, var_dir, io)) {
+        const ovf_env_xml = cdrom.readOvfEnv(gpa, io) catch |err| {
+            std.debug.print("azagent: failed to read ovf-env.xml from the provisioning media: {t}\n", .{err});
+            std.process.exit(1);
+        };
+        defer gpa.free(ovf_env_xml);
+
+        var home_parent_dir = try std.Io.Dir.cwd().openDir(io, "/home", .{});
+        defer home_parent_dir.close(io);
+        var ssh_dir = try etc_dir.openDir(io, "ssh", .{ .iterate = true });
+        defer ssh_dir.close(io);
+        var client: wireserver.Client = .init(gpa, io);
+        defer client.deinit();
+
+        try provision(.{
+            .allocator = gpa,
+            .io = io,
+            .etc_dir = etc_dir,
+            .home_parent_dir = home_parent_dir,
+            .var_dir = var_dir,
+            .ovf_env_xml = ovf_env_xml,
+            .now_unix_seconds = now_unix_seconds,
+            .wireserver_client = &client,
+            .ssh_dir = ssh_dir,
+            .waagent_conf = parsed_waagent_conf,
+        });
+    }
 
     // Unlike `provision` above, resource-disk activation runs on *every*
     // boot, not just the first: Azure can reallocate/resize the resource
@@ -327,6 +334,7 @@ test "provision runs the full sequence end to end against scoped temp directorie
     const sentinel_content = try tmp.dir.readFileAlloc(io, "var/lib/azagent/provisioned", allocator, .limited(4096));
     defer allocator.free(sentinel_content);
     try std.testing.expectEqualStrings("test-host", sentinel_content);
+    try std.testing.expect(try isProvisioned(allocator, var_dir, io));
 
     // A second call should be a no-op (sentinel present).
     try provision(.{

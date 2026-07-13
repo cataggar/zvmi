@@ -1041,10 +1041,9 @@ const azagent_unit_enable_path = "usr/lib/systemd/system/multi-user.target.wants
 
 const azagent_unit_content =
     \\[Unit]
-    \\Description=azagent first-boot Azure VM provisioning
+    \\Description=azagent Azure VM provisioning and disk maintenance
     \\After=network-online.target
     \\Wants=network-online.target
-    \\ConditionPathExists=!/var/lib/azagent/provisioned
     \\
     \\[Service]
     \\Type=oneshot
@@ -1060,7 +1059,8 @@ const azagent_unit_content =
 /// If `azagent_binary_path` is present in `source_tree` (added by the
 /// caller via an extra container layer -- see the doc comment on
 /// `azagent_binary_path`), installs and enables a oneshot systemd unit
-/// that runs it once at first boot, mirroring real `waagent.service`.
+/// that runs on every boot. Provisioning remains sentinel-gated inside
+/// `azagent`, while resource-disk and root-resize maintenance still runs.
 /// A no-op if the binary isn't present -- most `build-image` output
 /// doesn't set out to be an Azure-provisioned VM at all, so this must
 /// never be a hard requirement.
@@ -3197,6 +3197,7 @@ test "build-image installs and enables an azagent systemd unit when azagent is p
     const unit = try root_reader.readFileAlloc(io, allocator, azagent_unit_path);
     defer allocator.free(unit);
     try std.testing.expectEqualStrings(azagent_unit_content, unit);
+    try std.testing.expect(std.mem.indexOf(u8, unit, "ConditionPathExists") == null);
 
     const enabled_unit = try root_reader.readFileAlloc(io, allocator, azagent_unit_enable_path);
     defer allocator.free(enabled_unit);

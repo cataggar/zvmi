@@ -222,10 +222,7 @@ pub fn ensureFormatted(io: std.Io, allocator: Allocator, file: std.Io.File, tota
 /// the kernel to re-read a block device's partition table.
 const blkrrpart: u32 = 0x125F;
 
-/// `pub` so other modules that rewrite a real block device's partition
-/// table in place (e.g. `root_resize.zig`, issue #130) can reuse this
-/// instead of re-deriving the ioctl request code themselves.
-pub fn reReadPartitionTable(file: std.Io.File) void {
+fn reReadPartitionTable(file: std.Io.File) void {
     _ = linux.ioctl(file.handle, blkrrpart, 0);
 }
 
