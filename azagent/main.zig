@@ -21,6 +21,7 @@ pub const sentinel = @import("sentinel.zig");
 pub const cdrom = @import("cdrom.zig");
 pub const waagent_conf = @import("waagent_conf.zig");
 pub const resource_disk = @import("resource_disk.zig");
+pub const root_resize = @import("root_resize.zig");
 
 /// Everything `provision` needs, injected rather than hardcoded, so it's
 /// fully testable against a scoped temp directory instead of the real
@@ -182,6 +183,32 @@ pub fn main(init: std.process.Init) !void {
     // (logs and continues on failure), matching `reportHealthBestEffort`:
     // a VM without its temp disk mounted is still otherwise usable.
     resourceDiskSetupBestEffort(gpa, io, now_unix_seconds, parsed_waagent_conf);
+
+    // Same "every boot, best-effort" reasoning applies to growing the root
+    // partition/filesystem (issue #130): the platform can deploy a larger
+    // OS disk than the image was built at, and that's a redeploy-time
+    // event, not a first-boot-only one. Not gated by any `waagent.conf`
+    // toggle either -- real waagent has no growpart-equivalent conf key.
+    rootResizeSetupBestEffort(gpa, io);
+}
+
+/// Best-effort wrapper around `root_resize.setup` -- see its call site in
+/// `main` for why failures here are logged rather than fatal.
+fn rootResizeSetupBestEffort(allocator: std.mem.Allocator, io: std.Io) void {
+    rootResizeSetup(allocator, io) catch |err| {
+        std.debug.print("azagent: warning: failed to grow the root partition/filesystem: {t}\n", .{err});
+    };
+}
+
+fn rootResizeSetup(allocator: std.mem.Allocator, io: std.Io) !void {
+    var class_block_dir = try std.Io.Dir.cwd().openDir(io, "/sys/class/block", .{ .iterate = true });
+    defer class_block_dir.close(io);
+
+    try root_resize.setup(.{
+        .allocator = allocator,
+        .io = io,
+        .class_block_dir = class_block_dir,
+    });
 }
 
 /// Best-effort wrapper around `resourceDiskSetup` -- see its call site in
@@ -230,6 +257,7 @@ test {
     _ = cdrom;
     _ = waagent_conf;
     _ = resource_disk;
+    _ = root_resize;
 }
 
 test "provision runs the full sequence end to end against scoped temp directories" {

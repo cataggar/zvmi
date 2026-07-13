@@ -155,10 +155,67 @@ pub fn singleLinuxPartitionMbr(first_lba: u32, sector_count: u32) Mbr {
     return mbr;
 }
 
+pub const GrowError = error{
+    NoPartition,
+    NotEnoughSpace,
+};
+
+/// Grows partition `index` in `mb` in place: extends its `sector_count` to
+/// reach the disk's new, larger `new_total_sectors`. Unlike GPT, a plain
+/// MBR has no backup header/array to relocate -- growing is nothing more
+/// than this one field, matching `singleLinuxPartitionMbr`'s single
+/// bootable-0x83-entry layout used for Gen1 (BIOS) Azure VMs. Returns
+/// `error.NoPartition` if `index` names an empty entry, and
+/// `error.NotEnoughSpace` if the disk isn't actually larger than the
+/// partition's current end (e.g. called on an already-grown or
+/// unchanged-size disk).
+pub fn growPartition(mb: *Mbr, index: usize, new_total_sectors: u64) GrowError!void {
+    const entry = &mb.entries[index];
+    if (entry.partition_type == .empty) return error.NoPartition;
+
+    const current_end: u64 = @as(u64, entry.first_lba) + entry.sector_count;
+    if (new_total_sectors <= current_end) return error.NotEnoughSpace;
+
+    // MBR's sector_count/first_lba are 32-bit; clamp the same way
+    // `protectiveMbr` does for disks too large to fully address via
+    // classic 32-bit MBR fields.
+    const new_end = @min(new_total_sectors, 0xFFFF_FFFF);
+    entry.sector_count = @intCast(new_end - entry.first_lba);
+    entry.end_chs = chsForLba(entry.first_lba + entry.sector_count - 1);
+}
+
 /// Formats the Linux/udev-synthesized PARTUUID used for DOS/MBR partition
 /// tables: `<8-hex-disk-signature>-<2-hex-partition-number>`.
 pub fn formatPartuuid(buf: *[partuuid_len]u8, disk_signature: u32, partition_index_1based: u8) []const u8 {
     return std.fmt.bufPrint(buf, "{x:0>8}-{x:0>2}", .{ disk_signature, partition_index_1based }) catch unreachable;
+}
+
+test "growPartition extends sector_count and CHS to the disk's new end" {
+    var mb = singleLinuxPartitionMbr(2048, 1 * 1024 * 1024);
+    const original_first_lba = mb.entries[0].first_lba;
+
+    const new_total_sectors: u64 = 8 * 1024 * 1024;
+    try growPartition(&mb, 0, new_total_sectors);
+
+    try std.testing.expectEqual(original_first_lba, mb.entries[0].first_lba);
+    try std.testing.expectEqual(@as(u32, new_total_sectors) - original_first_lba, mb.entries[0].sector_count);
+    try std.testing.expectEqualSlices(u8, &chsForLba(original_first_lba + mb.entries[0].sector_count - 1), &mb.entries[0].end_chs);
+
+    // Round-trips through encode/decode too.
+    const encoded = mb.encode();
+    const decoded = try Mbr.decode(&encoded);
+    try std.testing.expectEqual(mb.entries[0].sector_count, decoded.entries[0].sector_count);
+}
+
+test "growPartition rejects an empty entry" {
+    var mb = Mbr{};
+    try std.testing.expectError(error.NoPartition, growPartition(&mb, 0, 8 * 1024 * 1024));
+}
+
+test "growPartition rejects a disk that hasn't actually grown" {
+    var mb = singleLinuxPartitionMbr(2048, 1 * 1024 * 1024);
+    const current_end: u64 = @as(u64, mb.entries[0].first_lba) + mb.entries[0].sector_count;
+    try std.testing.expectError(error.NotEnoughSpace, growPartition(&mb, 0, current_end));
 }
 
 test "protectiveMbr encode/decode round-trip" {

@@ -131,6 +131,10 @@ zvmi/
                               #   #125): parses the real format, but only
                               #   honors a small explicit key whitelist --
                               #   not full waagent.conf compatibility
+    root_resize.zig              # grows the root partition + ext4 filesystem
+                              #   to fill a larger deployed disk (issue #130,
+                              #   "growpart" equivalent); runs every boot,
+                              #   not sentinel-gated
   tests/
     boot_smoke.zig          # opportunistic real-QEMU boot verification for
                               #   build-image output (Gen1/Gen2, --verity,
