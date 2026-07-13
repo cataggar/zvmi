@@ -1,4 +1,4 @@
-# miniinit
+# azinit
 
 A minimal (~160 KB), statically-linked PID 1 replacement for real-boot
 testing of images built with `zvmi build-image --skip-iso-rootfs`, e.g.
@@ -44,7 +44,7 @@ reference for what a from-scratch container-image init needs to do.
   issue #112) is present, fork+execs it once after networking is up, so a
   `--skip-iso-rootfs` image can reach an actually-provisioned login (real
   hostname, a user account, SSH access) instead of just a bare shell.
-  Entirely optional: a no-op if `azagent` isn't present (most miniinit-based
+  Entirely optional: a no-op if `azagent` isn't present (most azinit-based
   test images don't have it), and tolerant of it failing or exiting non-zero
   (e.g. no provisioning CD-ROM attached, or no route to the WireServer yet)
   -- a provisioning failure never blocks reaching the fallback shell. This
@@ -56,7 +56,7 @@ reference for what a from-scratch container-image init needs to do.
 ## Building
 
 Built as part of the repo-root build graph (there's no separate
-`miniinit/build.zig`):
+`azinit/build.zig`):
 
 ```
 zig build
@@ -69,12 +69,12 @@ the whole point of this binary is to be tiny (this hardcodes
 
 ## Using it
 
-Add the built `zig-out/bin/miniinit` binary to a container image as
+Add the built `zig-out/bin/azinit` binary to a container image as
 `sbin/init` (plus `sbin/poweroff`/`sbin/reboot`/`sbin/shutdown` symlinks
 pointing at it), then build a bootable disk image with:
 
 ```
-zvmi build-image --iso <azurelinux.iso> --container <oci-layout-with-miniinit> \
+zvmi build-image --iso <azurelinux.iso> --container <oci-layout-with-azinit> \
   --generation 2 --size 768M --skip-iso-rootfs \
   --extra-kernel-options "console=tty0 console=ttyS0,115200n8" \
   -o out.vhd -O vhd

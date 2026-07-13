@@ -7,7 +7,7 @@
 //! provisioning media is documented to always show up as a SCSI CD-ROM,
 //! so a short fixed candidate list suffices.
 //!
-//! Uses direct `mount(2)`/`umount(2)` syscalls (matching `miniinit`'s
+//! Uses direct `mount(2)`/`umount(2)` syscalls (matching `azinit`'s
 //! style) rather than shelling out to `mount`/`umount`. Not covered by an
 //! automated test: it requires a real block device, which isn't available
 //! in a unit-test sandbox -- exercised only via manual/real-VM

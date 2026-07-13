@@ -178,10 +178,10 @@ pub fn build(
         // systemd unit is guaranteed to actually be usable. A
         // --skip-iso-rootfs image's rootfs *is* the given container --
         // there's no guarantee it has systemd at all (its PID 1 is
-        // whatever /sbin/init the container provides, e.g. miniinit),
+        // whatever /sbin/init the container provides, e.g. azinit),
         // so wiring in a systemd unit there wouldn't do anything; it's
         // that from-scratch init's own job to invoke azagent if it wants
-        // to (see miniinit/README.md).
+        // to (see azinit/README.md).
         logStep(options.verbose, "install azagent systemd unit if present in the source tree");
         try installAzagentSystemdUnitIfPresent(allocator, &source_tree);
     }
