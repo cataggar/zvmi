@@ -4,8 +4,11 @@
 //!
 //! Deliberately not named `waagent`: this project does not aim for
 //! binary/config/CLI compatibility with the real Azure Linux Agent (no
-//! `-deprovision` flag, no `/etc/waagent.conf`, no VM extension handling --
-//! see the issue for the full list of what's explicitly out of scope).
+//! `-deprovision` flag, no VM extension handling -- see the issue for the
+//! full list of what's explicitly out of scope). `waagent_conf.zig` does
+//! read `/etc/waagent.conf`, but only honors a small explicit whitelist of
+//! keys (see issue #125) -- not full compatibility with that format's ~50
+//! other settings.
 const std = @import("std");
 const wireserver = @import("wireserver");
 
@@ -16,6 +19,7 @@ pub const sudoers = @import("sudoers.zig");
 pub const ssh_keys = @import("ssh_keys.zig");
 pub const sentinel = @import("sentinel.zig");
 pub const cdrom = @import("cdrom.zig");
+pub const waagent_conf = @import("waagent_conf.zig");
 
 /// Everything `provision` needs, injected rather than hardcoded, so it's
 /// fully testable against a scoped temp directory instead of the real
@@ -40,14 +44,24 @@ pub const Deps = struct {
     /// `null` skips host key regeneration (used by tests, since it needs a
     /// real `/etc/ssh` and the `ssh-keygen` binary on `PATH`).
     ssh_dir: ?std.Io.Dir = null,
+    /// Parsed `/etc/waagent.conf` (or its defaults if the file is absent
+    /// -- see `waagent_conf.zig`). Currently only `provisioning_enabled`
+    /// is consulted here; the `resourcedisk_*` fields exist for #113 to
+    /// read once implemented.
+    waagent_conf: waagent_conf.WaagentConf = .{},
 };
 
 /// Runs the full first-boot provisioning sequence (see issue #112's
-/// phased plan), skipping entirely if the sentinel from a previous run is
-/// already present. Idempotent by construction: every step it calls is
-/// itself idempotent (see each module's doc comments), so re-running
-/// `provision` (e.g. if the sentinel were ever lost) is safe.
+/// phased plan), skipping entirely if `Provisioning.Enabled=n` in
+/// `/etc/waagent.conf` (matching real waagent's meaning: this VM's disk
+/// was pre-provisioned/is being used as a specialized, not generalized,
+/// boot source) or if the sentinel from a previous run is already
+/// present. Idempotent by construction: every step it calls is itself
+/// idempotent (see each module's doc comments), so re-running `provision`
+/// (e.g. if the sentinel were ever lost) is safe.
 pub fn provision(deps: Deps) !void {
+    if (!deps.waagent_conf.provisioning_enabled) return;
+
     if (try sentinel.readSentinel(deps.allocator, deps.var_dir, deps.io)) |existing| {
         deps.allocator.free(existing);
         return;
@@ -140,6 +154,10 @@ pub fn main(init: std.process.Init) !void {
     var ssh_dir = try etc_dir.openDir(io, "ssh", .{ .iterate = true });
     defer ssh_dir.close(io);
 
+    const waagent_conf_content = try waagent_conf.readWaagentConf(gpa, etc_dir, io);
+    defer if (waagent_conf_content) |c| gpa.free(c);
+    const parsed_waagent_conf = if (waagent_conf_content) |c| waagent_conf.WaagentConf.parse(c) else waagent_conf.WaagentConf{};
+
     var client: wireserver.Client = .init(gpa, io);
     defer client.deinit();
 
@@ -156,6 +174,7 @@ pub fn main(init: std.process.Init) !void {
         .now_unix_seconds = now_unix_seconds,
         .wireserver_client = &client,
         .ssh_dir = ssh_dir,
+        .waagent_conf = parsed_waagent_conf,
     });
 }
 
@@ -167,6 +186,7 @@ test {
     _ = ssh_keys;
     _ = sentinel;
     _ = cdrom;
+    _ = waagent_conf;
 }
 
 test "provision runs the full sequence end to end against scoped temp directories" {
@@ -247,4 +267,44 @@ test "provision runs the full sequence end to end against scoped temp directorie
         .ovf_env_xml = ovf_env_xml,
         .now_unix_seconds = 19700 * 86_400,
     });
+}
+
+test "provision skips entirely when waagent_conf.provisioning_enabled is false" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "passwd", .data = "root:x:0:0::/root:/bin/bash\n" });
+    try tmp.dir.createDir(io, "home", .default_dir);
+    try tmp.dir.createDir(io, "var", .default_dir);
+
+    var etc_dir = try tmp.dir.openDir(io, ".", .{});
+    defer etc_dir.close(io);
+    var home_parent_dir = try tmp.dir.openDir(io, "home", .{});
+    defer home_parent_dir.close(io);
+    var var_dir = try tmp.dir.openDir(io, "var", .{});
+    defer var_dir.close(io);
+
+    // Deliberately malformed ovf-env.xml: if provisioning is actually
+    // attempted despite the config gate, OvfEnv.parse would fail and this
+    // test would catch that as a hard error, not a silent false pass.
+    const ovf_env_xml = "<not-a-valid-ovf-env/>";
+
+    try provision(.{
+        .allocator = allocator,
+        .io = io,
+        .etc_dir = etc_dir,
+        .home_parent_dir = home_parent_dir,
+        .var_dir = var_dir,
+        .ovf_env_xml = ovf_env_xml,
+        .now_unix_seconds = 19700 * 86_400,
+        .waagent_conf = .{ .provisioning_enabled = false },
+    });
+
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "var/lib/azagent/provisioned", .{}));
+    const passwd_after = try tmp.dir.readFileAlloc(io, "passwd", allocator, .limited(4096));
+    defer allocator.free(passwd_after);
+    try std.testing.expectEqualStrings("root:x:0:0::/root:/bin/bash\n", passwd_after);
 }
