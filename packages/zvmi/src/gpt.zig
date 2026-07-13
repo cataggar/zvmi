@@ -293,6 +293,52 @@ pub const ParsedGpt = struct {
     partitions: []PartitionEntry,
 };
 
+pub const GrowError = error{
+    NoPartitions,
+    NotEnoughSpace,
+} || WriteError;
+
+/// Grows the *last* partition in `partitions` (by table order, matching
+/// both zvmi-built images and real Azure Linux images, where root is
+/// always the last partition) to reach the disk's new, larger end, and
+/// rewrites the full protective-MBR + GPT (primary + backup) layout.
+///
+/// Every field of every partition entry other than the last one's
+/// `last_lba` is preserved byte-for-byte -- GUIDs, name, and (unlike a
+/// round-trip through `writeGptPlaced`/`PlacedPartitionSpec`, which has no
+/// `attributes` field and would silently zero it) `attributes` too --
+/// because this reuses the original decoded `PartitionEntry` values
+/// directly instead of re-deriving them from a narrower spec type.
+///
+/// `img.virtual_size` must already reflect the disk's new, real byte size
+/// (e.g. from a `BLKGETSIZE64` ioctl) -- the new `last_usable_lba`, and
+/// thus the backup header/array's new location, is derived from it, the
+/// same way `writeGpt`/`writeGptPlaced` derive it from a fresh disk's
+/// size. Returns `error.NotEnoughSpace` if the disk isn't actually larger
+/// than the last partition's current extent (e.g. called on an
+/// already-grown disk, or one that didn't grow at all) -- callers that
+/// want a silent every-boot no-op should check this first rather than
+/// relying on the error, since re-writing an unchanged table on every
+/// boot is wasted (harmless, but unnecessary) I/O.
+pub fn growLastPartition(
+    img: *Image,
+    io: Io,
+    disk_guid: guid.Guid,
+    partitions: []PartitionEntry,
+) GrowError!void {
+    if (partitions.len == 0) return error.NoPartitions;
+
+    const total_sectors = img.virtual_size / sector_size;
+    const last_usable_lba: u64 = total_sectors - 2 - partition_array_sectors;
+
+    const last_idx = partitions.len - 1;
+    if (last_usable_lba <= partitions[last_idx].last_lba) return error.NotEnoughSpace;
+
+    partitions[last_idx].last_lba = last_usable_lba;
+
+    try writePartitionTables(img, io, disk_guid, partitions);
+}
+
 pub const ReadError = error{
     UnsupportedPartitionEntrySize,
     BadPartitionArrayChecksum,
@@ -328,6 +374,119 @@ pub fn readGpt(img: Image, io: Io, allocator: std.mem.Allocator) ReadError!Parse
     }
 
     return .{ .header = header, .partitions = try list.toOwnedSlice() };
+}
+
+test "growLastPartition extends the last partition and relocates the backup header/array" {
+    const io = std.testing.io;
+    const path = "test-gpt-grow.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const initial_size: u64 = 128 * 1024 * 1024; // 128 MiB
+    var img = try Image.create(io, path, .raw, initial_size, .{});
+    defer img.close(io);
+
+    const disk_guid = guid.parse("66666666-6666-6666-6666-666666666666");
+    const esp_sectors: u64 = (32 * 1024 * 1024) / sector_size;
+    const first_usable_lba: u64 = 2 + partition_array_sectors;
+    const esp_last_lba = first_usable_lba + esp_sectors - 1;
+    const root_first_lba = esp_last_lba + 1;
+    const initial_total_sectors = initial_size / sector_size;
+    const initial_last_usable_lba = initial_total_sectors - 2 - partition_array_sectors;
+
+    // Arbitrary nonzero attribute bits, standing in for whatever a real
+    // ESP sets (e.g. the "required partition" bit) -- there's no public
+    // way to set these via `writeGpt`/`writeGptPlaced` today (neither
+    // `PartitionSpec` nor `PlacedPartitionSpec` has an `attributes` field),
+    // so this test writes the initial layout directly via the
+    // module-private `writePartitionTables` to exercise the case anyway.
+    const esp_attributes: u64 = 0x3;
+
+    var entries = [_]PartitionEntry{
+        .{
+            .partition_type_guid = guid.esp,
+            .unique_partition_guid = guid.parse("11111111-1111-1111-1111-111111111111"),
+            .first_lba = first_usable_lba,
+            .last_lba = esp_last_lba,
+            .attributes = esp_attributes,
+            .name_utf16le = asciiName("EFI System"),
+        },
+        .{
+            .partition_type_guid = guid.linux_filesystem_data,
+            .unique_partition_guid = guid.parse("22222222-2222-2222-2222-222222222222"),
+            .first_lba = root_first_lba,
+            .last_lba = initial_last_usable_lba / 2, // deliberately not filling the disk
+            .name_utf16le = asciiName("root"),
+        },
+    };
+    try writePartitionTables(&img, io, disk_guid, &entries);
+
+    // Simulate the disk having been deployed at a larger size than the
+    // image was built at.
+    const grown_size: u64 = 512 * 1024 * 1024; // 512 MiB
+    try img.resize(io, grown_size);
+
+    const before = try readGpt(img, io, std.testing.allocator);
+    defer std.testing.allocator.free(before.partitions);
+    try std.testing.expectEqual(@as(usize, 2), before.partitions.len);
+
+    try growLastPartition(&img, io, disk_guid, before.partitions);
+
+    const after = try readGpt(img, io, std.testing.allocator);
+    defer std.testing.allocator.free(after.partitions);
+    try std.testing.expectEqual(@as(usize, 2), after.partitions.len);
+
+    // ESP is untouched: GUIDs, name, LBAs, and attributes all preserved.
+    try std.testing.expectEqualSlices(u8, &guid.esp, &after.partitions[0].partition_type_guid);
+    try std.testing.expectEqualSlices(u8, &entries[0].unique_partition_guid, &after.partitions[0].unique_partition_guid);
+    try std.testing.expectEqual(entries[0].first_lba, after.partitions[0].first_lba);
+    try std.testing.expectEqual(entries[0].last_lba, after.partitions[0].last_lba);
+    try std.testing.expectEqual(esp_attributes, after.partitions[0].attributes);
+    try std.testing.expectEqualSlices(u16, &entries[0].name_utf16le, &after.partitions[0].name_utf16le);
+
+    // Root's last_lba now reaches the new, larger disk's last usable LBA.
+    const grown_total_sectors = grown_size / sector_size;
+    const grown_last_usable_lba = grown_total_sectors - 2 - partition_array_sectors;
+    try std.testing.expectEqual(entries[1].first_lba, after.partitions[1].first_lba);
+    try std.testing.expectEqual(grown_last_usable_lba, after.partitions[1].last_lba);
+    try std.testing.expect(grown_last_usable_lba > initial_last_usable_lba);
+    try std.testing.expectEqual(grown_last_usable_lba, after.header.last_usable_lba);
+
+    // Backup header/array parse correctly from their new, relocated
+    // position at the disk's new true end -- proving the backup copy
+    // physically moved, not just the primary.
+    try std.testing.expectEqual(grown_total_sectors - 1, after.header.backup_lba);
+    var backup_header_buf: [sector_size]u8 = undefined;
+    _ = try img.pread(io, &backup_header_buf, sector_size * (grown_total_sectors - 1));
+    const backup_header = try Header.decode(&backup_header_buf);
+    try std.testing.expectEqual(@as(u64, 1), backup_header.backup_lba);
+    try std.testing.expectEqual(grown_last_usable_lba, backup_header.last_usable_lba);
+}
+
+test "growLastPartition rejects a disk that hasn't actually grown" {
+    const io = std.testing.io;
+    const path = "test-gpt-grow-noop.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const disk_size: u64 = 64 * 1024 * 1024;
+    var img = try Image.create(io, path, .raw, disk_size, .{});
+    defer img.close(io);
+
+    // Fill the partition all the way to the disk's current last usable
+    // LBA, so there's genuinely no free space left to grow into.
+    const total_sectors = disk_size / sector_size;
+    const first_usable_lba: u64 = 2 + partition_array_sectors;
+    const last_usable_lba: u64 = total_sectors - 2 - partition_array_sectors;
+    const specs = [_]PartitionSpec{
+        .{ .type_guid = guid.linux_filesystem_data, .unique_guid = guid.parse("77777777-7777-7777-7777-777777777777"), .size_sectors = last_usable_lba - first_usable_lba + 1 },
+    };
+    var placements: [specs.len]Placement = undefined;
+    const disk_guid = guid.parse("88888888-8888-8888-8888-888888888888");
+    try writeGpt(&img, io, disk_guid, &specs, &placements);
+
+    const parsed = try readGpt(img, io, std.testing.allocator);
+    defer std.testing.allocator.free(parsed.partitions);
+
+    try std.testing.expectError(error.NotEnoughSpace, growLastPartition(&img, io, disk_guid, parsed.partitions));
 }
 
 test "writeGpt + readGpt round-trip an ESP + Linux root layout" {
