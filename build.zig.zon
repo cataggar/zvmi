@@ -14,7 +14,7 @@
         "qmp",
         "nbd",
         "qcow2",
-        "miniinit",
+        "azinit",
         "README.md",
         "LICENSE",
     },

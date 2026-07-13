@@ -227,7 +227,7 @@ fn reReadPartitionTable(file: std.Io.File) void {
 }
 
 /// Mounts `device_path` (e.g. `/dev/sdb1`) at `mount_point` via a direct
-/// `mount(2)` syscall (matching `cdrom.zig`/`miniinit`'s style), creating
+/// `mount(2)` syscall (matching `cdrom.zig`/`azinit`'s style), creating
 /// the mount point directory if needed. Tolerates `EBUSY` (already mounted)
 /// for idempotency across repeated calls within the same boot.
 pub fn mountAt(io: std.Io, device_path: [:0]const u8, mount_point: [:0]const u8) !void {

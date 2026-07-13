@@ -29,7 +29,7 @@ pub fn build(b: *std.Build) void {
 
     // ---- azagent: minimal guest provisioning agent for first-boot Azure
     // VM setup (issue #112). Statically linked for self-containment
-    // (matching miniinit's philosophy), but -- unlike miniinit, which is
+    // (matching azinit's philosophy), but -- unlike azinit, which is
     // pinned to a single real-boot x86_64 QEMU test fixture -- built for
     // the standard target/optimize so it stays portable across whatever
     // architecture a given image targets (Azure supports Arm64 VMs too)
@@ -207,27 +207,27 @@ pub fn build(b: *std.Build) void {
     const qcow2_exe_tests = b.addTest(.{ .root_module = qcow2_exe.root_module });
     const run_qcow2_exe_tests = b.addRunArtifact(qcow2_exe_tests);
 
-    // ---- miniinit: standalone minimal PID 1 for real-boot testing of
+    // ---- azinit: standalone minimal PID 1 for real-boot testing of
     // --skip-iso-rootfs images ----
-    // miniinit always runs as PID 1 inside an x86_64 Azure Linux guest, so
+    // azinit always runs as PID 1 inside an x86_64 Azure Linux guest, so
     // unlike the rest of this repo it hardcodes its target rather than
     // using `target`/`optimize` above. Static linking keeps it fully
     // self-contained: no libc, no kmod, no other runtime dependency needs
     // to be present in the guest's root filesystem.
-    const miniinit_target = b.resolveTargetQuery(.{
+    const azinit_target = b.resolveTargetQuery(.{
         .cpu_arch = .x86_64,
         .os_tag = .linux,
     });
-    const miniinit_exe = b.addExecutable(.{
-        .name = "miniinit",
+    const azinit_exe = b.addExecutable(.{
+        .name = "azinit",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("miniinit/init.zig"),
-            .target = miniinit_target,
+            .root_source_file = b.path("azinit/init.zig"),
+            .target = azinit_target,
             .optimize = .ReleaseSmall,
         }),
         .linkage = .static,
     });
-    b.installArtifact(miniinit_exe);
+    b.installArtifact(azinit_exe);
 
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_zvmi_tests.step);

@@ -25,7 +25,7 @@ const linux = std.os.linux;
 var log_fd: i32 = -1;
 
 fn openDebugLog() void {
-    const rc = linux.open("/run/miniinit.log", .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644);
+    const rc = linux.open("/run/azinit.log", .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644);
     const fd: i32 = @intCast(rc);
     if (linux.errno(rc) == .SUCCESS) log_fd = fd;
 }
@@ -80,7 +80,7 @@ fn tryMountEsp() void {
             const e = linux.errno(rc);
             if (e == .SUCCESS) {
                 var buf: [64]u8 = undefined;
-                const msg = std.fmt.bufPrint(&buf, "[miniinit] mounted {s} at /boot/efi\r\n", .{dev}) catch "[miniinit] mounted ESP\r\n";
+                const msg = std.fmt.bufPrint(&buf, "[azinit] mounted {s} at /boot/efi\r\n", .{dev}) catch "[azinit] mounted ESP\r\n";
                 writeStr(msg);
                 return;
             }
@@ -88,7 +88,7 @@ fn tryMountEsp() void {
         const req: linux.timespec = .{ .sec = 0, .nsec = 200_000_000 };
         _ = linux.nanosleep(&req, null);
     }
-    writeStr("[miniinit] no ESP candidate device mounted (non-fatal)\r\n");
+    writeStr("[azinit] no ESP candidate device mounted (non-fatal)\r\n");
 }
 
 // --- signal-driven / argv0-driven shutdown ---
@@ -150,7 +150,7 @@ fn mountEtcOverlay() void {
     const rc = linux.mount("overlay", "/etc", "overlay", 0, @intFromPtr("lowerdir=/etc,upperdir=/run/etc-upper,workdir=/run/etc-work"));
     const e = linux.errno(rc);
     if (e != .SUCCESS) {
-        writeErrno("[miniinit] /etc overlay mount failed", e);
+        writeErrno("[azinit] /etc overlay mount failed", e);
         etc_writable = false;
     } else {
         etc_writable = true;
@@ -208,7 +208,7 @@ fn loadModuleAt(gpa: std.mem.Allocator, release: []const u8, rel_path: []const u
 
     const compressed = readWholeFileAlloc(gpa, path) orelse {
         var buf: [128]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "[miniinit] module {s} not found (non-fatal)\r\n", .{rel_path}) catch "[miniinit] module not found\r\n";
+        const msg = std.fmt.bufPrint(&buf, "[azinit] module {s} not found (non-fatal)\r\n", .{rel_path}) catch "[azinit] module not found\r\n";
         writeStr(msg);
         return;
     };
@@ -216,7 +216,7 @@ fn loadModuleAt(gpa: std.mem.Allocator, release: []const u8, rel_path: []const u
 
     const image = decompressXzAlloc(gpa, compressed) orelse {
         var buf: [128]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "[miniinit] module {s} decompress failed (non-fatal)\r\n", .{rel_path}) catch "[miniinit] module decompress failed\r\n";
+        const msg = std.fmt.bufPrint(&buf, "[azinit] module {s} decompress failed (non-fatal)\r\n", .{rel_path}) catch "[azinit] module decompress failed\r\n";
         writeStr(msg);
         return;
     };
@@ -226,10 +226,10 @@ fn loadModuleAt(gpa: std.mem.Allocator, release: []const u8, rel_path: []const u
     const e = linux.errno(rc);
     var buf: [160]u8 = undefined;
     if (e == .SUCCESS or e == .EXIST) {
-        const msg = std.fmt.bufPrint(&buf, "[miniinit] loaded module {s}\r\n", .{rel_path}) catch "[miniinit] module loaded\r\n";
+        const msg = std.fmt.bufPrint(&buf, "[azinit] loaded module {s}\r\n", .{rel_path}) catch "[azinit] module loaded\r\n";
         writeStr(msg);
     } else {
-        const msg = std.fmt.bufPrint(&buf, "[miniinit] init_module {s} failed: errno={d}\r\n", .{ rel_path, @intFromEnum(e) }) catch "[miniinit] init_module failed\r\n";
+        const msg = std.fmt.bufPrint(&buf, "[azinit] init_module {s} failed: errno={d}\r\n", .{ rel_path, @intFromEnum(e) }) catch "[azinit] init_module failed\r\n";
         writeStr(msg);
     }
 }
@@ -238,7 +238,7 @@ fn loadBootModules() void {
     const gpa = std.heap.page_allocator;
     var uts: linux.utsname = undefined;
     if (linux.errno(linux.uname(&uts)) != .SUCCESS) {
-        writeStr("[miniinit] uname failed; skipping module autoload\r\n");
+        writeStr("[azinit] uname failed; skipping module autoload\r\n");
         return;
     }
     const release = std.mem.sliceTo(&uts.release, 0);
@@ -450,14 +450,14 @@ fn ifIndex(fd: i32, name: []const u8) ?i32 {
 
 fn openRawIpRecvSocket(ctl_fd: i32, iface: []const u8) ?i32 {
     const index = ifIndex(ctl_fd, iface) orelse {
-        writeStr("[miniinit] dhcp: SIOCGIFINDEX failed\r\n");
+        writeStr("[azinit] dhcp: SIOCGIFINDEX failed\r\n");
         return null;
     };
 
     const sock_rc = linux.socket(linux.AF.PACKET, linux.SOCK.DGRAM, std.mem.nativeToBig(u16, ETH_P_IP));
     const sock: i32 = @intCast(sock_rc);
     if (linux.errno(sock_rc) != .SUCCESS) {
-        writeErrno("[miniinit] dhcp: AF_PACKET socket() failed", linux.errno(sock_rc));
+        writeErrno("[azinit] dhcp: AF_PACKET socket() failed", linux.errno(sock_rc));
         return null;
     }
 
@@ -471,7 +471,7 @@ fn openRawIpRecvSocket(ctl_fd: i32, iface: []const u8) ?i32 {
     };
     const bind_rc = linux.bind(sock, @ptrCast(&addr), @sizeOf(linux.sockaddr.ll));
     if (linux.errno(bind_rc) != .SUCCESS) {
-        writeErrno("[miniinit] dhcp: AF_PACKET bind failed", linux.errno(bind_rc));
+        writeErrno("[azinit] dhcp: AF_PACKET bind failed", linux.errno(bind_rc));
         _ = linux.close(sock);
         return null;
     }
@@ -504,12 +504,12 @@ fn runDhcp(iface: []const u8) ?DhcpResult {
     var hw_req: linux.ifreq = std.mem.zeroes(linux.ifreq);
     @memcpy(hw_req.ifrn.name[0..iface.len], iface);
     const hw_rc = linux.ioctl(ctl_fd, linux.SIOCGIFHWADDR, @intFromPtr(&hw_req));
-    if (linux.errno(hw_rc) != .SUCCESS) writeErrno("[miniinit] dhcp: SIOCGIFHWADDR failed", linux.errno(hw_rc));
+    if (linux.errno(hw_rc) != .SUCCESS) writeErrno("[azinit] dhcp: SIOCGIFHWADDR failed", linux.errno(hw_rc));
     var mac: [6]u8 = undefined;
     @memcpy(&mac, hw_req.ifru.hwaddr.data[0..6]);
     {
         var mbuf: [64]u8 = undefined;
-        const m = std.fmt.bufPrint(&mbuf, "[miniinit] dhcp: mac={x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}\r\n", .{ mac[0], mac[1], mac[2], mac[3], mac[4], mac[5] }) catch "[miniinit] dhcp: mac read\r\n";
+        const m = std.fmt.bufPrint(&mbuf, "[azinit] dhcp: mac={x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}\r\n", .{ mac[0], mac[1], mac[2], mac[3], mac[4], mac[5] }) catch "[azinit] dhcp: mac read\r\n";
         writeStr(m);
     }
 
@@ -518,7 +518,7 @@ fn runDhcp(iface: []const u8) ?DhcpResult {
     const sock_rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM, 0);
     const sock: i32 = @intCast(sock_rc);
     if (linux.errno(sock_rc) != .SUCCESS) {
-        writeErrno("[miniinit] dhcp: socket() failed", linux.errno(sock_rc));
+        writeErrno("[azinit] dhcp: socket() failed", linux.errno(sock_rc));
         return null;
     }
     defer _ = linux.close(sock);
@@ -526,15 +526,15 @@ fn runDhcp(iface: []const u8) ?DhcpResult {
     var one: i32 = 1;
     _ = linux.setsockopt(sock, linux.SOL.SOCKET, linux.SO.BROADCAST, std.mem.asBytes(&one), @sizeOf(i32));
     const bindtodev_rc = linux.setsockopt(sock, linux.SOL.SOCKET, linux.SO.BINDTODEVICE, iface.ptr, @intCast(iface.len));
-    if (linux.errno(bindtodev_rc) != .SUCCESS) writeErrno("[miniinit] dhcp: SO_BINDTODEVICE failed", linux.errno(bindtodev_rc));
+    if (linux.errno(bindtodev_rc) != .SUCCESS) writeErrno("[azinit] dhcp: SO_BINDTODEVICE failed", linux.errno(bindtodev_rc));
 
     const bind_addr = sockaddrInPort(0, std.mem.nativeToBig(u16, 68));
     const bind_rc = linux.bind(sock, &bind_addr, @sizeOf(linux.sockaddr));
     if (linux.errno(bind_rc) != .SUCCESS) {
-        writeErrno("[miniinit] dhcp bind failed", linux.errno(bind_rc));
+        writeErrno("[azinit] dhcp bind failed", linux.errno(bind_rc));
         return null;
     }
-    writeStr("[miniinit] dhcp: bound to udp/68\r\n");
+    writeStr("[azinit] dhcp: bound to udp/68\r\n");
 
     var recv_sock = sock;
     var recv_is_raw = false;
@@ -542,7 +542,7 @@ fn runDhcp(iface: []const u8) ?DhcpResult {
         recv_sock = raw_sock;
         recv_is_raw = true;
     } else {
-        writeStr("[miniinit] dhcp: falling back to udp recv (may miss replies on some networks)\r\n");
+        writeStr("[azinit] dhcp: falling back to udp recv (may miss replies on some networks)\r\n");
     }
     defer if (recv_is_raw) {
         _ = linux.close(recv_sock);
@@ -561,7 +561,7 @@ fn runDhcp(iface: []const u8) ?DhcpResult {
     const send_rc = linux.sendto(sock, &packet, send_len, 0, &dest_addr, @sizeOf(linux.sockaddr));
     {
         var sbuf: [64]u8 = undefined;
-        const smsg = std.fmt.bufPrint(&sbuf, "[miniinit] dhcp: sent DISCOVER, sendto_rc={d}\r\n", .{send_rc}) catch "[miniinit] dhcp: sent DISCOVER\r\n";
+        const smsg = std.fmt.bufPrint(&sbuf, "[azinit] dhcp: sent DISCOVER, sendto_rc={d}\r\n", .{send_rc}) catch "[azinit] dhcp: sent DISCOVER\r\n";
         writeStr(smsg);
     }
 
@@ -577,7 +577,7 @@ fn runDhcp(iface: []const u8) ?DhcpResult {
         const n_signed: isize = @bitCast(n_rc);
         {
             var rbuf: [80]u8 = undefined;
-            const rmsg = std.fmt.bufPrint(&rbuf, "[miniinit] dhcp: recvfrom attempt {d} -> {d}\r\n", .{ attempt, n_signed }) catch "[miniinit] dhcp: recv attempt\r\n";
+            const rmsg = std.fmt.bufPrint(&rbuf, "[azinit] dhcp: recvfrom attempt {d} -> {d}\r\n", .{ attempt, n_signed }) catch "[azinit] dhcp: recv attempt\r\n";
             writeStr(rmsg);
         }
         const payload: ?[]const u8 = if (n_signed <= 0)
@@ -589,7 +589,7 @@ fn runDhcp(iface: []const u8) ?DhcpResult {
         if (payload) |data| {
             if (parseDhcpReply(data, data.len, xid)) |reply| {
                 var pbuf: [64]u8 = undefined;
-                const pmsg = std.fmt.bufPrint(&pbuf, "[miniinit] dhcp: parsed reply msg_type={d}\r\n", .{reply.msg_type}) catch "[miniinit] dhcp: parsed reply\r\n";
+                const pmsg = std.fmt.bufPrint(&pbuf, "[azinit] dhcp: parsed reply msg_type={d}\r\n", .{reply.msg_type}) catch "[azinit] dhcp: parsed reply\r\n";
                 writeStr(pmsg);
                 if (reply.msg_type == 2) { // DHCPOFFER
                     offer_ip = reply.your_ip;
@@ -597,7 +597,7 @@ fn runDhcp(iface: []const u8) ?DhcpResult {
                     got_offer = true;
                 }
             } else if (n_signed > 0) {
-                writeStr("[miniinit] dhcp: recv'd packet failed to parse (xid/magic mismatch?)\r\n");
+                writeStr("[azinit] dhcp: recv'd packet failed to parse (xid/magic mismatch?)\r\n");
             }
         } else {
             send_len = buildDhcpPacket(&packet, xid, mac, 1, 0, 0);
@@ -605,7 +605,7 @@ fn runDhcp(iface: []const u8) ?DhcpResult {
         }
     }
     if (!got_offer) {
-        writeStr("[miniinit] dhcp: no offer received\r\n");
+        writeStr("[azinit] dhcp: no offer received\r\n");
         return null;
     }
 
@@ -639,7 +639,7 @@ fn runDhcp(iface: []const u8) ?DhcpResult {
             _ = linux.sendto(sock, &packet, send_len, 0, &dest_addr, @sizeOf(linux.sockaddr));
         }
     }
-    if (got_ack == null) writeStr("[miniinit] dhcp: no ack received\r\n");
+    if (got_ack == null) writeStr("[azinit] dhcp: no ack received\r\n");
     return got_ack;
 }
 
@@ -662,7 +662,7 @@ fn addDefaultRoute(iface: []const u8, gateway_be: u32) void {
 
     const rc = linux.ioctl(sock, linux.SIOCADDRT, @intFromPtr(&route));
     const e = linux.errno(rc);
-    if (e != .SUCCESS) writeErrno("[miniinit] add default route failed", e);
+    if (e != .SUCCESS) writeErrno("[azinit] add default route failed", e);
 }
 
 fn writeResolvConf(dns: [2]u32) void {
@@ -670,11 +670,11 @@ fn writeResolvConf(dns: [2]u32) void {
     const fd_rc = linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
     const fd: i32 = @intCast(fd_rc);
     if (linux.errno(fd_rc) != .SUCCESS) {
-        writeErrno("[miniinit] writing resolv.conf failed", linux.errno(fd_rc));
+        writeErrno("[azinit] writing resolv.conf failed", linux.errno(fd_rc));
         return;
     }
     defer _ = linux.close(fd);
-    if (!etc_writable) writeStr("[miniinit] /etc not writable (no overlayfs); wrote /run/resolv.conf instead\r\n");
+    if (!etc_writable) writeStr("[azinit] /etc not writable (no overlayfs); wrote /run/resolv.conf instead\r\n");
 
     var buf: [128]u8 = undefined;
     for (dns) |d| {
@@ -695,11 +695,11 @@ fn setupNetworking() void {
 
     var iface_buf: [linux.IFNAMESIZE]u8 = undefined;
     const iface = findPrimaryInterface(&iface_buf) orelse {
-        writeStr("[miniinit] no non-lo network interface found\r\n");
+        writeStr("[azinit] no non-lo network interface found\r\n");
         return;
     };
     var msg_buf: [96]u8 = undefined;
-    const msg = std.fmt.bufPrint(&msg_buf, "[miniinit] running DHCP on {s}\r\n", .{iface}) catch "[miniinit] running DHCP\r\n";
+    const msg = std.fmt.bufPrint(&msg_buf, "[azinit] running DHCP on {s}\r\n", .{iface}) catch "[azinit] running DHCP\r\n";
     writeStr(msg);
 
     const lease = runDhcp(iface) orelse return;
@@ -718,7 +718,7 @@ fn setupNetworking() void {
 
     const ip_bytes = std.mem.asBytes(&lease.your_ip);
     var ok_buf: [96]u8 = undefined;
-    const ok_msg = std.fmt.bufPrint(&ok_buf, "[miniinit] {s} configured: {d}.{d}.{d}.{d}\r\n", .{ iface, ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3] }) catch "[miniinit] network configured\r\n";
+    const ok_msg = std.fmt.bufPrint(&ok_buf, "[azinit] {s} configured: {d}.{d}.{d}.{d}\r\n", .{ iface, ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3] }) catch "[azinit] network configured\r\n";
     writeStr(ok_msg);
 }
 
@@ -729,7 +729,7 @@ fn setupNetworking() void {
 // once so this from-scratch init supports first-boot Azure provisioning
 // too, serving as a reference for what any --skip-iso-rootfs init needs
 // to do to actually reach a usable, provisioned login. Tolerant of it
-// being entirely absent (most miniinit-based test images don't have it)
+// being entirely absent (most azinit-based test images don't have it)
 // and of it failing/exiting non-zero (e.g. no provisioning CD-ROM
 // attached yet, or no network route to the WireServer) -- a provisioning
 // failure should never prevent reaching the fallback shell.
@@ -739,7 +739,7 @@ fn runAzagentIfPresent() void {
     const access_rc = linux.access(azagent_path, linux.F_OK);
     if (linux.errno(access_rc) != .SUCCESS) return;
 
-    writeStr("[miniinit] running azagent...\r\n");
+    writeStr("[azinit] running azagent...\r\n");
 
     const pid: i32 = @intCast(linux.fork());
     if (pid == 0) {
@@ -749,20 +749,20 @@ fn runAzagentIfPresent() void {
             null,
         };
         _ = linux.execve(azagent_path, &argv, &envp);
-        writeStr("[miniinit] execve(azagent) failed\r\n");
+        writeStr("[azinit] execve(azagent) failed\r\n");
         linux.exit(127);
     }
     if (pid < 0) {
-        writeStr("[miniinit] fork() for azagent failed\r\n");
+        writeStr("[azinit] fork() for azagent failed\r\n");
         return;
     }
 
     var status: u32 = 0;
     _ = linux.waitpid(pid, &status, 0);
     if (linux.W.IFEXITED(status) and linux.W.EXITSTATUS(status) == 0) {
-        writeStr("[miniinit] azagent completed successfully\r\n");
+        writeStr("[azinit] azagent completed successfully\r\n");
     } else {
-        writeStr("[miniinit] azagent exited non-zero (continuing anyway)\r\n");
+        writeStr("[azinit] azagent exited non-zero (continuing anyway)\r\n");
     }
 }
 
@@ -774,7 +774,7 @@ fn shellLoop() noreturn {
 
         const tty_fd_raw = linux.open("/dev/ttyS0", .{ .ACCMODE = .RDWR }, 0);
         if (linux.errno(tty_fd_raw) != .SUCCESS) {
-            writeStr("[miniinit] failed to open /dev/ttyS0, retrying in 1s\r\n");
+            writeStr("[azinit] failed to open /dev/ttyS0, retrying in 1s\r\n");
             const req: linux.timespec = .{ .sec = 1, .nsec = 0 };
             _ = linux.nanosleep(&req, null);
             continue;
@@ -799,7 +799,7 @@ fn shellLoop() noreturn {
                 null,
             };
             _ = linux.execve("/usr/bin/bash", &argv, &envp);
-            writeStr("[miniinit] execve(/usr/bin/bash) failed\r\n");
+            writeStr("[azinit] execve(/usr/bin/bash) failed\r\n");
             linux.exit(127);
         }
 
@@ -814,7 +814,7 @@ fn shellLoop() noreturn {
         }
 
         if (shutdown_requested) doReboot(.POWER_OFF);
-        writeStr("\r\n[miniinit] shell exited, respawning...\r\n");
+        writeStr("\r\n[azinit] shell exited, respawning...\r\n");
     }
 }
 
@@ -840,11 +840,11 @@ pub fn main(init: std.process.Init.Minimal) noreturn {
     tryMountEsp();
     setHostname();
 
-    writeStr("\r\n[miniinit] base mounts ready; configuring network...\r\n");
+    writeStr("\r\n[azinit] base mounts ready; configuring network...\r\n");
     setupNetworking();
 
     runAzagentIfPresent();
 
-    writeStr("[miniinit] spawning shell on ttyS0\r\n");
+    writeStr("[azinit] spawning shell on ttyS0\r\n");
     shellLoop();
 }

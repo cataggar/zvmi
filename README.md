@@ -90,8 +90,8 @@ zvmi/
         cosi.zig              # `zvmi cosi`
         build_image.zig       # `zvmi build-image`
         opts.zig              # shared `-o subformat=...` parsing
-  miniinit/                 # minimal PID 1 for real-boot testing of
-                              #   --skip-iso-rootfs images (see miniinit/README.md)
+  azinit/                   # minimal PID 1 for real-boot testing of
+                              #   --skip-iso-rootfs images (see azinit/README.md)
   qmp/                      # native Zig QEMU Machine Protocol (QMP) client,
                               #   MIT licensed (see qmp/README.md)
   nbd/                      # native Zig NBD client + reference server, MIT
@@ -248,7 +248,7 @@ full (non-`--skip-iso-rootfs`) image, since its systemd comes from the
 merged distro content; a `--skip-iso-rootfs` image's `/sbin/init` is
 responsible for invoking `azagent` itself if it wants first-boot
 provisioning, since there's no guarantee of systemd being present at all in
-that minimal path (`miniinit` does this -- see `miniinit/README.md`).
+that minimal path (`azinit` does this -- see `azinit/README.md`).
 
 `convert` skips all-zero chunks (aligned to the destination's block size for
 sparse block formats such as dynamic vhd and vhdx), so converting a
