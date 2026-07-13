@@ -149,8 +149,8 @@ zvmi/
                               #   fixture in CI
   .github/
     workflows/
-      ci.yml                 # build + test (required) and a best-effort
-                              #   real-QEMU boot-smoke job
+      ci.yml                 # required build + test for pushes and PRs
+      boot-smoke.yml         # required for release tags; also manual
 ```
 
 ## Requirements
@@ -169,15 +169,9 @@ zig build run -- <args>   # run the CLI, e.g. `zig build run -- info foo.vhd`
 
 ## CI
 
-`.github/workflows/ci.yml` runs on every push/PR:
+`.github/workflows/ci.yml` runs the required `zig fmt --check`, `zig build`, and `zig build test` checks on every pull request and push to `main`.
 
-- **`test`** (required): `zig fmt --check`, `zig build`, `zig build test`.
-- **`boot-smoke`** (best-effort, `continue-on-error: true`): installs
-  `qemu-system-x86`/`ovmf` via `apt`, downloads the
-  [Azure Linux 4.0 ISO](https://aka.ms/azurelinux-4.0-x86_64.iso) (cached
-  across runs), builds a minimal OCI fixture with
-  `scripts/ci/make-minimal-oci-fixture.py`, and runs
-  `zig build test-boot-smoke`.
+`.github/workflows/boot-smoke.yml` runs `zig build test-boot-smoke` for every release tag and when manually dispatched. It installs `qemu-system-x86`/`ovmf`, downloads and caches the [Azure Linux 4.0 ISO](https://aka.ms/azurelinux-4.0-x86_64.iso), and builds the OCI fixtures used by the real-QEMU tests. The job is required (not `continue-on-error`) for release tags but is not part of universal pull-request CI.
 
 ## Status (Milestone 7)
 
