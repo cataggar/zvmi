@@ -405,7 +405,20 @@ pub fn populate(
 
     const stat = try file.stat(io);
     if (stat.size < options.offset + options.length) {
-        try file.setLength(io, options.offset + options.length);
+        // `stat.size` reads back as 0 for a block-device special file (real
+        // hardware, e.g. formatting a resource disk directly rather than a
+        // disk-image regular file -- see azagent/resource_disk.zig), so
+        // this branch is always taken there even though the device already
+        // has a fixed, sufficient size. `setLength` on such a file fails
+        // with `NonResizable` rather than actually resizing anything;
+        // that's expected in this case, so it's tolerated rather than
+        // propagated. A regular file that's genuinely too small to hold
+        // the requested range fails for a different reason (`FileTooBig`,
+        // `NoSpaceLeft`, etc., surfaced normally by the writes below).
+        file.setLength(io, options.offset + options.length) catch |err| switch (err) {
+            error.NonResizable => {},
+            else => return err,
+        };
     }
 
     var plan = try buildPlan(allocator, tree, options);

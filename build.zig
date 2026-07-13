@@ -33,13 +33,16 @@ pub fn build(b: *std.Build) void {
     // pinned to a single real-boot x86_64 QEMU test fixture -- built for
     // the standard target/optimize so it stays portable across whatever
     // architecture a given image targets (Azure supports Arm64 VMs too)
-    // and remains natively testable via `zig build test` on any host. ----
+    // and remains natively testable via `zig build test` on any host.
+    // Imports `zvmi` too (issue #113's resource-disk setup reuses
+    // `mbr.zig`/`ext4.zig` directly against a real block device). ----
     const azagent_mod = b.createModule(.{
         .root_source_file = b.path("azagent/main.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "wireserver", .module = wireserver_mod },
+            .{ .name = "zvmi", .module = zvmi_mod },
         },
     });
 

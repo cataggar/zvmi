@@ -20,6 +20,7 @@ pub const ssh_keys = @import("ssh_keys.zig");
 pub const sentinel = @import("sentinel.zig");
 pub const cdrom = @import("cdrom.zig");
 pub const waagent_conf = @import("waagent_conf.zig");
+pub const resource_disk = @import("resource_disk.zig");
 
 /// Everything `provision` needs, injected rather than hardcoded, so it's
 /// fully testable against a scoped temp directory instead of the real
@@ -176,6 +177,50 @@ pub fn main(init: std.process.Init) !void {
         .ssh_dir = ssh_dir,
         .waagent_conf = parsed_waagent_conf,
     });
+
+    // Unlike `provision` above, resource-disk activation runs on *every*
+    // boot, not just the first: Azure can reallocate/resize the resource
+    // disk across a VM's lifetime, so its formatted/mounted state must be
+    // re-checked every time rather than gated by the sentinel. Best-effort
+    // (logs and continues on failure), matching `reportHealthBestEffort`:
+    // a VM without its temp disk mounted is still otherwise usable.
+    resourceDiskSetupBestEffort(gpa, io, now_unix_seconds, parsed_waagent_conf);
+}
+
+/// Best-effort wrapper around `resourceDiskSetup` -- see its call site in
+/// `main` for why failures here are logged rather than fatal.
+fn resourceDiskSetupBestEffort(allocator: std.mem.Allocator, io: std.Io, now_unix_seconds: i64, conf: waagent_conf.WaagentConf) void {
+    resourceDiskSetup(allocator, io, now_unix_seconds, conf) catch |err| {
+        std.debug.print("azagent: warning: failed to set up the resource disk: {t}\n", .{err});
+    };
+}
+
+fn resourceDiskSetup(allocator: std.mem.Allocator, io: std.Io, now_unix_seconds: i64, conf: waagent_conf.WaagentConf) !void {
+    // Matches real waagent's `ResourceDisk.Format` meaning: whether to
+    // touch the resource disk at all (off by default, per issue #113's
+    // "off by default" defaults and `waagent_conf.zig`'s own conservative
+    // default).
+    if (!conf.resourcedisk_format) return;
+
+    // `azagent` only has an ext4 writer -- a recognized-but-unsupported
+    // filesystem value is logged and ignored (per `waagent_conf.zig`'s doc
+    // comment), not treated as fatal.
+    if (!std.mem.eql(u8, conf.resourcedisk_filesystem, "ext4")) {
+        std.debug.print("azagent: warning: ResourceDisk.Filesystem={s} is not supported, using ext4 instead\n", .{conf.resourcedisk_filesystem});
+    }
+
+    var devices_dir = try std.Io.Dir.cwd().openDir(io, "/sys/bus/vmbus/devices", .{ .iterate = true });
+    defer devices_dir.close(io);
+
+    try resource_disk.setup(.{
+        .allocator = allocator,
+        .io = io,
+        .devices_dir = devices_dir,
+        .now_unix_seconds = now_unix_seconds,
+        .mount_point = conf.resourcedisk_mount_point,
+        .enable_swap = conf.resourcedisk_enable_swap,
+        .swap_size_mb = if (conf.resourcedisk_swap_size_mb > 0) conf.resourcedisk_swap_size_mb else resource_disk.default_swap_size_mb,
+    });
 }
 
 test {
@@ -187,6 +232,7 @@ test {
     _ = sentinel;
     _ = cdrom;
     _ = waagent_conf;
+    _ = resource_disk;
 }
 
 test "provision runs the full sequence end to end against scoped temp directories" {
