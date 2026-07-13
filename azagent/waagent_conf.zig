@@ -27,14 +27,6 @@ const std = @import("std");
 /// defaults (used verbatim when `/etc/waagent.conf` is absent, and as the
 /// starting point overridden by any recognized key present in it).
 pub const WaagentConf = struct {
-    /// If `false`, skip `provision()` entirely -- matches real waagent's
-    /// meaning closely: this VM's disk was pre-provisioned/is being used
-    /// as a specialized, not generalized, boot source. `azagent`'s own
-    /// default is `true` (always provision), unlike upstream's own
-    /// default of "auto"-detect (see `Provisioning.Agent`, not
-    /// implemented here -- `azagent` always provisions, deferring to
-    /// nothing else, per issue #112's cloud-init-detection scope note).
-    provisioning_enabled: bool = true,
     /// Matches upstream's own conservative default -- see issue #125's
     /// note on `config/mariner/waagent.conf` shipping this as `n`.
     resourcedisk_format: bool = false,
@@ -53,6 +45,15 @@ pub const WaagentConf = struct {
     /// used, matching `OvfEnv`'s existing lifetime contract in this
     /// repo), and any unparseable/unrecognized line or value is simply
     /// skipped rather than erroring.
+    ///
+    /// Deliberately does **not** recognize `Provisioning.Enabled`: real
+    /// Azure Linux images ship `/etc/waagent.conf` with that key set to
+    /// `n` by default (paired with `Provisioning.Agent=auto`, i.e. "let
+    /// cloud-init handle this instead"). `azagent` never defers to
+    /// cloud-init -- it always fully owns provisioning (see issue #112's
+    /// explicit cloud-init-interop scope note) -- so honoring that key
+    /// with upstream's semantics would silently disable `azagent` by
+    /// default on every real target image, defeating its entire purpose.
     pub fn parse(content: []const u8) WaagentConf {
         var result: WaagentConf = .{};
 
@@ -60,9 +61,7 @@ pub const WaagentConf = struct {
         while (lines.next()) |raw_line| {
             const kv = parseLine(raw_line) orelse continue;
 
-            if (std.mem.eql(u8, kv.key, "Provisioning.Enabled")) {
-                if (parseSwitch(kv.value)) |v| result.provisioning_enabled = v;
-            } else if (std.mem.eql(u8, kv.key, "ResourceDisk.Format")) {
+            if (std.mem.eql(u8, kv.key, "ResourceDisk.Format")) {
                 if (parseSwitch(kv.value)) |v| result.resourcedisk_format = v;
             } else if (std.mem.eql(u8, kv.key, "ResourceDisk.Filesystem")) {
                 if (kv.value) |v| result.resourcedisk_filesystem = v;
@@ -174,7 +173,6 @@ test "parseSwitch is case-insensitive and tolerates unrecognized values" {
 
 test "WaagentConf.parse returns defaults for an empty document" {
     const conf = WaagentConf.parse("");
-    try std.testing.expectEqual(true, conf.provisioning_enabled);
     try std.testing.expectEqual(false, conf.resourcedisk_format);
     try std.testing.expectEqualStrings("ext4", conf.resourcedisk_filesystem);
     try std.testing.expectEqualStrings("/mnt/resource", conf.resourcedisk_mount_point);
@@ -182,7 +180,7 @@ test "WaagentConf.parse returns defaults for an empty document" {
     try std.testing.expectEqual(@as(u32, 0), conf.resourcedisk_swap_size_mb);
 }
 
-test "WaagentConf.parse applies every recognized key from a realistic document" {
+test "WaagentConf.parse applies every recognized key from a realistic document, and ignores Provisioning.Enabled" {
     const sample =
         \\# Microsoft Azure Linux Agent Configuration
         \\#
@@ -199,7 +197,6 @@ test "WaagentConf.parse applies every recognized key from a realistic document" 
         \\ResourceDisk.SwapSizeMB=2048
     ;
     const conf = WaagentConf.parse(sample);
-    try std.testing.expectEqual(false, conf.provisioning_enabled);
     try std.testing.expectEqual(true, conf.resourcedisk_format);
     try std.testing.expectEqualStrings("ext4", conf.resourcedisk_filesystem);
     try std.testing.expectEqualStrings("/mnt/resource", conf.resourcedisk_mount_point);
