@@ -18,6 +18,18 @@
 //! event, not a first-boot-only one. Idempotent by construction: growing
 //! the partition table and the filesystem are both no-ops once they
 //! already reach the disk's current real size.
+//!
+//! The partition table (GPT/MBR) is grown by writing directly to the
+//! whole-disk block device -- safe regardless of mount state, since a
+//! partition table isn't something the kernel caches/owns the way a
+//! mounted filesystem's metadata is. The root ext4 filesystem itself,
+//! though, is *always* mounted while this runs (that's how it's found at
+//! all, via `/proc/mounts`), so it's grown live via the kernel's own
+//! `EXT4_IOC_RESIZE_FS` ioctl (matching what `resize2fs` itself does
+//! against a mounted filesystem) rather than this package's own
+//! `ext4.resize()`, which writes new metadata directly to the backing
+//! block device and is only safe when a filesystem is *not* currently
+//! mounted (e.g. `resource_disk.zig`'s fresh-format case).
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const linux = std.os.linux;
@@ -156,14 +168,49 @@ fn growMbrRoot(io: std.Io, img: *Image, decoded: mbr.Mbr, root: RootDevice) !boo
     return true;
 }
 
+/// Linux `EXT4_IOC_RESIZE_FS` ioctl request code (`_IOW('f', 16, __u64)`),
+/// used to grow an *already-mounted* ext4 filesystem live, in the kernel,
+/// so its own in-memory cached superblock/group-descriptor state stays
+/// consistent with what lands on disk.
+///
+/// Deliberately NOT this package's own `ext4.resize()`: that's an offline
+/// algorithm (see its doc comment) that `pwrite`s new metadata directly to
+/// the backing block device, bypassing the kernel's ext4 driver entirely
+/// -- safe for `resource_disk.zig`'s fresh, not-yet-mounted disk, but not
+/// for the root filesystem here, which is *always* mounted while
+/// `azagent` runs (that's literally how `findRootDevice` locates it, via
+/// `/proc/mounts`). Writing directly to a live mounted filesystem's
+/// backing device risks the kernel's cached view going stale (the growth
+/// silently unnoticed, or later overwritten by the kernel's own stale
+/// cached metadata) -- exactly what `resize2fs` itself avoids by using
+/// this same ioctl on a mounted filesystem instead of touching the device
+/// directly.
+const ext4_ioc_resize_fs: u32 = 0x40086610;
+
+/// Issues `EXT4_IOC_RESIZE_FS` against the filesystem mounted at
+/// `mount_point_path` (always `"/"` for this module's use), asking the
+/// kernel to grow it live to `new_block_count` (4096-byte) blocks.
+fn onlineResizeExt4(mount_point_path: [:0]const u8, new_block_count: u64) !void {
+    const open_rc = linux.open(mount_point_path, .{ .ACCMODE = .RDONLY }, 0);
+    if (linux.errno(open_rc) != .SUCCESS) return error.MountPointOpenFailed;
+    const fd: linux.fd_t = @intCast(open_rc);
+    defer _ = linux.close(fd);
+
+    var arg: u64 = new_block_count;
+    const rc = linux.ioctl(fd, ext4_ioc_resize_fs, @intFromPtr(&arg));
+    if (linux.errno(rc) != .SUCCESS) return error.Ext4OnlineResizeFailed;
+}
+
 /// Grows the root partition table entry and, if that changed anything,
-/// the ext4 filesystem within it to match. `disk_file` must be an
-/// already-open, read-write handle to the *whole disk* device node (e.g.
-/// `/dev/sda`), not the partition node -- partition-table growth must go
-/// through the whole-disk node, while the ext4 growth below must go
-/// through the *partition* node (`part_path`, e.g. `/dev/sda2`); mixing
-/// these two up is an easy, silent bug to introduce.
-fn growRoot(allocator: Allocator, io: std.Io, disk_file: std.Io.File, part_path: [:0]const u8, root: RootDevice) !void {
+/// the mounted-live root ext4 filesystem within it to match (via the
+/// kernel's own `EXT4_IOC_RESIZE_FS` ioctl -- see `onlineResizeExt4`).
+/// `disk_file` must be an already-open, read-write handle to the *whole
+/// disk* device node (e.g. `/dev/sda`), not the partition node --
+/// partition-table growth must go through the whole-disk node, while
+/// reading the partition's post-grow real size (to compute the new block
+/// count) goes through the *partition* node (`part_path`, e.g.
+/// `/dev/sda2`); mixing these two up is an easy, silent bug to introduce.
+fn growRoot(io: std.Io, allocator: Allocator, disk_file: std.Io.File, part_path: [:0]const u8, root: RootDevice) !void {
     const real_size = try resource_disk.blockDeviceSizeBytes(disk_file);
     var img = Image{ .file = disk_file, .format = .raw, .data_offset = 0, .virtual_size = real_size };
 
@@ -182,16 +229,17 @@ fn growRoot(allocator: Allocator, io: std.Io, disk_file: std.Io.File, part_path:
     // until the partition table is re-read.
     resource_disk.reReadPartitionTable(disk_file);
 
-    var part_file = try std.Io.Dir.cwd().openFile(io, part_path, .{ .mode = .read_write });
+    var part_file = try std.Io.Dir.cwd().openFile(io, part_path, .{ .mode = .read_only });
     defer part_file.close(io);
 
     const part_size_bytes = try resource_disk.blockDeviceSizeBytes(part_file);
-    // ext4.resize requires a block-size-aligned length; round down to be
-    // safe (the partition's real size need not be an exact multiple of
-    // the 4096-byte ext4 block size).
+    // The partition's real size need not be an exact multiple of the
+    // 4096-byte ext4 block size; round down to be safe.
     const aligned_length = part_size_bytes - (part_size_bytes % ext4.default_block_size);
+    const new_block_count = aligned_length / ext4.default_block_size;
 
-    _ = try ext4.resize(io, part_file, allocator, .{ .offset = 0, .length = aligned_length });
+    // The root filesystem is always mounted (at "/") while this runs.
+    try onlineResizeExt4("/", new_block_count);
 }
 
 pub const SetupOptions = struct {
@@ -226,7 +274,7 @@ pub fn setup(options: SetupOptions) !void {
     var disk_file = try std.Io.Dir.cwd().openFile(options.io, disk_path, .{ .mode = .read_write });
     defer disk_file.close(options.io);
 
-    try growRoot(options.allocator, options.io, disk_file, part_path, root);
+    try growRoot(options.io, options.allocator, disk_file, part_path, root);
 }
 
 test "rootPartitionNameFromMounts finds the device mounted at /" {
