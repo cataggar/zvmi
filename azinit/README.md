@@ -52,6 +52,20 @@ reference for what a from-scratch container-image init needs to do.
   the `--skip-iso-rootfs` path, which has no guaranteed systemd to hook a
   unit into (see the root README's build-image section); any other
   from-scratch init wanting the same behavior should do the equivalent.
+- If `/usr/sbin/sshd` is present, fork+execs it once right after
+  `runAzagentIfPresent()` (so any SSH host keys/`authorized_keys` azagent
+  deployed already exist by the time sshd starts), so a
+  `--skip-iso-rootfs` image can actually be reached over SSH -- the
+  primary way anyone interacts with a headless Linux VM (issue #129).
+  Entirely optional: a no-op if `sshd` isn't present (most azinit-based
+  test images, including the boot-smoke QEMU tests, don't have it).
+  Unlike `azagent`, sshd daemonizes itself and runs forever, so azinit
+  doesn't wait for it -- it just launches it and continues into the shell
+  loop, whose existing zombie-reaping loop transparently reaps the
+  transient first-generation sshd process once it exits after
+  daemonizing. This is one hardcoded fork+exec, not a general service
+  supervisor, and doesn't configure sshd beyond whatever the container
+  image already ships.
 
 ## Building
 

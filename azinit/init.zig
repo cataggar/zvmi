@@ -766,6 +766,55 @@ fn runAzagentIfPresent() void {
     }
 }
 
+// ============================== sshd invocation ==============================
+// If /usr/sbin/sshd exists (added via an extra container layer), fork+exec
+// it once networking and azagent's SSH host keys / authorized_keys
+// deployment are in place, so a --skip-iso-rootfs image can actually be
+// reached over SSH -- otherwise a "successfully provisioned" minimal
+// container has no way to be reached at all (see issue #129). Called after
+// runAzagentIfPresent() so host keys already exist by the time sshd
+// starts. Tolerant of sshd being entirely absent (most azinit-based test
+// images, including the boot-smoke QEMU tests, won't have it).
+//
+// Unlike azagent (a run-once step we wait for), sshd daemonizes itself and
+// runs forever, so we must not block on it here: fork+exec it and return
+// immediately, continuing on into shellLoop(). shellLoop()'s existing
+// waitpid(-1, ...) reaping loop already tolerates other children coming
+// and going (it only breaks when the *shell's* pid exits or waitpid
+// errors), so it transparently reaps the transient first-generation sshd
+// process once it exits after daemonizing -- no changes needed there.
+const sshd_path = "/usr/sbin/sshd";
+
+fn runSshdIfPresent() void {
+    const access_rc = linux.access(sshd_path, linux.F_OK);
+    if (linux.errno(access_rc) != .SUCCESS) return;
+
+    // sshd's privilege-separation directory; some builds expect it to
+    // already exist rather than creating it themselves.
+    mkdirIgnoreExists("/run/sshd");
+
+    writeStr("[azinit] running sshd...\r\n");
+
+    const pid: i32 = @intCast(linux.fork());
+    if (pid == 0) {
+        const argv = [_:null]?[*:0]const u8{ sshd_path, null };
+        const envp = [_:null]?[*:0]const u8{
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            null,
+        };
+        _ = linux.execve(sshd_path, &argv, &envp);
+        writeStr("[azinit] execve(sshd) failed\r\n");
+        linux.exit(127);
+    }
+    if (pid < 0) {
+        writeStr("[azinit] fork() for sshd failed\r\n");
+        return;
+    }
+
+    // Do not waitpid here -- sshd daemonizes and runs forever; shellLoop's
+    // reaping loop handles it (and any of its descendants) from here on.
+}
+
 // ============================== main loop ==============================
 
 fn shellLoop() noreturn {
@@ -844,6 +893,7 @@ pub fn main(init: std.process.Init.Minimal) noreturn {
     setupNetworking();
 
     runAzagentIfPresent();
+    runSshdIfPresent();
 
     writeStr("[azinit] spawning shell on ttyS0\r\n");
     shellLoop();
