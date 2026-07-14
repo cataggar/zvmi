@@ -292,13 +292,22 @@ pub fn build(b: *std.Build) void {
         zstd_preload_lib.root_module.linkSystemLibrary("dl", .{});
         b.installArtifact(zstd_preload_lib);
 
+        const builder_oci_mod = b.createModule(.{
+            .root_source_file = b.path("packages/zvmi/src/oci.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        });
+        const builder_mod = b.createModule(.{
+            .root_source_file = b.path("scripts/build_generalized_azurelinux4.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "oci", .module = builder_oci_mod },
+            },
+        });
         const builder_exe = b.addExecutable(.{
             .name = "build_generalized_azurelinux4",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("scripts/build_generalized_azurelinux4.zig"),
-                .target = b.graph.host,
-                .optimize = optimize,
-            }),
+            .root_module = builder_mod,
         });
         b.installArtifact(builder_exe);
 
@@ -325,11 +334,7 @@ pub fn build(b: *std.Build) void {
 
         // Tests for pure, side-effect-free helpers.
         const builder_tests = b.addTest(.{
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("scripts/build_generalized_azurelinux4.zig"),
-                .target = b.graph.host,
-                .optimize = optimize,
-            }),
+            .root_module = builder_mod,
         });
         const run_builder_tests = b.addRunArtifact(builder_tests);
         const builder_test_step = b.step("test-generalized-azurelinux4", "Run build_generalized_azurelinux4 unit tests");
