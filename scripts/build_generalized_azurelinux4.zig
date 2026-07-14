@@ -923,7 +923,7 @@ fn createOciLayout(
     return layout_dir;
 }
 
-fn validateOsRelease(image: oci.FileTree) !void {
+fn validateOsRelease(image: anytype) !void {
     const os_release = image.get("etc/os-release") orelse {
         std.debug.print("error: generated OCI layout is missing required rootfs path: /etc/os-release\n", .{});
         return error.IncompleteOciRootfs;
