@@ -960,11 +960,12 @@ fn validateGeneralizedOciLayout(gpa: Allocator, io: Io, layout_dir: []const u8) 
 
     try validateOsRelease(image);
 
+    // Azure Linux uses merged-/usr symlinks, so OCI records these physical paths.
     const required_paths = [_][]const u8{
         "usr/bin/bash",
-        "usr/sbin/azagent",
-        "usr/sbin/init",
-        "usr/sbin/sshd",
+        "usr/bin/azagent",
+        "usr/bin/init",
+        "usr/bin/sshd",
     };
     for (required_paths) |path| {
         const entry = image.get(path) orelse {
