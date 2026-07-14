@@ -32,8 +32,10 @@ pub fn readOvfEnv(allocator: std.mem.Allocator, io: std.Io) ReadError![]u8 {
     try std.Io.Dir.cwd().createDirPath(io, mount_point);
 
     var mounted = false;
+    var device_found = false;
     for (device_candidates) |device| {
         if (!deviceExists(device)) continue;
+        device_found = true;
         for (fstypes) |fstype| {
             const rc = linux.mount(device, mount_point, fstype, linux.MS.RDONLY, 0);
             if (linux.errno(rc) == .SUCCESS) {
@@ -43,7 +45,7 @@ pub fn readOvfEnv(allocator: std.mem.Allocator, io: std.Io) ReadError![]u8 {
         }
         if (mounted) break;
     }
-    if (!mounted) return error.NoProvisioningMediaFound;
+    if (!mounted) return if (device_found) error.MountFailed else error.NoProvisioningMediaFound;
     defer _ = linux.umount(mount_point);
 
     var dir = try std.Io.Dir.cwd().openDir(io, mount_point, .{});

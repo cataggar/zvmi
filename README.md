@@ -246,7 +246,24 @@ full (non-`--skip-iso-rootfs`) image, since its systemd comes from the
 merged distro content; a `--skip-iso-rootfs` image's `/sbin/init` is
 responsible for invoking `azagent` itself if it wants first-boot
 provisioning, since there's no guarantee of systemd being present at all in
-that minimal path (`azinit` does this -- see `azinit/README.md`).
+that minimal path (`azinit` does this -- see `azinit/README.md`). Generalized
+images using `azinit` must add `azinit.mode=persistent` to the kernel command
+line so provisioned users, SSH keys, host keys, and the azagent sentinel are
+written to the root filesystem instead of ephemeral overlays. Also add
+`init=/sbin/init` when the container includes systemd as an OpenSSH dependency,
+ensuring the initramfs launches `azinit` rather than systemd directly.
+
+### Minimal generalized Azure Linux 4 VHD
+
+`scripts/build-generalized-azurelinux4.py` provides the complete reproducible recipe used for the generalized Azure image: it downloads and verifies the official Azure Linux 4 ISO, pulls `mcr.microsoft.com/azurelinux-beta/base/core:4.0`, installs signed x86_64 `openssh-server` and `sudo` packages, injects static `azinit`/`azagent`, removes host identity, creates a bounded multi-layer OCI layout, and builds a fixed 768 MiB Gen2 VHD.
+
+```
+scripts/build-generalized-azurelinux4.py \
+  --work-dir /path/to/build-cache \
+  --output /path/to/zvmi-azurelinux4-generalized.vhd
+```
+
+The builder requires Python 3, Zig 0.16, `curl`, `dnf`, GNU tar, and passwordless or interactive `sudo`. On a non-x86_64 build host, x86_64 binfmt and `qemu-x86_64-static` are also required so RPM scriptlets can run inside the target rootfs; on Azure Linux install them with `sudo tdnf install -y qemu-user-static-x86`. Use `--iso` to supply an already-downloaded ISO and `--size` to override the 768 MiB virtual disk size.
 
 `convert` skips all-zero chunks (aligned to the destination's block size for
 sparse block formats such as dynamic vhd and vhdx), so converting a

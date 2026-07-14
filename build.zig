@@ -229,6 +229,17 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(azinit_exe);
 
+    const azinit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("azinit/init.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_azinit_tests = b.addRunArtifact(azinit_tests);
+    const azinit_test_step = b.step("test-azinit", "Run azinit tests");
+    azinit_test_step.dependOn(&run_azinit_tests.step);
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_zvmi_tests.step);
     test_step.dependOn(&run_wireserver_tests.step);
@@ -244,4 +255,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_nbd_server_tests.step);
     test_step.dependOn(&run_qcow2_mod_tests.step);
     test_step.dependOn(&run_qcow2_exe_tests.step);
+    test_step.dependOn(&run_azinit_tests.step);
 }

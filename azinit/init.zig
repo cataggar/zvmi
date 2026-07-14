@@ -15,10 +15,10 @@
 //!   - loop forever spawning an interactive shell on /dev/ttyS0, respawning
 //!     it if it ever exits (PID 1 exiting panics the kernel), and reaping
 //!     all other zombie children along the way.
-//! Root stays mounted read-only by design (matches the dm-verity/immutable
-//! image philosophy elsewhere in this project); only /var and /tmp get
-//! writable tmpfs overlays so package managers and general scratch usage
-//! have somewhere to write without violating that.
+//! Root stays mounted read-only by default (matches the dm-verity/immutable
+//! image philosophy elsewhere in this project). `azinit.mode=persistent`
+//! opts into a writable root for generalized VM images whose provisioned
+//! accounts, SSH keys, host keys, and azagent sentinel must survive reboot.
 const std = @import("std");
 const linux = std.os.linux;
 
@@ -39,6 +39,16 @@ fn writeErrno(prefix: []const u8, e: linux.E) void {
     var buf: [96]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, "{s}: errno={d}\r\n", .{ prefix, @intFromEnum(e) }) catch "errno format failed\r\n";
     writeStr(msg);
+}
+
+fn forkProcess(error_prefix: []const u8) ?linux.pid_t {
+    const rc = linux.fork();
+    const e = linux.errno(rc);
+    if (e != .SUCCESS) {
+        writeErrno(error_prefix, e);
+        return null;
+    }
+    return @intCast(rc);
 }
 
 fn mountIgnoreBusy(special: ?[*:0]const u8, dir: [*:0]const u8, fstype: ?[*:0]const u8, flags: u32) void {
@@ -117,21 +127,217 @@ fn installShutdownHandlers() void {
 }
 
 // --- hostname ---
-fn setHostname() void {
-    const name = "azurelinux";
+fn setKernelHostname(name: []const u8) void {
     const rc = linux.syscall2(.sethostname, @intFromPtr(name.ptr), name.len);
     const e = linux.errno(rc);
     if (e != .SUCCESS) writeErrno("sethostname failed", e);
 }
 
-// --- writable /var and /tmp on top of a read-only root ---
-fn mountWritableOverlays() void {
+fn parsePersistedHostname(content: []const u8) ?[]const u8 {
+    const name = std.mem.trim(u8, content, " \t\r\n");
+    if (name.len == 0 or name.len > linux.HOST_NAME_MAX or std.mem.indexOfScalar(u8, name, 0) != null) return null;
+    return name;
+}
+
+fn readPersistedHostname(buf: []u8) ?[]const u8 {
+    const fd_rc = linux.open("/etc/hostname", .{ .ACCMODE = .RDONLY }, 0);
+    if (linux.errno(fd_rc) != .SUCCESS) return null;
+    const fd: i32 = @intCast(fd_rc);
+    defer _ = linux.close(fd);
+
+    var total: usize = 0;
+    while (total < buf.len) {
+        const read_rc = linux.read(fd, buf[total..].ptr, buf.len - total);
+        const read_error = linux.errno(read_rc);
+        if (read_error == .INTR) continue;
+        if (read_error != .SUCCESS) {
+            writeErrno("[azinit] reading /etc/hostname failed", read_error);
+            return null;
+        }
+        if (read_rc == 0) break;
+        total += read_rc;
+    }
+    if (total == buf.len) {
+        writeStr("[azinit] /etc/hostname is too long; using default hostname\r\n");
+        return null;
+    }
+    return parsePersistedHostname(buf[0..total]);
+}
+
+fn setHostname(mode: BootMode, persistent_root_ready: bool) void {
+    if (mode == .persistent and persistent_root_ready) {
+        var buf: [linux.HOST_NAME_MAX + 2]u8 = undefined;
+        if (readPersistedHostname(&buf)) |name| {
+            setKernelHostname(name);
+            return;
+        }
+    }
+    setKernelHostname("azurelinux");
+}
+
+fn isValidMachineId(content: []const u8) bool {
+    const id = std.mem.trimEnd(u8, content, "\r\n");
+    if (id.len != 32) return false;
+    for (id) |c| {
+        if (!std.ascii.isDigit(c) and !(c >= 'a' and c <= 'f')) return false;
+    }
+    return true;
+}
+
+fn formatMachineId(random: [16]u8) [33]u8 {
+    const hex = "0123456789abcdef";
+    var result: [33]u8 = undefined;
+    for (random, 0..) |byte, index| {
+        result[index * 2] = hex[byte >> 4];
+        result[index * 2 + 1] = hex[byte & 0x0f];
+    }
+    result[32] = '\n';
+    return result;
+}
+
+fn machineIdExists() bool {
+    const fd_rc = linux.open("/etc/machine-id", .{ .ACCMODE = .RDONLY }, 0);
+    if (linux.errno(fd_rc) != .SUCCESS) return false;
+    const fd: i32 = @intCast(fd_rc);
+    defer _ = linux.close(fd);
+
+    var buf: [34]u8 = undefined;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const read_rc = linux.read(fd, buf[total..].ptr, buf.len - total);
+        const read_error = linux.errno(read_rc);
+        if (read_error == .INTR) continue;
+        if (read_error != .SUCCESS) return false;
+        if (read_rc == 0) break;
+        total += read_rc;
+    }
+    return total < buf.len and isValidMachineId(buf[0..total]);
+}
+
+fn ensureMachineId() void {
+    if (!etc_writable or machineIdExists()) return;
+
+    var random: [16]u8 = undefined;
+    var random_len: usize = 0;
+    while (random_len < random.len) {
+        const random_rc = linux.getrandom(random[random_len..].ptr, random.len - random_len, 0);
+        const random_error = linux.errno(random_rc);
+        if (random_error == .INTR) continue;
+        if (random_error != .SUCCESS or random_rc == 0) {
+            writeErrno("[azinit] generating machine-id failed", random_error);
+            return;
+        }
+        random_len += random_rc;
+    }
+
+    const content = formatMachineId(random);
+    const fd_rc = linux.open("/etc/machine-id", .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o444);
+    if (linux.errno(fd_rc) != .SUCCESS) {
+        writeErrno("[azinit] opening /etc/machine-id for writing failed", linux.errno(fd_rc));
+        return;
+    }
+    const fd: i32 = @intCast(fd_rc);
+    defer _ = linux.close(fd);
+
+    var written: usize = 0;
+    while (written < content.len) {
+        const write_rc = linux.write(fd, content[written..].ptr, content.len - written);
+        const write_error = linux.errno(write_rc);
+        if (write_error == .INTR) continue;
+        if (write_error != .SUCCESS or write_rc == 0) {
+            writeErrno("[azinit] writing /etc/machine-id failed", write_error);
+            return;
+        }
+        written += write_rc;
+    }
+    _ = linux.fsync(fd);
+    writeStr("[azinit] generated /etc/machine-id\r\n");
+}
+
+const BootMode = enum {
+    immutable,
+    persistent,
+};
+
+const BootModeConfig = struct {
+    mode: BootMode = .immutable,
+    invalid_value: ?[]const u8 = null,
+};
+
+fn parseBootMode(cmdline: []const u8) BootModeConfig {
+    const prefix = "azinit.mode=";
+    var config: BootModeConfig = .{};
+    var tokens = std.mem.tokenizeAny(u8, cmdline, " \t\r\n");
+    while (tokens.next()) |token| {
+        if (!std.mem.startsWith(u8, token, prefix)) continue;
+        const value = token[prefix.len..];
+        if (std.mem.eql(u8, value, "persistent")) {
+            config = .{ .mode = .persistent };
+        } else if (std.mem.eql(u8, value, "immutable")) {
+            config = .{ .mode = .immutable };
+        } else {
+            config = .{ .invalid_value = value };
+        }
+    }
+    return config;
+}
+
+fn readBootMode() BootMode {
+    var fd_rc: usize = undefined;
+    while (true) {
+        fd_rc = linux.open("/proc/cmdline", .{ .ACCMODE = .RDONLY }, 0);
+        if (linux.errno(fd_rc) != .INTR) break;
+    }
+    if (linux.errno(fd_rc) != .SUCCESS) {
+        writeErrno("[azinit] opening /proc/cmdline failed; using immutable mode", linux.errno(fd_rc));
+        return .immutable;
+    }
+    const fd: i32 = @intCast(fd_rc);
+    defer _ = linux.close(fd);
+
+    var buf: [4097]u8 = undefined;
+    var read_rc: usize = undefined;
+    while (true) {
+        read_rc = linux.read(fd, &buf, buf.len);
+        if (linux.errno(read_rc) != .INTR) break;
+    }
+    if (linux.errno(read_rc) != .SUCCESS) {
+        writeErrno("[azinit] reading /proc/cmdline failed; using immutable mode", linux.errno(read_rc));
+        return .immutable;
+    }
+    if (read_rc == buf.len) {
+        writeStr("[azinit] /proc/cmdline is too long; using immutable mode\r\n");
+        return .immutable;
+    }
+
+    const config = parseBootMode(buf[0..read_rc]);
+    if (config.invalid_value) |value| {
+        var msg_buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "[azinit] invalid azinit.mode={s}; using immutable mode\r\n", .{value}) catch "[azinit] invalid azinit.mode; using immutable mode\r\n";
+        writeStr(msg);
+        return .immutable;
+    }
+    return config.mode;
+}
+
+fn remountRootWritable() bool {
+    const rc = linux.mount(null, "/", null, linux.MS.REMOUNT, 0);
+    const e = linux.errno(rc);
+    if (e != .SUCCESS) {
+        writeErrno("[azinit] remounting / read-write failed", e);
+        return false;
+    }
+    writeStr("[azinit] persistent mode: remounted / read-write\r\n");
+    return true;
+}
+
+// --- writable paths on top of a read-only root ---
+fn mountImmutableWritableOverlays() void {
     mountIgnoreBusy("tmpfs", "/var", "tmpfs", 0);
     mkdirIgnoreExists("/var/log");
     mkdirIgnoreExists("/var/cache");
     mkdirIgnoreExists("/var/lib");
     mkdirIgnoreExists("/var/tmp");
-    mountIgnoreBusy("tmpfs", "/tmp", "tmpfs", 0);
 }
 
 // /etc needs a handful of files written at runtime (resolv.conf, hostname,
@@ -164,13 +370,11 @@ fn mountEtcOverlay() void {
 // modprobe/kmod binary is shipped either) -- see zvmi issue #88: build-image
 // used to drop /lib/modules entirely, and even after that's fixed, something
 // still has to actually call insmod. Since the exact drivers this appliance
-// needs are known ahead of time (Hyper-V's synthetic NIC for networking,
-// and overlayfs for the writable /etc overlay) and neither has any further
-// module dependencies (checked via modules.dep on the built image), loading
-// them directly with a raw init_module() syscall is simpler and more
-// self-contained than shipping kmod: no MODALIAS matching, no
-// dependency-chain resolution, and no extra shared-library dependencies
-// (liblzma/libzstd/libcrypto) added to the image.
+// needs are known ahead of time (Hyper-V networking, overlayfs for immutable
+// mode, and the provisioning DVD's UDF/ISO9660 filesystems), loading them in
+// dependency order with a raw init_module() syscall is simpler and more
+// self-contained than shipping kmod: no MODALIAS matching and no extra
+// shared-library dependencies (liblzma/libzstd/libcrypto) added to the image.
 
 const max_module_file_size: usize = 4 * 1024 * 1024;
 
@@ -234,7 +438,7 @@ fn loadModuleAt(gpa: std.mem.Allocator, release: []const u8, rel_path: []const u
     }
 }
 
-fn loadBootModules() void {
+fn loadBootModules(mode: BootMode) void {
     const gpa = std.heap.page_allocator;
     var uts: linux.utsname = undefined;
     if (linux.errno(linux.uname(&uts)) != .SUCCESS) {
@@ -243,8 +447,13 @@ fn loadBootModules() void {
     }
     const release = std.mem.sliceTo(&uts.release, 0);
 
-    loadModuleAt(gpa, release, "kernel/fs/overlayfs/overlay.ko.xz");
+    if (mode == .immutable) {
+        loadModuleAt(gpa, release, "kernel/fs/overlayfs/overlay.ko.xz");
+    }
     loadModuleAt(gpa, release, "kernel/drivers/net/hyperv/hv_netvsc.ko.xz");
+    loadModuleAt(gpa, release, "kernel/lib/crc/crc-itu-t.ko.xz");
+    loadModuleAt(gpa, release, "kernel/fs/udf/udf.ko.xz");
+    loadModuleAt(gpa, release, "kernel/fs/isofs/isofs.ko.xz");
 }
 
 // ============================== networking ==============================
@@ -728,20 +937,22 @@ fn setupNetworking() void {
 // equivalent, and the root README's build-image section), fork+exec it
 // once so this from-scratch init supports first-boot Azure provisioning
 // too, serving as a reference for what any --skip-iso-rootfs init needs
-// to do to actually reach a usable, provisioned login. Tolerant of it
-// being entirely absent (most azinit-based test images don't have it)
-// and of it failing/exiting non-zero (e.g. no provisioning CD-ROM
-// attached yet, or no network route to the WireServer) -- a provisioning
-// failure should never prevent reaching the fallback shell.
+// to do to actually reach a usable, provisioned login.
 const azagent_path = "/usr/sbin/azagent";
 
-fn runAzagentIfPresent() void {
+const AzagentResult = enum {
+    absent,
+    success,
+    failed,
+};
+
+fn runAzagentIfPresent() AzagentResult {
     const access_rc = linux.access(azagent_path, linux.F_OK);
-    if (linux.errno(access_rc) != .SUCCESS) return;
+    if (linux.errno(access_rc) != .SUCCESS) return .absent;
 
     writeStr("[azinit] running azagent...\r\n");
 
-    const pid: i32 = @intCast(linux.fork());
+    const pid = forkProcess("[azinit] fork() for azagent failed") orelse return .failed;
     if (pid == 0) {
         const argv = [_:null]?[*:0]const u8{ azagent_path, null };
         const envp = [_:null]?[*:0]const u8{
@@ -752,17 +963,23 @@ fn runAzagentIfPresent() void {
         writeStr("[azinit] execve(azagent) failed\r\n");
         linux.exit(127);
     }
-    if (pid < 0) {
-        writeStr("[azinit] fork() for azagent failed\r\n");
-        return;
-    }
-
     var status: u32 = 0;
-    _ = linux.waitpid(pid, &status, 0);
+    while (true) {
+        const wait_rc = linux.waitpid(pid, &status, 0);
+        const wait_error = linux.errno(wait_rc);
+        if (wait_error == .INTR) continue;
+        if (wait_error != .SUCCESS) {
+            writeErrno("[azinit] waitpid() for azagent failed", wait_error);
+            return .failed;
+        }
+        break;
+    }
     if (linux.W.IFEXITED(status) and linux.W.EXITSTATUS(status) == 0) {
         writeStr("[azinit] azagent completed successfully\r\n");
+        return .success;
     } else {
-        writeStr("[azinit] azagent exited non-zero (continuing anyway)\r\n");
+        writeStr("[azinit] azagent exited non-zero\r\n");
+        return .failed;
     }
 }
 
@@ -795,7 +1012,7 @@ fn runSshdIfPresent() void {
 
     writeStr("[azinit] running sshd...\r\n");
 
-    const pid: i32 = @intCast(linux.fork());
+    const pid = forkProcess("[azinit] fork() for sshd failed") orelse return;
     if (pid == 0) {
         const argv = [_:null]?[*:0]const u8{ sshd_path, null };
         const envp = [_:null]?[*:0]const u8{
@@ -806,13 +1023,41 @@ fn runSshdIfPresent() void {
         writeStr("[azinit] execve(sshd) failed\r\n");
         linux.exit(127);
     }
-    if (pid < 0) {
-        writeStr("[azinit] fork() for sshd failed\r\n");
+    // Do not waitpid here -- sshd daemonizes and runs forever; shellLoop's
+    // reaping loop handles it (and any of its descendants) from here on.
+}
+
+const provisioning_retry_seconds = 5;
+
+fn startPersistentProvisioning() void {
+    if (linux.errno(linux.access(azagent_path, linux.F_OK)) != .SUCCESS) {
+        writeStr("[azinit] persistent mode requires /usr/sbin/azagent; SSH will not start\r\n");
         return;
     }
 
-    // Do not waitpid here -- sshd daemonizes and runs forever; shellLoop's
-    // reaping loop handles it (and any of its descendants) from here on.
+    const supervisor_pid = forkProcess("[azinit] fork() for provisioning supervisor failed") orelse {
+        writeStr("[azinit] SSH will not start\r\n");
+        return;
+    };
+    if (supervisor_pid == 0) {
+        while (true) {
+            switch (runAzagentIfPresent()) {
+                .success => {
+                    runSshdIfPresent();
+                    linux.exit(0);
+                },
+                .absent => {
+                    writeStr("[azinit] azagent disappeared; SSH will not start\r\n");
+                    linux.exit(1);
+                },
+                .failed => {
+                    writeStr("[azinit] retrying azagent in 5 seconds\r\n");
+                    const req: linux.timespec = .{ .sec = provisioning_retry_seconds, .nsec = 0 };
+                    _ = linux.nanosleep(&req, null);
+                },
+            }
+        }
+    }
 }
 
 // ============================== main loop ==============================
@@ -833,7 +1078,12 @@ fn shellLoop() noreturn {
         _ = linux.setsid();
         _ = linux.ioctl(tty_fd, linux.T.IOCSCTTY, 0);
 
-        const pid: i32 = @intCast(linux.fork());
+        const pid = forkProcess("[azinit] fork() for shell failed") orelse {
+            _ = linux.close(tty_fd);
+            const req: linux.timespec = .{ .sec = 1, .nsec = 0 };
+            _ = linux.nanosleep(&req, null);
+            continue;
+        };
         if (pid == 0) {
             _ = linux.dup2(tty_fd, 0);
             _ = linux.dup2(tty_fd, 1);
@@ -857,9 +1107,12 @@ fn shellLoop() noreturn {
         while (true) {
             if (shutdown_requested) break;
             var status: u32 = 0;
-            const wpid: i32 = @intCast(linux.waitpid(-1, &status, 0));
+            const wait_rc = linux.waitpid(-1, &status, 0);
+            const wait_error = linux.errno(wait_rc);
+            if (wait_error == .INTR) continue;
+            if (wait_error != .SUCCESS) break;
+            const wpid: linux.pid_t = @intCast(wait_rc);
             if (wpid == pid) break;
-            if (wpid < 0) break;
         }
 
         if (shutdown_requested) doReboot(.POWER_OFF);
@@ -883,18 +1136,84 @@ pub fn main(init: std.process.Init.Minimal) noreturn {
     mountIgnoreBusy("devtmpfs", "/dev", "devtmpfs", 0);
     mountIgnoreBusy("tmpfs", "/run", "tmpfs", 0);
     openDebugLog();
-    loadBootModules();
-    mountWritableOverlays();
-    mountEtcOverlay();
+    const boot_mode = readBootMode();
+    const persistent_root_ready = if (boot_mode == .persistent) remountRootWritable() else false;
+    loadBootModules(boot_mode);
+    mountIgnoreBusy("tmpfs", "/tmp", "tmpfs", 0);
+    if (boot_mode == .immutable) {
+        mountImmutableWritableOverlays();
+        mountEtcOverlay();
+    } else {
+        etc_writable = persistent_root_ready;
+    }
     tryMountEsp();
-    setHostname();
+    setHostname(boot_mode, persistent_root_ready);
+    ensureMachineId();
 
     writeStr("\r\n[azinit] base mounts ready; configuring network...\r\n");
     setupNetworking();
 
-    runAzagentIfPresent();
-    runSshdIfPresent();
+    if (boot_mode == .persistent) {
+        if (persistent_root_ready) {
+            startPersistentProvisioning();
+        } else {
+            writeStr("[azinit] persistent storage is unavailable; azagent and SSH will not start\r\n");
+        }
+    } else {
+        _ = runAzagentIfPresent();
+        runSshdIfPresent();
+    }
 
     writeStr("[azinit] spawning shell on ttyS0\r\n");
     shellLoop();
+}
+
+test "parseBootMode defaults to immutable" {
+    try std.testing.expectEqual(BootMode.immutable, parseBootMode("root=/dev/sda2 console=ttyS0").mode);
+}
+
+test "parseBootMode accepts persistent and explicit immutable modes" {
+    try std.testing.expectEqual(BootMode.persistent, parseBootMode("root=/dev/sda2 azinit.mode=persistent console=ttyS0").mode);
+    try std.testing.expectEqual(BootMode.immutable, parseBootMode("azinit.mode=immutable").mode);
+}
+
+test "parseBootMode uses the last azinit mode" {
+    const config = parseBootMode("azinit.mode=persistent azinit.mode=immutable");
+    try std.testing.expectEqual(BootMode.immutable, config.mode);
+    try std.testing.expectEqual(@as(?[]const u8, null), config.invalid_value);
+}
+
+test "parseBootMode allows a later valid mode to replace an invalid one" {
+    const config = parseBootMode("azinit.mode=invalid azinit.mode=persistent");
+    try std.testing.expectEqual(BootMode.persistent, config.mode);
+    try std.testing.expectEqual(@as(?[]const u8, null), config.invalid_value);
+}
+
+test "parseBootMode rejects an invalid mode" {
+    const config = parseBootMode("azinit.mode=writable");
+    try std.testing.expectEqual(BootMode.immutable, config.mode);
+    try std.testing.expectEqualStrings("writable", config.invalid_value.?);
+}
+
+test "parsePersistedHostname trims line endings and rejects invalid content" {
+    try std.testing.expectEqualStrings("generalized-vm", parsePersistedHostname("generalized-vm\n").?);
+    try std.testing.expectEqual(@as(?[]const u8, null), parsePersistedHostname(" \r\n"));
+    try std.testing.expectEqual(@as(?[]const u8, null), parsePersistedHostname("invalid\x00hostname"));
+
+    const too_long = "a" ** (linux.HOST_NAME_MAX + 1);
+    try std.testing.expectEqual(@as(?[]const u8, null), parsePersistedHostname(too_long));
+}
+
+test "machine-id validation accepts lowercase 128-bit hex only" {
+    try std.testing.expect(isValidMachineId("0123456789abcdef0123456789abcdef\n"));
+    try std.testing.expect(!isValidMachineId(""));
+    try std.testing.expect(!isValidMachineId("0123456789ABCDEF0123456789ABCDEF\n"));
+    try std.testing.expect(!isValidMachineId("0123456789abcdef0123456789abcdeg\n"));
+}
+
+test "formatMachineId emits lowercase hex and a newline" {
+    try std.testing.expectEqualStrings(
+        "000102030405060708090a0b0c0d0e0f\n",
+        &formatMachineId(.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }),
+    );
 }

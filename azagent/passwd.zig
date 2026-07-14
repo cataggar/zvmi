@@ -16,6 +16,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 pub const min_uid: u32 = 1000;
+pub const max_uid: u32 = 60_000;
 pub const default_shell = "/bin/bash";
 
 /// A day-granularity "days since the Unix epoch", matching `/etc/shadow`'s
@@ -40,11 +41,7 @@ fn fieldZeroEquals(content: []const u8, name: []const u8) bool {
     return false;
 }
 
-/// Scans a `passwd`- or `group`-shaped file (`name:x:id:...`) and returns
-/// the next free id `>= min_id` (one past the highest id already in use
-/// that's `>= min_id`, or `min_id` itself if none are).
-pub fn nextFreeId(content: []const u8, min_id: u32) u32 {
-    var max_seen: u32 = min_id - 1;
+fn idInUse(content: []const u8, id: u32) bool {
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
         if (line.len == 0) continue;
@@ -52,10 +49,29 @@ pub fn nextFreeId(content: []const u8, min_id: u32) u32 {
         _ = fields.next() orelse continue; // name
         _ = fields.next() orelse continue; // password placeholder
         const id_field = fields.next() orelse continue;
-        const id = std.fmt.parseInt(u32, id_field, 10) catch continue;
-        if (id >= min_id and id > max_seen) max_seen = id;
+        const existing = std.fmt.parseInt(u32, id_field, 10) catch continue;
+        if (existing == id) return true;
     }
-    return max_seen + 1;
+    return false;
+}
+
+/// Returns the first free id in the normal login-user range. Choosing the
+/// first gap avoids treating reserved high IDs such as `nobody` (65534) as
+/// the end of the allocatable range.
+pub fn nextFreeId(content: []const u8, min_id: u32) !u32 {
+    var candidate = min_id;
+    while (candidate <= max_uid) : (candidate += 1) {
+        if (!idInUse(content, candidate)) return candidate;
+    }
+    return error.NoAvailableUserId;
+}
+
+fn nextFreeUserId(passwd_content: []const u8, group_content: []const u8) !u32 {
+    var candidate = min_uid;
+    while (candidate <= max_uid) : (candidate += 1) {
+        if (!idInUse(passwd_content, candidate) and !idInUse(group_content, candidate)) return candidate;
+    }
+    return error.NoAvailableUserId;
 }
 
 /// Appends a new `useradd -m`-equivalent entry to `passwd_content`
@@ -155,12 +171,23 @@ test "userExists finds an existing user by the first field only" {
 
 test "nextFreeId picks min_id when nothing at or above it is in use" {
     const passwd = "root:x:0:0::/root:/bin/bash\ndaemon:x:1:1::/:/usr/sbin/nologin\n";
-    try std.testing.expectEqual(@as(u32, 1000), nextFreeId(passwd, 1000));
+    try std.testing.expectEqual(@as(u32, 1000), try nextFreeId(passwd, 1000));
 }
 
-test "nextFreeId returns one past the highest id already in use" {
+test "nextFreeId returns the first free id" {
     const passwd = "root:x:0:0::/root:/bin/bash\nfirst:x:1000:1000::/home/first:/bin/bash\nsecond:x:1001:1001::/home/second:/bin/bash\n";
-    try std.testing.expectEqual(@as(u32, 1002), nextFreeId(passwd, 1000));
+    try std.testing.expectEqual(@as(u32, 1002), try nextFreeId(passwd, 1000));
+}
+
+test "nextFreeId ignores the reserved nobody id" {
+    const passwd = "root:x:0:0::/root:/bin/bash\nnobody:x:65534:65534:Nobody:/:/usr/sbin/nologin\n";
+    try std.testing.expectEqual(@as(u32, 1000), try nextFreeId(passwd, 1000));
+}
+
+test "nextFreeUserId avoids existing user and group ids" {
+    const passwd = "root:x:0:0::/root:/bin/bash\nfirst:x:1000:1000::/home/first:/bin/bash\nnobody:x:65534:65534:Nobody:/:/usr/sbin/nologin\n";
+    const group = "root:x:0:\nreserved:x:1001:\nnobody:x:65534:\n";
+    try std.testing.expectEqual(@as(u32, 1002), try nextFreeUserId(passwd, group));
 }
 
 test "appendPasswdLine appends a well-formed entry with a single trailing newline" {
@@ -269,7 +296,7 @@ pub fn createUserIfMissing(
     const shadow_content = try etc_dir.readFileAlloc(io, "shadow", allocator, read_limit);
     defer allocator.free(shadow_content);
 
-    const uid = nextFreeId(passwd_content, min_uid);
+    const uid = try nextFreeUserId(passwd_content, group_content);
     const gid = uid; // user-private-group scheme: gid mirrors uid
 
     const home = try std.fmt.allocPrint(allocator, "/home/{s}", .{username});
