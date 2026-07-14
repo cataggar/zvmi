@@ -1,0 +1,125 @@
+name: Rebuild Azure Linux 4 release image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: azurelinux4-release-image
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: AzureLinux4.0-20260714
+  RELEASE_TITLE: Azure Linux 4.0 - 20260714
+  ASSET_NAME: AzureLinux-4.0-x86_64.qcow2
+  WORK_DIR: .scratch/generalized-azurelinux4
+
+jobs:
+  rebuild:
+    name: rebuild and replace release asset
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out latest main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@v0.6.6
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tools: |
+            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Install image build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends dnf file jq qemu-utils
+
+      - name: Verify target release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY"
+
+      - name: Resolve ISO cache key
+        id: iso
+        run: |
+          checksum=$(curl -fsSL https://aka.ms/azurelinux-4.0-x86_64-iso-checksum | awk '{print $1}')
+          if [[ ! "$checksum" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Unexpected Azure Linux ISO checksum: $checksum"
+            exit 1
+          fi
+          echo "sha256=$checksum" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Azure Linux ISO
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.WORK_DIR }}/AzureLinux-4.0-x86_64.iso
+          key: azurelinux-4.0-x86_64-iso-${{ steps.iso.outputs.sha256 }}
+
+      - name: Build maximum-zstd QCOW2
+        run: |
+          mkdir -p dist
+          set -o pipefail
+          zig build generalized-azurelinux4 -- \
+            --work-dir "$WORK_DIR" \
+            --output "dist/$ASSET_NAME" 2>&1 | tee "$RUNNER_TEMP/azurelinux4-build.log"
+
+      - name: Validate release image
+        run: |
+          qemu-img check "dist/$ASSET_NAME"
+          test "$(qemu-img info --output=json "dist/$ASSET_NAME" | jq -r '.format')" = qcow2
+          test "$(qemu-img info --output=json "dist/$ASSET_NAME" | jq -r '."virtual-size"')" = 805306368
+          sha256sum "dist/$ASSET_NAME"
+
+      - name: Replace release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset_sha256=$(sha256sum "dist/$ASSET_NAME" | awk '{print $1}')
+          asset_bytes=$(stat --format='%s' "dist/$ASSET_NAME")
+          iso_sha256=$(sha256sum "$WORK_DIR/AzureLinux-4.0-x86_64.iso" | awk '{print $1}')
+          base_digest=$(sed -n 's/^Resolved to \(sha256:[0-9a-f]\{64\}\)$/\1/p' "$RUNNER_TEMP/azurelinux4-build.log" | tail -n 1)
+          source_commit=$(git rev-parse HEAD)
+
+          if [[ ! "$base_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Could not recover the base OCI manifest digest from the build log"
+            exit 1
+          fi
+
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
+          Generalized x86_64 Azure Linux 4.0 Gen2 image built with zvmi from current \`main\`. The QCOW2 uses maximum-level zstd cluster compression and is directly bootable with UEFI QEMU.
+
+          - Asset: \`$ASSET_NAME\`
+          - Virtual disk size: 768 MiB
+          - File size: $asset_bytes bytes
+          - SHA-256: \`$asset_sha256\`
+          - Source commit: \`$source_commit\`
+          - Azure deployment username convention: \`g\`
+
+          Provenance:
+
+          - Source ISO: \`AzureLinux-4.0-x86_64.iso\`
+          - ISO SHA-256: \`$iso_sha256\`
+          - Base OCI manifest: \`$base_digest\`
+
+          The base image identifies itself as Azure Linux 4.0 Container Image Beta with \`RELEASE_TYPE=development\`.
+          EOF
+
+          gh release upload "$RELEASE_TAG" "dist/$ASSET_NAME" --clobber --repo "$GITHUB_REPOSITORY"
+          gh release edit "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$RELEASE_TITLE" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"
+
+          {
+            echo "### Release asset replaced"
+            echo
+            echo "- Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$RELEASE_TAG"
+            echo "- Asset: https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$ASSET_NAME"
+            echo "- SHA-256: \`$asset_sha256\`"
+          } >> "$GITHUB_STEP_SUMMARY"
