@@ -923,12 +923,44 @@ fn createOciLayout(
     return layout_dir;
 }
 
+fn validateOsRelease(image: oci.FileTree) !void {
+    const os_release = image.get("etc/os-release") orelse {
+        std.debug.print("error: generated OCI layout is missing required rootfs path: /etc/os-release\n", .{});
+        return error.IncompleteOciRootfs;
+    };
+    switch (os_release.kind) {
+        .file => {},
+        .symlink => {
+            const target = os_release.link_name orelse "";
+            if (!std.mem.eql(u8, target, "../usr/lib/os-release") and
+                !std.mem.eql(u8, target, "/usr/lib/os-release"))
+            {
+                std.debug.print("error: generated OCI rootfs has unexpected /etc/os-release target: {s}\n", .{target});
+                return error.IncompleteOciRootfs;
+            }
+            const target_entry = image.get("usr/lib/os-release") orelse {
+                std.debug.print("error: generated OCI rootfs is missing /usr/lib/os-release\n", .{});
+                return error.IncompleteOciRootfs;
+            };
+            if (target_entry.kind != .file) {
+                std.debug.print("error: generated OCI rootfs path is not a file: /usr/lib/os-release\n", .{});
+                return error.IncompleteOciRootfs;
+            }
+        },
+        else => {
+            std.debug.print("error: generated OCI rootfs path is not a file or symlink: /etc/os-release\n", .{});
+            return error.IncompleteOciRootfs;
+        },
+    }
+}
+
 fn validateGeneralizedOciLayout(gpa: Allocator, io: Io, layout_dir: []const u8) !void {
     var image = try oci.loadLayout(io, gpa, layout_dir, .{});
     defer image.deinit();
 
+    try validateOsRelease(image);
+
     const required_paths = [_][]const u8{
-        "etc/os-release",
         "usr/bin/bash",
         "usr/sbin/azagent",
         "usr/sbin/init",
@@ -1213,6 +1245,30 @@ pub fn main(init: std.process.Init) !void {
 }
 
 // ─── unit tests ──────────────────────────────────────────────────────────────
+
+test "validateOsRelease accepts the standard Azure Linux symlink" {
+    var entries = [_]oci.FileTree.Entry{
+        .{
+            .path = "etc/os-release",
+            .kind = .symlink,
+            .mode = 0o777,
+            .size = 0,
+            .link_name = "../usr/lib/os-release",
+        },
+        .{
+            .path = "usr/lib/os-release",
+            .kind = .file,
+            .mode = 0o644,
+            .size = 0,
+        },
+    };
+    const image: oci.FileTree = .{
+        .allocator = std.testing.allocator,
+        .entries = &entries,
+    };
+
+    try validateOsRelease(image);
+}
 
 test "safeLayerPath strips ./ prefix" {
     try std.testing.expectEqualStrings("etc/passwd", (try safeLayerPath("./etc/passwd")).?);
