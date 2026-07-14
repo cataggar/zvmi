@@ -143,6 +143,10 @@ zvmi/
                               #   the ZVMI_BOOT_TEST_* fixture env vars aren't
                               #   available
   scripts/
+    build_generalized_azurelinux4.zig  # generalized Azure Linux 4 Gen2 QCOW2
+                              #   builder (run via `zig build generalized-azurelinux4`)
+    zstd_max_preload.zig       # LD_PRELOAD shared library that forces maximum
+                              #   zstd compression level in qemu-img
     ci/
       make-minimal-oci-fixture.py   # builds a tiny from-scratch OCI layout
                               #   used as the boot-smoke tests' --container
@@ -165,6 +169,9 @@ zig build test       # run all tests (boot-smoke tests skip gracefully
                       #   without qemu-system-x86_64/OVMF/fixtures)
 zig build test-boot-smoke  # run just the real-QEMU boot-smoke tests
 zig build run -- <args>   # run the CLI, e.g. `zig build run -- info foo.vhd`
+zig build generalized-azurelinux4 -- [--iso <path>] [--output <path>] [--size <size>] [--work-dir <dir>]
+                      # build a generalized Azure Linux 4 Gen2 QCOW2 image
+                      #   (Linux-only; requires root, curl, dnf, qemu-img, sudo)
 ```
 
 ## CI
@@ -246,7 +253,30 @@ full (non-`--skip-iso-rootfs`) image, since its systemd comes from the
 merged distro content; a `--skip-iso-rootfs` image's `/sbin/init` is
 responsible for invoking `azagent` itself if it wants first-boot
 provisioning, since there's no guarantee of systemd being present at all in
-that minimal path (`azinit` does this -- see `azinit/README.md`).
+that minimal path (`azinit` does this -- see `azinit/README.md`). Generalized
+images using `azinit` must add `azinit.mode=persistent` to the kernel command
+line so provisioned users, SSH keys, host keys, and the azagent sentinel are
+written to the root filesystem instead of ephemeral overlays. Also add
+`init=/sbin/init` when the container includes systemd as an OpenSSH dependency,
+ensuring the initramfs launches `azinit` rather than systemd directly.
+Azure still requires every generalized-VM deployment to supply an
+`adminUsername`; use `g` for this image convention. The generated
+`waagent.conf` mounts the temporary resource disk at `/d` and enables
+managed-data-disk activation by stable Azure LUN at `/e` through `/z`. Managed
+disks are mount-only: existing ext4 partition 1 is mounted, while blank and
+unknown layouts are left untouched.
+
+### Minimal generalized Azure Linux 4 QCOW2
+
+`scripts/build_generalized_azurelinux4.zig` (run via `zig build generalized-azurelinux4`) provides the complete reproducible recipe used for the generalized Azure image: it downloads and verifies the official Azure Linux 4 ISO, pulls `mcr.microsoft.com/azurelinux-beta/base/core:4.0`, installs signed x86_64 `openssh-server` and `sudo` packages, injects static `azinit`/`azagent`, removes host identity, creates a bounded multi-layer OCI layout, builds a 768 MiB Gen2 QCOW2, and compresses it to maximum zstd level via an LD_PRELOAD intercept library (`scripts/zstd_max_preload.zig`).
+
+```
+zig build generalized-azurelinux4 -- \
+  --work-dir /path/to/build-cache \
+  --output /path/to/zvmi-azurelinux4-generalized.qcow2
+```
+
+The builder requires Zig 0.16, `curl`, `dnf`, GNU tar, `qemu-img`, and passwordless or interactive `sudo`. On a non-x86_64 build host, x86_64 binfmt and `qemu-x86_64-static` are also required so RPM scriptlets can run inside the target rootfs; on Azure Linux install them with `sudo tdnf install -y qemu-user-static-x86`. Use `--iso` to supply an already-downloaded ISO and `--size` to override the 768 MiB virtual disk size. The build system automatically passes the paths of the built native zvmi, guest azinit/azagent binaries, and the preload library; no separate `zig build` invocation is needed.
 
 `convert` skips all-zero chunks (aligned to the destination's block size for
 sparse block formats such as dynamic vhd and vhdx), so converting a

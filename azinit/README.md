@@ -1,26 +1,11 @@
 # azinit
 
-A minimal (~160 KB), statically-linked PID 1 replacement for real-boot
-testing of images built with `zvmi build-image --skip-iso-rootfs`, e.g.
-against a real Azure VM. It exists to validate the fix for
-[issue #88](https://github.com/cataggar/zvmi/issues/88) end-to-end on real
-hardware rather than only structurally/in QEMU, and to serve as a small
-reference for what a from-scratch container-image init needs to do.
+A minimal (~160 KB), statically-linked PID 1 replacement for real-boot testing of images built with `zvmi build-image --skip-iso-rootfs`, e.g. against a real Azure VM. It exists to validate the fix for [issue #88](https://github.com/cataggar/zvmi/issues/88) end-to-end on real hardware rather than only structurally/in QEMU, and to serve as a small reference for what a from-scratch container-image init needs to do.
 
 ## What it does
 
-- Mounts `/proc`, `/sys`, `/dev`, `/run`, and a writable tmpfs overlay for
-  `/var`, `/tmp`, and `/etc` (root stays read-only, matching the
-  dm-verity/immutable-image philosophy elsewhere in this project).
-- Loads the kernel modules this appliance needs directly via a raw
-  `init_module()` syscall (decompressing the shipped `.ko.xz` with
-  `std.compress.xz`): `overlay` (for the `/etc` overlay mount) and
-  `hv_netvsc` (Hyper-V's synthetic NIC driver). There's no udev/mdev daemon
-  here to drive the kernel's usual uevent-triggered
-  `request_module()` -> `/sbin/modprobe` autoload path, and no modprobe/kmod
-  binary is shipped either -- see issue #88's discussion for why. Since both
-  modules have no further dependencies (checked via `modules.dep`), a direct
-  syscall is simpler and more self-contained than adding a kmod dependency.
+- Mounts `/proc`, `/sys`, `/dev`, and `/run`. Immutable mode is the default: root stays read-only, `/var` and `/tmp` use tmpfs, and `/etc` uses a tmpfs-backed overlay. The opt-in `azinit.mode=persistent` kernel option instead remounts root read-write, leaves `/etc`, `/var`, and `/home` persistent, and mounts only `/tmp` as tmpfs. If `/etc/machine-id` is empty after image generalization, azinit generates and persists a new 128-bit machine ID.
+- Loads the kernel modules this appliance needs directly via a raw `init_module()` syscall (decompressing the shipped `.ko.xz` with `std.compress.xz`): `overlay` for immutable `/etc`, `hv_netvsc` for Hyper-V networking, and `crc-itu-t`/`udf`/`isofs` for Azure's provisioning DVD. There's no udev/mdev daemon to drive `request_module()` through modprobe/kmod, so azinit loads the fixed dependency order itself.
 - Mounts the ESP, sets the hostname, brings up loopback, then runs a small
   DHCP client on the first non-`lo` interface it finds and writes
   `/etc/resolv.conf`. DHCP replies are received on a raw `AF_PACKET` socket
@@ -40,52 +25,23 @@ reference for what a from-scratch container-image init needs to do.
 - Loops forever spawning an interactive shell on `/dev/ttyS0`, respawning it
   if it ever exits (PID 1 exiting panics the kernel), and reaping all other
   zombie children along the way.
-- If `/usr/sbin/azagent` (the guest provisioning agent, see `azagent/`,
-  issue #112) is present, fork+execs it once after networking is up, so a
-  `--skip-iso-rootfs` image can reach an actually-provisioned login (real
-  hostname, a user account, SSH access) instead of just a bare shell.
-  Entirely optional: a no-op if `azagent` isn't present (most azinit-based
-  test images don't have it), and tolerant of it failing or exiting non-zero
-  (e.g. no provisioning CD-ROM attached, or no route to the WireServer yet)
-  -- a provisioning failure never blocks reaching the fallback shell. This
-  is `zvmi build-image`'s automatic systemd-unit wiring's counterpart for
-  the `--skip-iso-rootfs` path, which has no guaranteed systemd to hook a
-  unit into (see the root README's build-image section); any other
-  from-scratch init wanting the same behavior should do the equivalent.
-- If `/usr/sbin/sshd` is present, fork+execs it once right after
-  `runAzagentIfPresent()` (so any SSH host keys/`authorized_keys` azagent
-  deployed already exist by the time sshd starts), so a
-  `--skip-iso-rootfs` image can actually be reached over SSH -- the
-  primary way anyone interacts with a headless Linux VM (issue #129).
-  Entirely optional: a no-op if `sshd` isn't present (most azinit-based
-  test images, including the boot-smoke QEMU tests, don't have it).
-  Unlike `azagent`, sshd daemonizes itself and runs forever, so azinit
-  doesn't wait for it -- it just launches it and continues into the shell
-  loop, whose existing zombie-reaping loop transparently reaps the
-  transient first-generation sshd process once it exits after
-  daemonizing. This is one hardcoded fork+exec, not a general service
-  supervisor, and doesn't configure sshd beyond whatever the container
-  image already ships.
+- If `/usr/sbin/azagent` (the guest provisioning agent, see `azagent/`, issue #112) is present, fork+execs it after networking is up so a `--skip-iso-rootfs` image can reach a provisioned login instead of only a bare shell. Immutable mode retains the original best-effort behavior: azagent runs once, and failure does not block the fallback serial shell or optional sshd. Persistent mode requires azagent and retries it every five seconds in a child supervisor while keeping the serial shell available.
+- If `/usr/sbin/sshd` is present, fork+execs it after azagent. In persistent mode, sshd does not start until azagent succeeds, ensuring account data, host keys, and `authorized_keys` exist first. This remains one hardcoded fork+exec rather than a general service supervisor and uses the configuration shipped by the container image.
 
 ## Building
 
-Built as part of the repo-root build graph (there's no separate
-`azinit/build.zig`):
+Built as part of the repo-root build graph (there's no separate `azinit/build.zig`):
 
 ```
 zig build
+zig build test-azinit
 ```
 
-Always cross-compiles to static `x86_64-linux` regardless of host, since
-that's what real Azure Gen2 VMs run; there's no `-Doptimize=` toggle since
-the whole point of this binary is to be tiny (this hardcodes
-`ReleaseSmall`).
+The installed executable always cross-compiles to static `x86_64-linux` regardless of host, since that's what these real Azure Gen2 VM fixtures run; there's no `-Doptimize=` toggle because the binary hardcodes `ReleaseSmall`. The tests build for the selected native test target.
 
 ## Using it
 
-Add the built `zig-out/bin/azinit` binary to a container image as
-`sbin/init` (plus `sbin/poweroff`/`sbin/reboot`/`sbin/shutdown` symlinks
-pointing at it), then build a bootable disk image with:
+Add the built `zig-out/bin/azinit` binary to a container image as `sbin/init` (plus `sbin/poweroff`/`sbin/reboot`/`sbin/shutdown` symlinks pointing at it), then build an immutable bootable disk image with:
 
 ```
 zvmi build-image --iso <azurelinux.iso> --container <oci-layout-with-azinit> \
@@ -93,3 +49,20 @@ zvmi build-image --iso <azurelinux.iso> --container <oci-layout-with-azinit> \
   --extra-kernel-options "console=tty0 console=ttyS0,115200n8" \
   -o out.vhd -O vhd
 ```
+
+For a generalized Azure image, include `/usr/sbin/azagent`, `/usr/sbin/sshd`, `ssh-keygen`, and their runtime dependencies in the container, then opt into persistent mode:
+
+```
+zvmi build-image --iso <azurelinux.iso> --container <oci-layout-with-azinit-agent-sshd> \
+  --generation 2 --size 768M --skip-iso-rootfs \
+  --extra-kernel-options "init=/sbin/init azinit.mode=persistent console=tty0 console=ttyS0,115200n8" \
+  -o out.vhd -O vhd
+```
+
+`init=/sbin/init` is required when the packaged OpenSSH dependency set includes systemd; otherwise the systemd-based initramfs selects `/usr/lib/systemd/systemd` directly instead of azinit. Persistent mode is intentionally incompatible with a read-only dm-verity root. If the root remount fails, azinit leaves provisioning and SSH disabled and retains serial-console access for diagnosis.
+
+Generalized Azure deployments must still provide `adminUsername`; use `g` for
+the project image convention. With the builder's `waagent.conf`, azagent mounts
+the temporary resource disk at `/d`, then mounts existing ext4 partition 1 on
+managed disks by stable Azure LUN at `/e` through `/z`. Blank and unknown
+managed-disk layouts are never modified.

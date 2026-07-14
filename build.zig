@@ -229,7 +229,114 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(azinit_exe);
 
+    const azinit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("azinit/init.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_azinit_tests = b.addRunArtifact(azinit_tests);
+    const azinit_test_step = b.step("test-azinit", "Run azinit tests");
+    azinit_test_step.dependOn(&run_azinit_tests.step);
+
     const test_step = b.step("test", "Run all tests");
+
+    // ---- scripts/build_generalized_azurelinux4.zig: generalized Azure Linux 4
+    // QCOW2 builder, replacing scripts/build-generalized-azurelinux4.py.
+    // Linux-specific: the full pipeline (dnf, sudo chroot, qemu-img) is only
+    // meaningful on Linux.  The zstd_max_preload shared library is also
+    // Linux-specific. ----
+    if (b.graph.host.result.os.tag == .linux) {
+
+        // Guest-targeted azagent for embedding in the generalized image.
+        // Must be x86_64-linux (static) and ReleaseSmall, matching azinit.
+        const zvmi_guest_mod = b.createModule(.{
+            .root_source_file = b.path("packages/zvmi/src/root.zig"),
+            .target = azinit_target,
+            .optimize = .ReleaseSmall,
+        });
+        const wireserver_guest_mod = b.createModule(.{
+            .root_source_file = b.path("wireserver/wireserver.zig"),
+            .target = azinit_target,
+            .optimize = .ReleaseSmall,
+        });
+        const azagent_guest_mod = b.createModule(.{
+            .root_source_file = b.path("azagent/main.zig"),
+            .target = azinit_target,
+            .optimize = .ReleaseSmall,
+            .imports = &.{
+                .{ .name = "wireserver", .module = wireserver_guest_mod },
+                .{ .name = "zvmi", .module = zvmi_guest_mod },
+            },
+        });
+        const azagent_guest_exe = b.addExecutable(.{
+            .name = "azagent",
+            .root_module = azagent_guest_mod,
+            .linkage = .static,
+        });
+
+        // LD_PRELOAD shared library: intercepts ZSTD_compressStream2 and sets
+        // ZSTD_maxCLevel() so qemu-img -o compression_type=zstd uses max compression.
+        const zstd_preload_lib = b.addLibrary(.{
+            .name = "zstd_max_preload",
+            .linkage = .dynamic,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("scripts/zstd_max_preload.zig"),
+                .target = b.graph.host,
+                .optimize = .ReleaseFast,
+                .link_libc = true,
+            }),
+        });
+        // Link libdl for dlsym; libzstd is resolved at runtime via dlsym(RTLD_NEXT).
+        zstd_preload_lib.root_module.linkSystemLibrary("dl", .{});
+        b.installArtifact(zstd_preload_lib);
+
+        const builder_exe = b.addExecutable(.{
+            .name = "build_generalized_azurelinux4",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("scripts/build_generalized_azurelinux4.zig"),
+                .target = b.graph.host,
+                .optimize = optimize,
+            }),
+        });
+        b.installArtifact(builder_exe);
+
+        // `zig build generalized-azurelinux4 -- [--iso ...] [--output ...] ...`
+        // Automatically passes the paths of the just-built native zvmi, guest
+        // azinit/azagent, and the preload library so the builder does not need to
+        // invoke `zig build` itself.
+        const run_builder = b.addRunArtifact(builder_exe);
+        run_builder.step.dependOn(b.getInstallStep());
+        run_builder.addArg("--zvmi");
+        run_builder.addArtifactArg(cli_exe);
+        run_builder.addArg("--azinit");
+        run_builder.addArtifactArg(azinit_exe);
+        run_builder.addArg("--azagent");
+        run_builder.addArtifactArg(azagent_guest_exe);
+        run_builder.addArg("--preload");
+        run_builder.addArtifactArg(zstd_preload_lib);
+        if (b.args) |args| run_builder.addArgs(args);
+        const generalized_step = b.step(
+            "generalized-azurelinux4",
+            "Build a generalized Azure Linux 4 Gen2 QCOW2 image (requires root, Linux, dnf, qemu-img)",
+        );
+        generalized_step.dependOn(&run_builder.step);
+
+        // Tests for pure, side-effect-free helpers.
+        const builder_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("scripts/build_generalized_azurelinux4.zig"),
+                .target = b.graph.host,
+                .optimize = optimize,
+            }),
+        });
+        const run_builder_tests = b.addRunArtifact(builder_tests);
+        const builder_test_step = b.step("test-generalized-azurelinux4", "Run build_generalized_azurelinux4 unit tests");
+        builder_test_step.dependOn(&run_builder_tests.step);
+        test_step.dependOn(&run_builder_tests.step);
+    }
+
     test_step.dependOn(&run_zvmi_tests.step);
     test_step.dependOn(&run_wireserver_tests.step);
     test_step.dependOn(&run_azagent_tests.step);
@@ -244,4 +351,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_nbd_server_tests.step);
     test_step.dependOn(&run_qcow2_mod_tests.step);
     test_step.dependOn(&run_qcow2_exe_tests.step);
+    test_step.dependOn(&run_azinit_tests.step);
 }

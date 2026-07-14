@@ -34,9 +34,12 @@ pub const WaagentConf = struct {
     /// value here (anything other than "ext4") should be logged and
     /// ignored by whatever consumes this field (#113), not honored.
     resourcedisk_filesystem: []const u8 = "ext4",
-    resourcedisk_mount_point: []const u8 = "/mnt/resource",
+    resourcedisk_mount_point: []const u8 = "/d",
     resourcedisk_enable_swap: bool = false,
     resourcedisk_swap_size_mb: u32 = 0,
+    /// `azagent` extension: mount existing ext4 managed-data-disk
+    /// partitions by stable Azure LUN at `/e` through `/z`.
+    datadisk_mount: bool = false,
 
     /// Parses `content` (the file's raw bytes) and returns a `WaagentConf`
     /// with every recognized key applied on top of the defaults above.
@@ -75,6 +78,8 @@ pub const WaagentConf = struct {
                         result.resourcedisk_swap_size_mb = n;
                     } else |_| {}
                 }
+            } else if (std.mem.eql(u8, kv.key, "DataDisk.Mount")) {
+                if (parseSwitch(kv.value)) |v| result.datadisk_mount = v;
             }
             // Every other key is recognized as a valid line but simply
             // has no effect -- matches upstream's own permissive
@@ -175,9 +180,10 @@ test "WaagentConf.parse returns defaults for an empty document" {
     const conf = WaagentConf.parse("");
     try std.testing.expectEqual(false, conf.resourcedisk_format);
     try std.testing.expectEqualStrings("ext4", conf.resourcedisk_filesystem);
-    try std.testing.expectEqualStrings("/mnt/resource", conf.resourcedisk_mount_point);
+    try std.testing.expectEqualStrings("/d", conf.resourcedisk_mount_point);
     try std.testing.expectEqual(false, conf.resourcedisk_enable_swap);
     try std.testing.expectEqual(@as(u32, 0), conf.resourcedisk_swap_size_mb);
+    try std.testing.expectEqual(false, conf.datadisk_mount);
 }
 
 test "WaagentConf.parse applies every recognized key from a realistic document, and ignores Provisioning.Enabled" {
@@ -195,6 +201,7 @@ test "WaagentConf.parse applies every recognized key from a realistic document, 
         \\ResourceDisk.MountPoint=/mnt/resource
         \\ResourceDisk.EnableSwap=y
         \\ResourceDisk.SwapSizeMB=2048
+        \\DataDisk.Mount=y
     ;
     const conf = WaagentConf.parse(sample);
     try std.testing.expectEqual(true, conf.resourcedisk_format);
@@ -202,6 +209,7 @@ test "WaagentConf.parse applies every recognized key from a realistic document, 
     try std.testing.expectEqualStrings("/mnt/resource", conf.resourcedisk_mount_point);
     try std.testing.expectEqual(true, conf.resourcedisk_enable_swap);
     try std.testing.expectEqual(@as(u32, 2048), conf.resourcedisk_swap_size_mb);
+    try std.testing.expectEqual(true, conf.datadisk_mount);
 }
 
 test "WaagentConf.parse ignores unknown keys and unparseable values" {

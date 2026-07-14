@@ -107,7 +107,7 @@ pub fn findRootDevice(allocator: Allocator, io: std.Io, proc_mounts_content: []c
 /// silently empties/truncates results read through `Io.Dir.readFileAlloc`
 /// (which trusts that reported size) -- matching this repo's established
 /// workaround in `resource_disk.zig`'s `isSwapActive` for `/proc/swaps`.
-fn readProcMounts(allocator: Allocator) ![]u8 {
+pub fn readProcMounts(allocator: Allocator) ![]u8 {
     const open_rc = linux.open("/proc/mounts", .{ .ACCMODE = .RDONLY }, 0);
     if (linux.errno(open_rc) != .SUCCESS) return error.ProcMountsOpenFailed;
     const fd: linux.fd_t = @intCast(open_rc);
