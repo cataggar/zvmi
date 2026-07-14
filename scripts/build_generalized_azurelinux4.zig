@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const oci = @import("oci");
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
@@ -619,6 +620,30 @@ const LayerResult = struct {
     compressed_size: u64,
 };
 
+fn gzipFile(io: Io, source_path: []const u8, output_path: []const u8) !u64 {
+    var source_file = try Dir.cwd().openFile(io, source_path, .{});
+    defer source_file.close(io);
+
+    var output_file = try Dir.cwd().createFile(io, output_path, .{});
+    errdefer {
+        output_file.close(io);
+        Dir.cwd().deleteFile(io, output_path) catch {};
+    }
+    defer output_file.close(io);
+
+    var write_buf: [65536]u8 = undefined;
+    var output_writer = output_file.writer(io, &write_buf);
+    var history: [std.compress.flate.max_window_len]u8 = undefined;
+    var compressor = try std.compress.flate.Compress.init(&output_writer.interface, &history, .gzip, .level_9);
+
+    var read_buf: [65536]u8 = undefined;
+    var source_reader = source_file.reader(io, &read_buf);
+    const streamed = try source_reader.interface.streamRemaining(&compressor.writer);
+    try compressor.finish();
+    try output_writer.interface.flush();
+    return @intCast(streamed);
+}
+
 fn createOciLayer(
     gpa: Allocator,
     io: Io,
@@ -679,29 +704,10 @@ fn createOciLayer(
     const diff_id = try std.fmt.allocPrint(gpa, "sha256:{s}", .{&diff_hex});
     errdefer gpa.free(diff_id);
 
-    // Gzip-compress: tar → gz using Zig's flate compressor (gzip container,
-    // level 9, mtime=0 — Zig's gzip header has mtime=0 by default).
-    {
-        var tar_file = try Dir.cwd().openFile(io, layer_tar, .{});
-        defer tar_file.close(io);
-        var gz_file = try Dir.cwd().createFile(io, layer_gz, .{});
-        errdefer {
-            gz_file.close(io);
-            Dir.cwd().deleteFile(io, layer_gz) catch {};
-        }
-        defer gz_file.close(io);
-
-        var write_buf: [65536]u8 = undefined;
-        var gz_writer = gz_file.writer(io, &write_buf);
-        var gz_history: [std.compress.flate.max_window_len]u8 = undefined;
-        var gz = try std.compress.flate.Compress.init(&gz_writer.interface, &gz_history, .gzip, .level_9);
-
-        var read_buf: [65536]u8 = undefined;
-        var tar_reader = tar_file.reader(io, &read_buf);
-        _ = try tar_reader.interface.stream(&gz.writer, .unlimited);
-        try gz.finish();
-        try gz_writer.interface.flush();
-    }
+    // Zig's Reader.stream() copies only one chunk. Use streamRemaining() so
+    // the OCI layer contains the complete tar rather than its first 64 KiB.
+    const streamed = try gzipFile(io, layer_tar, layer_gz);
+    if (streamed != tar_stat.size) return error.IncompleteOciLayer;
 
     const gz_hex = try sha256File(io, layer_gz);
     const compressed_digest = try std.fmt.allocPrint(gpa, "sha256:{s}", .{&gz_hex});
@@ -917,6 +923,29 @@ fn createOciLayout(
     return layout_dir;
 }
 
+fn validateGeneralizedOciLayout(gpa: Allocator, io: Io, layout_dir: []const u8) !void {
+    var image = try oci.loadLayout(io, gpa, layout_dir, .{});
+    defer image.deinit();
+
+    const required_paths = [_][]const u8{
+        "etc/os-release",
+        "usr/bin/bash",
+        "usr/sbin/azagent",
+        "usr/sbin/init",
+        "usr/sbin/sshd",
+    };
+    for (required_paths) |path| {
+        const entry = image.get(path) orelse {
+            std.debug.print("error: generated OCI layout is missing required rootfs path: /{s}\n", .{path});
+            return error.IncompleteOciRootfs;
+        };
+        if (entry.kind != .file) {
+            std.debug.print("error: generated OCI rootfs path is not a file: /{s}\n", .{path});
+            return error.IncompleteOciRootfs;
+        }
+    }
+}
+
 // ─── ISO download ─────────────────────────────────────────────────────────────
 
 fn downloadIso(gpa: Allocator, io: Io, work_dir: []const u8) ![]const u8 {
@@ -1097,6 +1126,7 @@ pub fn main(init: std.process.Init) !void {
 
     const layout_dir = try createOciLayout(gpa, io, work_dir, rootfs_path, base_digest);
     defer gpa.free(layout_dir);
+    try validateGeneralizedOciLayout(gpa, io, layout_dir);
 
     // Ensure output parent directory exists.
     if (std.fs.path.dirname(args.output)) |parent| {
@@ -1248,4 +1278,29 @@ test "sha256Bytes produces known digest" {
     const hex = sha256Bytes("hello");
     // echo -n hello | sha256sum => 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
     try std.testing.expectEqualStrings("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824", &hex);
+}
+
+test "gzipFile streams the complete source" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const source_path = "test-generalized-azurelinux4-gzip-source";
+    const output_path = "test-generalized-azurelinux4-gzip-output";
+    defer Dir.cwd().deleteFile(io, source_path) catch {};
+    defer Dir.cwd().deleteFile(io, output_path) catch {};
+
+    const payload = try gpa.alloc(u8, 192 * 1024 + 17);
+    defer gpa.free(payload);
+    for (payload, 0..) |*byte, index| byte.* = @intCast(index % 251);
+    try Dir.cwd().writeFile(io, .{ .sub_path = source_path, .data = payload });
+
+    try std.testing.expectEqual(@as(u64, payload.len), try gzipFile(io, source_path, output_path));
+
+    const compressed = try Dir.cwd().readFileAlloc(io, output_path, gpa, .limited(payload.len + 1024));
+    defer gpa.free(compressed);
+    var compressed_reader = Io.Reader.fixed(compressed);
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var decompressor: std.compress.flate.Decompress = .init(&compressed_reader, .gzip, &window);
+    const actual = try decompressor.reader.allocRemaining(gpa, .limited(payload.len + 1));
+    defer gpa.free(actual);
+    try std.testing.expectEqualSlices(u8, payload, actual);
 }
