@@ -60,3 +60,9 @@ zvmi build-image --iso <azurelinux.iso> --container <oci-layout-with-azinit-agen
 ```
 
 `init=/sbin/init` is required when the packaged OpenSSH dependency set includes systemd; otherwise the systemd-based initramfs selects `/usr/lib/systemd/systemd` directly instead of azinit. Persistent mode is intentionally incompatible with a read-only dm-verity root. If the root remount fails, azinit leaves provisioning and SSH disabled and retains serial-console access for diagnosis.
+
+Generalized Azure deployments must still provide `adminUsername`; use `g` for
+the project image convention. With the builder's `waagent.conf`, azagent mounts
+the temporary resource disk at `/d`, then mounts existing ext4 partition 1 on
+managed disks by stable Azure LUN at `/e` through `/z`. Blank and unknown
+managed-disk layouts are never modified.

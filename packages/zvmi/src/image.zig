@@ -666,15 +666,16 @@ pub const CopyError = Image.PreadError || Image.PwriteError ||
 ///
 /// All-zero chunks are skipped rather than written, so converting into a
 /// sparse image stays sparse instead of eagerly allocating every block it
-/// touches. When `dst` is a dynamic vhd or vhdx, the chunk size is aligned to
-/// its block size so each chunk maps to exactly one BAT entry -- otherwise a
-/// single mostly-zero copy chunk spanning multiple blocks would force all of
-/// them to be allocated just because one had non-zero bytes.
+/// touches. For sparse destination formats, the chunk size is aligned to the
+/// format's allocation unit so a mostly-zero chunk cannot force adjacent
+/// blocks or clusters to be allocated just because one contains live data.
 pub fn copyAll(io: Io, src: Image, dst: *Image, allocator: std.mem.Allocator) CopyError!void {
     const chunk_size: usize = if (dst.dynamic) |d|
         d.block_size
     else if (dst.vhdx) |v|
         v.block_size
+    else if (dst.qcow2) |q|
+        @intCast(q.cluster_size)
     else
         4 * 1024 * 1024;
     const buf = try allocator.alloc(u8, chunk_size);
@@ -791,6 +792,34 @@ test "convert raw to dynamic vhd stays sparse for zero regions" {
     try std.testing.expectEqual(true, extents[1].allocated);
     try std.testing.expectEqual(@as(u64, vhd.default_block_size), extents[1].offset);
     try std.testing.expectEqual(@as(u64, vhd.default_block_size), extents[1].length);
+    try std.testing.expectEqual(false, extents[2].allocated);
+}
+
+test "convert raw to qcow2 allocates only non-zero clusters" {
+    const io = std.testing.io;
+    const src_path = "test-convert-sparse-qcow2-src.img";
+    const dst_path = "test-convert-sparse-dst.qcow2";
+    defer Io.Dir.cwd().deleteFile(io, src_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, dst_path) catch {};
+
+    const cluster_size: u64 = 1 << qcow2.default_cluster_bits;
+    const size = 4 * cluster_size;
+    var src = try Image.create(io, src_path, .raw, size, .{});
+    try src.pwrite(io, "only-cluster-1", cluster_size + 123);
+
+    var dst = try Image.create(io, dst_path, .qcow2, size, .{});
+    try copyAll(io, src, &dst, std.testing.allocator);
+    src.close(io);
+
+    const extents = try dst.mapExtents(io, std.testing.allocator);
+    defer std.testing.allocator.free(extents);
+    dst.close(io);
+
+    try std.testing.expectEqual(@as(usize, 3), extents.len);
+    try std.testing.expectEqual(false, extents[0].allocated);
+    try std.testing.expectEqual(true, extents[1].allocated);
+    try std.testing.expectEqual(cluster_size, extents[1].offset);
+    try std.testing.expectEqual(cluster_size, extents[1].length);
     try std.testing.expectEqual(false, extents[2].allocated);
 }
 

@@ -21,6 +21,7 @@ pub const sentinel = @import("sentinel.zig");
 pub const cdrom = @import("cdrom.zig");
 pub const waagent_conf = @import("waagent_conf.zig");
 pub const resource_disk = @import("resource_disk.zig");
+pub const drive_mounts = @import("drive_mounts.zig");
 pub const root_resize = @import("root_resize.zig");
 
 /// Everything `provision` needs, injected rather than hardcoded, so it's
@@ -183,13 +184,10 @@ pub fn main(init: std.process.Init) !void {
         });
     }
 
-    // Unlike `provision` above, resource-disk activation runs on *every*
-    // boot, not just the first: Azure can reallocate/resize the resource
-    // disk across a VM's lifetime, so its formatted/mounted state must be
-    // re-checked every time rather than gated by the sentinel. Best-effort
-    // (logs and continues on failure), matching `reportHealthBestEffort`:
-    // a VM without its temp disk mounted is still otherwise usable.
-    resourceDiskSetupBestEffort(gpa, io, now_unix_seconds, parsed_waagent_conf);
+    // Unlike `provision` above, disk activation runs on every boot: Azure
+    // can reallocate the temporary disk or attach managed data disks across
+    // a VM's lifetime. Failures remain best-effort so the OS stays usable.
+    driveMountSetupBestEffort(gpa, io, now_unix_seconds, parsed_waagent_conf);
 
     // Same "every boot, best-effort" reasoning applies to growing the root
     // partition/filesystem (issue #130): the platform can deploy a larger
@@ -218,39 +216,54 @@ fn rootResizeSetup(allocator: std.mem.Allocator, io: std.Io) !void {
     });
 }
 
-/// Best-effort wrapper around `resourceDiskSetup` -- see its call site in
-/// `main` for why failures here are logged rather than fatal.
-fn resourceDiskSetupBestEffort(allocator: std.mem.Allocator, io: std.Io, now_unix_seconds: i64, conf: waagent_conf.WaagentConf) void {
-    resourceDiskSetup(allocator, io, now_unix_seconds, conf) catch |err| {
-        std.debug.print("azagent: warning: failed to set up the resource disk: {t}\n", .{err});
+fn driveMountSetupBestEffort(allocator: std.mem.Allocator, io: std.Io, now_unix_seconds: i64, conf: waagent_conf.WaagentConf) void {
+    driveMountSetup(allocator, io, now_unix_seconds, conf) catch |err| {
+        std.debug.print("azagent: warning: failed to enumerate non-OS disks: {t}\n", .{err});
     };
 }
 
-fn resourceDiskSetup(allocator: std.mem.Allocator, io: std.Io, now_unix_seconds: i64, conf: waagent_conf.WaagentConf) !void {
-    // Matches real waagent's `ResourceDisk.Format` meaning: whether to
-    // touch the resource disk at all (off by default, per issue #113's
-    // "off by default" defaults and `waagent_conf.zig`'s own conservative
-    // default).
-    if (!conf.resourcedisk_format) return;
-
-    // `azagent` only has an ext4 writer -- a recognized-but-unsupported
-    // filesystem value is logged and ignored (per `waagent_conf.zig`'s doc
-    // comment), not treated as fatal.
-    if (!std.mem.eql(u8, conf.resourcedisk_filesystem, "ext4")) {
+fn driveMountSetup(allocator: std.mem.Allocator, io: std.Io, now_unix_seconds: i64, conf: waagent_conf.WaagentConf) !void {
+    if (!conf.resourcedisk_format and !conf.datadisk_mount) return;
+    if (conf.resourcedisk_format and !std.mem.eql(u8, conf.resourcedisk_filesystem, "ext4")) {
         std.debug.print("azagent: warning: ResourceDisk.Filesystem={s} is not supported, using ext4 instead\n", .{conf.resourcedisk_filesystem});
     }
 
     var devices_dir = try std.Io.Dir.cwd().openDir(io, "/sys/bus/vmbus/devices", .{ .iterate = true });
     defer devices_dir.close(io);
+    const resource_name = resource_disk.findResourceDiskName(allocator, devices_dir, io) catch |err| switch (err) {
+        error.ResourceDiskNotFound => null,
+        else => return err,
+    };
+    defer if (resource_name) |name| allocator.free(name);
 
-    try resource_disk.setup(.{
+    var class_block_dir = try std.Io.Dir.cwd().openDir(io, "/sys/class/block", .{ .iterate = true });
+    defer class_block_dir.close(io);
+    const proc_mounts = try root_resize.readProcMounts(allocator);
+    defer allocator.free(proc_mounts);
+    const root = root_resize.findRootDevice(allocator, io, proc_mounts, class_block_dir) catch |err| root: {
+        std.debug.print(
+            "azagent: warning: cannot resolve the physical root disk ({t}); managed data disks will not be mounted\n",
+            .{err},
+        );
+        break :root null;
+    };
+    defer if (root) |device| {
+        allocator.free(device.disk_name);
+        allocator.free(device.partition_name);
+    };
+
+    try drive_mounts.setup(.{
         .allocator = allocator,
         .io = io,
-        .devices_dir = devices_dir,
+        .class_block_dir = class_block_dir,
+        .root_disk_name = if (root) |device| device.disk_name else null,
+        .scsi_resource_disk_name = resource_name,
         .now_unix_seconds = now_unix_seconds,
-        .mount_point = conf.resourcedisk_mount_point,
-        .enable_swap = conf.resourcedisk_enable_swap,
-        .swap_size_mb = if (conf.resourcedisk_swap_size_mb > 0) conf.resourcedisk_swap_size_mb else resource_disk.default_swap_size_mb,
+        .resource_enabled = conf.resourcedisk_format,
+        .resource_mount_point = conf.resourcedisk_mount_point,
+        .resource_enable_swap = conf.resourcedisk_enable_swap,
+        .resource_swap_size_mb = if (conf.resourcedisk_swap_size_mb > 0) conf.resourcedisk_swap_size_mb else resource_disk.default_swap_size_mb,
+        .data_disks_enabled = conf.datadisk_mount and root != null,
     });
 }
 
@@ -264,6 +277,7 @@ test {
     _ = cdrom;
     _ = waagent_conf;
     _ = resource_disk;
+    _ = drive_mounts;
     _ = root_resize;
 }
 

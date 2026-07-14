@@ -1,5 +1,5 @@
 //! Detects, formats, and mounts Azure's temporary/local "resource disk"
-//! (typically `/dev/sdb`) at `/mnt/resource`, with optional swap-file setup.
+//! (typically `/dev/sdb`) at `/d`, with optional swap-file setup.
 //! Native replacement for the resource-disk portion of Python `waagent`
 //! (`azurelinuxagent/daemon/resourcedisk/default.py`) -- see zvmi issue #113.
 //!
@@ -18,7 +18,10 @@ const Allocator = std.mem.Allocator;
 const linux = std.os.linux;
 const zvmi = @import("zvmi");
 const mbr = zvmi.mbr;
+const gpt = zvmi.gpt;
+const guid_codec = zvmi.guid;
 const ext4 = zvmi.ext4;
+const Image = zvmi.Image;
 
 /// Gen1 (BIOS/synthetic-IDE) resource-disk VMBus device IDs start with this
 /// prefix (IDE port 1, per upstream's `device_for_ide_port(1)`).
@@ -43,11 +46,11 @@ pub fn findResourceDiskName(allocator: Allocator, devices_dir: std.Io.Dir, io: s
         var device_dir = (try openChildDirOrNull(devices_dir, io, top_entry.name)) orelse continue;
         defer device_dir.close(io);
 
-        const guid = (try readDeviceIdGuid(allocator, device_dir, io)) orelse continue;
-        defer allocator.free(guid);
+        const device_guid = (try readDeviceIdGuid(allocator, device_dir, io)) orelse continue;
+        defer allocator.free(device_guid);
 
-        const is_gen1 = std.mem.startsWith(u8, guid, gen1_device_id_prefix);
-        const is_gen2 = std.mem.eql(u8, guid, gen2_device_id);
+        const is_gen1 = std.mem.startsWith(u8, device_guid, gen1_device_id_prefix);
+        const is_gen2 = std.mem.eql(u8, device_guid, gen2_device_id);
         if (!is_gen1 and !is_gen2) continue;
 
         if (try findBlockDeviceName(allocator, device_dir, io, is_gen2)) |name| return name;
@@ -122,19 +125,19 @@ pub const partition_start_lba: u32 = 2048;
 /// `[partition_start_lba, total_sectors)` with no other partitions defined
 /// -- the shape `ensureFormatted` writes, checked before deciding whether a
 /// (re)format is needed.
-pub fn isWholeDiskLinuxPartition(decoded: mbr.Mbr, total_sectors: u32) bool {
+pub fn isWholeDiskLinuxPartition(decoded: mbr.Mbr, total_sectors: u64) bool {
     const e = decoded.entries[0];
     if (e.partition_type != .linux) return false;
     if (e.first_lba != partition_start_lba) return false;
     if (e.first_lba >= total_sectors) return false;
-    if (e.first_lba + e.sector_count != total_sectors) return false;
+    if (@as(u64, e.first_lba) + e.sector_count != total_sectors) return false;
     for (decoded.entries[1..]) |other| {
         if (other.partition_type != .empty) return false;
     }
     return true;
 }
 
-pub const default_mount_point = "/mnt/resource";
+pub const default_mount_point = "/d";
 pub const dataloss_warning_file_name = "DATALOSS_WARNING_README.txt";
 
 /// zvmi's own wording (not copied from upstream's copyrighted text):
@@ -174,7 +177,15 @@ const EmptyFileTree = struct {
 /// Idempotent: safe to call every boot, since a previously-formatted disk
 /// (persisted by the platform across reboots of the *same* VM) is left
 /// untouched.
-pub fn ensureFormatted(io: std.Io, allocator: Allocator, file: std.Io.File, total_sectors: u32, now_unix_seconds: i64) !void {
+pub fn ensureFormatted(io: std.Io, allocator: Allocator, file: std.Io.File, total_sectors: u64, now_unix_seconds: i64) !void {
+    if (total_sectors > std.math.maxInt(u32)) {
+        try ensureFormattedGpt(io, allocator, file, total_sectors, now_unix_seconds);
+    } else {
+        try ensureFormattedMbr(io, allocator, file, @intCast(total_sectors), now_unix_seconds);
+    }
+}
+
+fn ensureFormattedMbr(io: std.Io, allocator: Allocator, file: std.Io.File, total_sectors: u32, now_unix_seconds: i64) !void {
     if (total_sectors <= partition_start_lba) return error.DiskTooSmall;
 
     var sector0: [mbr.sector_size]u8 = undefined;
@@ -218,6 +229,82 @@ pub fn ensureFormatted(io: std.Io, allocator: Allocator, file: std.Io.File, tota
     reReadPartitionTable(file);
 }
 
+fn resourceGuid(now_unix_seconds: i64, total_sectors: u64, salt: u8) guid_codec.Guid {
+    var result: guid_codec.Guid = undefined;
+    std.mem.writeInt(i64, result[0..8], now_unix_seconds, .little);
+    std.mem.writeInt(u64, result[8..16], total_sectors, .little);
+    result[15] ^= salt;
+    result[7] = (result[7] & 0x0f) | 0x40;
+    result[8] = (result[8] & 0x3f) | 0x80;
+    return result;
+}
+
+fn isWholeDiskGptExt4(io: std.Io, allocator: Allocator, file: std.Io.File, total_sectors: u64) bool {
+    const img = Image{
+        .file = file,
+        .format = .raw,
+        .data_offset = 0,
+        .virtual_size = total_sectors * gpt.sector_size,
+    };
+    const parsed = gpt.readGpt(img, io, allocator) catch return false;
+    defer allocator.free(parsed.partitions);
+    const expected_first_usable = 2 + gpt.partition_array_sectors;
+    const expected_last_usable = total_sectors - 2 - gpt.partition_array_sectors;
+    if (parsed.header.current_lba != 1 or parsed.header.backup_lba != total_sectors - 1) return false;
+    if (parsed.header.first_usable_lba != expected_first_usable or parsed.header.last_usable_lba != expected_last_usable) return false;
+    if (parsed.partitions.len != 1) return false;
+    const partition = parsed.partitions[0];
+    if (!std.mem.eql(u8, &partition.partition_type_guid, &guid_codec.linux_filesystem_data)) return false;
+    if (partition.first_lba != partition_start_lba) return false;
+    const alignment_sectors = ext4.default_block_size / gpt.sector_size;
+    const partition_sectors = partition.last_lba - partition.first_lba + 1;
+    if (partition_sectors % alignment_sectors != 0) return false;
+    if (expected_last_usable - partition.last_lba >= alignment_sectors) return false;
+
+    var reader = ext4.open(io, file, allocator, .{ .offset = partition.first_lba * gpt.sector_size }) catch return false;
+    reader.deinit();
+    return true;
+}
+
+fn ensureFormattedGpt(io: std.Io, allocator: Allocator, file: std.Io.File, total_sectors: u64, now_unix_seconds: i64) !void {
+    if (total_sectors <= 2 * gpt.partition_array_sectors + 3) return error.DiskTooSmall;
+    if (isWholeDiskGptExt4(io, allocator, file, total_sectors)) return;
+
+    var img = Image{
+        .file = file,
+        .format = .raw,
+        .data_offset = 0,
+        .virtual_size = total_sectors * gpt.sector_size,
+    };
+    const last_usable_lba = total_sectors - 2 - gpt.partition_array_sectors;
+    if (last_usable_lba < partition_start_lba) return error.DiskTooSmall;
+    const alignment_sectors = ext4.default_block_size / gpt.sector_size;
+    const available_sectors = last_usable_lba - partition_start_lba + 1;
+    const partition_sectors = available_sectors / alignment_sectors * alignment_sectors;
+    if (partition_sectors == 0) return error.DiskTooSmall;
+    const placement = gpt.Placement{
+        .first_lba = partition_start_lba,
+        .last_lba = partition_start_lba + partition_sectors - 1,
+    };
+    const specs = [_]gpt.PlacedPartitionSpec{.{
+        .type_guid = guid_codec.linux_filesystem_data,
+        .unique_guid = resourceGuid(now_unix_seconds, total_sectors, 1),
+        .placement = placement,
+        .name_utf16le = gpt.asciiName("resource"),
+    }};
+    try gpt.writeGptPlaced(&img, io, resourceGuid(now_unix_seconds, total_sectors, 0), &specs);
+
+    var empty_tree: EmptyFileTree = .{};
+    var tree_view = empty_tree.view();
+    _ = try ext4.populate(io, file, allocator, &tree_view, .{
+        .offset = placement.first_lba * gpt.sector_size,
+        .length = partition_sectors * gpt.sector_size,
+        .label = "resource",
+        .timestamp = std.math.cast(u32, now_unix_seconds) orelse 0,
+    });
+    reReadPartitionTable(file);
+}
+
 /// The Linux `BLKRRPART` ioctl request code (`_IO(0x12, 95)`), used to ask
 /// the kernel to re-read a block device's partition table.
 const blkrrpart: u32 = 0x125F;
@@ -228,15 +315,55 @@ fn reReadPartitionTable(file: std.Io.File) void {
 
 /// Mounts `device_path` (e.g. `/dev/sdb1`) at `mount_point` via a direct
 /// `mount(2)` syscall (matching `cdrom.zig`/`azinit`'s style), creating
-/// the mount point directory if needed. Tolerates `EBUSY` (already mounted)
-/// for idempotency across repeated calls within the same boot.
+/// the mount point directory if needed. `EBUSY` is accepted only when
+/// `/proc/mounts` confirms this exact source/target pair is already mounted.
 pub fn mountAt(io: std.Io, device_path: [:0]const u8, mount_point: [:0]const u8) !void {
     try std.Io.Dir.cwd().createDirPath(io, mount_point);
+    switch (mountStatus(device_path, mount_point)) {
+        .exact => return,
+        .occupied => return error.MountPointBusy,
+        .unmounted => {},
+    }
+
     const rc = linux.mount(device_path.ptr, mount_point.ptr, "ext4", 0, 0);
     switch (linux.errno(rc)) {
-        .SUCCESS, .BUSY => {},
+        .SUCCESS => {},
+        .BUSY => if (mountStatus(device_path, mount_point) != .exact) return error.MountPointBusy,
         else => return error.MountFailed,
     }
+}
+
+const MountStatus = enum { unmounted, exact, occupied };
+
+fn mountStatusFromContent(content: []const u8, device_path: []const u8, mount_point: []const u8) MountStatus {
+    var status: MountStatus = .unmounted;
+    var lines = std.mem.tokenizeScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.tokenizeScalar(u8, line, ' ');
+        const device = fields.next() orelse continue;
+        const target = fields.next() orelse continue;
+        if (!std.mem.eql(u8, target, mount_point)) continue;
+        if (!std.mem.eql(u8, device, device_path)) return .occupied;
+        status = .exact;
+    }
+    return status;
+}
+
+fn mountStatus(device_path: []const u8, mount_point: []const u8) MountStatus {
+    const open_rc = linux.open("/proc/mounts", .{ .ACCMODE = .RDONLY }, 0);
+    if (linux.errno(open_rc) != .SUCCESS) return .occupied;
+    const fd: linux.fd_t = @intCast(open_rc);
+    defer _ = linux.close(fd);
+
+    var buf: [64 * 1024]u8 = undefined;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const read_rc = linux.read(fd, buf[total..].ptr, buf.len - total);
+        if (linux.errno(read_rc) != .SUCCESS) return .occupied;
+        if (read_rc == 0) break;
+        total += read_rc;
+    }
+    return mountStatusFromContent(buf[0..total], device_path, mount_point);
 }
 
 /// Writes the data-loss warning file into `mount_dir` (the mounted resource
@@ -362,6 +489,60 @@ pub const SetupOptions = struct {
     swap_size_mb: u32 = default_swap_size_mb,
 };
 
+pub const FormatPolicy = enum {
+    replace_invalid,
+    mount_existing,
+};
+
+pub const SetupDeviceOptions = struct {
+    allocator: Allocator,
+    io: std.Io,
+    device_name: []const u8,
+    now_unix_seconds: i64,
+    mount_point: []const u8,
+    format_policy: FormatPolicy,
+    write_dataloss_warning: bool = false,
+    enable_swap: bool = false,
+    swap_size_mb: u32 = default_swap_size_mb,
+};
+
+fn partitionDevicePath(buf: []u8, device_name: []const u8) ![:0]const u8 {
+    const separator = if (device_name.len > 0 and std.ascii.isDigit(device_name[device_name.len - 1])) "p" else "";
+    return std.fmt.bufPrintZ(buf, "/dev/{s}{s}1", .{ device_name, separator });
+}
+
+pub fn setupDevice(options: SetupDeviceOptions) !void {
+    var dev_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dev_path = try std.fmt.bufPrintZ(&dev_path_buf, "/dev/{s}", .{options.device_name});
+    var part_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const part_path = try partitionDevicePath(&part_path_buf, options.device_name);
+    var mount_point_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const mount_point = try std.fmt.bufPrintZ(&mount_point_buf, "{s}", .{options.mount_point});
+
+    {
+        const device_file = try std.Io.Dir.cwd().openFile(options.io, dev_path, .{ .mode = .read_write });
+        defer device_file.close(options.io);
+
+        switch (options.format_policy) {
+            .replace_invalid => {
+                const total_bytes = try blockDeviceSizeBytes(device_file);
+                const total_sectors = total_bytes / mbr.sector_size;
+                try ensureFormatted(options.io, options.allocator, device_file, total_sectors, options.now_unix_seconds);
+            },
+            .mount_existing => {},
+        }
+    }
+
+    try mountAt(options.io, part_path, mount_point);
+
+    var mount_dir = try std.Io.Dir.cwd().openDir(options.io, mount_point, .{});
+    defer mount_dir.close(options.io);
+    if (options.write_dataloss_warning) try writeDataLossWarning(mount_dir, options.io);
+    if (options.enable_swap) {
+        try enableSwap(options.allocator, options.io, mount_dir, mount_point, options.swap_size_mb);
+    }
+}
+
 /// Runs the full resource-disk activation sequence: locate the device,
 /// (re)format it idempotently if needed, mount it, write the data-loss
 /// warning, and optionally enable swap. Deliberately not covered by an
@@ -373,33 +554,17 @@ pub const SetupOptions = struct {
 pub fn setup(options: SetupOptions) !void {
     const name = try findResourceDiskName(options.allocator, options.devices_dir, options.io);
     defer options.allocator.free(name);
-
-    var dev_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dev_path = try std.fmt.bufPrintZ(&dev_path_buf, "/dev/{s}", .{name});
-    var part_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const part_path = try std.fmt.bufPrintZ(&part_path_buf, "/dev/{s}1", .{name});
-    var mount_point_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const mount_point = try std.fmt.bufPrintZ(&mount_point_buf, "{s}", .{options.mount_point});
-
-    {
-        const device_file = try std.Io.Dir.cwd().openFile(options.io, dev_path, .{ .mode = .read_write });
-        defer device_file.close(options.io);
-
-        const total_bytes = try blockDeviceSizeBytes(device_file);
-        const total_sectors = std.math.cast(u32, total_bytes / mbr.sector_size) orelse return error.DiskTooLarge;
-
-        try ensureFormatted(options.io, options.allocator, device_file, total_sectors, options.now_unix_seconds);
-    }
-
-    try mountAt(options.io, part_path, mount_point);
-
-    var mount_dir = try std.Io.Dir.cwd().openDir(options.io, mount_point, .{});
-    defer mount_dir.close(options.io);
-    try writeDataLossWarning(mount_dir, options.io);
-
-    if (options.enable_swap) {
-        try enableSwap(options.allocator, options.io, mount_dir, mount_point, options.swap_size_mb);
-    }
+    try setupDevice(.{
+        .allocator = options.allocator,
+        .io = options.io,
+        .device_name = name,
+        .now_unix_seconds = options.now_unix_seconds,
+        .mount_point = options.mount_point,
+        .format_policy = .replace_invalid,
+        .write_dataloss_warning = true,
+        .enable_swap = options.enable_swap,
+        .swap_size_mb = options.swap_size_mb,
+    });
 }
 
 test "isWholeDiskLinuxPartition accepts the exact shape ensureFormatted writes" {
@@ -429,9 +594,9 @@ test "isWholeDiskLinuxPartition accepts the exact shape ensureFormatted writes" 
     _ = &table;
 }
 
-fn writeDeviceId(io: std.Io, dir: std.Io.Dir, guid: []const u8) !void {
+fn writeDeviceId(io: std.Io, dir: std.Io.Dir, device_guid: []const u8) !void {
     var buf: [64]u8 = undefined;
-    const content = try std.fmt.bufPrint(&buf, "{{{s}}}\n", .{guid});
+    const content = try std.fmt.bufPrint(&buf, "{{{s}}}\n", .{device_guid});
     try dir.writeFile(io, .{ .sub_path = "device_id", .data = content });
 }
 
@@ -581,6 +746,42 @@ test "ensureFormatted rejects a disk too small to hold the aligned partition" {
     try file.setLength(io, 1024 * 1024);
 
     try std.testing.expectError(error.DiskTooSmall, ensureFormatted(io, allocator, file, partition_start_lba, 0));
+}
+
+test "partitionDevicePath handles conventional and digit-ending disk names" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("/dev/sdb1", try partitionDevicePath(&buf, "sdb"));
+    try std.testing.expectEqualStrings("/dev/nvme0n1p1", try partitionDevicePath(&buf, "nvme0n1"));
+}
+
+test "mount status distinguishes exact, occupied, and free targets" {
+    const mounts =
+        \\/dev/sda2 / ext4 rw 0 0
+        \\/dev/sdb1 /d ext4 rw 0 0
+        \\/dev/sdc1 /e ext4 rw 0 0
+    ;
+    try std.testing.expectEqual(MountStatus.exact, mountStatusFromContent(mounts, "/dev/sdb1", "/d"));
+    try std.testing.expectEqual(MountStatus.occupied, mountStatusFromContent(mounts, "/dev/sdb1", "/e"));
+    try std.testing.expectEqual(MountStatus.occupied, mountStatusFromContent(mounts, "/dev/sdd1", "/d"));
+    try std.testing.expectEqual(MountStatus.unmounted, mountStatusFromContent(mounts, "/dev/sdd1", "/f"));
+}
+
+test "GPT resource formatting supports a whole-disk ext4 partition" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const total_sectors: u64 = (64 * 1024 * 1024) / gpt.sector_size;
+    const file = try tmp.dir.createFile(io, "resource-gpt.img", .{ .truncate = true, .read = true });
+    defer file.close(io);
+    try file.setLength(io, total_sectors * gpt.sector_size);
+    try ensureFormattedGpt(io, allocator, file, total_sectors, 1_700_000_000);
+    try std.testing.expect(isWholeDiskGptExt4(io, allocator, file, total_sectors));
+
+    const grown_sectors = total_sectors + 2048;
+    try file.setLength(io, grown_sectors * gpt.sector_size);
+    try std.testing.expect(!isWholeDiskGptExt4(io, allocator, file, grown_sectors));
 }
 
 test "writeDataLossWarning writes the warning file under a scoped directory" {
