@@ -66,8 +66,8 @@ jobs:
           mkdir -p dist
           set -o pipefail
           zig build generalized-azurelinux4 -- \
-            --work-dir "$WORK_DIR" \
-            --output "dist/$ASSET_NAME" 2>&1 | tee "$RUNNER_TEMP/azurelinux4-build.log"
+            --work-dir "$GITHUB_WORKSPACE/$WORK_DIR" \
+            --output "$GITHUB_WORKSPACE/dist/$ASSET_NAME" 2>&1 | tee "$RUNNER_TEMP/azurelinux4-build.log"
 
       - name: Validate release image
         run: |
