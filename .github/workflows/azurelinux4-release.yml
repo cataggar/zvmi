@@ -39,6 +39,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends dnf file jq qemu-utils
+          # Ubuntu defaults to ~/.rpmdb; use the database shipped in the Azure Linux rootfs.
+          echo '%_dbpath /usr/lib/sysimage/rpm' | sudo tee /root/.rpmmacros
+          test "$(sudo rpm --eval '%{_dbpath}')" = /usr/lib/sysimage/rpm
 
       - name: Verify target release
         env:
