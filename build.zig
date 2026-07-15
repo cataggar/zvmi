@@ -1,5 +1,18 @@
 const std = @import("std");
 
+const image_build = @import("build/image.zig");
+
+pub const ImageFormat = image_build.Format;
+pub const ImageGeneration = image_build.Generation;
+pub const ImageBootMode = image_build.BootMode;
+pub const ImageUkiOptions = image_build.UkiOptions;
+pub const ImageContainer = image_build.Container;
+pub const ImageInput = image_build.Input;
+pub const ImageOutput = image_build.Output;
+pub const ImageOptions = image_build.Options;
+pub const ImageResult = image_build.Result;
+pub const addImage = image_build.add;
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -78,6 +91,40 @@ pub fn build(b: *std.Build) void {
 
     const cli_tests = b.addTest(.{ .root_module = cli_exe.root_module });
     const run_cli_tests = b.addRunArtifact(cli_tests);
+
+    // Host-only image builder used by the exported `addImage` build helper.
+    // It remains executable even when the dependency is configured for a
+    // foreign guest target.
+    const host_zvmi_mod = b.createModule(.{
+        .root_source_file = b.path("packages/zvmi/src/root.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    const image_builder_exe = b.addExecutable(.{
+        .name = "zvmi-image-builder",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cli/src/image_builder.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zvmi", .module = host_zvmi_mod },
+            },
+        }),
+    });
+    b.installArtifact(image_builder_exe);
+
+    const input_validator_mod = b.createModule(.{
+        .root_source_file = b.path("cli/src/input_validator.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    const input_validator_exe = b.addExecutable(.{
+        .name = "zvmi-input-validator",
+        .root_module = input_validator_mod,
+    });
+    b.installArtifact(input_validator_exe);
+    const input_validator_tests = b.addTest(.{ .root_module = input_validator_mod });
+    const run_input_validator_tests = b.addRunArtifact(input_validator_tests);
 
     // ---- qmp: native Zig QEMU Machine Protocol (QMP) client ----
     const qmp_mod = b.addModule("qmp", .{
@@ -242,6 +289,14 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run all tests");
 
+    const build_api_consumer_check = b.addSystemCommand(&.{
+        b.graph.zig_exe,
+        "build",
+        "--help",
+    });
+    build_api_consumer_check.setName("check external build.zig consumer");
+    build_api_consumer_check.setCwd(b.path("tests/build_api_consumer"));
+
     // ---- scripts/build_generalized_azurelinux4.zig: generalized Azure Linux 4
     // QCOW2 builder, replacing scripts/build-generalized-azurelinux4.py.
     // Linux-specific: the full pipeline (dnf, sudo chroot, qemu-img) is only
@@ -346,6 +401,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_wireserver_tests.step);
     test_step.dependOn(&run_azagent_tests.step);
     test_step.dependOn(&run_cli_tests.step);
+    test_step.dependOn(&run_input_validator_tests.step);
     test_step.dependOn(&run_qmp_mod_tests.step);
     test_step.dependOn(&run_qmp_exe_tests.step);
     test_step.dependOn(&run_qmp_codegen_tests.step);
@@ -357,4 +413,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_qcow2_mod_tests.step);
     test_step.dependOn(&run_qcow2_exe_tests.step);
     test_step.dependOn(&run_azinit_tests.step);
+    test_step.dependOn(&build_api_consumer_check.step);
 }
