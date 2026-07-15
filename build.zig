@@ -49,6 +49,15 @@ pub fn build(b: *std.Build) void {
     const wireserver_tests = b.addTest(.{ .root_module = wireserver_mod });
     const run_wireserver_tests = b.addRunArtifact(wireserver_tests);
 
+    // ---- qemu/host.zig: shared host-side QEMU and OVMF discovery ----
+    const qemu_host_mod = b.addModule("qemu_host", .{
+        .root_source_file = b.path("qemu/host.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const qemu_host_tests = b.addTest(.{ .root_module = qemu_host_mod });
+    const run_qemu_host_tests = b.addRunArtifact(qemu_host_tests);
+
     // ---- azagent: minimal guest provisioning agent for first-boot Azure
     // VM setup (issue #112). Statically linked for self-containment
     // (matching azinit's philosophy), but -- unlike azinit, which is
@@ -87,6 +96,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "zvmi", .module = zvmi_mod },
+                .{ .name = "qemu_host", .module = qemu_host_mod },
             },
         }),
     });
@@ -252,6 +262,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "zvmi", .module = zvmi_mod },
             .{ .name = "qmp", .module = qmp_mod },
+            .{ .name = "qemu_host", .module = qemu_host_mod },
         },
     }) });
     const run_boot_smoke_tests = b.addRunArtifact(boot_smoke_tests);
@@ -503,6 +514,7 @@ pub fn build(b: *std.Build) void {
 
     test_step.dependOn(&run_zvmi_tests.step);
     test_step.dependOn(&run_wireserver_tests.step);
+    test_step.dependOn(&run_qemu_host_tests.step);
     test_step.dependOn(&run_azagent_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_preserved_image_builder_tests.step);
