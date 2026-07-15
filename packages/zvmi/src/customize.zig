@@ -1,7 +1,7 @@
 //! Versioned image-customization request, planning, preflight, execution, and
-//! provenance API. The v1 executor intentionally covers the existing native
-//! ISO+OCI fresh-image backend; later customization backends extend the typed
-//! policies without changing v1 semantics.
+//! provenance API. The current executor covers the native ISO+OCI fresh-image
+//! backend; later customization backends extend the typed policies through
+//! explicitly versioned contracts.
 
 const std = @import("std");
 const Io = std.Io;
@@ -16,11 +16,13 @@ const gpt = @import("gpt.zig");
 const guid = @import("guid.zig");
 const image_mod = @import("image.zig");
 const layout = @import("layout.zig");
+const os_customization = @import("os_customization.zig");
+const customization_wire = @import("customization_wire.zig");
 const verity = @import("verity.zig");
 
-pub const current_api_version: u32 = 1;
-pub const plan_schema_version: u32 = 1;
-pub const provenance_schema_version: u32 = 1;
+pub const current_api_version: u32 = customization_wire.api_version;
+pub const plan_schema_version: u32 = 2;
+pub const provenance_schema_version: u32 = 2;
 const mib: u64 = 1024 * 1024;
 
 pub const Architecture = bootconfig.Architecture;
@@ -112,7 +114,20 @@ pub const StoragePolicy = union(enum) {
     preserve: void,
 };
 
-pub const OsCustomization = struct {};
+pub const OsCustomization = os_customization.OsCustomization;
+pub const FilesystemOperation = os_customization.FilesystemOperation;
+pub const PutFile = os_customization.PutFile;
+pub const PutDirectory = os_customization.PutDirectory;
+pub const PutSymlink = os_customization.PutSymlink;
+pub const FileSource = os_customization.FileSource;
+pub const Metadata = os_customization.Metadata;
+pub const MetadataChange = os_customization.MetadataChange;
+pub const Group = os_customization.Group;
+pub const User = os_customization.User;
+pub const Password = os_customization.Password;
+pub const Service = os_customization.Service;
+pub const ServiceState = os_customization.ServiceState;
+pub const KernelModule = os_customization.KernelModule;
 
 pub const UkiOptions = struct {
     stub_source_path: ?[]const u8 = null,
@@ -128,10 +143,8 @@ pub const BootSecurityPolicy = struct {
     uki: UkiOptions = .{},
 };
 
-pub const GeneralizationPolicy = enum {
-    none,
-    azure,
-};
+pub const AzureGeneralization = os_customization.AzureGeneralization;
+pub const GeneralizationPolicy = os_customization.GeneralizationPolicy;
 
 pub const ExecutionBackend = enum {
     native,
@@ -189,6 +202,7 @@ pub const DiagnosticCode = enum {
     unsupported_output_format,
     incompatible_boot_policy,
     unsupported_generalization,
+    invalid_customization,
     unsupported_execution_backend,
     incompatible_architecture,
     invalid_workspace,
@@ -288,7 +302,7 @@ pub fn validate(allocator: Allocator, request: *const Request) Allocator.Error!D
             .unsupported_input,
             "/input/disk",
             "preserved disk inputs require the later existing-image backend",
-            "use an ISO+OCI input for v1 or wait for the preserved-image backend",
+            "use an ISO+OCI input for the native backend or wait for the preserved-image backend",
         )),
     }
 
@@ -305,7 +319,7 @@ pub fn validate(allocator: Allocator, request: *const Request) Allocator.Error!D
         try diagnostics.append(validationError(
             .unsupported_output_format,
             "/output/format",
-            "COSI is modeled but is not yet supported by the v1 ISO+OCI executor",
+            "COSI is modeled but is not yet supported by the native ISO+OCI executor",
             "select raw, vhd, vhdx, or qcow2",
         ));
     }
@@ -369,23 +383,17 @@ pub fn validate(allocator: Allocator, request: *const Request) Allocator.Error!D
             .unsupported_storage,
             "/storage/preserve",
             "preserved storage requires the later existing-image mutation backend",
-            "use fresh storage for v1",
+            "use fresh storage for the native backend",
         )),
     }
 
-    if (request.generalization != .none) {
-        try diagnostics.append(validationError(
-            .unsupported_generalization,
-            "/generalization",
-            "generalization is modeled but not implemented by the v1 executor",
-            "set generalization to none",
-        ));
-    }
+    try validateOsCustomization(&diagnostics, request.os);
+    try validateGeneralization(&diagnostics, request.generalization);
     if (request.execution.backend != .native) {
         try diagnostics.append(validationError(
             .unsupported_execution_backend,
             "/execution/backend",
-            "only the unprivileged native backend is implemented in v1",
+            "only the unprivileged native backend is implemented",
             "set execution.backend to native",
         ));
     }
@@ -405,7 +413,7 @@ pub fn validate(allocator: Allocator, request: *const Request) Allocator.Error!D
             try diagnostics.append(validationError(
                 .path_conflict,
                 "/execution/workspace_path",
-                "the v1 native workspace must be the output directory so publication is atomic",
+                "the native workspace must be the output directory so publication is atomic",
                 "set workspace_path to the parent directory of output.path",
             ));
         }
@@ -443,6 +451,243 @@ pub fn validate(allocator: Allocator, request: *const Request) Allocator.Error!D
     }
 
     return .{ .items = try diagnostics.toOwnedSlice() };
+}
+
+fn validateOsCustomization(
+    diagnostics: *std.array_list.Managed(Diagnostic),
+    customization: OsCustomization,
+) Allocator.Error!void {
+    for (customization.filesystem) |operation| {
+        const path = switch (operation) {
+            .put_file => |value| value.path,
+            .put_directory => |value| value.path,
+            .put_symlink => |value| value.path,
+            .remove => |value| value,
+            .set_metadata => |value| value.path,
+        };
+        if (!validImagePath(path)) {
+            try diagnostics.append(validationError(
+                .invalid_customization,
+                "/os/filesystem/path",
+                "filesystem customization paths must be normalized absolute image paths",
+                "use a path such as /etc/example without empty, dot, or dot-dot components",
+            ));
+        }
+        switch (operation) {
+            .put_file => |file| {
+                if (file.source == .host_path and file.source.host_path.len == 0) {
+                    try diagnostics.append(validationError(
+                        .invalid_customization,
+                        "/os/filesystem/put_file/source/host_path",
+                        "host file source paths must not be empty",
+                        null,
+                    ));
+                }
+                try validateMetadata(diagnostics, file.metadata, "/os/filesystem/put_file/metadata");
+            },
+            .put_directory => |directory| try validateMetadata(
+                diagnostics,
+                directory.metadata,
+                "/os/filesystem/put_directory/metadata",
+            ),
+            .put_symlink => |link| {
+                if (link.target.len == 0 or std.mem.indexOfScalar(u8, link.target, 0) != null) {
+                    try diagnostics.append(validationError(
+                        .invalid_customization,
+                        "/os/filesystem/put_symlink/target",
+                        "symlink targets must not be empty or contain NUL",
+                        null,
+                    ));
+                }
+                try validateMetadata(diagnostics, link.metadata, "/os/filesystem/put_symlink/metadata");
+            },
+            .set_metadata => |change| {
+                if (change.mode) |mode| {
+                    if (mode & ~@as(u16, 0o7777) != 0) {
+                        try diagnostics.append(validationError(
+                            .invalid_customization,
+                            "/os/filesystem/set_metadata/mode",
+                            "file modes may contain only permission and special bits",
+                            null,
+                        ));
+                    }
+                }
+                if (change.xattrs) |xattrs| {
+                    try validateXattrs(diagnostics, xattrs, "/os/filesystem/set_metadata/xattrs");
+                }
+            },
+            .remove => {},
+        }
+    }
+
+    if (customization.hostname) |hostname| {
+        if (!validHostname(hostname)) {
+            try diagnostics.append(validationError(
+                .invalid_customization,
+                "/os/hostname",
+                "hostname must be a valid non-empty DNS-style name of at most 64 bytes",
+                null,
+            ));
+        }
+    }
+    for (customization.groups) |group| {
+        if (!validAccountName(group.name)) {
+            try diagnostics.append(validationError(.invalid_customization, "/os/groups/name", "group names must use portable account-name characters", null));
+        }
+        for (group.members) |member| {
+            if (!validAccountName(member)) {
+                try diagnostics.append(validationError(.invalid_customization, "/os/groups/members", "group members must use portable account-name characters", null));
+            }
+        }
+    }
+    for (customization.users) |user| {
+        if (!validAccountName(user.name)) {
+            try diagnostics.append(validationError(.invalid_customization, "/os/users/name", "user names must use portable account-name characters", null));
+        }
+        if (user.primary_group) |name| {
+            if (!validAccountName(name)) {
+                try diagnostics.append(validationError(.invalid_customization, "/os/users/primary_group", "primary group names must use portable account-name characters", null));
+            }
+        }
+        if (!validImagePath(user.home orelse "/home/default") or
+            user.shell.len == 0 or user.shell[0] != '/' or containsRecordDelimiter(user.shell))
+        {
+            try diagnostics.append(validationError(.invalid_customization, "/os/users", "user home and shell values must be safe absolute image paths", null));
+        }
+        switch (user.password) {
+            .locked => {},
+            .prehashed => |hash| {
+                if (!validPasswordHash(hash)) {
+                    try diagnostics.append(validationError(
+                        .invalid_customization,
+                        "/os/users/password/prehashed",
+                        "pre-hashed passwords must use a crypt-style $... value and contain no record delimiters",
+                        "provide a pre-hashed value or use the locked policy; plaintext passwords are not accepted",
+                    ));
+                }
+            },
+        }
+        for (user.secondary_groups) |name| {
+            if (!validAccountName(name)) {
+                try diagnostics.append(validationError(.invalid_customization, "/os/users/secondary_groups", "secondary group names must use portable account-name characters", null));
+            }
+        }
+        for (user.ssh_authorized_keys) |key| {
+            if (key.len == 0 or std.mem.indexOfAny(u8, key, "\r\n\x00") != null) {
+                try diagnostics.append(validationError(.invalid_customization, "/os/users/ssh_authorized_keys", "SSH authorized keys must each occupy one non-empty line", null));
+            }
+        }
+    }
+    for (customization.services) |service| {
+        if (!validConfigName(service.name)) {
+            try diagnostics.append(validationError(.invalid_customization, "/os/services/name", "service names must be safe systemd unit basenames", null));
+        }
+    }
+    for (customization.kernel_modules) |module| {
+        if (!validConfigName(module.name) or (module.load and module.disabled)) {
+            try diagnostics.append(validationError(.invalid_customization, "/os/kernel_modules", "kernel module names must be safe and cannot be loaded and disabled simultaneously", null));
+        }
+        if (module.options) |options| {
+            if (std.mem.indexOfAny(u8, options, "\r\n\x00") != null) {
+                try diagnostics.append(validationError(.invalid_customization, "/os/kernel_modules/options", "kernel module options must occupy one line", null));
+            }
+        }
+    }
+}
+
+fn validateGeneralization(
+    diagnostics: *std.array_list.Managed(Diagnostic),
+    policy: GeneralizationPolicy,
+) Allocator.Error!void {
+    switch (policy) {
+        .none => {},
+        .azure => |options| for (options.remove_users) |username| {
+            if (!validAccountName(username)) {
+                try diagnostics.append(validationError(
+                    .invalid_customization,
+                    "/generalization/azure/remove_users",
+                    "generalization user names must use portable account-name characters",
+                    null,
+                ));
+            }
+        },
+    }
+}
+
+fn validateMetadata(
+    diagnostics: *std.array_list.Managed(Diagnostic),
+    metadata: Metadata,
+    path: []const u8,
+) Allocator.Error!void {
+    if (metadata.mode & ~@as(u16, 0o7777) != 0) {
+        try diagnostics.append(validationError(.invalid_customization, path, "file modes may contain only permission and special bits", null));
+    }
+    try validateXattrs(diagnostics, metadata.xattrs, path);
+}
+
+fn validateXattrs(
+    diagnostics: *std.array_list.Managed(Diagnostic),
+    xattrs: []const ext4.Xattr,
+    path: []const u8,
+) Allocator.Error!void {
+    for (xattrs, 0..) |xattr, index| {
+        if (xattr.name.len == 0 or std.mem.indexOfScalar(u8, xattr.name, 0) != null) {
+            try diagnostics.append(validationError(.invalid_customization, path, "xattr names must not be empty or contain NUL", null));
+        }
+        for (xattrs[0..index]) |previous| {
+            if (std.mem.eql(u8, previous.name, xattr.name)) {
+                try diagnostics.append(validationError(.invalid_customization, path, "xattr names must be unique per operation", null));
+            }
+        }
+    }
+}
+
+fn validImagePath(path: []const u8) bool {
+    if (path.len < 2 or path[0] != '/' or path[1] == '/' or path[path.len - 1] == '/') return false;
+    var components = std.mem.splitScalar(u8, path[1..], '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or component.len > 255 or
+            std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..") or
+            std.mem.indexOfScalar(u8, component, 0) != null)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn validHostname(hostname: []const u8) bool {
+    if (hostname.len == 0 or hostname.len > 64 or hostname[0] == '.' or hostname[hostname.len - 1] == '.') return false;
+    var labels = std.mem.splitScalar(u8, hostname, '.');
+    while (labels.next()) |label| {
+        if (label.len == 0 or label.len > 63 or label[0] == '-' or label[label.len - 1] == '-') return false;
+        for (label) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '-') return false;
+    }
+    return true;
+}
+
+fn validAccountName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 32) return false;
+    for (name, 0..) |byte, index| {
+        if (std.ascii.isLower(byte) or byte == '_' or (index != 0 and (std.ascii.isDigit(byte) or byte == '-'))) continue;
+        return false;
+    }
+    return true;
+}
+
+fn validConfigName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 255 or name[0] == '.' or std.mem.indexOfAny(u8, name, "/\r\n\x00") != null) return false;
+    return true;
+}
+
+fn containsRecordDelimiter(value: []const u8) bool {
+    return std.mem.indexOfAny(u8, value, ":\r\n\x00") != null;
+}
+
+fn validPasswordHash(hash: []const u8) bool {
+    const value = if (std.mem.startsWith(u8, hash, "!")) hash[1..] else hash;
+    return value.len >= 3 and value[0] == '$' and std.mem.indexOfScalarPos(u8, value, 1, '$') != null and
+        !containsRecordDelimiter(value);
 }
 
 fn pathContains(parent: []const u8, child: []const u8) bool {
@@ -625,6 +870,7 @@ pub const Operation = struct {
 pub const CapabilityKind = enum {
     read_iso,
     read_container,
+    read_customization_file,
     write_workspace_parent,
     write_output_parent,
     output_absent,
@@ -740,7 +986,7 @@ pub fn resolve(
                 .phase = .resolution,
                 .code = .incompatible_architecture,
                 .configuration_path = "/architectures/firmware",
-                .message = "the v1 native backend uses image-architecture firmware assets",
+                .message = "the native backend uses image-architecture firmware assets",
                 .remediation = "set firmware_architecture to the target image architecture",
             });
         }
@@ -752,7 +998,7 @@ pub fn resolve(
                 .phase = .resolution,
                 .code = .incompatible_architecture,
                 .configuration_path = "/architectures/repository",
-                .message = "the v1 ISO+OCI backend requires target-architecture source content",
+                .message = "the native ISO+OCI backend requires target-architecture source content",
                 .remediation = "set repository_architecture to the target image architecture",
             });
         }
@@ -764,7 +1010,7 @@ pub fn resolve(
                 .phase = .resolution,
                 .code = .incompatible_architecture,
                 .configuration_path = "/architectures/runner",
-                .message = "the v1 native backend executes on the host architecture",
+                .message = "the native backend executes on the host architecture",
                 .remediation = "set runner_architecture to the host architecture",
             });
         }
@@ -787,7 +1033,7 @@ pub fn resolve(
             .phase = .resolution,
             .code = .path_conflict,
             .configuration_path = "/execution/workspace_path",
-            .message = "the resolved v1 native workspace must be the output directory so publication is atomic",
+            .message = "the resolved native workspace must be the output directory so publication is atomic",
             .remediation = "resolve workspace_path to the parent directory of output.path",
         });
     }
@@ -804,6 +1050,28 @@ pub fn resolve(
             .remediation = "resolve the output to a directory outside the ISO and container inputs",
         });
     }
+    for (request.os.filesystem) |operation| switch (operation) {
+        .put_file => |file| switch (file.source) {
+            .inline_bytes => {},
+            .host_path => |source_path| {
+                const checked_source_path = try std.fs.path.resolve(allocator, &.{ context.base_path, source_path });
+                defer allocator.free(checked_source_path);
+                if (std.mem.eql(u8, checked_output_path, checked_source_path) or
+                    pathContains(checked_source_path, checked_output_path))
+                {
+                    try resolution_diagnostics.append(.{
+                        .severity = .@"error",
+                        .phase = .resolution,
+                        .code = .path_conflict,
+                        .configuration_path = "/os/filesystem/put_file/source/host_path",
+                        .message = "the resolved output path must not alias or be contained by a customization source path",
+                        .remediation = "place customization sources outside the output location",
+                    });
+                }
+            },
+        },
+        else => {},
+    };
     if (resolution_diagnostics.items.len != 0) {
         allocator.free(diagnostics.items);
         return .{
@@ -856,6 +1124,8 @@ pub fn resolve(
         .ext4_label = try plan_allocator.dupe(u8, storage.ext4_label),
         .skip_iso_rootfs = storage.skip_iso_rootfs,
     };
+    const resolved_os = try dupeOsCustomization(plan_allocator, request.os, context.base_path);
+    const resolved_generalization = try dupeGeneralization(plan_allocator, request.generalization);
     const resolved_boot = try dupeBootPolicy(plan_allocator, request.boot_security);
     const operations = try buildOperations(plan_allocator, resolved_boot, resolved_storage.generation);
     const capabilities = try buildCapabilities(
@@ -864,6 +1134,7 @@ pub fn resolve(
         resolved_output,
         resolved_execution,
         transaction_path,
+        resolved_os,
     );
 
     var data = ResolvedPlanData{
@@ -878,9 +1149,9 @@ pub fn resolve(
         .input = resolved_input,
         .output = resolved_output,
         .storage = resolved_storage,
-        .os = request.os,
+        .os = resolved_os,
         .boot_security = resolved_boot,
-        .generalization = request.generalization,
+        .generalization = resolved_generalization,
         .execution = resolved_execution,
         .reproducibility = request.reproducibility,
         .transaction_path = transaction_path,
@@ -898,6 +1169,143 @@ pub fn resolve(
     return .{
         .diagnostics = diagnostics,
         .plan = .{ .arena = arena, .data = data_ptr },
+    };
+}
+
+fn dupeOsCustomization(
+    allocator: Allocator,
+    customization: OsCustomization,
+    base_path: ?[]const u8,
+) Allocator.Error!OsCustomization {
+    const filesystem = try allocator.alloc(FilesystemOperation, customization.filesystem.len);
+    for (customization.filesystem, 0..) |operation, index| {
+        filesystem[index] = switch (operation) {
+            .put_file => |file| .{ .put_file = .{
+                .path = try allocator.dupe(u8, file.path),
+                .source = switch (file.source) {
+                    .inline_bytes => |bytes| .{ .inline_bytes = try allocator.dupe(u8, bytes) },
+                    .host_path => |path| .{ .host_path = if (base_path) |base|
+                        try std.fs.path.resolve(allocator, &.{ base, path })
+                    else
+                        try allocator.dupe(u8, path) },
+                },
+                .metadata = try dupeMetadata(allocator, file.metadata),
+            } },
+            .put_directory => |directory| .{ .put_directory = .{
+                .path = try allocator.dupe(u8, directory.path),
+                .metadata = try dupeMetadata(allocator, directory.metadata),
+            } },
+            .put_symlink => |link| .{ .put_symlink = .{
+                .path = try allocator.dupe(u8, link.path),
+                .target = try allocator.dupe(u8, link.target),
+                .metadata = try dupeMetadata(allocator, link.metadata),
+            } },
+            .remove => |path| .{ .remove = try allocator.dupe(u8, path) },
+            .set_metadata => |change| .{ .set_metadata = .{
+                .path = try allocator.dupe(u8, change.path),
+                .mode = change.mode,
+                .uid = change.uid,
+                .gid = change.gid,
+                .xattrs = if (change.xattrs) |xattrs| try dupeXattrs(allocator, xattrs) else null,
+            } },
+        };
+    }
+
+    const groups = try allocator.alloc(Group, customization.groups.len);
+    for (customization.groups, 0..) |group, index| {
+        groups[index] = .{
+            .name = try allocator.dupe(u8, group.name),
+            .gid = group.gid,
+            .members = try dupeStrings(allocator, group.members),
+        };
+    }
+    const users = try allocator.alloc(User, customization.users.len);
+    for (customization.users, 0..) |user, index| {
+        users[index] = .{
+            .name = try allocator.dupe(u8, user.name),
+            .uid = user.uid,
+            .gid = user.gid,
+            .primary_group = if (user.primary_group) |value| try allocator.dupe(u8, value) else null,
+            .secondary_groups = try dupeStrings(allocator, user.secondary_groups),
+            .home = if (user.home) |value| try allocator.dupe(u8, value) else null,
+            .shell = try allocator.dupe(u8, user.shell),
+            .password = switch (user.password) {
+                .locked => .locked,
+                .prehashed => |value| .{ .prehashed = try allocator.dupe(u8, value) },
+            },
+            .ssh_authorized_keys = try dupeStrings(allocator, user.ssh_authorized_keys),
+            .passwordless_sudo = user.passwordless_sudo,
+        };
+    }
+    const services = try allocator.alloc(Service, customization.services.len);
+    for (customization.services, 0..) |service, index| {
+        services[index] = .{
+            .name = try allocator.dupe(u8, service.name),
+            .state = service.state,
+        };
+    }
+    const modules = try allocator.alloc(KernelModule, customization.kernel_modules.len);
+    for (customization.kernel_modules, 0..) |module, index| {
+        modules[index] = .{
+            .name = try allocator.dupe(u8, module.name),
+            .load = module.load,
+            .disabled = module.disabled,
+            .options = if (module.options) |value| try allocator.dupe(u8, value) else null,
+        };
+    }
+    return .{
+        .filesystem = filesystem,
+        .hostname = if (customization.hostname) |value| try allocator.dupe(u8, value) else null,
+        .groups = groups,
+        .users = users,
+        .services = services,
+        .kernel_modules = modules,
+    };
+}
+
+fn dupeMetadata(allocator: Allocator, metadata: Metadata) Allocator.Error!Metadata {
+    return .{
+        .mode = metadata.mode,
+        .uid = metadata.uid,
+        .gid = metadata.gid,
+        .xattrs = try dupeXattrs(allocator, metadata.xattrs),
+    };
+}
+
+fn dupeXattrs(allocator: Allocator, xattrs: []const ext4.Xattr) Allocator.Error![]const ext4.Xattr {
+    const owned = try allocator.alloc(ext4.Xattr, xattrs.len);
+    for (xattrs, 0..) |xattr, index| {
+        owned[index] = .{
+            .name = try allocator.dupe(u8, xattr.name),
+            .value = try allocator.dupe(u8, xattr.value),
+        };
+    }
+    return owned;
+}
+
+fn dupeStrings(allocator: Allocator, values: []const []const u8) Allocator.Error![]const []const u8 {
+    const owned = try allocator.alloc([]const u8, values.len);
+    for (values, 0..) |value, index| owned[index] = try allocator.dupe(u8, value);
+    return owned;
+}
+
+fn dupeGeneralization(
+    allocator: Allocator,
+    policy: GeneralizationPolicy,
+) Allocator.Error!GeneralizationPolicy {
+    return switch (policy) {
+        .none => .none,
+        .azure => |options| .{ .azure = .{
+            .reset_hostname = options.reset_hostname,
+            .clear_machine_id = options.clear_machine_id,
+            .remove_ssh_host_keys = options.remove_ssh_host_keys,
+            .remove_agent_state = options.remove_agent_state,
+            .remove_dhcp_leases = options.remove_dhcp_leases,
+            .remove_logs = options.remove_logs,
+            .remove_caches = options.remove_caches,
+            .clear_random_seed = options.clear_random_seed,
+            .remove_users = try dupeStrings(allocator, options.remove_users),
+        } },
     };
 }
 
@@ -991,12 +1399,32 @@ fn buildCapabilities(
     output: ResolvedOutput,
     execution: ExecutionPolicy,
     transaction_path: []const u8,
+    customization: OsCustomization,
 ) Allocator.Error![]CapabilityRequirement {
     var capabilities = std.array_list.Managed(CapabilityRequirement).init(allocator);
     defer capabilities.deinit();
 
     try capabilities.append(.{ .kind = .read_iso, .path = input.iso_path, .reason = "read the source ISO" });
     try capabilities.append(.{ .kind = .read_container, .path = input.container_path, .reason = "read the source OCI layout or archive" });
+    for (customization.filesystem) |operation| switch (operation) {
+        .put_file => |file| switch (file.source) {
+            .host_path => |path| {
+                try capabilities.append(.{
+                    .kind = .read_customization_file,
+                    .path = path,
+                    .reason = "read a declared customization file",
+                });
+                try capabilities.append(.{
+                    .kind = .path_isolation,
+                    .path = output.path,
+                    .related_path = path,
+                    .reason = "keep the output distinct from customization source files",
+                });
+            },
+            .inline_bytes => {},
+        },
+        else => {},
+    };
     try capabilities.append(.{
         .kind = .path_isolation,
         .path = output.path,
@@ -1127,6 +1555,7 @@ fn hashPlan(plan: ResolvedPlanData) Digest {
     hashInt(&hash, plan.storage.esp_size);
     hashString(&hash, plan.storage.ext4_label);
     hashBool(&hash, plan.storage.skip_iso_rootfs);
+    hashOsCustomization(&hash, plan.os);
     hashInt(&hash, @intFromEnum(plan.boot_security.boot_mode));
     hashBool(&hash, plan.boot_security.verity);
     hashString(&hash, plan.boot_security.extra_kernel_options);
@@ -1134,7 +1563,7 @@ fn hashPlan(plan: ResolvedPlanData) Digest {
     hashOptionalString(&hash, plan.boot_security.uki.os_release_source_path);
     hashOptionalString(&hash, plan.boot_security.uki.splash_source_path);
     hashString(&hash, plan.boot_security.uki.output_directory);
-    hashInt(&hash, @intFromEnum(plan.generalization));
+    hashGeneralization(&hash, plan.generalization);
     hashString(&hash, plan.execution.workspace_path);
     hashInt(&hash, @intFromEnum(plan.execution.backend));
     hashBool(&hash, plan.execution.overwrite);
@@ -1172,10 +1601,133 @@ fn hashPlan(plan: ResolvedPlanData) Digest {
     return .{ .bytes = digest };
 }
 
+fn hashOsCustomization(hash: *std.crypto.hash.sha2.Sha256, customization: OsCustomization) void {
+    hashInt(hash, customization.filesystem.len);
+    for (customization.filesystem) |operation| {
+        hashInt(hash, @intFromEnum(std.meta.activeTag(operation)));
+        switch (operation) {
+            .put_file => |file| {
+                hashString(hash, file.path);
+                hashInt(hash, @intFromEnum(std.meta.activeTag(file.source)));
+                switch (file.source) {
+                    .inline_bytes => |bytes| hashString(hash, bytes),
+                    .host_path => |path| hashString(hash, path),
+                }
+                hashMetadata(hash, file.metadata);
+            },
+            .put_directory => |directory| {
+                hashString(hash, directory.path);
+                hashMetadata(hash, directory.metadata);
+            },
+            .put_symlink => |link| {
+                hashString(hash, link.path);
+                hashString(hash, link.target);
+                hashMetadata(hash, link.metadata);
+            },
+            .remove => |path| hashString(hash, path),
+            .set_metadata => |change| {
+                hashString(hash, change.path);
+                hashOptionalInt(hash, change.mode);
+                hashOptionalInt(hash, change.uid);
+                hashOptionalInt(hash, change.gid);
+                if (change.xattrs) |xattrs| {
+                    hash.update(&.{1});
+                    hashXattrs(hash, xattrs);
+                } else {
+                    hash.update(&.{0});
+                }
+            },
+        }
+    }
+    hashOptionalString(hash, customization.hostname);
+    hashInt(hash, customization.groups.len);
+    for (customization.groups) |group| {
+        hashString(hash, group.name);
+        hashOptionalInt(hash, group.gid);
+        hashStrings(hash, group.members);
+    }
+    hashInt(hash, customization.users.len);
+    for (customization.users) |user| {
+        hashString(hash, user.name);
+        hashOptionalInt(hash, user.uid);
+        hashOptionalInt(hash, user.gid);
+        hashOptionalString(hash, user.primary_group);
+        hashStrings(hash, user.secondary_groups);
+        hashOptionalString(hash, user.home);
+        hashString(hash, user.shell);
+        hashInt(hash, @intFromEnum(std.meta.activeTag(user.password)));
+        switch (user.password) {
+            .locked => {},
+            .prehashed => |value| hashString(hash, value),
+        }
+        hashStrings(hash, user.ssh_authorized_keys);
+        hashBool(hash, user.passwordless_sudo);
+    }
+    hashInt(hash, customization.services.len);
+    for (customization.services) |service| {
+        hashString(hash, service.name);
+        hashInt(hash, @intFromEnum(service.state));
+    }
+    hashInt(hash, customization.kernel_modules.len);
+    for (customization.kernel_modules) |module| {
+        hashString(hash, module.name);
+        hashBool(hash, module.load);
+        hashBool(hash, module.disabled);
+        hashOptionalString(hash, module.options);
+    }
+}
+
+fn hashMetadata(hash: *std.crypto.hash.sha2.Sha256, metadata: Metadata) void {
+    hashInt(hash, metadata.mode);
+    hashInt(hash, metadata.uid);
+    hashInt(hash, metadata.gid);
+    hashXattrs(hash, metadata.xattrs);
+}
+
+fn hashXattrs(hash: *std.crypto.hash.sha2.Sha256, xattrs: []const ext4.Xattr) void {
+    hashInt(hash, xattrs.len);
+    for (xattrs) |xattr| {
+        hashString(hash, xattr.name);
+        hashString(hash, xattr.value);
+    }
+}
+
+fn hashStrings(hash: *std.crypto.hash.sha2.Sha256, values: []const []const u8) void {
+    hashInt(hash, values.len);
+    for (values) |value| hashString(hash, value);
+}
+
+fn hashGeneralization(hash: *std.crypto.hash.sha2.Sha256, policy: GeneralizationPolicy) void {
+    hashInt(hash, @intFromEnum(std.meta.activeTag(policy)));
+    switch (policy) {
+        .none => {},
+        .azure => |options| {
+            hashBool(hash, options.reset_hostname);
+            hashBool(hash, options.clear_machine_id);
+            hashBool(hash, options.remove_ssh_host_keys);
+            hashBool(hash, options.remove_agent_state);
+            hashBool(hash, options.remove_dhcp_leases);
+            hashBool(hash, options.remove_logs);
+            hashBool(hash, options.remove_caches);
+            hashBool(hash, options.clear_random_seed);
+            hashStrings(hash, options.remove_users);
+        },
+    }
+}
+
 fn hashInt(hash: *std.crypto.hash.sha2.Sha256, value: anytype) void {
     var bytes: [8]u8 = undefined;
     std.mem.writeInt(u64, &bytes, @intCast(value), .big);
     hash.update(&bytes);
+}
+
+fn hashOptionalInt(hash: *std.crypto.hash.sha2.Sha256, value: anytype) void {
+    if (value) |present| {
+        hash.update(&.{1});
+        hashInt(hash, present);
+    } else {
+        hash.update(&.{0});
+    }
 }
 
 fn hashBool(hash: *std.crypto.hash.sha2.Sha256, value: bool) void {
@@ -1303,6 +1855,7 @@ fn systemCapabilityCheck(_: ?*anyopaque, io: Io, requirement: CapabilityRequirem
     return switch (requirement.kind) {
         .read_iso => if (isReadableKind(cwd, io, requirement.path, .file)) .available else .missing,
         .read_container => if (isReadablePath(cwd, io, requirement.path)) .available else .missing,
+        .read_customization_file => if (isReadableKind(cwd, io, requirement.path, .file)) .available else .missing,
         .write_workspace_parent => if (canCreatePath(cwd, io, requirement.path)) .available else .missing,
         .write_output_parent => if (canCreatePath(cwd, io, requirement.path)) .available else .missing,
         .output_absent, .transaction_absent => if (pathAbsent(cwd, io, requirement.path)) .available else .missing,
@@ -1397,6 +1950,7 @@ fn pathAbsent(dir: Io.Dir, io: Io, path: []const u8) bool {
 pub const SourceKind = enum {
     iso,
     container,
+    customization_file,
 };
 
 pub const SourceRecord = struct {
@@ -1465,6 +2019,7 @@ pub const PartitionStyleRecord = struct {
 
 pub const ExecutionRecord = struct {
     rootfs_path_in_iso: []const u8,
+    root_tree_digest: ?Digest,
     partitions: []const PartitionRecord,
     verity: ?VerityRecord,
     vhd_alignment: ?azure.FixupResult,
@@ -1594,6 +2149,7 @@ fn buildResult(
     report: ?*const build_image.BuildImageReport,
     iso_digest: Digest,
     container_digest: Digest,
+    customization_digests: []const SourceRecord,
     output_digest: Digest,
     output_file_size: u64,
 ) Allocator.Error!Result {
@@ -1607,9 +2163,16 @@ fn buildResult(
         .container_path = try result_allocator.dupe(u8, plan.data.input.container_path),
         .rootfs_path_in_iso = try result_allocator.dupe(u8, plan.data.input.rootfs_path_in_iso),
     };
-    const sources = try result_allocator.alloc(SourceRecord, 2);
+    const sources = try result_allocator.alloc(SourceRecord, 2 + customization_digests.len);
     sources[0] = .{ .kind = .iso, .path = input.iso_path, .sha256 = iso_digest };
     sources[1] = .{ .kind = .container, .path = input.container_path, .sha256 = container_digest };
+    for (customization_digests, 0..) |source, index| {
+        sources[index + 2] = .{
+            .kind = .customization_file,
+            .path = try result_allocator.dupe(u8, source.path),
+            .sha256 = source.sha256,
+        };
+    }
     const resolved_output = ResolvedOutput{
         .path = output_path,
         .format = plan.data.output.format,
@@ -1628,6 +2191,8 @@ fn buildResult(
         .overwrite = plan.data.execution.overwrite,
     };
     const resolved_boot = try dupeBootPolicy(result_allocator, plan.data.boot_security);
+    const resolved_os = try dupeOsCustomization(result_allocator, plan.data.os, null);
+    const resolved_generalization = try dupeGeneralization(result_allocator, plan.data.generalization);
     const operations = try dupeOperations(result_allocator, plan.data.operations);
     const partitions = if (report) |build_report| blk: {
         const records = try result_allocator.alloc(PartitionRecord, build_report.planned_partitions.len);
@@ -1680,9 +2245,9 @@ fn buildResult(
                 .input = input,
                 .output = resolved_output,
                 .storage = resolved_storage,
-                .os = plan.data.os,
+                .os = resolved_os,
                 .boot_security = resolved_boot,
-                .generalization = plan.data.generalization,
+                .generalization = resolved_generalization,
                 .execution = resolved_execution,
                 .operations = operations,
             },
@@ -1691,6 +2256,10 @@ fn buildResult(
             .tools = &.{},
             .execution = .{
                 .rootfs_path_in_iso = actual_rootfs_path,
+                .root_tree_digest = if (report) |build_report|
+                    if (build_report.root_tree_digest) |digest| .{ .bytes = digest } else null
+                else
+                    null,
                 .partitions = partitions,
                 .verity = verity_record,
                 .vhd_alignment = if (report) |build_report| build_report.vhd_alignment else null,
@@ -1769,6 +2338,12 @@ pub fn execute(
         emitDiagnostics(event_sink, diagnostics.items);
         return try failureOutcome(allocator, diagnostics.items);
     };
+    const customization_digests_before = hashCustomizationSources(allocator, io, plan.data.os) catch |err| {
+        try appendFailure(&diagnostics, .source_hash_failed, .execution, "/os/filesystem", "failed to hash a customization source file", err);
+        emitDiagnostics(event_sink, diagnostics.items);
+        return try failureOutcome(allocator, diagnostics.items);
+    };
+    defer allocator.free(customization_digests_before);
 
     const cwd = Io.Dir.cwd();
     cwd.createDirPath(io, plan.data.execution.workspace_path) catch |err| {
@@ -1808,8 +2383,16 @@ pub fn execute(
         emitDiagnostics(event_sink, diagnostics.items);
         return try failureOutcome(allocator, diagnostics.items);
     };
+    const customization_digests_after = hashCustomizationSources(allocator, io, plan.data.os) catch |err| {
+        try appendFailure(&diagnostics, .source_hash_failed, .execution, "/os/filesystem", "failed to verify a customization source hash", err);
+        if (cleanupTransaction(io, plan.data.transaction_path)) |diagnostic| try diagnostics.append(diagnostic);
+        emitDiagnostics(event_sink, diagnostics.items);
+        return try failureOutcome(allocator, diagnostics.items);
+    };
+    defer allocator.free(customization_digests_after);
     if (!std.mem.eql(u8, &iso_digest_before.bytes, &iso_digest_after.bytes) or
-        !std.mem.eql(u8, &container_digest_before.bytes, &container_digest_after.bytes))
+        !std.mem.eql(u8, &container_digest_before.bytes, &container_digest_after.bytes) or
+        !sourceRecordsEqual(customization_digests_before, customization_digests_after))
     {
         try diagnostics.append(.{
             .severity = .@"error",
@@ -1843,6 +2426,7 @@ pub fn execute(
         if (report) |*build_report| build_report else null,
         iso_digest_before,
         container_digest_before,
+        customization_digests_before,
         output_digest,
         output_file_size,
     );
@@ -1951,6 +2535,8 @@ fn buildOptionsFromPlan(plan: *const ResolvedPlan, bridge: *BuildEventBridge) bu
         .output_format = plan.data.output.format.imageFormat().?,
         .rootfs_path_in_iso = plan.data.input.rootfs_path_in_iso,
         .skip_iso_rootfs = plan.data.storage.skip_iso_rootfs,
+        .os = plan.data.os,
+        .generalization = plan.data.generalization,
         .esp_size = plan.data.storage.esp_size,
         .ext4_label = plan.data.storage.ext4_label,
         .verity = plan.data.boot_security.verity,
@@ -2072,6 +2658,49 @@ const HashEntry = struct {
     path: []u8,
     kind: Io.File.Kind,
 };
+
+fn hashCustomizationSources(
+    allocator: Allocator,
+    io: Io,
+    customization: OsCustomization,
+) ![]SourceRecord {
+    var records = std.array_list.Managed(SourceRecord).init(allocator);
+    errdefer records.deinit();
+    for (customization.filesystem) |operation| switch (operation) {
+        .put_file => |file| switch (file.source) {
+            .inline_bytes => {},
+            .host_path => |path| {
+                var already_recorded = false;
+                for (records.items) |record| {
+                    if (std.mem.eql(u8, record.path, path)) {
+                        already_recorded = true;
+                        break;
+                    }
+                }
+                if (!already_recorded) try records.append(.{
+                    .kind = .customization_file,
+                    .path = path,
+                    .sha256 = try hashPath(allocator, io, path),
+                });
+            },
+        },
+        else => {},
+    };
+    return records.toOwnedSlice();
+}
+
+fn sourceRecordsEqual(left: []const SourceRecord, right: []const SourceRecord) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |left_record, right_record| {
+        if (left_record.kind != right_record.kind or
+            !std.mem.eql(u8, left_record.path, right_record.path) or
+            !std.mem.eql(u8, &left_record.sha256.bytes, &right_record.sha256.bytes))
+        {
+            return false;
+        }
+    }
+    return true;
+}
 
 fn hashPath(allocator: Allocator, io: Io, path: []const u8) !Digest {
     const stat = try Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
@@ -2279,6 +2908,91 @@ test "validation rejects guaranteed-invalid filesystem and partition geometries"
             (diagnostic.cause != null and std.mem.eql(u8, diagnostic.cause.?.error_name, "FilesystemTooLarge"));
     }
     try std.testing.expect(saw_huge_verity_limit);
+}
+
+test "validation rejects unsafe customization values and plaintext-shaped password hashes" {
+    var request = validRequest();
+    const operations = [_]FilesystemOperation{
+        .{ .put_file = .{
+            .path = "etc/not-absolute",
+            .source = .{ .inline_bytes = "value" },
+        } },
+        .{ .set_metadata = .{
+            .path = "/etc/example",
+            .mode = 0o10000,
+        } },
+    };
+    const users = [_]User{.{
+        .name = "Invalid User",
+        .password = .{ .prehashed = "plaintext" },
+        .ssh_authorized_keys = &.{"line1\nline2"},
+    }};
+    request.os = .{
+        .filesystem = &operations,
+        .hostname = "-invalid",
+        .users = &users,
+    };
+
+    var diagnostics = try validate(std.testing.allocator, &request);
+    defer diagnostics.deinit(std.testing.allocator);
+    var customization_errors: usize = 0;
+    for (diagnostics.items) |diagnostic| {
+        customization_errors += @intFromBool(diagnostic.code == .invalid_customization);
+    }
+    try std.testing.expect(customization_errors >= 6);
+}
+
+test "resolved customization deeply owns nested content and contributes to plan integrity" {
+    var inline_bytes = "original".*;
+    var hostname = "owned-vm".*;
+    var key = "ssh-ed25519 AAAA original".*;
+    const operations = [_]FilesystemOperation{.{ .put_file = .{
+        .path = "/etc/owned",
+        .source = .{ .inline_bytes = &inline_bytes },
+    } }};
+    const users = [_]User{.{
+        .name = "alice",
+        .ssh_authorized_keys = &.{&key},
+    }};
+    var request = validRequest();
+    request.os = .{
+        .filesystem = &operations,
+        .hostname = &hostname,
+        .users = &users,
+    };
+
+    var resolved = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer resolved.deinit(std.testing.allocator);
+    const original_hash = resolved.plan.?.data.plan_hash;
+    inline_bytes[0] = 'X';
+    hostname[0] = 'X';
+    key[0] = 'X';
+
+    try std.testing.expectEqualStrings(
+        "original",
+        resolved.plan.?.data.os.filesystem[0].put_file.source.inline_bytes,
+    );
+    try std.testing.expectEqualStrings("owned-vm", resolved.plan.?.data.os.hostname.?);
+    try std.testing.expectEqualStrings(
+        "ssh-ed25519 AAAA original",
+        resolved.plan.?.data.os.users[0].ssh_authorized_keys[0],
+    );
+    try std.testing.expect(try hasValidPlanIntegrity(std.testing.allocator, &resolved.plan.?));
+    try std.testing.expectEqualSlices(u8, &original_hash.bytes, &resolved.plan.?.data.plan_hash.bytes);
+
+    var changed_request = validRequest();
+    const changed_operations = [_]FilesystemOperation{.{ .put_file = .{
+        .path = "/etc/owned",
+        .source = .{ .inline_bytes = "different" },
+    } }};
+    changed_request.os.filesystem = &changed_operations;
+    var changed = try resolve(std.testing.allocator, &changed_request, .{ .host_architecture = .x86_64 });
+    defer changed.deinit(std.testing.allocator);
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &original_hash.bytes,
+        &changed.plan.?.data.plan_hash.bytes,
+    ));
 }
 
 test "resolution applies base_path before checking mixed path forms" {
@@ -2575,10 +3289,12 @@ test "successful execution commits output and emits provenance" {
     const io = std.testing.io;
     const iso_path = "test-customize-success.iso";
     const container_path = "test-customize-success.container";
+    const customization_path = "test-customize-success.conf";
     const workspace_path = "test-customize-success-work";
     const output_path = workspace_path ++ "/output.raw";
     defer Io.Dir.cwd().deleteFile(io, iso_path) catch {};
     defer Io.Dir.cwd().deleteFile(io, container_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, customization_path) catch {};
     defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
     defer Io.Dir.cwd().deleteTree(io, workspace_path) catch {};
     try Io.Dir.cwd().createDirPath(io, workspace_path);
@@ -2593,14 +3309,26 @@ test "successful execution commits output and emits provenance" {
         defer file.close(io);
         try file.writePositionalAll(io, "source-container", 0);
     }
+    {
+        var file = try Io.Dir.cwd().createFile(io, customization_path, .{});
+        defer file.close(io);
+        try file.writePositionalAll(io, "source-customization", 0);
+    }
 
     var request = validRequest();
+    const filesystem = [_]FilesystemOperation{
+        .{ .put_file = .{
+            .path = "/etc/example.conf",
+            .source = .{ .host_path = customization_path },
+        } },
+    };
     request.input = .{ .iso_oci = .{
         .iso_path = iso_path,
         .container_path = container_path,
         .rootfs_path_in_iso = "rootfs.squashfs",
     } };
     request.output = .{ .path = output_path, .format = .raw, .size = 128 * mib };
+    request.os.filesystem = &filesystem;
     request.execution.workspace_path = workspace_path;
 
     const FakeRunner = struct {
@@ -2640,6 +3368,98 @@ test "successful execution commits output and emits provenance" {
         &output_digest.bytes,
         &outcome.result.?.provenance.final_output.sha256.bytes,
     );
+    try std.testing.expectEqual(@as(usize, 3), outcome.result.?.provenance.sources.len);
+    try std.testing.expectEqual(SourceKind.customization_file, outcome.result.?.provenance.sources[2].kind);
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        outcome.result.?.provenance.sources[2].path,
+        customization_path,
+    ));
+}
+
+test "execution rejects a customization source changed during the build" {
+    const io = std.testing.io;
+    const iso_path = "test-customize-source-change.iso";
+    const container_path = "test-customize-source-change.container";
+    const customization_path = "test-customize-source-change.conf";
+    const workspace_path = "test-customize-source-change-work";
+    const output_path = workspace_path ++ "/output.raw";
+    defer Io.Dir.cwd().deleteFile(io, iso_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, container_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, customization_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, workspace_path) catch {};
+    try Io.Dir.cwd().createDirPath(io, workspace_path);
+
+    for ([_]struct { path: []const u8, content: []const u8 }{
+        .{ .path = iso_path, .content = "source-iso" },
+        .{ .path = container_path, .content = "source-container" },
+        .{ .path = customization_path, .content = "before" },
+    }) |source| {
+        var file = try Io.Dir.cwd().createFile(io, source.path, .{});
+        defer file.close(io);
+        try file.writePositionalAll(io, source.content, 0);
+    }
+
+    const filesystem = [_]FilesystemOperation{
+        .{ .put_file = .{
+            .path = "/etc/example.conf",
+            .source = .{ .host_path = customization_path },
+        } },
+    };
+    var request = validRequest();
+    request.input = .{ .iso_oci = .{
+        .iso_path = iso_path,
+        .container_path = container_path,
+        .rootfs_path_in_iso = "rootfs.squashfs",
+    } };
+    request.output = .{ .path = output_path, .format = .raw, .size = 128 * mib };
+    request.os.filesystem = &filesystem;
+    request.execution.workspace_path = workspace_path;
+
+    const MutationRunner = struct {
+        const Context = struct {
+            source_path: []const u8,
+        };
+
+        fn run(
+            context_ptr: ?*anyopaque,
+            _: Allocator,
+            run_io: Io,
+            plan: *const ResolvedPlan,
+            _: ?EventSink,
+            stage_sink: build_image.StageSink,
+        ) !void {
+            for (plan.data.operations) |operation| {
+                if (!stage_sink.advance(operation.action)) return error.InvalidOperationOrder;
+            }
+            const output = try Io.Dir.cwd().createFile(run_io, plan.data.staging_output_path, .{});
+            defer output.close(run_io);
+            try output.writePositionalAll(run_io, "completed-image", 0);
+
+            const context: *Context = @ptrCast(@alignCast(context_ptr.?));
+            const source = try Io.Dir.cwd().createFile(run_io, context.source_path, .{ .truncate = true });
+            defer source.close(run_io);
+            try source.writePositionalAll(run_io, "after", 0);
+        }
+    };
+
+    var resolved = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer resolved.deinit(std.testing.allocator);
+    var context = MutationRunner.Context{ .source_path = customization_path };
+    var platform = Platform.system();
+    platform.context = &context;
+    platform.runFn = MutationRunner.run;
+    var outcome = try execute(std.testing.allocator, io, &resolved.plan.?, platform, null);
+    defer outcome.deinit(std.testing.allocator);
+
+    try std.testing.expect(outcome.result == null);
+    var found_source_changed = false;
+    for (outcome.diagnostics.items) |diagnostic| {
+        if (diagnostic.code == .source_changed) found_source_changed = true;
+    }
+    try std.testing.expect(found_source_changed);
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, output_path, .{}));
 }
 
 test "plan JSON renders identifiers as stable strings" {
@@ -2651,6 +3471,6 @@ test "plan JSON renders identifiers as stable strings" {
     defer output.deinit();
     try writePlanJson(&resolved.plan.?, &output.writer);
     const json = output.written();
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"schema_version\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"schema_version\": 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"plan_hash\": \"") != null);
 }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const customization_wire = @import("../packages/zvmi/src/customization_wire.zig");
 
 pub const Format = enum {
     raw,
@@ -54,6 +55,46 @@ pub const UkiOptions = struct {
     output_directory: []const u8 = "EFI/Linux",
 };
 
+pub const Xattr = customization_wire.Xattr;
+pub const Metadata = customization_wire.Metadata;
+
+pub const FileSource = union(enum) {
+    inline_bytes: []const u8,
+    path: std.Build.LazyPath,
+};
+
+pub const PutFile = struct {
+    path: []const u8,
+    source: FileSource,
+    metadata: Metadata = .{ .mode = 0o644 },
+};
+
+pub const FilesystemOperation = union(enum) {
+    put_file: PutFile,
+    put_directory: customization_wire.PutDirectory,
+    put_symlink: customization_wire.PutSymlink,
+    remove: []const u8,
+    set_metadata: customization_wire.MetadataChange,
+};
+
+pub const Group = customization_wire.Group;
+pub const User = customization_wire.User;
+pub const Password = customization_wire.Password;
+pub const Service = customization_wire.Service;
+pub const ServiceState = customization_wire.ServiceState;
+pub const KernelModule = customization_wire.KernelModule;
+pub const AzureGeneralization = customization_wire.AzureGeneralization;
+pub const GeneralizationPolicy = customization_wire.GeneralizationPolicy;
+
+pub const OsCustomization = struct {
+    filesystem: []const FilesystemOperation = &.{},
+    hostname: ?[]const u8 = null,
+    groups: []const Group = &.{},
+    users: []const User = &.{},
+    services: []const Service = &.{},
+    kernel_modules: []const KernelModule = &.{},
+};
+
 pub const Container = union(enum) {
     /// An OCI image-layout directory. The helper snapshots the complete
     /// directory into the build cache so additions and removals invalidate
@@ -89,6 +130,8 @@ pub const Options = struct {
     extra_kernel_options: []const u8 = "",
     boot_mode: BootMode = .bls,
     uki: UkiOptions = .{},
+    os: OsCustomization = .{},
+    generalization: GeneralizationPolicy = .none,
     verbose: bool = false,
 };
 
@@ -190,7 +233,7 @@ fn configureRequest(
     const seed_hex = std.fmt.bytesToHex(options.reproducibility.seed, .lower);
     run.addArgs(&.{ "--seed", b.fmt("{s}", .{seed_hex}) });
     run.addArgs(&.{ "--source-date-epoch", b.fmt("{d}", .{options.reproducibility.source_date_epoch}) });
-    run.addArgs(&.{ "--api-version", "1" });
+    run.addArgs(&.{ "--api-version", b.fmt("{d}", .{customization_wire.api_version}) });
     run.addArgs(&.{ "--rootfs-path", options.rootfs_path_in_iso });
     if (options.skip_iso_rootfs) run.addArg("--skip-iso-rootfs");
     if (options.esp_size) |size| run.addArgs(&.{ "--esp-size", b.fmt("{d}", .{size}) });
@@ -204,5 +247,79 @@ fn configureRequest(
     if (!std.mem.eql(u8, options.uki.output_directory, "EFI/Linux")) {
         run.addArgs(&.{ "--uki-output-directory", options.uki.output_directory });
     }
+    addCustomizationArgs(b, run, options) catch @panic("failed to materialize image customization");
     if (options.verbose) run.addArg("--verbose");
+}
+
+fn addCustomizationArgs(
+    b: *std.Build,
+    run: *std.Build.Step.Run,
+    options: Options,
+) !void {
+    if (!hasCustomization(options.os, options.generalization)) return;
+
+    const operations = try b.allocator.alloc(customization_wire.FilesystemOperation, options.os.filesystem.len);
+    var sources = std.array_list.Managed(std.Build.LazyPath).init(b.allocator);
+    defer sources.deinit();
+    const inline_files = b.addWriteFiles();
+    inline_files.step.name = b.fmt("materialize inline customization for {s}", .{options.name});
+
+    for (options.os.filesystem, 0..) |operation, index| {
+        operations[index] = switch (operation) {
+            .put_file => |file| blk: {
+                const source: std.Build.LazyPath = switch (file.source) {
+                    .path => |path| path,
+                    .inline_bytes => |bytes| inline_files.add(
+                        b.fmt("inline-{d}", .{index}),
+                        bytes,
+                    ),
+                };
+                const source_index = sources.items.len;
+                try sources.append(source);
+                break :blk .{ .put_file = .{
+                    .path = file.path,
+                    .source_index = source_index,
+                    .metadata = file.metadata,
+                } };
+            },
+            .put_directory => |directory| .{ .put_directory = directory },
+            .put_symlink => |link| .{ .put_symlink = link },
+            .remove => |path| .{ .remove = path },
+            .set_metadata => |change| .{ .set_metadata = change },
+        };
+    }
+
+    const configuration = customization_wire.Configuration{
+        .os = .{
+            .filesystem = operations,
+            .hostname = options.os.hostname,
+            .groups = options.os.groups,
+            .users = options.os.users,
+            .services = options.os.services,
+            .kernel_modules = options.os.kernel_modules,
+        },
+        .generalization = options.generalization,
+    };
+    const json = try std.json.Stringify.valueAlloc(b.allocator, configuration, .{});
+    const config_files = b.addWriteFiles();
+    config_files.step.name = b.fmt("write customization plan for {s}", .{options.name});
+    const config_path = config_files.add("customization.json", json);
+    run.addArg("--customization");
+    run.addFileArg(config_path);
+    for (sources.items) |source| {
+        run.addArg("--customization-source");
+        run.addFileArg(source);
+    }
+}
+
+fn hasCustomization(os: OsCustomization, generalization: GeneralizationPolicy) bool {
+    if (os.filesystem.len != 0 or os.hostname != null or os.groups.len != 0 or
+        os.users.len != 0 or os.services.len != 0 or os.kernel_modules.len != 0)
+    {
+        return true;
+    }
+    return switch (generalization) {
+        .none => false,
+        .azure => true,
+    };
 }

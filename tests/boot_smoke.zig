@@ -428,7 +428,7 @@ fn serialOutputShowsKernelBoot(serial_output: []const u8) bool {
         std.mem.indexOf(u8, serial_output, "Kernel command line:") != null;
 }
 
-test "build-image opportunistically boot-smokes a provisioned Gen2 raw image under QEMU" {
+test "build-image boot-smokes typed customization and generalization under Gen2 QEMU" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -444,6 +444,53 @@ test "build-image opportunistically boot-smokes a provisioned Gen2 raw image und
     defer Io.Dir.cwd().deleteFile(io, ovmf_vars_copy_path) catch {};
     defer Io.Dir.cwd().deleteFile(io, serial_output_path) catch {};
 
+    const service_name = "zvmi-customization-smoke.service";
+    const smoke_script =
+        \\#!/bin/sh
+        \\set -eu
+        \\test "$(cat /etc/hostname)" = "zvmi-customized"
+        \\grep -q '^zvmi-smoke:' /etc/passwd
+        \\grep -q 'ssh-ed25519 AAAATEST zvmi-smoke' /home/zvmi-smoke/.ssh/authorized_keys
+        \\test ! -e /var/lib/azagent/captured
+        \\printf 'ZVMI customization verified\n' >/dev/ttyS0
+        \\
+    ;
+    const service_unit =
+        \\[Unit]
+        \\Description=Verify zvmi typed image customization
+        \\After=local-fs.target
+        \\
+        \\[Service]
+        \\Type=oneshot
+        \\ExecStart=/usr/local/sbin/zvmi-customization-smoke
+        \\
+        \\[Install]
+        \\WantedBy=multi-user.target
+        \\
+    ;
+    const filesystem = [_]zvmi.os_customization.FilesystemOperation{
+        .{ .put_file = .{
+            .path = "/usr/local/sbin/zvmi-customization-smoke",
+            .source = .{ .inline_bytes = smoke_script },
+            .metadata = .{ .mode = 0o755 },
+        } },
+        .{ .put_file = .{
+            .path = "/usr/lib/systemd/system/" ++ service_name,
+            .source = .{ .inline_bytes = service_unit },
+        } },
+        .{ .put_file = .{
+            .path = "/var/lib/azagent/captured",
+            .source = .{ .inline_bytes = "remove-me" },
+        } },
+    };
+    const users = [_]zvmi.os_customization.User{.{
+        .name = "zvmi-smoke",
+        .ssh_authorized_keys = &.{"ssh-ed25519 AAAATEST zvmi-smoke"},
+    }};
+    const services = [_]zvmi.os_customization.Service{.{
+        .name = service_name,
+        .state = .enabled,
+    }};
     var report = try zvmi.build_image.build(allocator, io, .{
         .iso_path = prereqs.iso_path,
         .container_path = prereqs.oci_path,
@@ -452,6 +499,13 @@ test "build-image opportunistically boot-smokes a provisioned Gen2 raw image und
         .generation = .gen2,
         .size = qemu_boot_smoke_disk_size,
         .extra_kernel_options = "console=tty0 console=ttyS0,115200n8",
+        .os = .{
+            .filesystem = &filesystem,
+            .hostname = "zvmi-customized",
+            .users = &users,
+            .services = &services,
+        },
+        .generalization = .{ .azure = .{ .reset_hostname = false } },
     });
     defer report.deinit(allocator);
 
@@ -464,7 +518,7 @@ test "build-image opportunistically boot-smokes a provisioned Gen2 raw image und
         .{ .firmware = ovmf, .vars_copy_path = ovmf_vars_copy_path },
         output_path,
         serial_output_path,
-        null,
+        "ZVMI customization verified",
     );
     defer qemu.deinit(allocator);
 
@@ -475,6 +529,7 @@ test "build-image opportunistically boot-smokes a provisioned Gen2 raw image und
         );
     }
     try std.testing.expect(serialOutputShowsKernelBoot(qemu.serial_output));
+    try std.testing.expect(std.mem.indexOf(u8, qemu.serial_output, "ZVMI customization verified") != null);
 }
 
 test "build-image opportunistically boot-smokes a provisioned Gen1 BIOS raw image under QEMU" {

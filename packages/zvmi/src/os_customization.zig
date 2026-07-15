@@ -1,0 +1,799 @@
+const std = @import("std");
+const ext4 = @import("ext4.zig");
+const root_tree = @import("root_tree.zig");
+
+const Allocator = std.mem.Allocator;
+const RootTree = root_tree.RootTree;
+
+pub const Metadata = struct {
+    mode: u16,
+    uid: u32 = 0,
+    gid: u32 = 0,
+    xattrs: []const ext4.Xattr = &.{},
+
+    fn rootTree(self: Metadata) root_tree.Metadata {
+        return .{
+            .mode = self.mode,
+            .uid = self.uid,
+            .gid = self.gid,
+            .xattrs = self.xattrs,
+        };
+    }
+};
+
+pub const FileSource = union(enum) {
+    inline_bytes: []const u8,
+    host_path: []const u8,
+};
+
+pub const PutFile = struct {
+    path: []const u8,
+    source: FileSource,
+    metadata: Metadata = .{ .mode = 0o644 },
+};
+
+pub const PutDirectory = struct {
+    path: []const u8,
+    metadata: Metadata = .{ .mode = 0o755 },
+};
+
+pub const PutSymlink = struct {
+    path: []const u8,
+    target: []const u8,
+    metadata: Metadata = .{ .mode = 0o777 },
+};
+
+pub const MetadataChange = struct {
+    path: []const u8,
+    mode: ?u16 = null,
+    uid: ?u32 = null,
+    gid: ?u32 = null,
+    xattrs: ?[]const ext4.Xattr = null,
+};
+
+pub const FilesystemOperation = union(enum) {
+    put_file: PutFile,
+    put_directory: PutDirectory,
+    put_symlink: PutSymlink,
+    remove: []const u8,
+    set_metadata: MetadataChange,
+};
+
+pub const Password = union(enum) {
+    locked,
+    prehashed: []const u8,
+};
+
+pub const Group = struct {
+    name: []const u8,
+    gid: ?u32 = null,
+    members: []const []const u8 = &.{},
+};
+
+pub const User = struct {
+    name: []const u8,
+    uid: ?u32 = null,
+    gid: ?u32 = null,
+    primary_group: ?[]const u8 = null,
+    secondary_groups: []const []const u8 = &.{},
+    home: ?[]const u8 = null,
+    shell: []const u8 = "/bin/bash",
+    password: Password = .locked,
+    ssh_authorized_keys: []const []const u8 = &.{},
+    passwordless_sudo: bool = false,
+};
+
+pub const ServiceState = enum {
+    enabled,
+    disabled,
+};
+
+pub const Service = struct {
+    name: []const u8,
+    state: ServiceState,
+};
+
+pub const KernelModule = struct {
+    name: []const u8,
+    load: bool = false,
+    disabled: bool = false,
+    options: ?[]const u8 = null,
+};
+
+pub const OsCustomization = struct {
+    filesystem: []const FilesystemOperation = &.{},
+    hostname: ?[]const u8 = null,
+    groups: []const Group = &.{},
+    users: []const User = &.{},
+    services: []const Service = &.{},
+    kernel_modules: []const KernelModule = &.{},
+};
+
+pub const AzureGeneralization = struct {
+    reset_hostname: bool = true,
+    clear_machine_id: bool = true,
+    remove_ssh_host_keys: bool = true,
+    remove_agent_state: bool = true,
+    remove_dhcp_leases: bool = true,
+    remove_logs: bool = false,
+    remove_caches: bool = false,
+    clear_random_seed: bool = true,
+    remove_users: []const []const u8 = &.{},
+};
+
+pub const GeneralizationPolicy = union(enum) {
+    none,
+    azure: AzureGeneralization,
+};
+
+pub fn apply(
+    allocator: Allocator,
+    tree: *RootTree,
+    customization: OsCustomization,
+    source_date_epoch: u64,
+) !void {
+    for (customization.filesystem) |operation| try applyFilesystemOperation(tree, operation);
+    if (customization.hostname) |hostname| try applyHostname(tree, hostname);
+    if (customization.groups.len != 0 or customization.users.len != 0) {
+        try applyAccounts(allocator, tree, customization.groups, customization.users, source_date_epoch);
+    }
+    try applyServices(tree, customization.services);
+    try applyKernelModules(allocator, tree, customization.kernel_modules);
+}
+
+pub fn generalize(
+    allocator: Allocator,
+    tree: *RootTree,
+    policy: GeneralizationPolicy,
+) !void {
+    switch (policy) {
+        .none => {},
+        .azure => |options| {
+            try validateUserRemovals(allocator, tree, options.remove_users);
+            if (options.reset_hostname) {
+                try tree.putFileBytes("etc/hostname", "localhost.localdomain\n", replacementMetadata(tree, "etc/hostname", 0o644));
+            }
+            if (options.clear_machine_id) {
+                try tree.putFileBytes("etc/machine-id", "", replacementMetadata(tree, "etc/machine-id", 0o444));
+            }
+            if (options.remove_ssh_host_keys) try removeSshHostKeys(tree);
+            if (options.remove_agent_state) _ = try tree.remove("var/lib/azagent");
+            if (options.remove_dhcp_leases) {
+                inline for (.{ "var/lib/dhclient", "var/lib/dhcpcd", "var/lib/dhcp" }) |path| {
+                    _ = try tree.remove(path);
+                }
+            }
+            if (options.remove_logs) try clearDirectory(tree, "var/log");
+            if (options.remove_caches) try clearDirectory(tree, "var/cache");
+            if (options.clear_random_seed) {
+                if (tree.findNode("var/lib/systemd/random-seed") != null) {
+                    try tree.putFileBytes(
+                        "var/lib/systemd/random-seed",
+                        "",
+                        replacementMetadata(tree, "var/lib/systemd/random-seed", 0o600),
+                    );
+                }
+            }
+            for (options.remove_users) |username| try removeUser(allocator, tree, username);
+        },
+    }
+}
+
+fn applyFilesystemOperation(tree: *RootTree, operation: FilesystemOperation) !void {
+    switch (operation) {
+        .put_file => |file| {
+            const path = try normalizedPath(file.path);
+            switch (file.source) {
+                .inline_bytes => |bytes| try tree.putFileBytes(path, bytes, file.metadata.rootTree()),
+                .host_path => |source_path| try tree.putFileFromPath(path, source_path, file.metadata.rootTree()),
+            }
+        },
+        .put_directory => |directory| try tree.putDirectory(
+            try normalizedPath(directory.path),
+            directory.metadata.rootTree(),
+        ),
+        .put_symlink => |link| try tree.putSymlink(
+            try normalizedPath(link.path),
+            link.target,
+            link.metadata.rootTree(),
+        ),
+        .remove => |path| _ = try tree.remove(try normalizedPath(path)),
+        .set_metadata => |change| {
+            const path = try normalizedPath(change.path);
+            const node = tree.findNode(path) orelse return error.MissingCustomizationPath;
+            try tree.setMetadata(path, .{
+                .mode = change.mode orelse node.metadata.mode,
+                .uid = change.uid orelse node.metadata.uid,
+                .gid = change.gid orelse node.metadata.gid,
+                .atime = node.metadata.atime,
+                .mtime = node.metadata.mtime,
+                .ctime = node.metadata.ctime,
+                .xattrs = change.xattrs orelse node.metadata.xattrs,
+            });
+        },
+    }
+}
+
+fn applyHostname(tree: *RootTree, hostname: []const u8) !void {
+    var content: [65]u8 = undefined;
+    const value = try std.fmt.bufPrint(&content, "{s}\n", .{hostname});
+    try tree.putFileBytes("etc/hostname", value, replacementMetadata(tree, "etc/hostname", 0o644));
+}
+
+fn applyAccounts(
+    allocator: Allocator,
+    tree: *RootTree,
+    groups: []const Group,
+    users: []const User,
+    source_date_epoch: u64,
+) !void {
+    var passwd = try readRequiredFile(allocator, tree, "etc/passwd");
+    defer allocator.free(passwd);
+    var shadow = try readRequiredFile(allocator, tree, "etc/shadow");
+    defer allocator.free(shadow);
+    var group_file = try readRequiredFile(allocator, tree, "etc/group");
+    defer allocator.free(group_file);
+
+    for (groups) |group| {
+        if (recordExists(group_file, group.name)) return error.GroupAlreadyExists;
+        const gid = group.gid orelse try nextFreeId(group_file, 1000);
+        if (idExists(group_file, gid)) return error.GroupIdInUse;
+        const members = try joinComma(allocator, group.members);
+        defer allocator.free(members);
+        group_file = try appendFormatted(
+            allocator,
+            group_file,
+            "{s}:x:{d}:{s}\n",
+            .{ group.name, gid, members },
+        );
+    }
+
+    for (users) |user| {
+        if (recordExists(passwd, user.name)) return error.UserAlreadyExists;
+        const uid = user.uid orelse try nextFreeUserId(passwd, group_file);
+        if (idExists(passwd, uid)) return error.UserIdInUse;
+        const primary_name = user.primary_group orelse user.name;
+        var gid = user.gid;
+        if (findRecordId(group_file, primary_name)) |existing_gid| {
+            if (gid != null and gid.? != existing_gid) return error.PrimaryGroupIdMismatch;
+            gid = existing_gid;
+        } else {
+            const new_gid = gid orelse uid;
+            if (idExists(group_file, new_gid)) return error.GroupIdInUse;
+            group_file = try appendFormatted(
+                allocator,
+                group_file,
+                "{s}:x:{d}:\n",
+                .{ primary_name, new_gid },
+            );
+            gid = new_gid;
+        }
+
+        const home = user.home orelse try defaultHomePath(allocator, user.name);
+        defer if (user.home == null) allocator.free(home);
+        passwd = try appendFormatted(
+            allocator,
+            passwd,
+            "{s}:x:{d}:{d}::{s}:{s}\n",
+            .{ user.name, uid, gid.?, home, user.shell },
+        );
+        const password = switch (user.password) {
+            .locked => "!",
+            .prehashed => |hash| hash,
+        };
+        shadow = try appendFormatted(
+            allocator,
+            shadow,
+            "{s}:{s}:{d}:0:99999:7:::\n",
+            .{ user.name, password, source_date_epoch / 86_400 },
+        );
+        for (user.secondary_groups) |group_name| {
+            const updated = try addGroupMember(allocator, group_file, group_name, user.name);
+            allocator.free(group_file);
+            group_file = updated;
+        }
+
+        const home_path = try normalizedPath(home);
+        try tree.putDirectory(home_path, .{ .mode = 0o700, .uid = uid, .gid = gid.? });
+        if (user.ssh_authorized_keys.len != 0) {
+            const ssh_path = try std.fmt.allocPrint(allocator, "{s}/.ssh", .{home_path});
+            defer allocator.free(ssh_path);
+            const authorized_keys_path = try std.fmt.allocPrint(allocator, "{s}/authorized_keys", .{ssh_path});
+            defer allocator.free(authorized_keys_path);
+            try tree.putDirectory(ssh_path, .{ .mode = 0o700, .uid = uid, .gid = gid.? });
+            const keys = try authorizedKeysContent(allocator, user.ssh_authorized_keys);
+            defer allocator.free(keys);
+            try tree.putFileBytes(authorized_keys_path, keys, .{ .mode = 0o600, .uid = uid, .gid = gid.? });
+        }
+        if (user.passwordless_sudo) {
+            const sudo_path = try std.fmt.allocPrint(allocator, "etc/sudoers.d/{s}", .{user.name});
+            defer allocator.free(sudo_path);
+            const sudo_line = try std.fmt.allocPrint(allocator, "{s} ALL=(ALL) NOPASSWD: ALL\n", .{user.name});
+            defer allocator.free(sudo_line);
+            try tree.putFileBytes(sudo_path, sudo_line, .{ .mode = 0o440 });
+        }
+    }
+
+    try tree.putFileBytes("etc/passwd", passwd, replacementMetadata(tree, "etc/passwd", 0o644));
+    try tree.putFileBytes("etc/shadow", shadow, replacementMetadata(tree, "etc/shadow", 0o600));
+    try tree.putFileBytes("etc/group", group_file, replacementMetadata(tree, "etc/group", 0o644));
+}
+
+fn applyServices(tree: *RootTree, services: []const Service) !void {
+    for (services) |service| {
+        var destination_buffer: [512]u8 = undefined;
+        const destination = try std.fmt.bufPrint(
+            &destination_buffer,
+            "etc/systemd/system/multi-user.target.wants/{s}",
+            .{service.name},
+        );
+        switch (service.state) {
+            .enabled => {
+                var target_buffer: [512]u8 = undefined;
+                const target = try std.fmt.bufPrint(&target_buffer, "/usr/lib/systemd/system/{s}", .{service.name});
+                try tree.putSymlink(destination, target, .{ .mode = 0o777 });
+            },
+            .disabled => _ = try tree.remove(destination),
+        }
+    }
+}
+
+fn applyKernelModules(allocator: Allocator, tree: *RootTree, modules: []const KernelModule) !void {
+    var load: std.Io.Writer.Allocating = .init(allocator);
+    defer load.deinit();
+    var blacklist: std.Io.Writer.Allocating = .init(allocator);
+    defer blacklist.deinit();
+    var options: std.Io.Writer.Allocating = .init(allocator);
+    defer options.deinit();
+
+    for (modules) |module| {
+        if (module.load) try load.writer.print("{s}\n", .{module.name});
+        if (module.disabled) try blacklist.writer.print("blacklist {s}\n", .{module.name});
+        if (module.options) |value| try options.writer.print("options {s} {s}\n", .{ module.name, value });
+    }
+    if (load.writer.end != 0) {
+        try tree.putFileBytes("etc/modules-load.d/zvmi.conf", load.written(), .{ .mode = 0o644 });
+    }
+    if (blacklist.writer.end != 0) {
+        try tree.putFileBytes("etc/modprobe.d/zvmi-blacklist.conf", blacklist.written(), .{ .mode = 0o644 });
+    }
+    if (options.writer.end != 0) {
+        try tree.putFileBytes("etc/modprobe.d/zvmi-options.conf", options.written(), .{ .mode = 0o644 });
+    }
+}
+
+fn removeSshHostKeys(tree: *RootTree) !void {
+    try tree.sortNodes();
+    var index = tree.nodeCount();
+    while (index != 0) {
+        index -= 1;
+        const path = tree.nodeView(index).path;
+        const basename = std.fs.path.basename(path);
+        if (std.mem.startsWith(u8, path, "etc/ssh/") and
+            std.mem.startsWith(u8, basename, "ssh_host_") and
+            std.mem.indexOf(u8, basename, "_key") != null)
+        {
+            _ = try tree.remove(path);
+        }
+    }
+}
+
+fn clearDirectory(tree: *RootTree, path: []const u8) !void {
+    _ = try tree.remove(path);
+    try tree.putDirectory(path, .{ .mode = 0o755 });
+}
+
+fn validateUserRemovals(
+    allocator: Allocator,
+    tree: *const RootTree,
+    removed_users: []const []const u8,
+) !void {
+    if (removed_users.len == 0 or tree.findNode("etc/passwd") == null) return;
+    const passwd = try readRequiredFile(allocator, tree, "etc/passwd");
+    defer allocator.free(passwd);
+    for (removed_users) |username| {
+        const home = findUserHome(passwd, username) orelse continue;
+        if (std.mem.eql(u8, home, "/")) return error.UnsafeUserHomeRemoval;
+        const normalized_home = try normalizedPath(home);
+        if (!std.mem.eql(u8, std.fs.path.basename(normalized_home), username)) {
+            return error.UnsafeUserHomeRemoval;
+        }
+
+        var lines = std.mem.splitScalar(u8, passwd, '\n');
+        while (lines.next()) |line| {
+            var fields = std.mem.splitScalar(u8, line, ':');
+            const retained_name = fields.next() orelse continue;
+            if (std.mem.eql(u8, retained_name, username) or stringInList(removed_users, retained_name)) continue;
+            _ = fields.next() orelse continue;
+            _ = fields.next() orelse continue;
+            _ = fields.next() orelse continue;
+            _ = fields.next() orelse continue;
+            const retained_home = fields.next() orelse continue;
+            if (std.mem.eql(u8, retained_home, "/")) continue;
+            const normalized_retained = normalizedPath(retained_home) catch return error.UnsafeUserHomeRemoval;
+            if (std.mem.eql(u8, normalized_home, normalized_retained) or
+                customizationPathContains(normalized_home, normalized_retained) or
+                customizationPathContains(normalized_retained, normalized_home))
+            {
+                return error.SharedUserHome;
+            }
+        }
+    }
+}
+
+fn removeUser(allocator: Allocator, tree: *RootTree, username: []const u8) !void {
+    var home_path: ?[]u8 = null;
+    defer if (home_path) |path| allocator.free(path);
+    if (tree.findNode("etc/passwd") != null) {
+        const passwd = try readRequiredFile(allocator, tree, "etc/passwd");
+        defer allocator.free(passwd);
+        if (findUserHome(passwd, username)) |home| {
+            if (!std.mem.eql(u8, home, "/")) {
+                home_path = try allocator.dupe(u8, try normalizedPath(home));
+            }
+        }
+    }
+
+    for ([_][]const u8{ "etc/passwd", "etc/shadow", "etc/group" }) |path| {
+        if (tree.findNode(path) == null) continue;
+        const content = try readRequiredFile(allocator, tree, path);
+        defer allocator.free(content);
+        const filtered = if (std.mem.eql(u8, path, "etc/group"))
+            try removeUserFromGroups(allocator, content, username)
+        else
+            try removeRecord(allocator, content, username);
+        defer allocator.free(filtered);
+        try tree.putFileBytes(path, filtered, replacementMetadata(tree, path, if (std.mem.eql(u8, path, "etc/shadow")) 0o600 else 0o644));
+    }
+    if (home_path) |path| _ = try tree.remove(path);
+    const sudoers_path = try std.fmt.allocPrint(allocator, "etc/sudoers.d/{s}", .{username});
+    defer allocator.free(sudoers_path);
+    _ = try tree.remove(sudoers_path);
+}
+
+fn normalizedPath(path: []const u8) ![]const u8 {
+    if (path.len < 2 or path[0] != '/' or path[1] == '/') return error.InvalidCustomizationPath;
+    return path[1..];
+}
+
+fn customizationPathContains(parent: []const u8, candidate: []const u8) bool {
+    return parent.len < candidate.len and
+        std.mem.startsWith(u8, candidate, parent) and
+        candidate[parent.len] == '/';
+}
+
+fn stringInList(values: []const []const u8, needle: []const u8) bool {
+    for (values) |value| {
+        if (std.mem.eql(u8, value, needle)) return true;
+    }
+    return false;
+}
+
+fn replacementMetadata(tree: *const RootTree, path: []const u8, default_mode: u16) root_tree.Metadata {
+    return if (tree.findNode(path)) |node| node.metadata else .{ .mode = default_mode };
+}
+
+fn readRequiredFile(allocator: Allocator, tree: *const RootTree, path: []const u8) ![]u8 {
+    return tree.readFileAlloc(allocator, path, 16 * 1024 * 1024);
+}
+
+fn recordExists(content: []const u8, name: []const u8) bool {
+    return findRecordId(content, name) != null;
+}
+
+fn findUserHome(content: []const u8, name: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.splitScalar(u8, line, ':');
+        if (!std.mem.eql(u8, fields.next() orelse continue, name)) continue;
+        _ = fields.next() orelse continue;
+        _ = fields.next() orelse continue;
+        _ = fields.next() orelse continue;
+        _ = fields.next() orelse continue;
+        return fields.next() orelse continue;
+    }
+    return null;
+}
+
+fn findRecordId(content: []const u8, name: []const u8) ?u32 {
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.splitScalar(u8, line, ':');
+        if (!std.mem.eql(u8, fields.next() orelse continue, name)) continue;
+        _ = fields.next() orelse continue;
+        return std.fmt.parseInt(u32, fields.next() orelse continue, 10) catch null;
+    }
+    return null;
+}
+
+fn idExists(content: []const u8, id: u32) bool {
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.splitScalar(u8, line, ':');
+        _ = fields.next() orelse continue;
+        _ = fields.next() orelse continue;
+        const current = std.fmt.parseInt(u32, fields.next() orelse continue, 10) catch continue;
+        if (current == id) return true;
+    }
+    return false;
+}
+
+fn nextFreeId(content: []const u8, start: u32) !u32 {
+    var candidate = start;
+    while (candidate <= 60_000) : (candidate += 1) {
+        if (!idExists(content, candidate)) return candidate;
+    }
+    return error.NoAvailableId;
+}
+
+fn nextFreeUserId(passwd: []const u8, groups: []const u8) !u32 {
+    var candidate: u32 = 1000;
+    while (candidate <= 60_000) : (candidate += 1) {
+        if (!idExists(passwd, candidate) and !idExists(groups, candidate)) return candidate;
+    }
+    return error.NoAvailableId;
+}
+
+fn appendFormatted(
+    allocator: Allocator,
+    previous: []u8,
+    comptime format: []const u8,
+    args: anytype,
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = try .initCapacity(allocator, previous.len + 128);
+    errdefer output.deinit();
+    const trimmed = std.mem.trimEnd(u8, previous, "\n");
+    if (trimmed.len != 0) {
+        try output.writer.writeAll(trimmed);
+        try output.writer.writeByte('\n');
+    }
+    try output.writer.print(format, args);
+    const owned = try output.toOwnedSlice();
+    allocator.free(previous);
+    return owned;
+}
+
+fn joinComma(allocator: Allocator, members: []const []const u8) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    for (members, 0..) |member, index| {
+        if (index != 0) try output.writer.writeByte(',');
+        try output.writer.writeAll(member);
+    }
+    return output.toOwnedSlice();
+}
+
+fn defaultHomePath(allocator: Allocator, username: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "/home/{s}", .{username});
+}
+
+fn authorizedKeysContent(allocator: Allocator, keys: []const []const u8) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    for (keys) |key| {
+        try output.writer.writeAll(key);
+        try output.writer.writeByte('\n');
+    }
+    return output.toOwnedSlice();
+}
+
+fn addGroupMember(allocator: Allocator, content: []const u8, group_name: []const u8, username: []const u8) ![]u8 {
+    var output: std.Io.Writer.Allocating = try .initCapacity(allocator, content.len + username.len + 2);
+    errdefer output.deinit();
+    var found = false;
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const first_colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.InvalidGroupFile;
+        if (!std.mem.eql(u8, line[0..first_colon], group_name)) {
+            try output.writer.print("{s}\n", .{line});
+            continue;
+        }
+        found = true;
+        const members_colon = std.mem.lastIndexOfScalar(u8, line, ':') orelse return error.InvalidGroupFile;
+        const members = line[members_colon + 1 ..];
+        var existing = std.mem.splitScalar(u8, members, ',');
+        while (existing.next()) |member| {
+            if (std.mem.eql(u8, member, username)) {
+                try output.writer.print("{s}\n", .{line});
+                break;
+            }
+        } else {
+            try output.writer.writeAll(line[0 .. members_colon + 1]);
+            if (members.len != 0) {
+                try output.writer.writeAll(members);
+                try output.writer.writeByte(',');
+            }
+            try output.writer.print("{s}\n", .{username});
+        }
+    }
+    if (!found) return error.MissingSecondaryGroup;
+    return output.toOwnedSlice();
+}
+
+fn removeRecord(allocator: Allocator, content: []const u8, name: []const u8) ![]u8 {
+    var output: std.Io.Writer.Allocating = try .initCapacity(allocator, content.len);
+    errdefer output.deinit();
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse line.len;
+        if (std.mem.eql(u8, line[0..colon], name)) continue;
+        try output.writer.print("{s}\n", .{line});
+    }
+    return output.toOwnedSlice();
+}
+
+fn removeUserFromGroups(allocator: Allocator, content: []const u8, username: []const u8) ![]u8 {
+    var output: std.Io.Writer.Allocating = try .initCapacity(allocator, content.len);
+    errdefer output.deinit();
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const first_colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.InvalidGroupFile;
+        if (std.mem.eql(u8, line[0..first_colon], username)) continue;
+        const members_colon = std.mem.lastIndexOfScalar(u8, line, ':') orelse return error.InvalidGroupFile;
+        try output.writer.writeAll(line[0 .. members_colon + 1]);
+        var members = std.mem.splitScalar(u8, line[members_colon + 1 ..], ',');
+        var wrote_member = false;
+        while (members.next()) |member| {
+            if (member.len == 0 or std.mem.eql(u8, member, username)) continue;
+            if (wrote_member) try output.writer.writeByte(',');
+            try output.writer.writeAll(member);
+            wrote_member = true;
+        }
+        try output.writer.writeByte('\n');
+    }
+    return output.toOwnedSlice();
+}
+
+test "typed customization applies files accounts SSH services and modules" {
+    const io = std.testing.io;
+    const spool_path = "test-os-customization.spool";
+    defer std.Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    var tree = try RootTree.init(std.testing.allocator, io, spool_path, .{});
+    defer tree.deinit();
+
+    try tree.putFileBytes("etc/passwd", "root:x:0:0::/root:/bin/bash\n", .{ .mode = 0o644 });
+    try tree.putFileBytes("etc/shadow", "root:!:19000:0:99999:7:::\n", .{ .mode = 0o600 });
+    try tree.putFileBytes("etc/group", "root:x:0:\n", .{ .mode = 0o644 });
+
+    const operations = [_]FilesystemOperation{
+        .{ .put_file = .{
+            .path = "/etc/application.conf",
+            .source = .{ .inline_bytes = "enabled=true\n" },
+            .metadata = .{ .mode = 0o640 },
+        } },
+        .{ .put_symlink = .{ .path = "/application.conf", .target = "etc/application.conf" } },
+        .{ .set_metadata = .{ .path = "/etc/application.conf", .uid = 12, .gid = 34 } },
+    };
+    const groups = [_]Group{.{ .name = "admins", .gid = 2000 }};
+    const users = [_]User{.{
+        .name = "alice",
+        .uid = 1000,
+        .secondary_groups = &.{"admins"},
+        .ssh_authorized_keys = &.{"ssh-ed25519 AAAATEST alice@example"},
+        .passwordless_sudo = true,
+    }};
+    const services = [_]Service{.{ .name = "example.service", .state = .enabled }};
+    const modules = [_]KernelModule{.{
+        .name = "hv_netvsc",
+        .load = true,
+        .options = "ring_size=256",
+    }};
+    try apply(std.testing.allocator, &tree, .{
+        .filesystem = &operations,
+        .hostname = "custom-vm",
+        .groups = &groups,
+        .users = &users,
+        .services = &services,
+        .kernel_modules = &modules,
+    }, 1_735_689_600);
+
+    const hostname = try tree.readFileAlloc(std.testing.allocator, "etc/hostname", 1024);
+    defer std.testing.allocator.free(hostname);
+    try std.testing.expectEqualStrings("custom-vm\n", hostname);
+    const passwd = try tree.readFileAlloc(std.testing.allocator, "etc/passwd", 4096);
+    defer std.testing.allocator.free(passwd);
+    try std.testing.expect(std.mem.indexOf(u8, passwd, "alice:x:1000:1000::/home/alice:/bin/bash") != null);
+    const groups_after = try tree.readFileAlloc(std.testing.allocator, "etc/group", 4096);
+    defer std.testing.allocator.free(groups_after);
+    try std.testing.expect(std.mem.indexOf(u8, groups_after, "admins:x:2000:alice") != null);
+    const keys = try tree.readFileAlloc(std.testing.allocator, "home/alice/.ssh/authorized_keys", 4096);
+    defer std.testing.allocator.free(keys);
+    try std.testing.expectEqualStrings("ssh-ed25519 AAAATEST alice@example\n", keys);
+    try std.testing.expectEqual(@as(u32, 12), tree.findNode("etc/application.conf").?.metadata.uid);
+    try std.testing.expectEqual(root_tree.Kind.symlink, tree.findNode("etc/systemd/system/multi-user.target.wants/example.service").?.kind);
+    const module_options = try tree.readFileAlloc(std.testing.allocator, "etc/modprobe.d/zvmi-options.conf", 4096);
+    defer std.testing.allocator.free(module_options);
+    try std.testing.expectEqualStrings("options hv_netvsc ring_size=256\n", module_options);
+}
+
+test "Azure generalization resets machine-specific owned-tree state" {
+    const io = std.testing.io;
+    const spool_path = "test-os-generalization.spool";
+    defer std.Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    var tree = try RootTree.init(std.testing.allocator, io, spool_path, .{});
+    defer tree.deinit();
+
+    try tree.putFileBytes("etc/hostname", "captured\n", .{ .mode = 0o644 });
+    try tree.putFileBytes("etc/machine-id", "0123456789abcdef\n", .{ .mode = 0o444 });
+    try tree.putFileBytes("etc/ssh/ssh_host_rsa_key", "private", .{ .mode = 0o600 });
+    try tree.putFileBytes("etc/ssh/sshd_config", "keep", .{ .mode = 0o644 });
+    try tree.putFileBytes("var/lib/azagent/state", "captured", .{ .mode = 0o600 });
+    try tree.putFileBytes("var/lib/dhcp/lease", "captured", .{ .mode = 0o600 });
+    try tree.putFileBytes("var/lib/systemd/random-seed", "captured", .{ .mode = 0o600 });
+    try tree.putFileBytes("etc/passwd", "root:x:0:0::/root:/bin/bash\ndaemon:x:2:2::/:/usr/sbin/nologin\nalice:x:1000:1000::/srv/alice:/bin/bash\n", .{ .mode = 0o644 });
+    try tree.putFileBytes("etc/shadow", "root:!:19000:0:99999:7:::\nalice:!:19000:0:99999:7:::\n", .{ .mode = 0o600 });
+    try tree.putFileBytes("etc/group", "root:x:0:\nwheel:x:10:alice\nalice:x:1000:\n", .{ .mode = 0o644 });
+    try tree.putFileBytes("srv/alice/.ssh/authorized_keys", "captured-key\n", .{ .mode = 0o600 });
+    try tree.putFileBytes("etc/sudoers.d/alice", "alice ALL=(ALL) NOPASSWD: ALL\n", .{ .mode = 0o440 });
+    try generalize(std.testing.allocator, &tree, .{ .azure = .{ .remove_users = &.{"alice"} } });
+
+    const hostname = try tree.readFileAlloc(std.testing.allocator, "etc/hostname", 1024);
+    defer std.testing.allocator.free(hostname);
+    try std.testing.expectEqualStrings("localhost.localdomain\n", hostname);
+    const machine_id = try tree.readFileAlloc(std.testing.allocator, "etc/machine-id", 1024);
+    defer std.testing.allocator.free(machine_id);
+    try std.testing.expectEqual(@as(usize, 0), machine_id.len);
+    try std.testing.expect(tree.findNode("etc/ssh/ssh_host_rsa_key") == null);
+    try std.testing.expect(tree.findNode("etc/ssh/sshd_config") != null);
+    try std.testing.expect(tree.findNode("var/lib/azagent") == null);
+    try std.testing.expect(tree.findNode("var/lib/dhcp") == null);
+    const random_seed = try tree.readFileAlloc(std.testing.allocator, "var/lib/systemd/random-seed", 1024);
+    defer std.testing.allocator.free(random_seed);
+    try std.testing.expectEqual(@as(usize, 0), random_seed.len);
+    try std.testing.expect(tree.findNode("srv/alice") == null);
+    try std.testing.expect(tree.findNode("etc/sudoers.d/alice") == null);
+    const passwd = try tree.readFileAlloc(std.testing.allocator, "etc/passwd", 4096);
+    defer std.testing.allocator.free(passwd);
+    try std.testing.expect(std.mem.indexOf(u8, passwd, "alice:") == null);
+    const group = try tree.readFileAlloc(std.testing.allocator, "etc/group", 4096);
+    defer std.testing.allocator.free(group);
+    try std.testing.expect(std.mem.indexOf(u8, group, "wheel:x:10:alice") == null);
+}
+
+test "Azure generalization rejects shared home removal before mutation" {
+    const io = std.testing.io;
+    const spool_path = "test-os-shared-home-generalization.spool";
+    defer std.Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    var tree = try RootTree.init(std.testing.allocator, io, spool_path, .{});
+    defer tree.deinit();
+
+    try tree.putFileBytes("etc/hostname", "captured\n", .{ .mode = 0o644 });
+    try tree.putFileBytes(
+        "etc/passwd",
+        "alice:x:1000:1000::/srv/alice:/bin/bash\nbob:x:1001:1001::/srv:/bin/bash\n",
+        .{ .mode = 0o644 },
+    );
+    try std.testing.expectError(
+        error.SharedUserHome,
+        generalize(std.testing.allocator, &tree, .{ .azure = .{ .remove_users = &.{"alice"} } }),
+    );
+
+    const hostname = try tree.readFileAlloc(std.testing.allocator, "etc/hostname", 1024);
+    defer std.testing.allocator.free(hostname);
+    try std.testing.expectEqualStrings("captured\n", hostname);
+}
+
+test "Azure generalization does not infer a home for an absent user" {
+    const io = std.testing.io;
+    const spool_path = "test-os-absent-user-generalization.spool";
+    defer std.Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    var tree = try RootTree.init(std.testing.allocator, io, spool_path, .{});
+    defer tree.deinit();
+
+    try tree.putFileBytes("etc/passwd", "bob:x:1001:1001::/home/alice:/bin/bash\n", .{ .mode = 0o644 });
+    try tree.putFileBytes("home/alice/authorized_keys", "bob-key\n", .{ .mode = 0o600 });
+    try generalize(std.testing.allocator, &tree, .{ .azure = .{
+        .reset_hostname = false,
+        .clear_machine_id = false,
+        .remove_ssh_host_keys = false,
+        .remove_agent_state = false,
+        .remove_dhcp_leases = false,
+        .clear_random_seed = false,
+        .remove_users = &.{"alice"},
+    } });
+
+    try std.testing.expect(tree.findNode("home/alice/authorized_keys") != null);
+}
