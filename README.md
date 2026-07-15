@@ -174,6 +174,41 @@ zig build generalized-azurelinux4 -- [--iso <path>] [--output <path>] [--size <s
                       #   (Linux-only; requires root, curl, dnf, qemu-img, sudo)
 ```
 
+## Use from another `build.zig`
+
+Declare zvmi as a package dependency named `zvmi`, then import its build helper and use the returned `LazyPath` like any other generated file:
+
+```zig
+const std = @import("std");
+const zvmi = @import("zvmi");
+
+pub fn build(b: *std.Build) void {
+    const dependency = b.dependencyFromBuildZig(zvmi, .{
+        .target = b.graph.host,
+    });
+
+    const image = zvmi.addImage(b, dependency, .{
+        .name = "appliance",
+        .input = .{
+            .iso = b.path("inputs/azurelinux.iso"),
+            .container = .{ .oci_layout = b.path("inputs/oci-layout") },
+        },
+        .output = .{
+            .format = .qcow2,
+            .basename = "appliance.qcow2",
+        },
+        .size = 4 * 1024 * 1024 * 1024,
+        .generation = .gen2,
+        .verity = true,
+    });
+
+    const install = b.addInstallFile(image.path, "images/appliance.qcow2");
+    b.getInstallStep().dependOn(&install.step);
+}
+```
+
+Use `.container = .{ .archive = ... }` for a docker/podman save tarball. OCI layout directories are validated and snapshotted into the Zig build cache so adding, removing, or changing a blob invalidates the image step. Layouts containing symlinks or special files are rejected because Zig 0.16's cached directory-copy step cannot preserve them. The helper runs the dedicated `zvmi-image-builder` artifact for the build host even when the consuming project targets another architecture.
+
 ## CI
 
 `.github/workflows/ci.yml` runs the required `zig fmt --check`, `zig build`, and `zig build test` checks on every pull request and push to `main`.

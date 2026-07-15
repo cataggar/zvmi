@@ -4,13 +4,20 @@ const std = @import("std");
 const zvmi = @import("zvmi");
 
 const help_text =
-    \\usage: zvmi build-image --iso <file.iso> --container <oci-layout> --generation 1|2 --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}> [-O raw|vhd|vhdx|qcow2] [--rootfs-path <path>] [--skip-iso-rootfs] [--esp-size <size>] [--stub-source-path <path>] [--verity] [--extra-kernel-options <opts>] [--boot-mode bls|uki|both] [--dry-run] [-v]
+    \\usage: zvmi build-image --iso <file.iso> --container <oci-layout> --generation 1|2 --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}> [-O raw|vhd|vhdx|qcow2] [--rootfs-path <path>] [--skip-iso-rootfs] [--esp-size <size>] [--ext4-label <label>] [--stub-source-path <path>] [--os-release-source-path <path>] [--splash-source-path <path>] [--uki-output-directory <path>] [--verity] [--extra-kernel-options <opts>] [--boot-mode bls|uki|both] [--dry-run] [-v]
     \\
     \\Options:
     \\  --boot-mode bls|uki|both   Gen2 boot files: GRUB+BLS only (default), UKI only, or both.
     \\  --esp-size <size>          ESP size (default 96M). UKI/both commonly need 512M or larger.
+    \\  --ext4-label <label>       Root ext4 filesystem label (default rootfs).
     \\  --skip-iso-rootfs          Use the container as the root filesystem; keep only boot-critical files from the ISO/squashfs.
     \\  --stub-source-path <path>  UKI/both only: use this systemd EFI stub path from the merged source tree.
+    \\  --os-release-source-path <path>
+    \\                              UKI/both only: use this os-release path from the merged source tree.
+    \\  --splash-source-path <path>
+    \\                              UKI/both only: embed this splash image from the merged source tree.
+    \\  --uki-output-directory <path>
+    \\                              UKI/both only: ESP destination directory (default EFI/Linux).
     \\  --verity                   Append a dm-verity hash tree and wire the matching kernel arguments.
     \\  --extra-kernel-options     Extra kernel command-line arguments appended after root=...
     \\
@@ -45,7 +52,11 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     var generation: zvmi.azure.Generation = .gen2;
     var size: ?u64 = null;
     var esp_size: ?u64 = null;
+    var ext4_label: []const u8 = "rootfs";
     var stub_source_path: ?[]const u8 = null;
+    var os_release_source_path: ?[]const u8 = null;
+    var splash_source_path: ?[]const u8 = null;
+    var uki_output_directory: []const u8 = "EFI/Linux";
     var enable_verity = false;
     var extra_kernel_options: []const u8 = "";
     var boot_mode: zvmi.bootconfig.BootMode = .bls_only;
@@ -83,10 +94,26 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
             if (i >= args.len) return fail("build-image: --esp-size requires a value", .{});
             esp_size = zvmi.parseSize(args[i]) catch |err|
                 return fail("build-image: invalid --esp-size '{s}': {s}", .{ args[i], @errorName(err) });
+        } else if (std.mem.eql(u8, arg, "--ext4-label")) {
+            i += 1;
+            if (i >= args.len) return fail("build-image: --ext4-label requires a value", .{});
+            ext4_label = args[i];
         } else if (std.mem.eql(u8, arg, "--stub-source-path")) {
             i += 1;
             if (i >= args.len) return fail("build-image: --stub-source-path requires a path", .{});
             stub_source_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--os-release-source-path")) {
+            i += 1;
+            if (i >= args.len) return fail("build-image: --os-release-source-path requires a path", .{});
+            os_release_source_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--splash-source-path")) {
+            i += 1;
+            if (i >= args.len) return fail("build-image: --splash-source-path requires a path", .{});
+            splash_source_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--uki-output-directory")) {
+            i += 1;
+            if (i >= args.len) return fail("build-image: --uki-output-directory requires a path", .{});
+            uki_output_directory = args[i];
         } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
             i += 1;
             if (i >= args.len) return fail("build-image: -o/--output requires a path", .{});
@@ -142,11 +169,15 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
             .rootfs_path_in_iso = rootfs_path,
             .skip_iso_rootfs = skip_iso_rootfs,
             .esp_size = esp_size orelse zvmi.build_image.default_esp_size,
+            .ext4_label = ext4_label,
             .verity = enable_verity,
             .extra_kernel_options = extra_kernel_options,
             .boot_mode = boot_mode,
             .uki = .{
                 .stub_source_path = stub_source_path,
+                .os_release_source_path = os_release_source_path,
+                .splash_source_path = splash_source_path,
+                .output_directory = uki_output_directory,
             },
             .dry_run = dry_run,
             .verbose = verbose,
