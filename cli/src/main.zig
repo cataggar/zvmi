@@ -1,6 +1,6 @@
 //! `zvmi`: a qemu-img-like CLI over the `zvmi` library. Supports `create`,
-//! `info`, `convert`, `resize`, `check`, `map`, `build-image`, `azure`, and
-//! `cosi` over `raw`, `vhd`, `vhdx`, and `qcow2`.
+//! `info`, `convert`, `resize`, `check`, `map`, `build-image`, `azure`,
+//! `cosi`, and `qemu` over `raw`, `vhd`, `vhdx`, and `qcow2`.
 
 const std = @import("std");
 const zvmi = @import("zvmi");
@@ -14,6 +14,7 @@ const map_cmd = @import("commands/map.zig");
 const azure_cmd = @import("commands/azure.zig");
 const cosi_cmd = @import("commands/cosi.zig");
 const build_image_cmd = @import("commands/build_image.zig");
+const qemu_cmd = @import("commands/qemu.zig");
 
 const usage =
     \\Usage: zvmi <command> [options]
@@ -29,6 +30,7 @@ const usage =
     \\  azure deprovision [--user <username>] <file>
     \\  cosi <disk-image> -o <output.cosi>
     \\  build-image --iso <file.iso> --container <oci-layout> --generation 1|2 --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}> [--skip-iso-rootfs] [--esp-size <size>] [--boot-mode bls|uki|both] [--stub-source-path <path>] [--verity]
+    \\  qemu [<image>] [--snapshot] [--accel auto|whpx|kvm|hvf|tcg] [--qemu <path>] [--ovmf-code <path>] [--ovmf-vars <path>] [-- <extra-qemu-args...>]
     \\
     \\Formats: raw, vhd (alias: vpc), vhdx, qcow2
     \\Sizes accept K/M/G/T binary suffixes (e.g. 20G).
@@ -41,11 +43,16 @@ pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const argv = try init.minimal.args.toSlice(arena);
 
-    const exit_code = run(gpa, io, argv[1..]);
+    const exit_code = run(gpa, io, init.minimal.environ, argv[1..]);
     std.process.exit(exit_code);
 }
 
-fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
+fn run(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    environ: std.process.Environ,
+    args: []const []const u8,
+) u8 {
     if (args.len < 1) {
         std.debug.print("{s}", .{usage});
         return 1;
@@ -63,6 +70,7 @@ fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     if (std.mem.eql(u8, command, "azure")) return azure_cmd.run(gpa, io, rest);
     if (std.mem.eql(u8, command, "cosi")) return cosi_cmd.run(gpa, io, rest);
     if (std.mem.eql(u8, command, "build-image")) return build_image_cmd.run(gpa, io, rest);
+    if (std.mem.eql(u8, command, "qemu")) return qemu_cmd.run(gpa, io, environ, rest);
     if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h") or std.mem.eql(u8, command, "help")) {
         std.debug.print("{s}", .{usage});
         return 0;
@@ -81,4 +89,5 @@ test {
     _ = azure_cmd;
     _ = cosi_cmd;
     _ = build_image_cmd;
+    _ = qemu_cmd;
 }
