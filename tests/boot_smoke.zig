@@ -16,21 +16,13 @@ const std = @import("std");
 const Io = std.Io;
 const zvmi = @import("zvmi");
 const qmp = @import("qmp");
+const qemu_host = @import("qemu_host");
 
 const qemu_boot_smoke_timeout_seconds: i64 = 60;
 const qemu_boot_smoke_serial_limit: usize = 256 * 1024;
 const qemu_boot_smoke_disk_size: u64 = 4 * 1024 * zvmi.azure.one_mib;
 
-const OvmfFirmwarePair = struct {
-    code_path: []u8,
-    vars_path: []u8,
-
-    fn deinit(self: *OvmfFirmwarePair, allocator: std.mem.Allocator) void {
-        allocator.free(self.code_path);
-        allocator.free(self.vars_path);
-        self.* = undefined;
-    }
-};
+const OvmfFirmwarePair = qemu_host.FirmwarePair;
 
 const QemuBootSmokePrereqs = struct {
     qemu_path: []u8,
@@ -66,14 +58,6 @@ const QemuBootSmokeResult = struct {
         self.* = undefined;
     }
 };
-
-fn pathAccessible(io: Io, path: []const u8, options: Io.Dir.AccessOptions) !bool {
-    Io.Dir.cwd().access(io, path, options) catch |err| switch (err) {
-        error.FileNotFound, error.AccessDenied, error.PermissionDenied => return false,
-        else => return err,
-    };
-    return true;
-}
 
 fn readOptionalFileAlloc(
     allocator: std.mem.Allocator,
@@ -112,7 +96,7 @@ fn requireProvisionedBootTestPathAlloc(
     };
     errdefer allocator.free(path);
 
-    if (!try pathAccessible(io, path, .{ .read = true })) {
+    if (!try qemu_host.pathAccessible(io, path, .{ .read = true })) {
         std.debug.print(
             "skipping build-image QEMU boot smoke test: {s} points to an unreadable path: {s}\n",
             .{ key, path },
@@ -136,7 +120,7 @@ fn optionalProvisionedBootTestPathAlloc(
     const path = try getOptionalTestEnvPathAlloc(allocator, key) orelse return null;
     errdefer allocator.free(path);
 
-    if (!try pathAccessible(io, path, .{ .read = true })) {
+    if (!try qemu_host.pathAccessible(io, path, .{ .read = true })) {
         std.debug.print(
             "skipping: {s} points to an unreadable path: {s}\n",
             .{ key, path },
@@ -148,37 +132,15 @@ fn optionalProvisionedBootTestPathAlloc(
     return path;
 }
 
-fn findExecutableInPathAlloc(
-    allocator: std.mem.Allocator,
-    io: Io,
-    name: []const u8,
-) !?[]u8 {
-    const path_value = try getOptionalTestEnvPathAlloc(allocator, "PATH") orelse return null;
-    defer allocator.free(path_value);
-
-    var it = std.mem.splitScalar(u8, path_value, std.fs.path.delimiter);
-    while (it.next()) |dir_path| {
-        const candidate = if (dir_path.len == 0)
-            try allocator.dupe(u8, name)
-        else
-            try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ dir_path, std.fs.path.sep, name });
-        errdefer allocator.free(candidate);
-
-        if (try pathAccessible(io, candidate, .{ .execute = true })) return candidate;
-        allocator.free(candidate);
-    }
-
-    return null;
-}
-
 fn requireOvmfFirmwarePairAlloc(
     allocator: std.mem.Allocator,
     io: Io,
+    qemu_path: []const u8,
 ) !OvmfFirmwarePair {
     const env_code = try getOptionalTestEnvPathAlloc(allocator, "ZVMI_BOOT_TEST_OVMF_CODE");
-    errdefer if (env_code) |path| allocator.free(path);
+    defer if (env_code) |path| allocator.free(path);
     const env_vars = try getOptionalTestEnvPathAlloc(allocator, "ZVMI_BOOT_TEST_OVMF_VARS");
-    errdefer if (env_vars) |path| allocator.free(path);
+    defer if (env_vars) |path| allocator.free(path);
 
     if (env_code != null or env_vars != null) {
         if (env_code == null or env_vars == null) {
@@ -189,40 +151,22 @@ fn requireOvmfFirmwarePairAlloc(
             return error.SkipZigTest;
         }
 
-        if (!try pathAccessible(io, env_code.?, .{ .read = true }) or
-            !try pathAccessible(io, env_vars.?, .{ .read = true }))
-        {
+        return qemu_host.findFirmwarePairAlloc(allocator, io, .{
+            .explicit_code_path = env_code,
+            .explicit_vars_path = env_vars,
+            .qemu_path = qemu_path,
+        }) catch {
             std.debug.print(
                 "skipping build-image QEMU boot smoke test: configured OVMF paths are unreadable ({s}, {s})\n",
                 .{ env_code.?, env_vars.? },
             );
             return error.SkipZigTest;
-        }
-
-        return .{
-            .code_path = env_code.?,
-            .vars_path = env_vars.?,
-        };
+        } orelse return error.SkipZigTest;
     }
 
-    const candidates = [_]struct { code: []const u8, vars: []const u8 }{
-        .{ .code = "/usr/share/OVMF/OVMF_CODE.fd", .vars = "/usr/share/OVMF/OVMF_VARS.fd" },
-        // Ubuntu's `ovmf` package (e.g. 24.04 "noble") ships only the 4M
-        // variants under these names -- no plain OVMF_CODE.fd/OVMF_VARS.fd.
-        .{ .code = "/usr/share/OVMF/OVMF_CODE_4M.fd", .vars = "/usr/share/OVMF/OVMF_VARS_4M.fd" },
-        .{ .code = "/usr/share/edk2/ovmf/OVMF_CODE.fd", .vars = "/usr/share/edk2/ovmf/OVMF_VARS.fd" },
-        .{ .code = "/usr/share/edk2/x64/OVMF_CODE.fd", .vars = "/usr/share/edk2/x64/OVMF_VARS.fd" },
-    };
-    inline for (candidates) |candidate| {
-        if (try pathAccessible(io, candidate.code, .{ .read = true }) and
-            try pathAccessible(io, candidate.vars, .{ .read = true }))
-        {
-            return .{
-                .code_path = try allocator.dupe(u8, candidate.code),
-                .vars_path = try allocator.dupe(u8, candidate.vars),
-            };
-        }
-    }
+    if (try qemu_host.findFirmwarePairAlloc(allocator, io, .{
+        .qemu_path = qemu_path,
+    })) |pair| return pair;
 
     std.debug.print(
         "skipping build-image QEMU boot smoke test: OVMF firmware not found; set ZVMI_BOOT_TEST_OVMF_CODE and ZVMI_BOOT_TEST_OVMF_VARS\n",
@@ -261,7 +205,12 @@ fn requireQemuBootSmokePrereqs(
     allocator: std.mem.Allocator,
     io: Io,
 ) !QemuBootSmokePrereqs {
-    const qemu_path = try findExecutableInPathAlloc(allocator, io, "qemu-system-x86_64") orelse {
+    const qemu_path = try qemu_host.findExecutableInPathAlloc(
+        allocator,
+        io,
+        std.testing.environ,
+        "qemu-system-x86_64",
+    ) orelse {
         std.debug.print(
             "skipping build-image QEMU boot smoke test: qemu-system-x86_64 not found on PATH\n",
             .{},
@@ -434,7 +383,7 @@ test "build-image boot-smokes typed customization and generalization under Gen2 
 
     var prereqs = try requireQemuBootSmokePrereqs(allocator, io);
     defer prereqs.deinit(allocator);
-    var ovmf = try requireOvmfFirmwarePairAlloc(allocator, io);
+    var ovmf = try requireOvmfFirmwarePairAlloc(allocator, io, prereqs.qemu_path);
     defer ovmf.deinit(allocator);
 
     const output_path = "test-build-image-qemu-gen2.raw";
@@ -618,7 +567,7 @@ test "build-image --boot-mode uki opportunistically boot-smokes a provisioned st
 
     var prereqs = try requireQemuBootSmokePrereqs(allocator, io);
     defer prereqs.deinit(allocator);
-    var ovmf = try requireOvmfFirmwarePairAlloc(allocator, io);
+    var ovmf = try requireOvmfFirmwarePairAlloc(allocator, io, prereqs.qemu_path);
     defer ovmf.deinit(allocator);
 
     const uki_oci_path = try optionalProvisionedBootTestPathAlloc(allocator, io, "ZVMI_BOOT_TEST_UKI_OCI") orelse {
@@ -718,7 +667,7 @@ test "build-image --verity opportunistically boot-smokes a provisioned verity-ca
 
     var prereqs = try requireQemuBootSmokePrereqs(allocator, io);
     defer prereqs.deinit(allocator);
-    var ovmf = try requireOvmfFirmwarePairAlloc(allocator, io);
+    var ovmf = try requireOvmfFirmwarePairAlloc(allocator, io, prereqs.qemu_path);
     defer ovmf.deinit(allocator);
 
     const verity_oci_path = try optionalProvisionedBootTestPathAlloc(allocator, io, "ZVMI_BOOT_TEST_VERITY_OCI") orelse {

@@ -89,11 +89,14 @@ zvmi/
         azure.zig             # `zvmi azure fixup`, `zvmi azure deprovision`
         cosi.zig              # `zvmi cosi`
         build_image.zig       # `zvmi build-image`
+        qemu.zig              # `zvmi qemu`
         opts.zig              # shared `-o subformat=...` parsing
   azinit/                   # minimal PID 1 for real-boot testing of
                               #   --skip-iso-rootfs images (see azinit/README.md)
   qmp/                      # native Zig QEMU Machine Protocol (QMP) client,
                               #   MIT licensed (see qmp/README.md)
+  qemu/
+    host.zig                # shared host QEMU executable + OVMF discovery
   nbd/                      # native Zig NBD client + reference server, MIT
                               #   licensed (see nbd/README.md)
   qcow2/                    # native Zig qcow2 reader/writer, MIT licensed
@@ -160,6 +163,9 @@ zvmi/
 ## Requirements
 
 - Zig **0.16.0** or later.
+- `zvmi qemu` additionally requires [ghr](https://github.com/cataggar/ghr)
+  for automatic image download. Install the packaged QEMU build with
+  `ghr install cataggar/qemu`, or provide a system QEMU/OVMF installation.
 
 ## Build
 
@@ -169,6 +175,7 @@ zig build test       # run all tests (boot-smoke tests skip gracefully
                       #   without qemu-system-x86_64/OVMF/fixtures)
 zig build test-boot-smoke  # run just the real-QEMU boot-smoke tests
 zig build run -- <args>   # run the CLI, e.g. `zig build run -- info foo.vhd`
+zig build run -- qemu     # download (if needed) and boot the Azure Linux image
 zig build generalized-azurelinux4 -- [--iso <path>] [--output <path>] [--size <size>] [--work-dir <dir>]
                       # build a generalized Azure Linux 4 Gen2 QCOW2 image
                       #   (Linux-only; requires root, curl, dnf, qemu-img, sudo)
@@ -380,6 +387,8 @@ zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 384M --skip-iso-rootfs -o output-minimal.raw -O raw
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G --verity -o output.vhd
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G --boot-mode uki --esp-size 512M -o output-uki.vhd
+zvmi qemu
+zvmi qemu --snapshot
 ```
 
 `--skip-iso-rootfs` is useful with genuinely minimal base containers: it keeps
@@ -447,6 +456,65 @@ zig build generalized-azurelinux4 -- \
 The builder requires Zig 0.16, `curl`, `dnf`, GNU tar, `qemu-img`, and passwordless or interactive `sudo`. On a non-x86_64 build host, x86_64 binfmt and `qemu-x86_64-static` are also required so RPM scriptlets can run inside the target rootfs; on Azure Linux install them with `sudo tdnf install -y qemu-user-static-x86`. Use `--iso` to supply an already-downloaded ISO and `--size` to override the 768 MiB virtual disk size. The build system automatically passes the paths of the built native zvmi, guest azinit/azagent binaries, and the preload library; no separate `zig build` invocation is needed.
 
 The manually dispatched **Rebuild Azure Linux 4 release image** GitHub Actions workflow builds this image from current `main`, validates it, and replaces `AzureLinux-4.0-x86_64.qcow2` in the `AzureLinux4.0-20260714` release while refreshing the published checksum and provenance.
+
+### Booting the release image with QEMU
+
+Install QEMU once through ghr:
+
+```text
+ghr install cataggar/qemu
+```
+
+Then run the command from the directory where the VM disk should live:
+
+```text
+zvmi qemu
+```
+
+If `AzureLinux-4.0-x86_64.qcow2` is absent, `zvmi` runs the verified ghr
+download for
+`cataggar/zvmi/AzureLinux-4.0-x86_64.qcow2@AzureLinux4.0-20260714`.
+Existing images are never refreshed or overwritten. QEMU and its matching
+EDK2 firmware are resolved from the `cataggar/qemu` ghr installation first,
+then from a system QEMU/OVMF installation.
+
+The default boot is persistent: QEMU writes directly to the image, and a
+matching `AzureLinux-4.0-x86_64.vars.fd` UEFI variables file is created once
+beside it and reused. Use snapshot mode when guest changes should be discarded:
+
+```text
+zvmi qemu --snapshot
+```
+
+Snapshot mode uses the sibling `qemu-img` binary to create a temporary qcow2
+overlay plus a temporary UEFI variables copy; `zvmi` removes both when QEMU
+exits. The automatic accelerator is WHPX on x86_64 Windows, HVF on x86_64
+macOS, KVM on x86_64 Linux when `/dev/kvm` is available, and TCG otherwise.
+Override it when needed:
+
+```text
+zvmi qemu --accel tcg
+```
+
+An explicit image path must already exist and is still launched as an x86_64
+Gen2/UEFI VM:
+
+```text
+zvmi qemu custom.qcow2
+```
+
+Use `--qemu`, `--ovmf-code`, and `--ovmf-vars` for non-standard installations.
+Arguments after `--` are appended directly to QEMU. The terminal is attached to
+QEMU's `-nographic` serial console; use QEMU's `Ctrl+A`, then `X`, escape to
+exit. A successful local boot reaches the root shell with:
+
+```text
+[azinit] non-Azure environment detected; skipping azagent
+[root@azurelinux /]#
+```
+
+This command is intentionally a focused launcher for the published x86_64
+Gen2 Azure Linux image, not a general VM configuration manager.
 
 `convert` skips all-zero chunks (aligned to the destination's block size for
 sparse block formats such as dynamic vhd and vhdx), so converting a
