@@ -30,6 +30,10 @@ pub const FormatOptions = struct {
     volume_label: [11]u8 = "NO NAME    ".*,
 };
 
+pub fn validateFormatOptions(options: FormatOptions) Error!void {
+    _ = try computeLayout(options);
+}
+
 pub const DirEntryKind = enum { file, directory };
 
 pub const DirEntry = struct {

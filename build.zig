@@ -5,6 +5,8 @@ const image_build = @import("build/image.zig");
 pub const ImageFormat = image_build.Format;
 pub const ImageGeneration = image_build.Generation;
 pub const ImageBootMode = image_build.BootMode;
+pub const ImageArchitecture = image_build.Architecture;
+pub const ImageReproducibility = image_build.Reproducibility;
 pub const ImageUkiOptions = image_build.UkiOptions;
 pub const ImageContainer = image_build.Container;
 pub const ImageInput = image_build.Input;
@@ -125,6 +127,19 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(input_validator_exe);
     const input_validator_tests = b.addTest(.{ .root_module = input_validator_mod });
     const run_input_validator_tests = b.addRunArtifact(input_validator_tests);
+
+    const image_status_check_mod = b.createModule(.{
+        .root_source_file = b.path("cli/src/image_status_check.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    const image_status_check_exe = b.addExecutable(.{
+        .name = "zvmi-image-status-check",
+        .root_module = image_status_check_mod,
+    });
+    b.installArtifact(image_status_check_exe);
+    const image_status_check_tests = b.addTest(.{ .root_module = image_status_check_mod });
+    const run_image_status_check_tests = b.addRunArtifact(image_status_check_tests);
 
     // ---- qmp: native Zig QEMU Machine Protocol (QMP) client ----
     const qmp_mod = b.addModule("qmp", .{
@@ -314,6 +329,22 @@ pub fn build(b: *std.Build) void {
     build_api_consumer_check.setName("check external build.zig consumer");
     build_api_consumer_check.setCwd(b.path("tests/build_api_consumer"));
 
+    const build_api_diagnostics_check = b.addSystemCommand(&.{
+        b.graph.zig_exe,
+        "build",
+        "diagnostics",
+    });
+    build_api_diagnostics_check.setName("check external build.zig diagnostics");
+    build_api_diagnostics_check.setCwd(b.path("tests/build_api_consumer"));
+
+    const build_api_execution_diagnostics_check = b.addSystemCommand(&.{
+        b.graph.zig_exe,
+        "build",
+        "execution-diagnostics",
+    });
+    build_api_execution_diagnostics_check.setName("check external build.zig execution diagnostics");
+    build_api_execution_diagnostics_check.setCwd(b.path("tests/build_api_consumer"));
+
     // ---- scripts/build_generalized_azurelinux4.zig: generalized Azure Linux 4
     // QCOW2 builder, replacing scripts/build-generalized-azurelinux4.py.
     // Linux-specific: the full pipeline (dnf, sudo chroot, qemu-img) is only
@@ -419,6 +450,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_azagent_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_input_validator_tests.step);
+    test_step.dependOn(&run_image_status_check_tests.step);
     test_step.dependOn(&run_qmp_mod_tests.step);
     test_step.dependOn(&run_qmp_exe_tests.step);
     test_step.dependOn(&run_qmp_codegen_tests.step);
@@ -431,4 +463,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_qcow2_exe_tests.step);
     test_step.dependOn(&run_azinit_tests.step);
     test_step.dependOn(&build_api_consumer_check.step);
+    test_step.dependOn(&build_api_diagnostics_check.step);
+    test_step.dependOn(&build_api_execution_diagnostics_check.step);
 }

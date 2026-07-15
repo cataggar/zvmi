@@ -198,16 +198,70 @@ pub fn build(b: *std.Build) void {
             .basename = "appliance.qcow2",
         },
         .size = 4 * 1024 * 1024 * 1024,
+        .target_architecture = .x86_64,
         .generation = .gen2,
+        .rootfs_path_in_iso = "images/rootfs.squashfs",
+        .reproducibility = .{
+            .seed = [_]u8{0x42} ** 32,
+            .source_date_epoch = 1_735_689_600,
+        },
         .verity = true,
     });
 
     const install = b.addInstallFile(image.path, "images/appliance.qcow2");
+    const install_provenance = b.addInstallFile(image.provenance_path, "images/appliance.provenance.json");
     b.getInstallStep().dependOn(&install.step);
+    b.getInstallStep().dependOn(&install_provenance.step);
 }
 ```
 
 Use `.container = .{ .archive = ... }` for a docker/podman save tarball. OCI layout directories are validated and snapshotted into the Zig build cache so adding, removing, or changing a blob invalidates the image step. Layouts containing symlinks or special files are rejected because Zig 0.16's cached directory-copy step cannot preserve them. The helper runs the dedicated `zvmi-image-builder` artifact for the build host even when the consuming project targets another architecture.
+
+`addImage` also returns `plan_path`, `diagnostics_path`, and `provenance_path` from image execution, plus `preflight_plan_path`, `preflight_diagnostics_path`, and `preflight_provenance_path` from a separate non-cacheable capability check. The preflight artifacts remain consumable even when its status gate blocks image execution; unavailable plan or provenance documents contain JSON `null`, while diagnostics explains the failure. Preflight and execution use separate build-cache bundle paths, so their plan hashes intentionally differ; execution repeats preflight against its exact resolved plan before mutation. Successful execution bundles are reused only when a content key covering the host builder, complete request arguments, ISO, and container still matches; failed or stale bundles are cleared and retried instead of becoming permanent cache hits. The target architecture, rootfs path, deterministic seed, and source timestamp are explicit inputs; the resolved plan records generated identifiers and operation ordering, while provenance records source and final-output SHA-256 hashes.
+
+## Runtime customization API
+
+The library exposes the same versioned request-plan runtime used by `addImage`:
+
+```zig
+const std = @import("std");
+const customize = @import("zvmi").customize;
+
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.arena.allocator();
+    const request = customize.Request{
+        .target_architecture = .x86_64,
+        .input = .{ .iso_oci = .{
+            .iso_path = "azurelinux.iso",
+            .container_path = "oci-layout",
+            .rootfs_path_in_iso = "images/rootfs.squashfs",
+        } },
+        .output = .{ .path = "appliance.qcow2", .format = .qcow2, .size = 4 * 1024 * 1024 * 1024 },
+        .storage = .{ .fresh = .{} },
+        .execution = .{ .workspace_path = "." },
+        .reproducibility = .{
+            .seed = .{ .bytes = [_]u8{0x42} ** 32 },
+            .source_date_epoch = 1_735_689_600,
+        },
+    };
+
+    var resolved = try customize.resolve(allocator, &request, .{ .host_architecture = .x86_64 });
+    defer resolved.deinit(allocator);
+    if (resolved.plan == null) return error.InvalidConfiguration;
+
+    var capabilities = try customize.preflight(allocator, init.io, &resolved.plan.?, customize.Platform.system());
+    defer capabilities.deinit(allocator);
+    if (!capabilities.ready()) return error.PreflightFailed;
+
+    var outcome = try customize.execute(allocator, init.io, &resolved.plan.?, customize.Platform.system(), null);
+    defer outcome.deinit(allocator);
+    if (outcome.result == null) return error.ImageBuildFailed;
+}
+```
+
+`resolve` is deterministic and does not inspect or mutate the host. The v1 native backend requires `workspace_path` to be the parent directory of `output.path`, keeping all planned scratch state on the destination filesystem for atomic publication. `preflight` returns all missing capabilities, and `execute` repeats preflight before mutation, stages the image in a planned transaction directory, verifies that source hashes remain unchanged, and atomically publishes the final output. Validation, preflight, and execution diagnostics are structured and independently owned; successful results include source hashes, resolved configuration, generated identifiers, observed partition, VHDX, and verity metadata, and the final artifact hash.
+
+`customize.current_api_version` identifies the request contract. v1 semantics are stable; incompatible request changes require a new API version, and unsupported versions produce an `unsupported_api_version` diagnostic rather than being migrated implicitly. Plan and provenance JSON have independent `schema_version` fields so artifact consumers can reject or migrate formats separately. Serialization adapters must convert older inputs to a current typed `Request` before calling `resolve`.
 
 ## CI
 

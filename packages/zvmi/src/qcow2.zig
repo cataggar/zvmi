@@ -470,8 +470,13 @@ fn parseLayer(file: Io.File, io: Io) OpenError!ParsedLayer {
 
 /// Creates a new qcow2 image with a version 3 header, 64 KiB clusters, an
 /// empty L1 table, and preallocated refcount metadata sized for `size`.
-pub fn create(io: Io, file: Io.File, size: u64) CreateError!Info {
+pub fn validateCreateSize(size: u64) CreateError!void {
     if (size % 512 != 0) return error.SizeNotSectorAligned;
+    _ = try layoutForSize(size, default_cluster_bits, default_refcount_order);
+}
+
+pub fn create(io: Io, file: Io.File, size: u64) CreateError!Info {
+    try validateCreateSize(size);
     const layout = try layoutForSize(size, default_cluster_bits, default_refcount_order);
 
     const refcount_table_offset = layout.cluster_size;

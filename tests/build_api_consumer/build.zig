@@ -18,6 +18,12 @@ pub fn build(b: *std.Build) void {
             .basename = "layout-fixture.qcow2",
         },
         .size = 64 * 1024 * 1024,
+        .target_architecture = .x86_64,
+        .rootfs_path_in_iso = "images/rootfs.squashfs",
+        .reproducibility = .{
+            .seed = [_]u8{0x11} ** 32,
+            .source_date_epoch = 1_735_689_600,
+        },
     });
 
     const archive_image = zvmi.addImage(b, dependency, .{
@@ -31,6 +37,12 @@ pub fn build(b: *std.Build) void {
             .basename = "archive-fixture.vhd",
         },
         .size = 64 * 1024 * 1024,
+        .target_architecture = .x86_64,
+        .rootfs_path_in_iso = "images/rootfs.squashfs",
+        .reproducibility = .{
+            .seed = [_]u8{0x22} ** 32,
+            .source_date_epoch = 1_735_689_600,
+        },
         .boot_mode = .both,
         .uki = .{
             .stub_source_path = "usr/lib/systemd/boot/efi/linuxx64.efi.stub",
@@ -40,9 +52,47 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const execution_failure_image = zvmi.addImage(b, dependency, .{
+        .name = "execution-failure-fixture",
+        .input = .{
+            .iso = b.path("fixtures/os.iso"),
+            .container = .{ .archive = b.path("fixtures/container.tar") },
+        },
+        .output = .{
+            .format = .qcow2,
+            .basename = "execution-failure-fixture.qcow2",
+        },
+        .size = 256 * 1024 * 1024,
+        .target_architecture = .x86_64,
+        .rootfs_path_in_iso = "images/rootfs.squashfs",
+        .reproducibility = .{
+            .seed = [_]u8{0x33} ** 32,
+            .source_date_epoch = 1_735_689_600,
+        },
+    });
+
     const install_layout = b.addInstallFile(layout_image.path, "images/layout-fixture.qcow2");
     const install_archive = b.addInstallFile(archive_image.path, "images/archive-fixture.vhd");
+    const install_plan = b.addInstallFile(layout_image.plan_path, "images/layout-fixture.plan.json");
+    const install_provenance = b.addInstallFile(layout_image.provenance_path, "images/layout-fixture.provenance.json");
     const image_step = b.step("image", "Build and install both fixture images");
     image_step.dependOn(&install_layout.step);
     image_step.dependOn(&install_archive.step);
+    image_step.dependOn(&install_plan.step);
+    image_step.dependOn(&install_provenance.step);
+
+    const install_diagnostics = b.addInstallFile(layout_image.preflight_diagnostics_path, "images/layout-fixture.diagnostics.json");
+    const install_failure_plan = b.addInstallFile(layout_image.preflight_plan_path, "images/layout-fixture.failure-plan.json");
+    const install_failure_provenance = b.addInstallFile(layout_image.preflight_provenance_path, "images/layout-fixture.failure-provenance.json");
+    const diagnostics_step = b.step("diagnostics", "Produce diagnostics without requiring a successful image");
+    diagnostics_step.dependOn(&install_diagnostics.step);
+    diagnostics_step.dependOn(&install_failure_plan.step);
+    diagnostics_step.dependOn(&install_failure_provenance.step);
+
+    const install_execution_diagnostics = b.addInstallFile(
+        execution_failure_image.diagnostics_path,
+        "images/execution-failure-fixture.diagnostics.json",
+    );
+    const execution_diagnostics_step = b.step("execution-diagnostics", "Produce structured diagnostics for a retryable execution failure");
+    execution_diagnostics_step.dependOn(&install_execution_diagnostics.step);
 }

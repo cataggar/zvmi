@@ -61,8 +61,72 @@ pub const BuildImageOptions = struct {
     /// Additional UKI discovery/output controls forwarded to
     /// `bootconfig.populateEsp()`.
     uki: bootconfig.UkiOptions = .{},
+    architecture: ?bootconfig.Architecture = null,
+    deterministic: ?BuildImageDeterminism = null,
+    event_sink: ?EventSink = null,
+    stage_sink: ?StageSink = null,
     dry_run: bool = false,
     verbose: bool = false,
+};
+
+pub const BuildImageDeterminism = struct {
+    disk_guid: guid.Guid,
+    esp_partition_guid: guid.Guid,
+    root_partition_guid: guid.Guid,
+    mbr_disk_signature: u32,
+    root_filesystem_uuid: [16]u8,
+    verity_salt: [verity.salt_size]u8,
+    filesystem_timestamp: u32,
+    output_create_options: image_mod.CreateOptions,
+};
+
+pub const Event = union(enum) {
+    progress: []const u8,
+    warning: Warning,
+};
+
+pub const Warning = struct {
+    code: []const u8,
+    message: []const u8,
+};
+
+pub const EventSink = struct {
+    context: ?*anyopaque = null,
+    emitFn: *const fn (context: ?*anyopaque, event: Event) void,
+
+    fn emit(self: EventSink, event: Event) void {
+        self.emitFn(self.context, event);
+    }
+};
+
+pub const Stage = enum {
+    load_sources,
+    apply_filesystem_changes,
+    generalize_and_cleanup,
+    prepare_initramfs,
+    prepare_boot_configuration,
+    populate_filesystem,
+    seal_verity,
+    install_bootloader,
+    generate_uki,
+    check_and_close_filesystems,
+    convert_output,
+};
+
+pub const StageSink = struct {
+    context: ?*anyopaque = null,
+    advanceFn: *const fn (context: ?*anyopaque, stage: Stage) bool,
+
+    pub fn advance(self: StageSink, stage: Stage) bool {
+        return self.advanceFn(self.context, stage);
+    }
+};
+
+pub const VhdxMetadataReport = struct {
+    header_sequence_number: u64,
+    file_write_guid: guid.Guid,
+    data_write_guid: guid.Guid,
+    page83_guid: guid.Guid,
 };
 
 pub const BuildImageReport = struct {
@@ -76,6 +140,7 @@ pub const BuildImageReport = struct {
     verity: ?verity.Info = null,
     vhd_alignment: ?azure.FixupResult = null,
     partition_style: ?azure.PartitionStyleReport = null,
+    vhdx_metadata: ?VhdxMetadataReport = null,
 
     pub fn deinit(self: *BuildImageReport, allocator: std.mem.Allocator) void {
         allocator.free(self.rootfs_path_in_iso);
@@ -89,23 +154,43 @@ pub fn build(
     io: Io,
     options: BuildImageOptions,
 ) !BuildImageReport {
+    try enterStage(options, .load_sources);
     const output_format = try resolveOutputFormat(options.output_format, options.output_path);
     const disk_size = if (output_format == .vhd) azure.alignSizeToMib(options.size) else options.size;
 
-    if (options.verbose and output_format == .vhd and disk_size != options.size) {
-        std.debug.print("build-image: aligned requested VHD size from {d} to {d} bytes for Azure compatibility\n", .{ options.size, disk_size });
+    if (output_format == .vhd and disk_size != options.size) {
+        if (options.event_sink) |sink| {
+            sink.emit(.{ .progress = "align requested VHD size for Azure compatibility" });
+        } else if (options.verbose) {
+            std.debug.print("build-image: aligned requested VHD size from {d} to {d} bytes for Azure compatibility\n", .{ options.size, disk_size });
+        }
     }
 
-    logStep(options.verbose, "load container image");
+    logStep(options, "load container image");
     var container_image = try oci.load(io, allocator, options.container_path, .{});
     defer container_image.deinit();
 
-    const architecture = inferArchitecture(container_image.config.architecture);
-    const planned_partitions = try planPartitionIdentities(allocator, io, disk_size, options.generation, architecture, options.esp_size);
+    const inferred_architecture = parseArchitecture(container_image.config.architecture);
+    if (options.architecture != null and inferred_architecture == null) {
+        return error.UnsupportedContainerArchitecture;
+    }
+    const architecture = options.architecture orelse inferred_architecture orelse .x86_64;
+    if (options.architecture != null and inferred_architecture != null and options.architecture.? != inferred_architecture.?) {
+        return error.ContainerArchitectureMismatch;
+    }
+    const planned_partitions = try planPartitionIdentities(
+        allocator,
+        io,
+        disk_size,
+        options.generation,
+        architecture,
+        options.esp_size,
+        if (options.deterministic) |*deterministic| deterministic else null,
+    );
     var planned_partitions_owned = false;
     errdefer if (!planned_partitions_owned) allocator.free(planned_partitions);
 
-    logStep(options.verbose, "open ISO");
+    logStep(options, "open ISO");
     var iso_reader = try iso9660.Reader.openPath(allocator, io, options.iso_path);
     defer iso_reader.close(io);
 
@@ -135,41 +220,31 @@ pub fn build(
     var extracted_rootfs = false;
     defer if (extracted_rootfs) Io.Dir.cwd().deleteFile(io, rootfs_scratch_path) catch {};
 
-    logStep(options.verbose, "extract squashfs payload from ISO");
+    logStep(options, "extract squashfs payload from ISO");
     try extractIsoEntryToPath(allocator, io, &iso_reader, rootfs_path_in_iso, rootfs_scratch_path);
     extracted_rootfs = true;
 
-    logStep(options.verbose, "open squashfs rootfs");
+    logStep(options, "open squashfs rootfs");
     var squash_reader = try squashfs.Reader.openPath(allocator, io, rootfs_scratch_path);
     defer squash_reader.close(io);
 
     const nested_scratch_prefix = try std.fmt.allocPrint(allocator, "{s}.build-image-nested", .{options.output_path});
     defer allocator.free(nested_scratch_prefix);
 
-    logStep(options.verbose, "merge ISO, squashfs, and OCI trees");
+    logStep(options, "merge ISO, squashfs, and OCI trees");
     var source_tree = try MergedSourceTree.init(allocator, io, &iso_reader, rootfs_path_in_iso, &squash_reader, &container_image, nested_scratch_prefix);
     source_tree.bind();
     defer source_tree.deinit(allocator);
+
+    try enterStage(options, .apply_filesystem_changes);
     if (options.skip_iso_rootfs) {
-        logStep(options.verbose, "prune merged tree to container rootfs + boot assets");
+        logStep(options, "prune merged tree to container rootfs + boot assets");
         try source_tree.pruneToContainerRootfsAndBootAssets(
             allocator,
             &container_image,
             architecture,
             options.boot_mode != .bls_only,
         );
-    }
-
-    if (options.verity) {
-        logStep(options.verbose, "check initramfs for dm-verity tooling");
-        switch (try checkInitramfsVerityTooling(allocator, &source_tree.view)) {
-            .present => {},
-            .absent => return error.InitramfsMissingVerityTooling,
-            .inconclusive => std.debug.print(
-                "build-image: warning: could not conclusively verify that the source initramfs includes dm-verity userspace tooling (systemd-veritysetup-generator/systemd-veritysetup/veritysetup); --verity images built from an initramfs lacking this tooling will hang at boot waiting on /dev/mapper/root (see https://github.com/cataggar/zvmi/issues/77)\n",
-                .{},
-            ),
-        }
     }
 
     if (!options.skip_iso_rootfs) {
@@ -182,8 +257,26 @@ pub fn build(
         // so wiring in a systemd unit there wouldn't do anything; it's
         // that from-scratch init's own job to invoke azagent if it wants
         // to (see azinit/README.md).
-        logStep(options.verbose, "install azagent systemd unit if present in the source tree");
+        logStep(options, "install azagent systemd unit if present in the source tree");
         try installAzagentSystemdUnitIfPresent(allocator, &source_tree);
+    }
+
+    try enterStage(options, .generalize_and_cleanup);
+    try enterStage(options, .prepare_initramfs);
+    if (options.verity) {
+        logStep(options, "check initramfs for dm-verity tooling");
+        switch (try checkInitramfsVerityTooling(allocator, &source_tree.view)) {
+            .present => {},
+            .absent => return error.InitramfsMissingVerityTooling,
+            .inconclusive => emitWarning(
+                options,
+                "initramfs_verity_tooling_inconclusive",
+                "could not conclusively verify that the source initramfs includes dm-verity userspace tooling (systemd-veritysetup-generator/systemd-veritysetup/veritysetup); --verity images built from an initramfs lacking this tooling will hang at boot waiting on /dev/mapper/root (see https://github.com/cataggar/zvmi/issues/77)",
+            ),
+        }
+    }
+    if (options.generation == .gen1 and !options.verity) {
+        try enterStage(options, .prepare_boot_configuration);
     }
 
     const raw_build_path = if (output_format == .raw)
@@ -194,25 +287,25 @@ pub fn build(
     const remove_raw_build = output_format != .raw;
     defer if (remove_raw_build) Io.Dir.cwd().deleteFile(io, raw_build_path) catch {};
 
-    logStep(options.verbose, "create build image");
+    logStep(options, "create build image");
     var raw_img = try Image.create(io, raw_build_path, .raw, disk_size, .{});
     var raw_img_open = true;
     defer if (raw_img_open) raw_img.close(io);
 
-    const disk_guid = randomGuid(io);
+    const disk_guid = if (options.deterministic) |deterministic| deterministic.disk_guid else randomGuid(io);
     switch (options.generation) {
         .gen2 => {
-            logStep(options.verbose, "write GPT partition tables");
+            logStep(options, "write GPT partition tables");
             try writeGptLayout(allocator, &raw_img, io, disk_guid, planned_partitions);
         },
         .gen1 => {
-            logStep(options.verbose, "write MBR partition table");
+            logStep(options, "write MBR partition table");
             try writeMbrLayout(&raw_img, io, planned_partitions);
         },
     }
 
     if (findPartitionByRole(planned_partitions, .esp)) |esp_partition| {
-        logStep(options.verbose, "format ESP as FAT32");
+        logStep(options, "format ESP as FAT32");
         try fat32.format(&raw_img, io, .{
             .partition_offset = esp_partition.planned.offset_bytes,
             .partition_len = esp_partition.planned.length_bytes,
@@ -227,21 +320,25 @@ pub fn build(
         null;
     const rootfs_length = if (verity_layout) |layout_for_verity| layout_for_verity.data_size else root_partition.planned.length_bytes;
 
-    logStep(options.verbose, "populate root ext4 filesystem");
     // Generate a real, random ext4 filesystem UUID and thread it into the
     // generated GRUB configs' `search --fs-uuid` lines -- GRUB's `search`
     // command has no `--partuuid` search type, so without this the generated
     // boot chain fails to locate the root filesystem at all (see issue #72,
     // confirmed via real QEMU + OVMF boot testing against the real Azure
     // Linux 4.0 ISO).
-    var root_filesystem_uuid: [16]u8 = undefined;
-    Io.random(io, &root_filesystem_uuid);
+    const root_filesystem_uuid = if (options.deterministic) |deterministic|
+        deterministic.root_filesystem_uuid
+    else blk: {
+        var uuid: [16]u8 = undefined;
+        Io.random(io, &uuid);
+        break :blk uuid;
+    };
     if (options.generation == .gen1 and !options.verity) {
         // Non-verity Gen1 can safely overlay a generated BIOS grub.cfg into
         // the source tree before `ext4.populate()`. Gen1+verity remains a
         // follow-up: once grub.cfg lives inside the verified root filesystem,
         // embedding the final `roothash=` there becomes self-referential.
-        logStep(options.verbose, "generate BIOS GRUB configuration");
+        logStep(options, "generate BIOS GRUB configuration");
         const bios_grub_cfg = try bootconfig.generateBiosGrubCfg(allocator, &source_tree.view, .{
             .planned_partitions = planned_partitions,
             .architecture = architecture,
@@ -250,17 +347,26 @@ pub fn build(
         });
         try source_tree.upsertOwnedFile(allocator, bios_grub_cfg.path, bios_grub_cfg.bytes);
     }
+    try enterStage(options, .populate_filesystem);
+    logStep(options, "populate root ext4 filesystem");
     _ = try ext4.populate(io, raw_img.file, allocator, &source_tree.view, .{
         .offset = root_partition.planned.offset_bytes,
         .length = rootfs_length,
         .label = options.ext4_label,
         .uuid = root_filesystem_uuid,
+        .timestamp = if (options.deterministic) |deterministic| deterministic.filesystem_timestamp else 0,
     });
 
     if (verity_layout) |layout_for_verity| {
-        logStep(options.verbose, "generate dm-verity hash tree");
-        var salt: [verity.salt_size]u8 = undefined;
-        Io.random(io, &salt);
+        try enterStage(options, .seal_verity);
+        logStep(options, "generate dm-verity hash tree");
+        const salt = if (options.deterministic) |deterministic|
+            deterministic.verity_salt
+        else blk: {
+            var random_salt: [verity.salt_size]u8 = undefined;
+            Io.random(io, &random_salt);
+            break :blk random_salt;
+        };
         report.verity = try verity.generateAndWrite(io, raw_img.file, allocator, .{
             .device_offset = root_partition.planned.offset_bytes,
             .data_size = layout_for_verity.data_size,
@@ -272,7 +378,8 @@ pub fn build(
     }
 
     if (options.generation == .gen1) {
-        logStep(options.verbose, "install BIOS GRUB boot chain");
+        try enterStage(options, .install_bootloader);
+        logStep(options, "install BIOS GRUB boot chain");
         try bootconfig.installBiosBoot(allocator, io, &raw_img, &source_tree.view, .{
             .planned_partitions = planned_partitions,
             .architecture = architecture,
@@ -281,11 +388,12 @@ pub fn build(
     }
 
     if (findPartitionByRole(planned_partitions, .esp)) |esp_partition| {
-        logStep(options.verbose, "populate ESP boot files");
+        logStep(options, "populate ESP boot files");
         var esp_fs = try fat32.open(&raw_img, io, .{
             .offset = esp_partition.planned.offset_bytes,
             .length = esp_partition.planned.length_bytes,
         });
+        var populate_stage_bridge = PopulateStageBridge{ .sink = options.stage_sink };
         _ = bootconfig.populateEsp(allocator, io, &esp_fs, &source_tree.view, .{
             .planned_partitions = planned_partitions,
             .architecture = architecture,
@@ -294,6 +402,10 @@ pub fn build(
             .boot_mode = options.boot_mode,
             .extra_kernel_options = options.extra_kernel_options,
             .uki = options.uki,
+            .stage_sink = if (options.stage_sink != null)
+                .{ .context = &populate_stage_bridge, .advanceFn = PopulateStageBridge.advance }
+            else
+                null,
         }) catch |err| switch (err) {
             error.NoSpaceLeft => if (options.boot_mode != .bls_only)
                 return error.EspTooSmallForBootArtifacts
@@ -303,24 +415,44 @@ pub fn build(
         };
     }
 
+    try enterStage(options, .check_and_close_filesystems);
     raw_img.close(io);
     raw_img_open = false;
 
+    try enterStage(options, .convert_output);
     if (output_format != .raw) {
-        logStep(options.verbose, "convert raw build image to requested output format");
-        try convertRawToOutput(allocator, io, raw_build_path, options.output_path, output_format, disk_size);
+        logStep(options, "convert raw build image to requested output format");
+        try convertRawToOutput(
+            allocator,
+            io,
+            raw_build_path,
+            options.output_path,
+            output_format,
+            disk_size,
+            if (options.deterministic) |deterministic| deterministic.output_create_options else .{},
+        );
     }
 
     var final_img = try Image.openPath(io, options.output_path);
     defer final_img.close(io);
 
+    if (output_format == .vhdx) {
+        const metadata = try vhdx.open(io, final_img.file);
+        report.vhdx_metadata = .{
+            .header_sequence_number = metadata.header_sequence_number,
+            .file_write_guid = metadata.file_write_guid,
+            .data_write_guid = metadata.data_write_guid,
+            .page83_guid = metadata.page83_guid,
+        };
+    }
+
     if (output_format == .vhd) {
-        logStep(options.verbose, "validate Azure VHD alignment");
+        logStep(options, "validate Azure VHD alignment");
         report.vhd_alignment = try azure.alignFixedVhd(&final_img, io);
     }
 
     if (output_format != .qcow2) {
-        logStep(options.verbose, "validate partition style");
+        logStep(options, "validate partition style");
         const partition_style = try azure.checkPartitionStyle(final_img, io, allocator, options.generation);
         report.partition_style = partition_style;
         if (!partition_style.ok) return error.PartitionStyleCheckFailed;
@@ -344,11 +476,11 @@ fn resolveOutputFormat(explicit: ?Format, output_path: []const u8) !Format {
     return resolved;
 }
 
-fn inferArchitecture(raw_arch: ?[]const u8) bootconfig.Architecture {
-    const arch = raw_arch orelse return .x86_64;
+fn parseArchitecture(raw_arch: ?[]const u8) ?bootconfig.Architecture {
+    const arch = raw_arch orelse return null;
     if (std.ascii.eqlIgnoreCase(arch, "amd64") or std.ascii.eqlIgnoreCase(arch, "x86_64")) return .x86_64;
     if (std.ascii.eqlIgnoreCase(arch, "arm64") or std.ascii.eqlIgnoreCase(arch, "aarch64")) return .aarch64;
-    return .x86_64;
+    return null;
 }
 
 fn planPartitionIdentities(
@@ -358,10 +490,11 @@ fn planPartitionIdentities(
     generation: azure.Generation,
     architecture: bootconfig.Architecture,
     esp_size: u64,
+    deterministic: ?*const BuildImageDeterminism,
 ) ![]bootconfig.PlannedPartitionIdentity {
     return switch (generation) {
-        .gen2 => try planGen2PartitionIdentities(allocator, io, disk_size, architecture, esp_size),
-        .gen1 => try planGen1PartitionIdentities(allocator, io, disk_size, architecture),
+        .gen2 => try planGen2PartitionIdentities(allocator, io, disk_size, architecture, esp_size, deterministic),
+        .gen1 => try planGen1PartitionIdentities(allocator, io, disk_size, architecture, deterministic),
     };
 }
 
@@ -371,6 +504,7 @@ fn planGen2PartitionIdentities(
     disk_size: u64,
     architecture: bootconfig.Architecture,
     esp_size: u64,
+    deterministic: ?*const BuildImageDeterminism,
 ) ![]bootconfig.PlannedPartitionIdentity {
     const root_role: layout.PartitionRole = switch (architecture) {
         .x86_64 => .root_x86_64,
@@ -384,7 +518,11 @@ fn planGen2PartitionIdentities(
     errdefer allocator.free(planned);
     const identities = try allocator.alloc(bootconfig.PlannedPartitionIdentity, planned.len);
     for (planned, 0..) |part, index| {
-        identities[index] = .{ .planned = part, .unique_guid = randomGuid(io) };
+        const unique_guid = if (deterministic) |values|
+            if (part.role == .esp) values.esp_partition_guid else values.root_partition_guid
+        else
+            randomGuid(io);
+        identities[index] = .{ .planned = part, .unique_guid = unique_guid };
     }
     allocator.free(planned);
     return identities;
@@ -395,6 +533,7 @@ fn planGen1PartitionIdentities(
     io: Io,
     disk_size: u64,
     architecture: bootconfig.Architecture,
+    deterministic: ?*const BuildImageDeterminism,
 ) ![]bootconfig.PlannedPartitionIdentity {
     if (disk_size % gpt.sector_size != 0) return error.InvalidDiskSize;
     const root_role: layout.PartitionRole = switch (architecture) {
@@ -407,7 +546,7 @@ fn planGen1PartitionIdentities(
     if (disk_size <= offset_bytes + mib) return error.DiskTooSmall;
     const usable_bytes = alignDown(disk_size - offset_bytes, mib);
     if (usable_bytes == 0) return error.DiskTooSmall;
-    const disk_signature = randomDiskSignature(io);
+    const disk_signature = if (deterministic) |values| values.mbr_disk_signature else randomDiskSignature(io);
 
     const identities = try allocator.alloc(bootconfig.PlannedPartitionIdentity, 1);
     identities[0] = .{ .planned = .{
@@ -416,7 +555,7 @@ fn planGen1PartitionIdentities(
         .type_guid = root_role.defaultTypeGuid(),
         .offset_bytes = offset_bytes,
         .length_bytes = usable_bytes,
-    }, .unique_guid = randomGuid(io), .mbr_disk_signature = disk_signature };
+    }, .unique_guid = if (deterministic) |values| values.root_partition_guid else randomGuid(io), .mbr_disk_signature = disk_signature };
     return identities;
 }
 
@@ -483,23 +622,56 @@ fn convertRawToOutput(
     output_path: []const u8,
     output_format: Format,
     disk_size: u64,
+    create_options: image_mod.CreateOptions,
 ) !void {
     var src = try Image.openPath(io, raw_path);
     defer src.close(io);
 
-    var create_options: image_mod.CreateOptions = .{};
+    var effective_create_options = create_options;
     if (output_format == .vhd) {
-        create_options.vhd_subformat = .fixed;
+        effective_create_options.vhd_subformat = .fixed;
     }
 
-    var dst = try Image.create(io, output_path, output_format, disk_size, create_options);
+    var dst = try Image.create(io, output_path, output_format, disk_size, effective_create_options);
     defer dst.close(io);
 
     try image_mod.copyAll(io, src, &dst, allocator);
 }
 
-fn logStep(verbose: bool, message: []const u8) void {
-    if (verbose) std.debug.print("build-image: {s}\n", .{message});
+fn logStep(options: BuildImageOptions, message: []const u8) void {
+    if (options.event_sink) |sink| {
+        sink.emit(.{ .progress = message });
+    } else if (options.verbose) {
+        std.debug.print("build-image: {s}\n", .{message});
+    }
+}
+
+fn enterStage(options: BuildImageOptions, stage: Stage) !void {
+    if (options.stage_sink) |sink| {
+        if (!sink.advance(stage)) return error.InvalidOperationOrder;
+    }
+}
+
+const PopulateStageBridge = struct {
+    sink: ?StageSink,
+
+    fn advance(context: ?*anyopaque, stage: bootconfig.PopulateStage) bool {
+        const self: *PopulateStageBridge = @ptrCast(@alignCast(context.?));
+        const sink = self.sink orelse return true;
+        return sink.advance(switch (stage) {
+            .prepare => .prepare_boot_configuration,
+            .bootloader => .install_bootloader,
+            .uki => .generate_uki,
+        });
+    }
+};
+
+fn emitWarning(options: BuildImageOptions, code: []const u8, message: []const u8) void {
+    if (options.event_sink) |sink| {
+        sink.emit(.{ .warning = .{ .code = code, .message = message } });
+    } else {
+        std.debug.print("build-image: warning: {s}\n", .{message});
+    }
 }
 
 fn discoverRootfsPathInIso(
@@ -2163,6 +2335,18 @@ test "build-image builds Gen2 VHD, VHDX, and qcow2 outputs from XZ squashfs + OC
     var fixture = try createBuildImageOciFixture(allocator, io, oci_root);
     defer fixture.deinit(allocator);
 
+    const StageRecorder = struct {
+        stages: [11]Stage = undefined,
+        len: usize = 0,
+
+        fn advance(context: ?*anyopaque, stage: Stage) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.stages[self.len] = stage;
+            self.len += 1;
+            return true;
+        }
+    };
+    var stage_recorder = StageRecorder{};
     var vhd_report = try build(allocator, io, .{
         .iso_path = iso_path,
         .container_path = oci_root,
@@ -2170,9 +2354,22 @@ test "build-image builds Gen2 VHD, VHDX, and qcow2 outputs from XZ squashfs + OC
         .output_format = .vhd,
         .generation = .gen2,
         .size = 256 * mib,
+        .stage_sink = .{ .context = &stage_recorder, .advanceFn = StageRecorder.advance },
     });
     defer vhd_report.deinit(allocator);
 
+    const expected_stages = [_]Stage{
+        .load_sources,
+        .apply_filesystem_changes,
+        .generalize_and_cleanup,
+        .prepare_initramfs,
+        .populate_filesystem,
+        .prepare_boot_configuration,
+        .install_bootloader,
+        .check_and_close_filesystems,
+        .convert_output,
+    };
+    try std.testing.expectEqualSlices(Stage, &expected_stages, stage_recorder.stages[0..stage_recorder.len]);
     try std.testing.expectEqual(Format.vhd, vhd_report.output_format);
     try std.testing.expect(vhd_report.partition_style.?.ok);
     try std.testing.expectEqual(@as(usize, 2), vhd_report.planned_partitions.len);
@@ -2199,6 +2396,10 @@ test "build-image builds Gen2 VHD, VHDX, and qcow2 outputs from XZ squashfs + OC
     defer vhdx_file.close(io);
     const vhdx_info = try vhdx.open(io, vhdx_file);
     try std.testing.expectEqual(vhdx_report.disk_size, vhdx_info.virtual_size);
+    try std.testing.expectEqual(vhdx_info.header_sequence_number, vhdx_report.vhdx_metadata.?.header_sequence_number);
+    try std.testing.expectEqualSlices(u8, &vhdx_info.file_write_guid, &vhdx_report.vhdx_metadata.?.file_write_guid);
+    try std.testing.expectEqualSlices(u8, &vhdx_info.data_write_guid, &vhdx_report.vhdx_metadata.?.data_write_guid);
+    try std.testing.expectEqualSlices(u8, &vhdx_info.page83_guid, &vhdx_report.vhdx_metadata.?.page83_guid);
 
     var vhdx_img = try Image.openPath(io, vhdx_output_path);
     defer vhdx_img.close(io);
