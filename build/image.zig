@@ -166,6 +166,11 @@ pub const PreservedOperation = union(enum) {
     remove_tree: []const u8,
 };
 
+pub const PreservedBackend = enum {
+    native_edit,
+    rebuild,
+};
+
 pub const PreservedOptions = struct {
     name: []const u8,
     input: PreservedInput,
@@ -173,7 +178,10 @@ pub const PreservedOptions = struct {
     output: Output,
     target_architecture: Architecture,
     reproducibility: Reproducibility,
+    backend: PreservedBackend = .native_edit,
     operations: []const PreservedOperation = &.{},
+    os: OsCustomization = .{},
+    generalization: GeneralizationPolicy = .none,
     verbose: bool = false,
 };
 
@@ -385,12 +393,56 @@ fn materializePreservedConfiguration(
         };
     }
 
+    const filesystem = try b.allocator.alloc(
+        customization_wire.FilesystemOperation,
+        options.os.filesystem.len,
+    );
+    for (options.os.filesystem, 0..) |operation, index| {
+        filesystem[index] = switch (operation) {
+            .put_file => |file| blk: {
+                const source: std.Build.LazyPath = switch (file.source) {
+                    .path => |path| path,
+                    .inline_bytes => |bytes| inline_files.add(
+                        b.fmt("customization-inline-{d}", .{index}),
+                        bytes,
+                    ),
+                };
+                const source_index = sources.items.len;
+                try sources.append(source);
+                break :blk .{ .put_file = .{
+                    .path = file.path,
+                    .source_index = source_index,
+                    .metadata = file.metadata,
+                } };
+            },
+            .put_directory => |directory| .{ .put_directory = directory },
+            .put_symlink => |link| .{ .put_symlink = link },
+            .remove => |path| .{ .remove = path },
+            .set_metadata => |change| .{ .set_metadata = change },
+        };
+    }
+
     const configuration = preserved_image_wire.Configuration{
+        .backend = switch (options.backend) {
+            .native_edit => .native_edit,
+            .rebuild => .rebuild,
+        },
         .root_partition = switch (options.root_partition) {
             .gpt_index => |index| .{ .gpt_index = index },
             .mbr_index => |index| .{ .mbr_index = index },
         },
         .operations = operations,
+        .customization = .{
+            .os = .{
+                .filesystem = filesystem,
+                .hostname = options.os.hostname,
+                .groups = options.os.groups,
+                .users = options.os.users,
+                .services = options.os.services,
+                .kernel_modules = options.os.kernel_modules,
+            },
+            .generalization = options.generalization,
+        },
     };
     try preserved_image_wire.validate(configuration, sources.items.len);
     const json = try std.json.Stringify.valueAlloc(b.allocator, configuration, .{});

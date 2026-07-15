@@ -25,8 +25,8 @@ const verity = @import("verity.zig");
 
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
-pub const plan_schema_version: u32 = 3;
-pub const provenance_schema_version: u32 = 3;
+pub const plan_schema_version: u32 = 4;
+pub const provenance_schema_version: u32 = 4;
 const mib: u64 = 1024 * 1024;
 
 comptime {
@@ -1497,13 +1497,14 @@ pub const Action = enum {
     check_and_close_filesystems,
     convert_output,
     load_preserved_source,
+    extract_preserved_root,
     edit_existing_paths,
+    populate_preserved_root,
     publish_standalone_output,
     execute_package_action,
     execute_hook,
     regenerate_initramfs,
     apply_selinux_policy,
-    rebuild_image,
     execute_unsafe_chroot,
     execute_vm,
 };
@@ -2435,7 +2436,14 @@ fn appendBackendOperationSpecs(
             try specs.append(.{ .phase = .prepare, .action = .load_preserved_source });
             try specs.append(.{ .phase = .filesystem_changes, .action = .edit_existing_paths });
         },
-        .rebuild => try specs.append(.{ .phase = .filesystem_changes, .action = .rebuild_image }),
+        .rebuild => {
+            try specs.append(.{ .phase = .prepare, .action = .load_preserved_source });
+            try specs.append(.{ .phase = .prepare, .action = .extract_preserved_root });
+            try specs.append(.{ .phase = .filesystem_changes, .action = .edit_existing_paths });
+            try specs.append(.{ .phase = .filesystem_changes, .action = .apply_filesystem_changes });
+            try specs.append(.{ .phase = .generalization_cleanup, .action = .generalize_and_cleanup });
+            try specs.append(.{ .phase = .filesystem_finalize, .action = .populate_preserved_root });
+        },
         .unsafe_chroot => try specs.append(.{ .phase = .filesystem_changes, .action = .execute_unsafe_chroot }),
         .vm => try specs.append(.{ .phase = .filesystem_changes, .action = .execute_vm }),
     }
@@ -2663,7 +2671,7 @@ fn buildCapabilities(
             try capabilities.append(.{ .kind = .standalone_output, .path = output.path, .reason = "publish a standalone output with any backing chain flattened" });
         },
         .rebuild => {
-            try capabilities.append(.{ .kind = .rebuild, .path = "", .reason = "the rebuild backend is not implemented" });
+            try capabilities.append(.{ .kind = .rebuild, .path = "", .reason = "extract and rebuild the strict writer-compatible ext4 profile without guest execution" });
             try capabilities.append(.{ .kind = .standalone_output, .path = output.path, .reason = "publish a standalone rebuilt output" });
         },
         .unsafe_chroot => {
@@ -2678,7 +2686,14 @@ fn buildCapabilities(
         },
     }
     if (execution.backend != .native_fresh and hasOsCustomization(customization)) {
-        try capabilities.append(.{ .kind = .arbitrary_filesystem_mutation, .path = "", .reason = "general preserved-filesystem creation and metadata mutation are not implemented" });
+        try capabilities.append(.{
+            .kind = .arbitrary_filesystem_mutation,
+            .path = "",
+            .reason = if (execution.backend == .rebuild)
+                "apply deterministic filesystem and OS changes to the imported strict ext4 tree"
+            else
+                "general preserved-filesystem creation and metadata mutation are not implemented",
+        });
     }
     if (packages.actions.len != 0) {
         try capabilities.append(.{ .kind = .package_management, .path = "", .reason = "execute declared package actions" });
@@ -2716,7 +2731,14 @@ fn buildCapabilities(
         try capabilities.append(.{ .kind = .boot_policy_mutation, .path = "", .reason = "mutate preserved boot configuration" });
     }
     if (execution.backend != .native_fresh and generalization_policy != .none) {
-        try capabilities.append(.{ .kind = .generalization, .path = "", .reason = "apply preserved-image generalization" });
+        try capabilities.append(.{
+            .kind = .generalization,
+            .path = "",
+            .reason = if (execution.backend == .rebuild)
+                "apply deterministic generalization to the imported strict ext4 tree"
+            else
+                "apply preserved-image generalization",
+        });
     }
     if (target_architecture != host_architecture and
         (execution.backend == .unsafe_chroot or
@@ -3325,7 +3347,13 @@ pub fn preflight(
                 ),
                 .iso_oci => .unsupported,
             },
-            .rebuild,
+            .rebuild => if (plan.data.execution.backend == .rebuild)
+                rebuildAvailable(io, plan)
+            else
+                .unsupported,
+            .arbitrary_filesystem_mutation,
+            .generalization,
+            => if (plan.data.execution.backend == .rebuild) .available else .unsupported,
             .unsafe_chroot,
             .vm,
             .package_management,
@@ -3339,9 +3367,7 @@ pub fn preflight(
             .selinux_policy,
             .selinux_relabel,
             .cross_architecture_runner,
-            .arbitrary_filesystem_mutation,
             .boot_policy_mutation,
-            .generalization,
             => .unsupported,
             else => platform.check(io, requirement),
         };
@@ -3446,6 +3472,34 @@ fn diskDependenciesAvailable(
         ) orelse return .unsupported;
         if (overlaps) return .missing;
     }
+    return .available;
+}
+
+fn rebuildAvailable(io: Io, plan: *const ResolvedPlan) CapabilityState {
+    const disk = switch (plan.data.input) {
+        .disk => |value| value,
+        .iso_oci => return .unsupported,
+    };
+    const storage = switch (plan.data.storage) {
+        .preserve => |value| value,
+        .fresh => return .unsupported,
+    };
+    const output_format = plan.data.output.format.imageFormat() orelse return .unsupported;
+    _ = preserved_image.inspectRebuild(std.heap.page_allocator, io, .{
+        .source_path = disk.path,
+        .output_path = plan.data.staging_output_path,
+        .output_format = output_format,
+        .root_partition = storage.root_partition,
+        .existing_operations = plan.data.existing_path_operations,
+        .customization = plan.data.os,
+        .generalization = plan.data.generalization,
+        .source_date_epoch = plan.data.reproducibility.source_date_epoch,
+        .expected_virtual_size = null,
+        .output_create_options = outputCreateOptions(plan),
+    }) catch |err| switch (err) {
+        error.FileNotFound => return .missing,
+        else => return .unsupported,
+    };
     return .available;
 }
 
@@ -3628,6 +3682,23 @@ pub const PreservedExecutionRecord = struct {
     partition_length: u64,
     flattened_backing_chain: bool,
     operation_count: usize,
+    rebuild: ?PreservedRebuildRecord,
+};
+
+pub const PreservedRebuildRecord = struct {
+    profile: ext4.StrictProfile,
+    ext4_uuid: Uuid,
+    ext4_label: [16]u8,
+    ext4_block_size: u32,
+    filesystem_length: u64,
+    ext4_global_timestamp: u32,
+    source_root_tree_digest: Digest,
+    final_root_tree_digest: Digest,
+    imported_node_count: usize,
+    final_node_count: usize,
+    existing_operation_count: usize,
+    os_customization_count: usize,
+    generalization_count: usize,
 };
 
 pub const ExecutionRecord = struct {
@@ -3763,6 +3834,7 @@ fn buildResult(
     plan: *const ResolvedPlan,
     fresh_report: ?*const build_image.BuildImageReport,
     preserved_report: ?*const preserved_image.Report,
+    rebuild_report: ?*const preserved_image.RebuildReport,
     source_digests: []const SourceRecord,
     output_digest: Digest,
     output_file_size: u64,
@@ -3871,15 +3943,39 @@ fn buildResult(
         .iso_oci => |iso_oci| iso_oci.rootfs_path_in_iso,
         .disk => "",
     };
-    const preserved_record = if (preserved_report) |report| PreservedExecutionRecord{
-        .source_format = report.source_format,
-        .output_format = report.output_format,
-        .virtual_size = report.virtual_size,
-        .selected_partition = plan.data.storage.preserve.root_partition,
-        .partition_offset = report.partition_offset,
-        .partition_length = report.partition_length,
-        .flattened_backing_chain = report.flattened_backing_chain,
-        .operation_count = report.operation_count,
+    const preserved_record = if (preserved_report != null or rebuild_report != null) blk: {
+        const source_format = if (preserved_report) |report| report.source_format else rebuild_report.?.source_format;
+        const output_format = if (preserved_report) |report| report.output_format else rebuild_report.?.output_format;
+        const virtual_size = if (preserved_report) |report| report.virtual_size else rebuild_report.?.virtual_size;
+        const partition_offset = if (preserved_report) |report| report.partition_offset else rebuild_report.?.partition_offset;
+        const partition_length = if (preserved_report) |report| report.partition_length else rebuild_report.?.partition_length;
+        const flattened = if (preserved_report) |report| report.flattened_backing_chain else rebuild_report.?.flattened_backing_chain;
+        const operation_count = if (preserved_report) |report| report.operation_count else rebuild_report.?.existing_operation_count;
+        break :blk PreservedExecutionRecord{
+            .source_format = source_format,
+            .output_format = output_format,
+            .virtual_size = virtual_size,
+            .selected_partition = plan.data.storage.preserve.root_partition,
+            .partition_offset = partition_offset,
+            .partition_length = partition_length,
+            .flattened_backing_chain = flattened,
+            .operation_count = operation_count,
+            .rebuild = if (rebuild_report) |report| .{
+                .profile = report.strict_profile,
+                .ext4_uuid = .{ .bytes = report.ext4_uuid },
+                .ext4_label = report.ext4_label,
+                .ext4_block_size = report.ext4_block_size,
+                .filesystem_length = report.filesystem_length,
+                .ext4_global_timestamp = report.ext4_global_timestamp,
+                .source_root_tree_digest = .{ .bytes = report.source_manifest_sha256 },
+                .final_root_tree_digest = .{ .bytes = report.final_manifest_sha256 },
+                .imported_node_count = report.imported_node_count,
+                .final_node_count = report.final_node_count,
+                .existing_operation_count = report.existing_operation_count,
+                .os_customization_count = report.os_customization_count,
+                .generalization_count = report.generalization_count,
+            } else null,
+        };
     } else null;
 
     return .{
@@ -4013,6 +4109,7 @@ pub fn execute(
     var fresh_report: ?build_image.BuildImageReport = null;
     defer if (fresh_report) |*report| report.deinit(allocator);
     var preserved_report: ?preserved_image.Report = null;
+    var rebuild_report: ?preserved_image.RebuildReport = null;
     switch (plan.data.execution.backend) {
         .native_fresh => {
             fresh_report = runPlan(allocator, io, plan, platform, event_sink, &bridge) catch |err| {
@@ -4042,7 +4139,30 @@ pub fn execute(
                 return try failureOutcome(allocator, diagnostics.items);
             };
         },
-        .rebuild, .unsafe_chroot, .vm => {
+        .rebuild => {
+            if (event_sink) |sink| sink.emit(.{ .progress = .{
+                .phase = .execution,
+                .message = "extract, customize, and rebuild preserved ext4 root",
+            } });
+            rebuild_report = preserved_image.rebuild(allocator, io, .{
+                .source_path = plan.data.input.disk.path,
+                .output_path = plan.data.staging_output_path,
+                .output_format = plan.data.output.format.imageFormat().?,
+                .root_partition = plan.data.storage.preserve.root_partition,
+                .existing_operations = plan.data.existing_path_operations,
+                .customization = plan.data.os,
+                .generalization = plan.data.generalization,
+                .source_date_epoch = plan.data.reproducibility.source_date_epoch,
+                .expected_virtual_size = null,
+                .output_create_options = outputCreateOptions(plan),
+            }) catch |err| {
+                try appendFailure(&diagnostics, .execution_failed, .execution, "/execution/backend", "strict preserved-image rebuild failed", err);
+                if (cleanupTransaction(io, plan.data.transaction_path)) |diagnostic| try diagnostics.append(diagnostic);
+                emitDiagnostics(event_sink, diagnostics.items);
+                return try failureOutcome(allocator, diagnostics.items);
+            };
+        },
+        .unsafe_chroot, .vm => {
             try diagnostics.append(.{
                 .severity = .@"error",
                 .phase = .execution,
@@ -4096,6 +4216,7 @@ pub fn execute(
         plan,
         if (fresh_report) |*report| report else null,
         if (preserved_report) |*report| report else null,
+        if (rebuild_report) |*report| report else null,
         source_digests_before,
         output_digest,
         output_file_size,
@@ -4910,7 +5031,7 @@ test "unimplemented typed policies become semantic preflight requirements" {
     };
 }
 
-test "unsupported preserved backends fail preflight before workspace mutation" {
+test "unsupported guest-code backends fail preflight before workspace mutation" {
     const io = std.testing.io;
     const source_path = "test-customize-unsupported-source.raw";
     defer Io.Dir.cwd().deleteFile(io, source_path) catch {};
@@ -4925,7 +5046,6 @@ test "unsupported preserved backends fail preflight before workspace mutation" {
         workspace: []const u8,
         output: []const u8,
     }{
-        .{ .backend = .rebuild, .workspace = "test-customize-rebuild-work", .output = "test-customize-rebuild-work/output.raw" },
         .{ .backend = .unsafe_chroot, .workspace = "test-customize-chroot-work", .output = "test-customize-chroot-work/output.raw" },
         .{ .backend = .vm, .workspace = "test-customize-vm-work", .output = "test-customize-vm-work/output.raw" },
     };
@@ -4958,6 +5078,52 @@ test "unsupported preserved backends fail preflight before workspace mutation" {
         try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, case.workspace, .{}));
         try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, case.output, .{}));
     }
+}
+
+test "rebuild rejects unsupported source profiles before workspace mutation" {
+    const io = std.testing.io;
+    const source_path = "test-customize-rebuild-unsupported.raw";
+    const workspace_path = "test-customize-rebuild-unsupported-work";
+    const output_path = workspace_path ++ "/output.raw";
+    defer Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, workspace_path) catch {};
+    {
+        const source = try Io.Dir.cwd().createFile(io, source_path, .{});
+        defer source.close(io);
+        try source.setLength(io, 4096);
+    }
+
+    var request = validNativeEditRequest(source_path, output_path, workspace_path, &.{});
+    request.execution.backend = .rebuild;
+    var resolved = try resolve(
+        std.testing.allocator,
+        &request,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer resolved.deinit(std.testing.allocator);
+    try std.testing.expect(resolved.plan != null);
+
+    var report = try preflight(
+        std.testing.allocator,
+        io,
+        &resolved.plan.?,
+        Platform.system(),
+    );
+    defer report.deinit(std.testing.allocator);
+    try std.testing.expect(!report.ready());
+    var saw_rebuild_rejection = false;
+    for (report.capabilities) |capability| {
+        if (capability.requirement.kind == .rebuild and
+            capability.state == .unsupported)
+        {
+            saw_rebuild_rejection = true;
+        }
+    }
+    try std.testing.expect(saw_rebuild_rejection);
+    try std.testing.expectError(
+        error.FileNotFound,
+        Io.Dir.cwd().statFile(io, workspace_path, .{}),
+    );
 }
 
 test "validation reports multiple problems without mutating the request" {
@@ -5623,7 +5789,7 @@ test "plan JSON renders identifiers as stable strings" {
     defer output.deinit();
     try writePlanJson(&resolved.plan.?, &output.writer);
     const json = output.written();
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"schema_version\": 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"schema_version\": 4") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"plan_hash\": \"") != null);
 }
 
@@ -5982,4 +6148,106 @@ test "native-edit execution preserves source size and emits preserved provenance
     const source_config = try source_reader.readFileAlloc(io, std.testing.allocator, "/etc/config");
     defer std.testing.allocator.free(source_config);
     try std.testing.expectEqualStrings("before\n", source_config);
+}
+
+test "rebuild execution creates paths and emits strict tree provenance" {
+    const io = std.testing.io;
+    const source_path = "test-customize-rebuild-source.raw";
+    const spool_path = "test-customize-rebuild-root.spool";
+    const workspace_path = "test-customize-rebuild-work";
+    const output_path = workspace_path ++ "/output.raw";
+    defer Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, workspace_path) catch {};
+    try createCustomizeTestDisk(io, source_path, spool_path);
+    const source_before = try hashPath(std.testing.allocator, io, source_path);
+
+    const existing = [_]ExistingPathOperation{.{ .overwrite_file = .{
+        .path = "/etc/config",
+        .source = .{ .bytes = "rebuilt\n" },
+    } }};
+    var request = validNativeEditRequest(
+        source_path,
+        output_path,
+        workspace_path,
+        &existing,
+    );
+    request.execution.backend = .rebuild;
+    request.os.filesystem = &.{
+        .{ .put_file = .{
+            .path = "/etc/new.conf",
+            .source = .{ .inline_bytes = "created\n" },
+            .metadata = .{ .mode = 0o600, .uid = 45, .gid = 67 },
+        } },
+    };
+
+    var resolved = try resolve(
+        std.testing.allocator,
+        &request,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer resolved.deinit(std.testing.allocator);
+    try std.testing.expect(resolved.plan != null);
+    const operations = resolved.plan.?.data.operations;
+    try std.testing.expectEqual(@as(usize, 7), operations.len);
+    try std.testing.expectEqual(Action.load_preserved_source, operations[0].action);
+    try std.testing.expectEqual(Action.extract_preserved_root, operations[1].action);
+    try std.testing.expectEqual(Action.edit_existing_paths, operations[2].action);
+    try std.testing.expectEqual(Action.apply_filesystem_changes, operations[3].action);
+    try std.testing.expectEqual(Action.generalize_and_cleanup, operations[4].action);
+    try std.testing.expectEqual(Action.populate_preserved_root, operations[5].action);
+    try std.testing.expectEqual(Action.publish_standalone_output, operations[6].action);
+
+    var preflight_report = try preflight(
+        std.testing.allocator,
+        io,
+        &resolved.plan.?,
+        Platform.system(),
+    );
+    defer preflight_report.deinit(std.testing.allocator);
+    try std.testing.expect(preflight_report.ready());
+
+    var outcome = try execute(
+        std.testing.allocator,
+        io,
+        &resolved.plan.?,
+        Platform.system(),
+        null,
+    );
+    defer outcome.deinit(std.testing.allocator);
+    try std.testing.expect(outcome.result != null);
+    try std.testing.expect(!outcome.diagnostics.hasErrors());
+    const rebuild_record = outcome.result.?.provenance.execution.preserved.?.rebuild.?;
+    try std.testing.expectEqual(ext4.StrictProfile.zvmi_ext4_v1, rebuild_record.profile);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0x63} ** 16), &rebuild_record.ext4_uuid.bytes);
+    try std.testing.expectEqual(@as(usize, 1), rebuild_record.existing_operation_count);
+    try std.testing.expectEqual(@as(usize, 1), rebuild_record.os_customization_count);
+    try std.testing.expect(rebuild_record.final_node_count > rebuild_record.imported_node_count);
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &rebuild_record.source_root_tree_digest.bytes,
+        &rebuild_record.final_root_tree_digest.bytes,
+    ));
+    try std.testing.expectEqualSlices(
+        u8,
+        &source_before.bytes,
+        &(try hashPath(std.testing.allocator, io, source_path)).bytes,
+    );
+
+    var output = try image_mod.Image.openPathReadOnly(io, output_path);
+    defer output.close(io);
+    var reader = try ext4.open(io, output.file, std.testing.allocator, .{
+        .offset = @as(u64, customize_test_partition_first_lba) * mbr.sector_size,
+    });
+    defer reader.deinit();
+    const rebuilt = try reader.readFileAlloc(io, std.testing.allocator, "/etc/config");
+    defer std.testing.allocator.free(rebuilt);
+    try std.testing.expectEqualStrings("rebuilt\n", rebuilt);
+    const created = try reader.readFileAlloc(io, std.testing.allocator, "/etc/new.conf");
+    defer std.testing.allocator.free(created);
+    try std.testing.expectEqualStrings("created\n", created);
+    const created_stat = try reader.statPath(io, "/etc/new.conf");
+    try std.testing.expectEqual(@as(u16, 0o600), created_stat.mode);
+    try std.testing.expectEqual(@as(u32, 45), created_stat.uid);
+    try std.testing.expectEqual(@as(u32, 67), created_stat.gid);
 }

@@ -18,6 +18,7 @@ pub const PreservedImageInput = image_build.PreservedInput;
 pub const PreservedImageRootPartition = image_build.PreservedRootPartition;
 pub const PreservedImageFileSource = image_build.PreservedFileSource;
 pub const PreservedImageOperation = image_build.PreservedOperation;
+pub const PreservedImageBackend = image_build.PreservedBackend;
 pub const PreservedImageOptions = image_build.PreservedOptions;
 pub const addPreservedImage = image_build.addPreserved;
 
@@ -143,7 +144,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "zvmi", .module = host_zvmi_mod },
-                .{ .name = "preserved_image_wire", .module = preserved_image_wire_mod },
             },
         }),
     });
