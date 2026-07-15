@@ -1191,7 +1191,7 @@ pub fn main(init: std.process.Init) !void {
         args.size,
         "--skip-iso-rootfs",
         "--extra-kernel-options",
-        "init=/sbin/init azinit.mode=persistent console=tty0 console=ttyS0,115200n8",
+        "init=/sbin/init azinit.mode=persistent azinit.azure=auto console=tty0 console=ttyS0,115200n8",
         "-o",
         raw_qcow2,
         "-O",

@@ -256,7 +256,12 @@ provisioning, since there's no guarantee of systemd being present at all in
 that minimal path (`azinit` does this -- see `azinit/README.md`). Generalized
 images using `azinit` must add `azinit.mode=persistent` to the kernel command
 line so provisioned users, SSH keys, host keys, and the azagent sentinel are
-written to the root filesystem instead of ephemeral overlays. Also add
+written to the root filesystem instead of ephemeral overlays. `azinit` defaults
+to `azinit.azure=auto`: readable provisioning media or DHCP option 245 selects
+Azure, while a completed DHCP lease with neither signal selects non-Azure and
+skips `azagent`. Persistent decisions are stored under `/var/lib/azagent` and
+bound to the current DMI product UUID; `zvmi azure deprovision` clears them.
+Use `azinit.azure=on` or `off` as a per-boot diagnostic override. Also add
 `init=/sbin/init` when the container includes systemd as an OpenSSH dependency,
 ensuring the initramfs launches `azinit` rather than systemd directly.
 Azure still requires every generalized-VM deployment to supply an

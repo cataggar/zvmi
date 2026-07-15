@@ -20,6 +20,7 @@
 //! opts into a writable root for generalized VM images whose provisioned
 //! accounts, SSH keys, host keys, and azagent sentinel must survive reboot.
 const std = @import("std");
+const provisioning_media = @import("provisioning_media");
 const linux = std.os.linux;
 
 var log_fd: i32 = -1;
@@ -259,38 +260,66 @@ const BootMode = enum {
     persistent,
 };
 
-const BootModeConfig = struct {
-    mode: BootMode = .immutable,
-    invalid_value: ?[]const u8 = null,
+const AzurePolicy = enum {
+    auto,
+    on,
+    off,
 };
 
-fn parseBootMode(cmdline: []const u8) BootModeConfig {
-    const prefix = "azinit.mode=";
-    var config: BootModeConfig = .{};
+const BootConfig = struct {
+    mode: BootMode = .immutable,
+    azure_policy: AzurePolicy = .auto,
+    invalid_mode: ?[]const u8 = null,
+    invalid_azure_policy: ?[]const u8 = null,
+};
+
+fn parseBootConfig(cmdline: []const u8) BootConfig {
+    const mode_prefix = "azinit.mode=";
+    const azure_prefix = "azinit.azure=";
+    var config: BootConfig = .{};
     var tokens = std.mem.tokenizeAny(u8, cmdline, " \t\r\n");
     while (tokens.next()) |token| {
-        if (!std.mem.startsWith(u8, token, prefix)) continue;
-        const value = token[prefix.len..];
-        if (std.mem.eql(u8, value, "persistent")) {
-            config = .{ .mode = .persistent };
-        } else if (std.mem.eql(u8, value, "immutable")) {
-            config = .{ .mode = .immutable };
-        } else {
-            config = .{ .invalid_value = value };
+        if (std.mem.startsWith(u8, token, mode_prefix)) {
+            const value = token[mode_prefix.len..];
+            if (std.mem.eql(u8, value, "persistent")) {
+                config.mode = .persistent;
+                config.invalid_mode = null;
+            } else if (std.mem.eql(u8, value, "immutable")) {
+                config.mode = .immutable;
+                config.invalid_mode = null;
+            } else {
+                config.mode = .immutable;
+                config.invalid_mode = value;
+            }
+        } else if (std.mem.startsWith(u8, token, azure_prefix)) {
+            const value = token[azure_prefix.len..];
+            if (std.mem.eql(u8, value, "auto")) {
+                config.azure_policy = .auto;
+                config.invalid_azure_policy = null;
+            } else if (std.mem.eql(u8, value, "on")) {
+                config.azure_policy = .on;
+                config.invalid_azure_policy = null;
+            } else if (std.mem.eql(u8, value, "off")) {
+                config.azure_policy = .off;
+                config.invalid_azure_policy = null;
+            } else {
+                config.azure_policy = .auto;
+                config.invalid_azure_policy = value;
+            }
         }
     }
     return config;
 }
 
-fn readBootMode() BootMode {
+fn readBootConfig() BootConfig {
     var fd_rc: usize = undefined;
     while (true) {
         fd_rc = linux.open("/proc/cmdline", .{ .ACCMODE = .RDONLY }, 0);
         if (linux.errno(fd_rc) != .INTR) break;
     }
     if (linux.errno(fd_rc) != .SUCCESS) {
-        writeErrno("[azinit] opening /proc/cmdline failed; using immutable mode", linux.errno(fd_rc));
-        return .immutable;
+        writeErrno("[azinit] opening /proc/cmdline failed; using boot defaults", linux.errno(fd_rc));
+        return .{};
     }
     const fd: i32 = @intCast(fd_rc);
     defer _ = linux.close(fd);
@@ -302,22 +331,211 @@ fn readBootMode() BootMode {
         if (linux.errno(read_rc) != .INTR) break;
     }
     if (linux.errno(read_rc) != .SUCCESS) {
-        writeErrno("[azinit] reading /proc/cmdline failed; using immutable mode", linux.errno(read_rc));
-        return .immutable;
+        writeErrno("[azinit] reading /proc/cmdline failed; using boot defaults", linux.errno(read_rc));
+        return .{};
     }
     if (read_rc == buf.len) {
-        writeStr("[azinit] /proc/cmdline is too long; using immutable mode\r\n");
-        return .immutable;
+        writeStr("[azinit] /proc/cmdline is too long; using boot defaults\r\n");
+        return .{};
     }
 
-    const config = parseBootMode(buf[0..read_rc]);
-    if (config.invalid_value) |value| {
+    var config = parseBootConfig(buf[0..read_rc]);
+    if (config.invalid_mode) |value| {
         var msg_buf: [128]u8 = undefined;
         const msg = std.fmt.bufPrint(&msg_buf, "[azinit] invalid azinit.mode={s}; using immutable mode\r\n", .{value}) catch "[azinit] invalid azinit.mode; using immutable mode\r\n";
         writeStr(msg);
-        return .immutable;
+        config.invalid_mode = null;
     }
-    return config.mode;
+    if (config.invalid_azure_policy) |value| {
+        var msg_buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "[azinit] invalid azinit.azure={s}; using auto\r\n", .{value}) catch "[azinit] invalid azinit.azure; using auto\r\n";
+        writeStr(msg);
+        config.invalid_azure_policy = null;
+    }
+    return config;
+}
+
+const AzureDecision = enum {
+    unknown,
+    azure,
+    non_azure,
+};
+
+const AzureEvidence = struct {
+    dhcp_acknowledged: bool = false,
+    saw_option_245: bool = false,
+    media: provisioning_media.ProbeResult = .indeterminate,
+};
+
+fn resolveAzureDecision(policy: AzurePolicy, cached: ?AzureDecision, evidence: AzureEvidence) AzureDecision {
+    return switch (policy) {
+        .on => .azure,
+        .off => .non_azure,
+        .auto => if (evidence.saw_option_245 or evidence.media == .present)
+            .azure
+        else if (cached) |decision|
+            decision
+        else if (evidence.dhcp_acknowledged and evidence.media == .absent)
+            .non_azure
+        else
+            .unknown,
+    };
+}
+
+const environment_state_dir = "/var/lib/azagent";
+const environment_state_path = environment_state_dir ++ "/azure-environment";
+const environment_state_tmp_path = environment_state_path ++ ".tmp";
+const provisioned_sentinel_path = environment_state_dir ++ "/provisioned";
+const vm_identity_path = "/sys/class/dmi/id/product_uuid";
+
+const EnvironmentState = struct {
+    identity: [36]u8,
+    decision: AzureDecision,
+};
+
+fn normalizeVmIdentity(content: []const u8) ?[36]u8 {
+    const text = std.mem.trim(u8, content, " \t\r\n");
+    if (text.len != 36) return null;
+
+    var normalized: [36]u8 = undefined;
+    var all_zero = true;
+    for (text, 0..) |c, index| {
+        if (index == 8 or index == 13 or index == 18 or index == 23) {
+            if (c != '-') return null;
+            normalized[index] = '-';
+            continue;
+        }
+        if (!std.ascii.isHex(c)) return null;
+        normalized[index] = std.ascii.toLower(c);
+        if (c != '0') all_zero = false;
+    }
+    return if (all_zero) null else normalized;
+}
+
+fn parseEnvironmentState(content: []const u8) ?EnvironmentState {
+    var tokens = std.mem.tokenizeAny(u8, content, " \t\r\n");
+    if (!std.mem.eql(u8, tokens.next() orelse return null, "v1")) return null;
+    const identity = normalizeVmIdentity(tokens.next() orelse return null) orelse return null;
+    const decision_text = tokens.next() orelse return null;
+    if (tokens.next() != null) return null;
+
+    const decision: AzureDecision = if (std.mem.eql(u8, decision_text, "azure"))
+        .azure
+    else if (std.mem.eql(u8, decision_text, "non-azure"))
+        .non_azure
+    else
+        return null;
+    return .{ .identity = identity, .decision = decision };
+}
+
+fn renderEnvironmentState(buf: []u8, identity: [36]u8, decision: AzureDecision) ?[]const u8 {
+    const decision_text = switch (decision) {
+        .azure => "azure",
+        .non_azure => "non-azure",
+        .unknown => return null,
+    };
+    return std.fmt.bufPrint(buf, "v1 {s} {s}\n", .{ &identity, decision_text }) catch null;
+}
+
+fn readBoundedFile(path: [*:0]const u8, buf: []u8) ?[]const u8 {
+    const fd_rc = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
+    if (linux.errno(fd_rc) != .SUCCESS) return null;
+    const fd: i32 = @intCast(fd_rc);
+    defer _ = linux.close(fd);
+
+    var total: usize = 0;
+    while (total < buf.len) {
+        const read_rc = linux.read(fd, buf[total..].ptr, buf.len - total);
+        const read_error = linux.errno(read_rc);
+        if (read_error == .INTR) continue;
+        if (read_error != .SUCCESS) return null;
+        if (read_rc == 0) return buf[0..total];
+        total += read_rc;
+    }
+    return null;
+}
+
+fn readVmIdentity() ?[36]u8 {
+    var buf: [64]u8 = undefined;
+    return normalizeVmIdentity(readBoundedFile(vm_identity_path, &buf) orelse return null);
+}
+
+fn cachedDecisionForIdentity(state: EnvironmentState, identity: [36]u8) ?AzureDecision {
+    if (!std.mem.eql(u8, &state.identity, &identity)) return null;
+    return state.decision;
+}
+
+fn readCachedAzureDecision(identity: [36]u8) ?AzureDecision {
+    var buf: [128]u8 = undefined;
+    const state = parseEnvironmentState(readBoundedFile(environment_state_path, &buf) orelse return null) orelse return null;
+    return cachedDecisionForIdentity(state, identity);
+}
+
+fn writeAll(fd: i32, content: []const u8) bool {
+    var written: usize = 0;
+    while (written < content.len) {
+        const write_rc = linux.write(fd, content[written..].ptr, content.len - written);
+        const write_error = linux.errno(write_rc);
+        if (write_error == .INTR) continue;
+        if (write_error != .SUCCESS or write_rc == 0) return false;
+        written += write_rc;
+    }
+    return true;
+}
+
+fn persistAzureDecision(identity: ?[36]u8, decision: AzureDecision) void {
+    const vm_identity = identity orelse return;
+    var content_buf: [64]u8 = undefined;
+    const content = renderEnvironmentState(&content_buf, vm_identity, decision) orelse return;
+
+    mkdirIgnoreExists(environment_state_dir);
+    const fd_rc = linux.open(environment_state_tmp_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    if (linux.errno(fd_rc) != .SUCCESS) {
+        writeErrno("[azinit] opening Azure environment state failed", linux.errno(fd_rc));
+        return;
+    }
+    const fd: i32 = @intCast(fd_rc);
+    if (!writeAll(fd, content)) {
+        writeStr("[azinit] writing Azure environment state failed\r\n");
+        _ = linux.close(fd);
+        _ = linux.unlink(environment_state_tmp_path);
+        return;
+    }
+    const sync_rc = linux.fsync(fd);
+    const sync_error = linux.errno(sync_rc);
+    _ = linux.close(fd);
+    if (sync_error != .SUCCESS) {
+        writeErrno("[azinit] syncing Azure environment state failed", sync_error);
+        _ = linux.unlink(environment_state_tmp_path);
+        return;
+    }
+
+    const rename_rc = linux.rename(environment_state_tmp_path, environment_state_path);
+    if (linux.errno(rename_rc) != .SUCCESS) {
+        writeErrno("[azinit] replacing Azure environment state failed", linux.errno(rename_rc));
+        _ = linux.unlink(environment_state_tmp_path);
+        return;
+    }
+
+    const dir_fd_rc = linux.open(environment_state_dir, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
+    if (linux.errno(dir_fd_rc) == .SUCCESS) {
+        const dir_fd: i32 = @intCast(dir_fd_rc);
+        _ = linux.fsync(dir_fd);
+        _ = linux.close(dir_fd);
+    }
+}
+
+fn isProvisioned() bool {
+    return linux.errno(linux.access(provisioned_sentinel_path, linux.F_OK)) == .SUCCESS;
+}
+
+fn probeProvisioningMedia() provisioning_media.ProbeResult {
+    mkdirIgnoreExists("/run/azinit");
+    mkdirIgnoreExists("/run/azinit/provision-media");
+    return provisioning_media.probe(
+        "/run/azinit/provision-media",
+        "/run/azinit/provision-media/ovf-env.xml",
+    );
 }
 
 fn remountRootWritable() bool {
@@ -539,6 +757,11 @@ const DhcpResult = struct {
     dns: [2]u32, // network byte order, 0 if absent
 };
 
+const DhcpAttempt = struct {
+    lease: ?DhcpResult = null,
+    saw_option_245: bool = false,
+};
+
 const DHCP_MAGIC = [4]u8{ 0x63, 0x82, 0x53, 0x63 };
 
 fn buildDhcpPacket(buf: []u8, xid: u32, mac: [6]u8, msg_type: u8, requested_ip: u32, server_ip: u32) usize {
@@ -571,18 +794,31 @@ fn buildDhcpPacket(buf: []u8, xid: u32, mac: [6]u8, msg_type: u8, requested_ip: 
     }
 
     buf[pos] = 55;
-    buf[pos + 1] = 3;
+    buf[pos + 1] = 4;
     buf[pos + 2] = 1; // subnet mask
     buf[pos + 3] = 3; // router
     buf[pos + 4] = 6; // DNS
-    pos += 5;
+    buf[pos + 5] = 245; // Azure WireServer endpoint
+    pos += 6;
 
     buf[pos] = 255; // end
     pos += 1;
     return pos;
 }
 
-const ParsedReply = struct { msg_type: u8, your_ip: u32, server_ip: u32, router: u32, mask: u32, dns: [2]u32 };
+const ParsedReply = struct {
+    msg_type: u8,
+    your_ip: u32,
+    server_ip: u32,
+    router: u32,
+    mask: u32,
+    dns: [2]u32,
+    has_option_245: bool,
+};
+
+fn recordDhcpEvidence(attempt: *DhcpAttempt, reply: ParsedReply) void {
+    attempt.saw_option_245 = attempt.saw_option_245 or reply.has_option_245;
+}
 
 fn parseDhcpReply(buf: []const u8, len: usize, expected_xid: u32) ?ParsedReply {
     if (len < 240) return null;
@@ -597,6 +833,7 @@ fn parseDhcpReply(buf: []const u8, len: usize, expected_xid: u32) ?ParsedReply {
     var router: u32 = 0;
     var mask: u32 = 0;
     var dns: [2]u32 = .{ 0, 0 };
+    var has_option_245 = false;
 
     var pos: usize = 240;
     while (pos < len) {
@@ -627,11 +864,22 @@ fn parseDhcpReply(buf: []const u8, len: usize, expected_xid: u32) ?ParsedReply {
                 if (opt_len >= 4) dns[0] = std.mem.readInt(u32, buf[val_start..][0..4], .big);
                 if (opt_len >= 8) dns[1] = std.mem.readInt(u32, buf[val_start + 4 ..][0..4], .big);
             },
+            245 => {
+                has_option_245 = opt_len == 4;
+            },
             else => {},
         }
         pos = val_start + opt_len;
     }
-    return .{ .msg_type = msg_type, .your_ip = your_ip, .server_ip = server_ip, .router = router, .mask = mask, .dns = dns };
+    return .{
+        .msg_type = msg_type,
+        .your_ip = your_ip,
+        .server_ip = server_ip,
+        .router = router,
+        .mask = mask,
+        .dns = dns,
+        .has_option_245 = has_option_245,
+    };
 }
 
 // --- raw packet socket receive path ---
@@ -704,10 +952,11 @@ fn extractUdpPayload(packet: []const u8, dest_port: u16) ?[]const u8 {
     return udp[8..udp_len];
 }
 
-fn runDhcp(iface: []const u8) ?DhcpResult {
+fn runDhcp(iface: []const u8) DhcpAttempt {
+    var result: DhcpAttempt = .{};
     const ctl_fd_rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM, 0);
     const ctl_fd: i32 = @intCast(ctl_fd_rc);
-    if (linux.errno(ctl_fd_rc) != .SUCCESS) return null;
+    if (linux.errno(ctl_fd_rc) != .SUCCESS) return result;
     defer _ = linux.close(ctl_fd);
 
     var hw_req: linux.ifreq = std.mem.zeroes(linux.ifreq);
@@ -728,7 +977,7 @@ fn runDhcp(iface: []const u8) ?DhcpResult {
     const sock: i32 = @intCast(sock_rc);
     if (linux.errno(sock_rc) != .SUCCESS) {
         writeErrno("[azinit] dhcp: socket() failed", linux.errno(sock_rc));
-        return null;
+        return result;
     }
     defer _ = linux.close(sock);
 
@@ -741,7 +990,7 @@ fn runDhcp(iface: []const u8) ?DhcpResult {
     const bind_rc = linux.bind(sock, &bind_addr, @sizeOf(linux.sockaddr));
     if (linux.errno(bind_rc) != .SUCCESS) {
         writeErrno("[azinit] dhcp bind failed", linux.errno(bind_rc));
-        return null;
+        return result;
     }
     writeStr("[azinit] dhcp: bound to udp/68\r\n");
 
@@ -797,6 +1046,7 @@ fn runDhcp(iface: []const u8) ?DhcpResult {
             recv_buf[0..@intCast(n_signed)];
         if (payload) |data| {
             if (parseDhcpReply(data, data.len, xid)) |reply| {
+                recordDhcpEvidence(&result, reply);
                 var pbuf: [64]u8 = undefined;
                 const pmsg = std.fmt.bufPrint(&pbuf, "[azinit] dhcp: parsed reply msg_type={d}\r\n", .{reply.msg_type}) catch "[azinit] dhcp: parsed reply\r\n";
                 writeStr(pmsg);
@@ -815,7 +1065,7 @@ fn runDhcp(iface: []const u8) ?DhcpResult {
     }
     if (!got_offer) {
         writeStr("[azinit] dhcp: no offer received\r\n");
-        return null;
+        return result;
     }
 
     send_len = buildDhcpPacket(&packet, xid, mac, 3, offer_ip, offer_server);
@@ -834,8 +1084,9 @@ fn runDhcp(iface: []const u8) ?DhcpResult {
             recv_buf[0..@intCast(n_signed)];
         if (payload) |data| {
             if (parseDhcpReply(data, data.len, xid)) |reply| {
+                recordDhcpEvidence(&result, reply);
                 if (reply.msg_type == 5) { // DHCPACK
-                    got_ack = DhcpResult{
+                    got_ack = .{
                         .your_ip = std.mem.nativeToBig(u32, reply.your_ip),
                         .subnet_mask = if (reply.mask != 0) std.mem.nativeToBig(u32, reply.mask) else std.mem.nativeToBig(u32, 0xffffff00),
                         .router = std.mem.nativeToBig(u32, reply.router),
@@ -849,7 +1100,8 @@ fn runDhcp(iface: []const u8) ?DhcpResult {
         }
     }
     if (got_ack == null) writeStr("[azinit] dhcp: no ack received\r\n");
-    return got_ack;
+    result.lease = got_ack;
+    return result;
 }
 
 fn addDefaultRoute(iface: []const u8, gateway_be: u32) void {
@@ -894,7 +1146,12 @@ fn writeResolvConf(dns: [2]u32) void {
     }
 }
 
-fn setupNetworking() void {
+const NetworkResult = struct {
+    dhcp_acknowledged: bool = false,
+    saw_option_245: bool = false,
+};
+
+fn setupNetworking() NetworkResult {
     const lo_sock_rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM, 0);
     const lo_sock: i32 = @intCast(lo_sock_rc);
     if (linux.errno(lo_sock_rc) == .SUCCESS) {
@@ -905,17 +1162,22 @@ fn setupNetworking() void {
     var iface_buf: [linux.IFNAMESIZE]u8 = undefined;
     const iface = findPrimaryInterface(&iface_buf) orelse {
         writeStr("[azinit] no non-lo network interface found\r\n");
-        return;
+        return .{};
     };
     var msg_buf: [96]u8 = undefined;
     const msg = std.fmt.bufPrint(&msg_buf, "[azinit] running DHCP on {s}\r\n", .{iface}) catch "[azinit] running DHCP\r\n";
     writeStr(msg);
 
-    const lease = runDhcp(iface) orelse return;
+    const attempt = runDhcp(iface);
+    const network_result: NetworkResult = .{
+        .dhcp_acknowledged = attempt.lease != null,
+        .saw_option_245 = attempt.saw_option_245,
+    };
+    const lease = attempt.lease orelse return network_result;
 
     const ctl_rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM, 0);
     const ctl: i32 = @intCast(ctl_rc);
-    if (linux.errno(ctl_rc) != .SUCCESS) return;
+    if (linux.errno(ctl_rc) != .SUCCESS) return network_result;
     defer _ = linux.close(ctl);
 
     setIfaceAddr(ctl, iface, linux.SIOCSIFADDR, lease.your_ip);
@@ -929,6 +1191,7 @@ fn setupNetworking() void {
     var ok_buf: [96]u8 = undefined;
     const ok_msg = std.fmt.bufPrint(&ok_buf, "[azinit] {s} configured: {d}.{d}.{d}.{d}\r\n", .{ iface, ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3] }) catch "[azinit] network configured\r\n";
     writeStr(ok_msg);
+    return network_result;
 }
 
 // ============================== azagent invocation ==============================
@@ -1029,34 +1292,129 @@ fn runSshdIfPresent() void {
 
 const provisioning_retry_seconds = 5;
 
-fn startPersistentProvisioning() void {
-    if (linux.errno(linux.access(azagent_path, linux.F_OK)) != .SUCCESS) {
-        writeStr("[azinit] persistent mode requires /usr/sbin/azagent; SSH will not start\r\n");
+fn azureEvidence(network: NetworkResult, media: provisioning_media.ProbeResult) AzureEvidence {
+    return .{
+        .dhcp_acknowledged = network.dhcp_acknowledged,
+        .saw_option_245 = network.saw_option_245,
+        .media = media,
+    };
+}
+
+fn persistObservedAzureDecision(
+    policy: AzurePolicy,
+    cached: ?AzureDecision,
+    identity: ?[36]u8,
+    evidence: AzureEvidence,
+) void {
+    if (policy != .auto) return;
+    if (evidence.saw_option_245 or evidence.media == .present) {
+        persistAzureDecision(identity, .azure);
+    } else if (cached == null and evidence.dhcp_acknowledged and evidence.media == .absent) {
+        persistAzureDecision(identity, .non_azure);
+    }
+}
+
+fn logAzureDecision(decision: AzureDecision, policy: AzurePolicy, evidence: AzureEvidence, cached: ?AzureDecision) void {
+    switch (policy) {
+        .on => writeStr("[azinit] Azure environment forced on by azinit.azure=on\r\n"),
+        .off => writeStr("[azinit] Azure environment forced off by azinit.azure=off\r\n"),
+        .auto => switch (decision) {
+            .azure => if (evidence.saw_option_245)
+                writeStr("[azinit] Azure environment detected from DHCP option 245\r\n")
+            else if (evidence.media == .present)
+                writeStr("[azinit] Azure environment detected from provisioning media\r\n")
+            else if (cached == .azure)
+                writeStr("[azinit] Azure environment restored from persistent state\r\n")
+            else
+                writeStr("[azinit] Azure environment detected\r\n"),
+            .non_azure => if (cached == .non_azure)
+                writeStr("[azinit] non-Azure environment restored from persistent state; skipping azagent\r\n")
+            else
+                writeStr("[azinit] non-Azure environment detected; skipping azagent\r\n"),
+            .unknown => writeStr("[azinit] Azure environment is unknown; retrying detection\r\n"),
+        },
+    }
+}
+
+fn runPersistentSupervisor(
+    policy: AzurePolicy,
+    initial_decision: AzureDecision,
+    initial_network: NetworkResult,
+    initial_media: provisioning_media.ProbeResult,
+    identity: ?[36]u8,
+    cached: ?AzureDecision,
+) noreturn {
+    var decision = initial_decision;
+    var network = initial_network;
+    var media = initial_media;
+    var sshd_started = false;
+
+    while (true) {
+        switch (decision) {
+            .azure => {
+                if (linux.errno(linux.access(azagent_path, linux.F_OK)) != .SUCCESS) {
+                    writeStr("[azinit] persistent mode requires /usr/sbin/azagent; SSH will not start\r\n");
+                    linux.exit(1);
+                }
+                switch (runAzagentIfPresent()) {
+                    .success => {
+                        if (!network.dhcp_acknowledged) network = setupNetworking();
+                        if (!sshd_started) runSshdIfPresent();
+                        linux.exit(0);
+                    },
+                    .absent => {
+                        writeStr("[azinit] azagent disappeared; SSH will not start\r\n");
+                        linux.exit(1);
+                    },
+                    .failed => {
+                        writeStr("[azinit] retrying azagent in 5 seconds\r\n");
+                    },
+                }
+            },
+            .non_azure => {
+                if (isProvisioned() and !sshd_started) runSshdIfPresent();
+                linux.exit(0);
+            },
+            .unknown => {
+                if (isProvisioned() and !sshd_started) {
+                    runSshdIfPresent();
+                    sshd_started = true;
+                }
+            },
+        }
+
+        const req: linux.timespec = .{ .sec = provisioning_retry_seconds, .nsec = 0 };
+        _ = linux.nanosleep(&req, null);
+
+        if (!network.dhcp_acknowledged) network = setupNetworking();
+        if (decision == .unknown) {
+            media = probeProvisioningMedia();
+            const next_evidence = azureEvidence(network, media);
+            decision = resolveAzureDecision(policy, cached, next_evidence);
+            persistObservedAzureDecision(policy, cached, identity, next_evidence);
+            if (decision != .unknown) logAzureDecision(decision, policy, next_evidence, cached);
+        }
+    }
+}
+
+fn startPersistentProvisioning(policy: AzurePolicy, network: NetworkResult, identity: ?[36]u8, cached: ?AzureDecision) void {
+    const media: provisioning_media.ProbeResult = if (policy == .auto) probeProvisioningMedia() else .indeterminate;
+    const evidence = azureEvidence(network, media);
+    const decision = resolveAzureDecision(policy, cached, evidence);
+    persistObservedAzureDecision(policy, cached, identity, evidence);
+    logAzureDecision(decision, policy, evidence, cached);
+
+    if (decision == .non_azure) {
+        if (isProvisioned()) runSshdIfPresent();
         return;
     }
 
     const supervisor_pid = forkProcess("[azinit] fork() for provisioning supervisor failed") orelse {
-        writeStr("[azinit] SSH will not start\r\n");
+        if (isProvisioned()) runSshdIfPresent() else writeStr("[azinit] SSH will not start\r\n");
         return;
     };
     if (supervisor_pid == 0) {
-        while (true) {
-            switch (runAzagentIfPresent()) {
-                .success => {
-                    runSshdIfPresent();
-                    linux.exit(0);
-                },
-                .absent => {
-                    writeStr("[azinit] azagent disappeared; SSH will not start\r\n");
-                    linux.exit(1);
-                },
-                .failed => {
-                    writeStr("[azinit] retrying azagent in 5 seconds\r\n");
-                    const req: linux.timespec = .{ .sec = provisioning_retry_seconds, .nsec = 0 };
-                    _ = linux.nanosleep(&req, null);
-                },
-            }
-        }
+        runPersistentSupervisor(policy, decision, network, media, identity, cached);
     }
 }
 
@@ -1136,7 +1494,8 @@ pub fn main(init: std.process.Init.Minimal) noreturn {
     mountIgnoreBusy("devtmpfs", "/dev", "devtmpfs", 0);
     mountIgnoreBusy("tmpfs", "/run", "tmpfs", 0);
     openDebugLog();
-    const boot_mode = readBootMode();
+    const boot_config = readBootConfig();
+    const boot_mode = boot_config.mode;
     const persistent_root_ready = if (boot_mode == .persistent) remountRootWritable() else false;
     loadBootModules(boot_mode);
     mountIgnoreBusy("tmpfs", "/tmp", "tmpfs", 0);
@@ -1151,16 +1510,22 @@ pub fn main(init: std.process.Init.Minimal) noreturn {
     ensureMachineId();
 
     writeStr("\r\n[azinit] base mounts ready; configuring network...\r\n");
-    setupNetworking();
+    const network = setupNetworking();
 
     if (boot_mode == .persistent) {
         if (persistent_root_ready) {
-            startPersistentProvisioning();
+            const identity = readVmIdentity();
+            const cached = if (identity) |vm_identity| readCachedAzureDecision(vm_identity) else null;
+            startPersistentProvisioning(boot_config.azure_policy, network, identity, cached);
         } else {
             writeStr("[azinit] persistent storage is unavailable; azagent and SSH will not start\r\n");
         }
     } else {
-        _ = runAzagentIfPresent();
+        const media: provisioning_media.ProbeResult = if (boot_config.azure_policy == .auto) probeProvisioningMedia() else .indeterminate;
+        const evidence = azureEvidence(network, media);
+        const decision = resolveAzureDecision(boot_config.azure_policy, null, evidence);
+        logAzureDecision(decision, boot_config.azure_policy, evidence, null);
+        if (decision != .non_azure) _ = runAzagentIfPresent();
         runSshdIfPresent();
     }
 
@@ -1168,31 +1533,44 @@ pub fn main(init: std.process.Init.Minimal) noreturn {
     shellLoop();
 }
 
-test "parseBootMode defaults to immutable" {
-    try std.testing.expectEqual(BootMode.immutable, parseBootMode("root=/dev/sda2 console=ttyS0").mode);
-}
-
-test "parseBootMode accepts persistent and explicit immutable modes" {
-    try std.testing.expectEqual(BootMode.persistent, parseBootMode("root=/dev/sda2 azinit.mode=persistent console=ttyS0").mode);
-    try std.testing.expectEqual(BootMode.immutable, parseBootMode("azinit.mode=immutable").mode);
-}
-
-test "parseBootMode uses the last azinit mode" {
-    const config = parseBootMode("azinit.mode=persistent azinit.mode=immutable");
+test "parseBootConfig defaults to immutable and automatic Azure detection" {
+    const config = parseBootConfig("root=/dev/sda2 console=ttyS0");
     try std.testing.expectEqual(BootMode.immutable, config.mode);
-    try std.testing.expectEqual(@as(?[]const u8, null), config.invalid_value);
+    try std.testing.expectEqual(AzurePolicy.auto, config.azure_policy);
 }
 
-test "parseBootMode allows a later valid mode to replace an invalid one" {
-    const config = parseBootMode("azinit.mode=invalid azinit.mode=persistent");
+test "parseBootConfig accepts boot modes and Azure policies independently" {
+    const persistent = parseBootConfig("root=/dev/sda2 azinit.mode=persistent azinit.azure=on console=ttyS0");
+    try std.testing.expectEqual(BootMode.persistent, persistent.mode);
+    try std.testing.expectEqual(AzurePolicy.on, persistent.azure_policy);
+
+    const immutable = parseBootConfig("azinit.mode=immutable azinit.azure=off");
+    try std.testing.expectEqual(BootMode.immutable, immutable.mode);
+    try std.testing.expectEqual(AzurePolicy.off, immutable.azure_policy);
+}
+
+test "parseBootConfig uses the last value for each setting" {
+    const config = parseBootConfig("azinit.mode=persistent azinit.azure=off azinit.mode=immutable azinit.azure=auto");
+    try std.testing.expectEqual(BootMode.immutable, config.mode);
+    try std.testing.expectEqual(AzurePolicy.auto, config.azure_policy);
+    try std.testing.expectEqual(@as(?[]const u8, null), config.invalid_mode);
+    try std.testing.expectEqual(@as(?[]const u8, null), config.invalid_azure_policy);
+}
+
+test "parseBootConfig allows later valid values to replace invalid ones" {
+    const config = parseBootConfig("azinit.mode=invalid azinit.azure=maybe azinit.mode=persistent azinit.azure=on");
     try std.testing.expectEqual(BootMode.persistent, config.mode);
-    try std.testing.expectEqual(@as(?[]const u8, null), config.invalid_value);
+    try std.testing.expectEqual(AzurePolicy.on, config.azure_policy);
+    try std.testing.expectEqual(@as(?[]const u8, null), config.invalid_mode);
+    try std.testing.expectEqual(@as(?[]const u8, null), config.invalid_azure_policy);
 }
 
-test "parseBootMode rejects an invalid mode" {
-    const config = parseBootMode("azinit.mode=writable");
+test "parseBootConfig rejects invalid values with safe defaults" {
+    const config = parseBootConfig("azinit.mode=writable azinit.azure=maybe");
     try std.testing.expectEqual(BootMode.immutable, config.mode);
-    try std.testing.expectEqualStrings("writable", config.invalid_value.?);
+    try std.testing.expectEqual(AzurePolicy.auto, config.azure_policy);
+    try std.testing.expectEqualStrings("writable", config.invalid_mode.?);
+    try std.testing.expectEqualStrings("maybe", config.invalid_azure_policy.?);
 }
 
 test "parsePersistedHostname trims line endings and rejects invalid content" {
@@ -1216,4 +1594,122 @@ test "formatMachineId emits lowercase hex and a newline" {
         "000102030405060708090a0b0c0d0e0f\n",
         &formatMachineId(.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }),
     );
+}
+
+test "resolveAzureDecision honors overrides, positive evidence, cache, and safe negatives" {
+    const none: AzureEvidence = .{ .media = .absent };
+    try std.testing.expectEqual(AzureDecision.azure, resolveAzureDecision(.on, .non_azure, none));
+    try std.testing.expectEqual(AzureDecision.non_azure, resolveAzureDecision(.off, .azure, .{ .saw_option_245 = true }));
+
+    try std.testing.expectEqual(
+        AzureDecision.azure,
+        resolveAzureDecision(.auto, .non_azure, .{ .saw_option_245 = true }),
+    );
+    try std.testing.expectEqual(
+        AzureDecision.azure,
+        resolveAzureDecision(.auto, .non_azure, .{ .media = .present }),
+    );
+    try std.testing.expectEqual(AzureDecision.azure, resolveAzureDecision(.auto, .azure, none));
+    try std.testing.expectEqual(AzureDecision.non_azure, resolveAzureDecision(.auto, null, .{
+        .dhcp_acknowledged = true,
+        .media = .absent,
+    }));
+    try std.testing.expectEqual(AzureDecision.unknown, resolveAzureDecision(.auto, null, .{
+        .dhcp_acknowledged = true,
+        .media = .indeterminate,
+    }));
+    try std.testing.expectEqual(AzureDecision.unknown, resolveAzureDecision(.auto, null, none));
+}
+
+test "Azure environment state normalizes identities, round trips, and rejects mismatches" {
+    const identity = normalizeVmIdentity("01234567-89AB-CDEF-0123-456789ABCDEF\n").?;
+    try std.testing.expectEqualStrings("01234567-89ab-cdef-0123-456789abcdef", &identity);
+    try std.testing.expectEqual(@as(?[36]u8, null), normalizeVmIdentity("00000000-0000-0000-0000-000000000000"));
+    try std.testing.expectEqual(@as(?[36]u8, null), normalizeVmIdentity("not-a-uuid"));
+
+    var buf: [64]u8 = undefined;
+    const rendered = renderEnvironmentState(&buf, identity, .non_azure).?;
+    try std.testing.expectEqualStrings(
+        "v1 01234567-89ab-cdef-0123-456789abcdef non-azure\n",
+        rendered,
+    );
+
+    const parsed = parseEnvironmentState(rendered).?;
+    try std.testing.expectEqual(AzureDecision.non_azure, parsed.decision);
+    try std.testing.expectEqualSlices(u8, &identity, &parsed.identity);
+    try std.testing.expectEqual(AzureDecision.non_azure, cachedDecisionForIdentity(parsed, identity).?);
+
+    const other_identity = normalizeVmIdentity("11234567-89ab-cdef-0123-456789abcdef").?;
+    try std.testing.expectEqual(@as(?AzureDecision, null), cachedDecisionForIdentity(parsed, other_identity));
+    try std.testing.expectEqual(@as(?EnvironmentState, null), parseEnvironmentState("v2 01234567-89ab-cdef-0123-456789abcdef azure"));
+    try std.testing.expectEqual(@as(?EnvironmentState, null), parseEnvironmentState("v1 01234567-89ab-cdef-0123-456789abcdef unknown"));
+}
+
+test "DHCP requests include Azure option 245" {
+    const expected = &[_]u8{ 55, 4, 1, 3, 6, 245, 255 };
+    var packet: [512]u8 = undefined;
+    const mac = [_]u8{ 0, 1, 2, 3, 4, 5 };
+
+    const discover_len = buildDhcpPacket(&packet, 0x12345678, mac, 1, 0, 0);
+    try std.testing.expect(std.mem.indexOf(u8, packet[240..discover_len], expected) != null);
+
+    const request_len = buildDhcpPacket(&packet, 0x12345678, mac, 3, 0x0a000002, 0x0a000001);
+    try std.testing.expect(std.mem.indexOf(u8, packet[240..request_len], expected) != null);
+}
+
+fn makeTestDhcpReply(buf: []u8, xid: u32, msg_type: u8, option_245: ?[]const u8) usize {
+    @memset(buf, 0);
+    buf[0] = 2;
+    std.mem.writeInt(u32, buf[4..8], xid, .big);
+    std.mem.writeInt(u32, buf[16..20], 0x0a000002, .big);
+    @memcpy(buf[236..240], &DHCP_MAGIC);
+
+    var pos: usize = 240;
+    buf[pos] = 53;
+    buf[pos + 1] = 1;
+    buf[pos + 2] = msg_type;
+    pos += 3;
+    if (option_245) |value| {
+        buf[pos] = 245;
+        buf[pos + 1] = @intCast(value.len);
+        @memcpy(buf[pos + 2 ..][0..value.len], value);
+        pos += 2 + value.len;
+    }
+    buf[pos] = 255;
+    return pos + 1;
+}
+
+test "DHCP parser retains valid option 245 evidence from OFFER or ACK" {
+    const xid = 0x12345678;
+    var buf: [512]u8 = undefined;
+    const endpoint = [_]u8{ 168, 63, 129, 16 };
+
+    const offer_len = makeTestDhcpReply(&buf, xid, 2, &endpoint);
+    const offer = parseDhcpReply(&buf, offer_len, xid).?;
+    try std.testing.expect(offer.has_option_245);
+
+    var attempt: DhcpAttempt = .{};
+    recordDhcpEvidence(&attempt, offer);
+    const ack_len = makeTestDhcpReply(&buf, xid, 5, null);
+    const ack = parseDhcpReply(&buf, ack_len, xid).?;
+    recordDhcpEvidence(&attempt, ack);
+    try std.testing.expect(attempt.saw_option_245);
+
+    const ack_only_len = makeTestDhcpReply(&buf, xid, 5, &endpoint);
+    try std.testing.expect(parseDhcpReply(&buf, ack_only_len, xid).?.has_option_245);
+}
+
+test "DHCP parser ignores malformed or truncated option 245" {
+    const xid = 0x12345678;
+    var buf: [512]u8 = undefined;
+
+    const short_len = makeTestDhcpReply(&buf, xid, 2, &[_]u8{ 1, 2, 3 });
+    try std.testing.expect(!parseDhcpReply(&buf, short_len, xid).?.has_option_245);
+
+    const base_len = makeTestDhcpReply(&buf, xid, 2, null);
+    buf[base_len - 1] = 245;
+    buf[base_len] = 4;
+    buf[base_len + 1] = 1;
+    buf[base_len + 2] = 2;
+    try std.testing.expect(!parseDhcpReply(&buf, base_len + 3, xid).?.has_option_245);
 }
