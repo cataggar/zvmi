@@ -34,6 +34,13 @@ pub fn validateFormatOptions(options: FormatOptions) Error!void {
     _ = try computeLayout(options);
 }
 
+/// Validates a non-root relative path using FAT long-filename rules.
+pub fn validateRelativePath(path: []const u8) Error!void {
+    if (path.len == 0 or path[0] == '/' or path[path.len - 1] == '/') return error.InvalidPath;
+    var components = std.mem.splitScalar(u8, path, '/');
+    while (components.next()) |component| try validateComponent(component);
+}
+
 pub const DirEntryKind = enum { file, directory };
 
 pub const DirEntry = struct {

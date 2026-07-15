@@ -17,13 +17,34 @@ pub fn build(b: *std.Build) void {
             .format = .qcow2,
             .basename = "layout-fixture.qcow2",
         },
-        .size = 64 * 1024 * 1024,
+        .size = 256 * 1024 * 1024,
         .target_architecture = .x86_64,
         .rootfs_path_in_iso = "images/rootfs.squashfs",
         .reproducibility = .{
             .seed = [_]u8{0x11} ** 32,
             .source_date_epoch = 1_735_689_600,
         },
+        .os = .{
+            .filesystem = &.{
+                .{ .put_file = .{
+                    .path = "/etc/inline.conf",
+                    .source = .{ .inline_bytes = "source=inline\n" },
+                } },
+                .{ .put_file = .{
+                    .path = "/etc/tracked.conf",
+                    .source = .{ .path = b.path("fixtures/custom.conf") },
+                    .metadata = .{ .mode = 0o640 },
+                } },
+                .{ .put_symlink = .{
+                    .path = "/tracked.conf",
+                    .target = "etc/tracked.conf",
+                } },
+            },
+            .hostname = "build-api-vm",
+            .services = &.{.{ .name = "example.service", .state = .enabled }},
+            .kernel_modules = &.{.{ .name = "hv_netvsc", .load = true }},
+        },
+        .generalization = .{ .azure = .{ .reset_hostname = false } },
     });
 
     const archive_image = zvmi.addImage(b, dependency, .{

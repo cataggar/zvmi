@@ -22,6 +22,8 @@ const ParsedArgs = struct {
     extra_kernel_options: []const u8 = "",
     boot_mode: zvmi.bootconfig.BootMode = .bls_only,
     uki: zvmi.customize.UkiOptions = .{},
+    customization_path: ?[]const u8 = null,
+    customization_source_paths: []const []const u8 = &.{},
     seed: zvmi.customize.Seed,
     source_date_epoch: u64,
     preflight_only: bool = false,
@@ -32,7 +34,7 @@ const ParsedArgs = struct {
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const argv = try init.minimal.args.toSlice(arena);
-    const args = parseArgs(argv[1..]) catch |err| {
+    const args = parseArgs(arena, argv[1..]) catch |err| {
         std.debug.print("zvmi-image-builder: invalid arguments: {t}\n", .{err});
         std.process.exit(2);
     };
@@ -51,6 +53,24 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("zvmi-image-builder: result bundle and source paths must be distinct\n", .{});
         std.process.exit(2);
     }
+    if (args.customization_path) |path| {
+        if (pathsOverlapCanonically(arena, init.io, args.bundle_output_path, path) catch |err| {
+            std.debug.print("zvmi-image-builder: cannot isolate result bundle from customization config: {t}\n", .{err});
+            std.process.exit(1);
+        }) {
+            std.debug.print("zvmi-image-builder: result bundle and customization config must be distinct\n", .{});
+            std.process.exit(2);
+        }
+    }
+    for (args.customization_source_paths) |path| {
+        if (pathsOverlapCanonically(arena, init.io, args.bundle_output_path, path) catch |err| {
+            std.debug.print("zvmi-image-builder: cannot isolate result bundle from customization source: {t}\n", .{err});
+            std.process.exit(1);
+        }) {
+            std.debug.print("zvmi-image-builder: result bundle and customization sources must be distinct\n", .{});
+            std.process.exit(2);
+        }
+    }
     const lock_path = try std.fmt.allocPrint(arena, "{s}.lock", .{args.bundle_output_path});
     const lock_overlaps_source = pathsOverlapCanonically(arena, init.io, lock_path, args.iso_path) catch |err| {
         std.debug.print("zvmi-image-builder: cannot isolate result lock from ISO source: {t}\n", .{err});
@@ -63,6 +83,24 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("zvmi-image-builder: result lock and source paths must be distinct\n", .{});
         std.process.exit(2);
     }
+    if (args.customization_path) |path| {
+        if (pathsOverlapCanonically(arena, init.io, lock_path, path) catch |err| {
+            std.debug.print("zvmi-image-builder: cannot isolate result lock from customization config: {t}\n", .{err});
+            std.process.exit(1);
+        }) {
+            std.debug.print("zvmi-image-builder: result lock and customization config must be distinct\n", .{});
+            std.process.exit(2);
+        }
+    }
+    for (args.customization_source_paths) |path| {
+        if (pathsOverlapCanonically(arena, init.io, lock_path, path) catch |err| {
+            std.debug.print("zvmi-image-builder: cannot isolate result lock from customization source: {t}\n", .{err});
+            std.process.exit(1);
+        }) {
+            std.debug.print("zvmi-image-builder: result lock and customization sources must be distinct\n", .{});
+            std.process.exit(2);
+        }
+    }
     const lock_file = try acquireBundleLock(init.io, lock_path);
     defer lock_file.close(init.io);
 
@@ -74,7 +112,18 @@ pub fn main(init: std.process.Init) !void {
         args.container_path,
         args.bundle_output_path,
         args.image_basename,
+        args.customization_path,
+        args.customization_source_paths,
     )) return;
+    const reuse_key_before = try computeReuseKey(
+        arena,
+        init.io,
+        argv,
+        args.iso_path,
+        args.container_path,
+        args.customization_path,
+        args.customization_source_paths,
+    );
     try resetBundle(init.io, args.bundle_output_path);
     std.Io.Dir.cwd().createDirPath(init.io, args.bundle_output_path) catch |err| {
         std.debug.print("zvmi-image-builder: cannot create result bundle: {t}\n", .{err});
@@ -89,6 +138,16 @@ pub fn main(init: std.process.Init) !void {
     try writeBytes(init.io, plan_output_path, "null\n");
     try writeBytes(init.io, diagnostics_output_path, "[]\n");
     try writeBytes(init.io, provenance_output_path, "null\n");
+
+    const customization = loadCustomization(
+        arena,
+        init.io,
+        args.customization_path,
+        args.customization_source_paths,
+    ) catch |err| {
+        std.debug.print("zvmi-image-builder: invalid customization: {t}\n", .{err});
+        std.process.exit(2);
+    };
 
     const request = zvmi.customize.Request{
         .api_version = args.api_version,
@@ -115,6 +174,8 @@ pub fn main(init: std.process.Init) !void {
             .extra_kernel_options = args.extra_kernel_options,
             .uki = args.uki,
         },
+        .os = customization.os,
+        .generalization = customization.generalization,
         .execution = .{ .workspace_path = args.bundle_output_path },
         .reproducibility = .{
             .seed = args.seed,
@@ -182,22 +243,28 @@ pub fn main(init: std.process.Init) !void {
         try writeBytes(init.io, status_output_path, "failure\n");
         return;
     };
+    const reuse_key_after = try computeReuseKey(
+        arena,
+        init.io,
+        argv,
+        args.iso_path,
+        args.container_path,
+        args.customization_path,
+        args.customization_source_paths,
+    );
+    if (!std.mem.eql(u8, &reuse_key_before, &reuse_key_after)) {
+        try writeBytes(init.io, status_output_path, "failure\n");
+        return error.SourceChangedDuringBuild;
+    }
     writeProvenance(init.gpa, init.io, provenance_output_path, result.provenance) catch |err| {
         std.debug.print("zvmi-image-builder: cannot write provenance: {t}\n", .{err});
         std.process.exit(1);
     };
-    try writeReuseKey(
-        init.gpa,
-        init.io,
-        reuse_key_output_path,
-        argv,
-        args.iso_path,
-        args.container_path,
-    );
+    try writeReuseKey(init.io, reuse_key_output_path, reuse_key_before);
     try writeBytes(init.io, status_output_path, "success\n");
 }
 
-fn parseArgs(args: []const []const u8) !ParsedArgs {
+fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs {
     var api_version: u32 = zvmi.customize.current_api_version;
     var architecture: ?zvmi.customize.Architecture = null;
     var iso_path: ?[]const u8 = null;
@@ -215,6 +282,9 @@ fn parseArgs(args: []const []const u8) !ParsedArgs {
     var extra_kernel_options: []const u8 = "";
     var boot_mode: zvmi.bootconfig.BootMode = .bls_only;
     var uki: zvmi.customize.UkiOptions = .{};
+    var customization_path: ?[]const u8 = null;
+    var customization_sources = std.array_list.Managed([]const u8).init(allocator);
+    errdefer customization_sources.deinit();
     var seed: ?zvmi.customize.Seed = null;
     var source_date_epoch: ?u64 = null;
     var preflight_only = false;
@@ -284,6 +354,10 @@ fn parseArgs(args: []const []const u8) !ParsedArgs {
             uki.splash_source_path = value;
         } else if (std.mem.eql(u8, arg, "--uki-output-directory")) {
             uki.output_directory = value;
+        } else if (std.mem.eql(u8, arg, "--customization")) {
+            customization_path = value;
+        } else if (std.mem.eql(u8, arg, "--customization-source")) {
+            try customization_sources.append(value);
         } else if (std.mem.eql(u8, arg, "--seed")) {
             if (value.len != 64) return error.InvalidSeed;
             var bytes: [32]u8 = undefined;
@@ -315,12 +389,155 @@ fn parseArgs(args: []const []const u8) !ParsedArgs {
         .extra_kernel_options = extra_kernel_options,
         .boot_mode = boot_mode,
         .uki = uki,
+        .customization_path = customization_path,
+        .customization_source_paths = try customization_sources.toOwnedSlice(),
         .seed = seed orelse return error.MissingSeed,
         .source_date_epoch = source_date_epoch orelse return error.MissingSourceDateEpoch,
         .preflight_only = preflight_only,
         .reuse_success = reuse_success,
         .verbose = verbose,
     };
+}
+
+const LoadedCustomization = struct {
+    os: zvmi.customize.OsCustomization,
+    generalization: zvmi.customize.GeneralizationPolicy,
+};
+
+fn loadCustomization(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    config_path: ?[]const u8,
+    source_paths: []const []const u8,
+) !LoadedCustomization {
+    const path = config_path orelse {
+        if (source_paths.len != 0) return error.CustomizationSourcesWithoutConfig;
+        return .{ .os = .{}, .generalization = .none };
+    };
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024));
+    const parsed = try std.json.parseFromSlice(
+        zvmi.customization_wire.Configuration,
+        allocator,
+        bytes,
+        .{ .ignore_unknown_fields = false },
+    );
+    const wire = parsed.value;
+
+    const filesystem = try allocator.alloc(zvmi.customize.FilesystemOperation, wire.os.filesystem.len);
+    for (wire.os.filesystem, 0..) |operation, index| {
+        filesystem[index] = switch (operation) {
+            .put_file => |file| .{ .put_file = .{
+                .path = file.path,
+                .source = .{ .host_path = if (file.source_index < source_paths.len)
+                    source_paths[file.source_index]
+                else
+                    return error.CustomizationSourceIndexOutOfBounds },
+                .metadata = try convertMetadata(allocator, file.metadata),
+            } },
+            .put_directory => |directory| .{ .put_directory = .{
+                .path = directory.path,
+                .metadata = try convertMetadata(allocator, directory.metadata),
+            } },
+            .put_symlink => |link| .{ .put_symlink = .{
+                .path = link.path,
+                .target = link.target,
+                .metadata = try convertMetadata(allocator, link.metadata),
+            } },
+            .remove => |remove_path| .{ .remove = remove_path },
+            .set_metadata => |change| .{ .set_metadata = .{
+                .path = change.path,
+                .mode = change.mode,
+                .uid = change.uid,
+                .gid = change.gid,
+                .xattrs = if (change.xattrs) |xattrs| try convertXattrs(allocator, xattrs) else null,
+            } },
+        };
+    }
+    const groups = try allocator.alloc(zvmi.customize.Group, wire.os.groups.len);
+    for (wire.os.groups, 0..) |group, index| groups[index] = .{
+        .name = group.name,
+        .gid = group.gid,
+        .members = group.members,
+    };
+    const users = try allocator.alloc(zvmi.customize.User, wire.os.users.len);
+    for (wire.os.users, 0..) |user, index| users[index] = .{
+        .name = user.name,
+        .uid = user.uid,
+        .gid = user.gid,
+        .primary_group = user.primary_group,
+        .secondary_groups = user.secondary_groups,
+        .home = user.home,
+        .shell = user.shell,
+        .password = switch (user.password) {
+            .locked => .locked,
+            .prehashed => |value| .{ .prehashed = value },
+        },
+        .ssh_authorized_keys = user.ssh_authorized_keys,
+        .passwordless_sudo = user.passwordless_sudo,
+    };
+    const services = try allocator.alloc(zvmi.customize.Service, wire.os.services.len);
+    for (wire.os.services, 0..) |service, index| services[index] = .{
+        .name = service.name,
+        .state = switch (service.state) {
+            .enabled => .enabled,
+            .disabled => .disabled,
+        },
+    };
+    const modules = try allocator.alloc(zvmi.customize.KernelModule, wire.os.kernel_modules.len);
+    for (wire.os.kernel_modules, 0..) |module, index| modules[index] = .{
+        .name = module.name,
+        .load = module.load,
+        .disabled = module.disabled,
+        .options = module.options,
+    };
+    return .{
+        .os = .{
+            .filesystem = filesystem,
+            .hostname = wire.os.hostname,
+            .groups = groups,
+            .users = users,
+            .services = services,
+            .kernel_modules = modules,
+        },
+        .generalization = switch (wire.generalization) {
+            .none => .none,
+            .azure => |options| .{ .azure = .{
+                .reset_hostname = options.reset_hostname,
+                .clear_machine_id = options.clear_machine_id,
+                .remove_ssh_host_keys = options.remove_ssh_host_keys,
+                .remove_agent_state = options.remove_agent_state,
+                .remove_dhcp_leases = options.remove_dhcp_leases,
+                .remove_logs = options.remove_logs,
+                .remove_caches = options.remove_caches,
+                .clear_random_seed = options.clear_random_seed,
+                .remove_users = options.remove_users,
+            } },
+        },
+    };
+}
+
+fn convertMetadata(
+    allocator: std.mem.Allocator,
+    metadata: zvmi.customization_wire.Metadata,
+) !zvmi.customize.Metadata {
+    return .{
+        .mode = metadata.mode,
+        .uid = metadata.uid,
+        .gid = metadata.gid,
+        .xattrs = try convertXattrs(allocator, metadata.xattrs),
+    };
+}
+
+fn convertXattrs(
+    allocator: std.mem.Allocator,
+    xattrs: []const zvmi.customization_wire.Xattr,
+) ![]const zvmi.ext4.Xattr {
+    const converted = try allocator.alloc(zvmi.ext4.Xattr, xattrs.len);
+    for (xattrs, 0..) |xattr, index| converted[index] = .{
+        .name = xattr.name,
+        .value = xattr.value,
+    };
+    return converted;
 }
 
 fn parseArchitecture(value: []const u8) ?zvmi.customize.Architecture {
@@ -420,6 +637,8 @@ fn hasReusableSuccess(
     container_path: []const u8,
     bundle_path: []const u8,
     image_basename: []const u8,
+    customization_path: ?[]const u8,
+    customization_source_paths: []const []const u8,
 ) !bool {
     const status_path = try std.fs.path.join(allocator, &.{ bundle_path, "status" });
     const status = std.Io.Dir.cwd().readFileAlloc(io, status_path, allocator, .limited(64)) catch return false;
@@ -433,7 +652,15 @@ fn hasReusableSuccess(
     }
     const reuse_key_path = try std.fs.path.join(allocator, &.{ bundle_path, "reuse-key" });
     const stored_key = std.Io.Dir.cwd().readFileAlloc(io, reuse_key_path, allocator, .limited(128)) catch return false;
-    const current_key = computeReuseKey(allocator, io, argv, iso_path, container_path) catch return false;
+    const current_key = computeReuseKey(
+        allocator,
+        io,
+        argv,
+        iso_path,
+        container_path,
+        customization_path,
+        customization_source_paths,
+    ) catch return false;
     const current_hex = std.fmt.bytesToHex(current_key, .lower);
     return std.mem.eql(u8, std.mem.trim(u8, stored_key, " \r\n\t"), &current_hex);
 }
@@ -462,14 +689,10 @@ fn acquireBundleLock(io: std.Io, path: []const u8) !std.Io.File {
 }
 
 fn writeReuseKey(
-    allocator: std.mem.Allocator,
     io: std.Io,
     path: []const u8,
-    argv: []const []const u8,
-    iso_path: []const u8,
-    container_path: []const u8,
+    key: [32]u8,
 ) !void {
-    const key = try computeReuseKey(allocator, io, argv, iso_path, container_path);
     const key_hex = std.fmt.bytesToHex(key, .lower);
     var bytes: [key_hex.len + 1]u8 = undefined;
     @memcpy(bytes[0..key_hex.len], &key_hex);
@@ -483,13 +706,15 @@ fn computeReuseKey(
     argv: []const []const u8,
     iso_path: []const u8,
     container_path: []const u8,
+    customization_path: ?[]const u8,
+    customization_source_paths: []const []const u8,
 ) ![32]u8 {
     const executable_digest = try zvmi.customize.hashSourcePath(allocator, io, argv[0]);
     const iso_digest = try zvmi.customize.hashSourcePath(allocator, io, iso_path);
     const container_digest = try zvmi.customize.hashSourcePath(allocator, io, container_path);
 
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("zvmi-image-builder-reuse-v1\x00");
+    hash.update("zvmi-image-builder-reuse-v2\x00");
     for (argv[1..]) |arg| {
         var length: [8]u8 = undefined;
         std.mem.writeInt(u64, &length, arg.len, .big);
@@ -499,6 +724,14 @@ fn computeReuseKey(
     hash.update(&executable_digest.bytes);
     hash.update(&iso_digest.bytes);
     hash.update(&container_digest.bytes);
+    if (customization_path) |path| {
+        const digest = try zvmi.customize.hashSourcePath(allocator, io, path);
+        hash.update(&digest.bytes);
+    }
+    for (customization_source_paths) |path| {
+        const digest = try zvmi.customize.hashSourcePath(allocator, io, path);
+        hash.update(&digest.bytes);
+    }
     var digest: [32]u8 = undefined;
     hash.final(&digest);
     return digest;

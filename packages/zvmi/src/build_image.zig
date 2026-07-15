@@ -14,8 +14,10 @@ const Image = image_mod.Image;
 const layout = @import("layout.zig");
 const mbr = @import("mbr.zig");
 const oci = @import("oci.zig");
+const os_customization = @import("os_customization.zig");
 const iso9660 = @import("iso9660.zig");
 const qcow2 = @import("qcow2.zig");
+const root_tree_mod = @import("root_tree.zig");
 const vhdx = @import("vhdx.zig");
 const squashfs = @import("squashfs.zig");
 const verity = @import("verity.zig");
@@ -46,6 +48,8 @@ pub const BuildImageOptions = struct {
     /// hardware). This keeps live/installer-only OS payload out of the
     /// final root partition.
     skip_iso_rootfs: bool = false,
+    os: os_customization.OsCustomization = .{},
+    generalization: os_customization.GeneralizationPolicy = .none,
     esp_size: u64 = default_esp_size,
     ext4_label: []const u8 = "rootfs",
     verity: bool = false,
@@ -141,6 +145,7 @@ pub const BuildImageReport = struct {
     vhd_alignment: ?azure.FixupResult = null,
     partition_style: ?azure.PartitionStyleReport = null,
     vhdx_metadata: ?VhdxMetadataReport = null,
+    root_tree_digest: ?[32]u8 = null,
 
     pub fn deinit(self: *BuildImageReport, allocator: std.mem.Allocator) void {
         allocator.free(self.rootfs_path_in_iso);
@@ -165,15 +170,18 @@ pub fn build(
             std.debug.print("build-image: aligned requested VHD size from {d} to {d} bytes for Azure compatibility\n", .{ options.size, disk_size });
         }
     }
+    try validateBuildPathIsolation(allocator, io, options, output_format);
 
     logStep(options, "load container image");
     var container_image = try oci.load(io, allocator, options.container_path, .{});
-    defer container_image.deinit();
+    var container_image_open = true;
+    defer if (container_image_open) container_image.deinit();
 
     const inferred_architecture = parseArchitecture(container_image.config.architecture);
     if (options.architecture != null and inferred_architecture == null) {
         return error.UnsupportedContainerArchitecture;
     }
+
     const architecture = options.architecture orelse inferred_architecture orelse .x86_64;
     if (options.architecture != null and inferred_architecture != null and options.architecture.? != inferred_architecture.?) {
         return error.ContainerArchitectureMismatch;
@@ -192,7 +200,8 @@ pub fn build(
 
     logStep(options, "open ISO");
     var iso_reader = try iso9660.Reader.openPath(allocator, io, options.iso_path);
-    defer iso_reader.close(io);
+    var iso_reader_open = true;
+    defer if (iso_reader_open) iso_reader.close(io);
 
     const rootfs_path_in_iso = try discoverRootfsPathInIso(allocator, &iso_reader, options.rootfs_path_in_iso);
     var rootfs_path_in_iso_owned = false;
@@ -226,7 +235,8 @@ pub fn build(
 
     logStep(options, "open squashfs rootfs");
     var squash_reader = try squashfs.Reader.openPath(allocator, io, rootfs_scratch_path);
-    defer squash_reader.close(io);
+    var squash_reader_open = true;
+    defer if (squash_reader_open) squash_reader.close(io);
 
     const nested_scratch_prefix = try std.fmt.allocPrint(allocator, "{s}.build-image-nested", .{options.output_path});
     defer allocator.free(nested_scratch_prefix);
@@ -234,7 +244,8 @@ pub fn build(
     logStep(options, "merge ISO, squashfs, and OCI trees");
     var source_tree = try MergedSourceTree.init(allocator, io, &iso_reader, rootfs_path_in_iso, &squash_reader, &container_image, nested_scratch_prefix);
     source_tree.bind();
-    defer source_tree.deinit(allocator);
+    var source_tree_open = true;
+    defer if (source_tree_open) source_tree.deinit(allocator);
 
     try enterStage(options, .apply_filesystem_changes);
     if (options.skip_iso_rootfs) {
@@ -261,11 +272,44 @@ pub fn build(
         try installAzagentSystemdUnitIfPresent(allocator, &source_tree);
     }
 
+    const root_tree_spool_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}.build-image-root-tree.spool",
+        .{options.output_path},
+    );
+    defer allocator.free(root_tree_spool_path);
+    logStep(options, "materialize merged sources into owned root tree");
+    var root_tree = try root_tree_mod.RootTree.init(allocator, io, root_tree_spool_path, .{});
+    defer root_tree.deinit();
+    try root_tree.importExt4View(&source_tree.view);
+
+    // RootTree owns every path, xattr, and content byte from this point on.
+    // Release all format readers and their scratch files before customization.
+    source_tree.deinit(allocator);
+    source_tree_open = false;
+    squash_reader.close(io);
+    squash_reader_open = false;
+    Io.Dir.cwd().deleteFile(io, rootfs_scratch_path) catch |err| return err;
+    extracted_rootfs = false;
+    iso_reader.close(io);
+    iso_reader_open = false;
+    container_image.deinit();
+    container_image_open = false;
+
+    const customization_epoch: u64 = if (options.deterministic) |deterministic|
+        deterministic.filesystem_timestamp
+    else blk: {
+        const now: i64 = @intCast(@divTrunc(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+        if (now < 0) return error.InvalidSystemTime;
+        break :blk @intCast(now);
+    };
+    try os_customization.apply(allocator, &root_tree, options.os, customization_epoch);
     try enterStage(options, .generalize_and_cleanup);
+    try os_customization.generalize(allocator, &root_tree, options.generalization);
     try enterStage(options, .prepare_initramfs);
     if (options.verity) {
         logStep(options, "check initramfs for dm-verity tooling");
-        switch (try checkInitramfsVerityTooling(allocator, &source_tree.view)) {
+        switch (try checkInitramfsVerityTooling(allocator, try root_tree.ext4View())) {
             .present => {},
             .absent => return error.InitramfsMissingVerityTooling,
             .inconclusive => emitWarning(
@@ -339,17 +383,24 @@ pub fn build(
         // follow-up: once grub.cfg lives inside the verified root filesystem,
         // embedding the final `roothash=` there becomes self-referential.
         logStep(options, "generate BIOS GRUB configuration");
-        const bios_grub_cfg = try bootconfig.generateBiosGrubCfg(allocator, &source_tree.view, .{
+        var bios_grub_cfg = try bootconfig.generateBiosGrubCfg(allocator, try root_tree.ext4View(), .{
             .planned_partitions = planned_partitions,
             .architecture = architecture,
             .root_filesystem_uuid = root_filesystem_uuid,
             .extra_kernel_options = options.extra_kernel_options,
         });
-        try source_tree.upsertOwnedFile(allocator, bios_grub_cfg.path, bios_grub_cfg.bytes);
+        defer bios_grub_cfg.deinit(allocator);
+        const existing = root_tree.findNode(bios_grub_cfg.path);
+        try root_tree.putFileBytes(
+            bios_grub_cfg.path,
+            bios_grub_cfg.bytes,
+            if (existing) |node| node.metadata else .{ .mode = 0o644 },
+        );
     }
     try enterStage(options, .populate_filesystem);
+    report.root_tree_digest = try root_tree.manifestDigest();
     logStep(options, "populate root ext4 filesystem");
-    _ = try ext4.populate(io, raw_img.file, allocator, &source_tree.view, .{
+    _ = try ext4.populate(io, raw_img.file, allocator, try root_tree.ext4View(), .{
         .offset = root_partition.planned.offset_bytes,
         .length = rootfs_length,
         .label = options.ext4_label,
@@ -380,7 +431,7 @@ pub fn build(
     if (options.generation == .gen1) {
         try enterStage(options, .install_bootloader);
         logStep(options, "install BIOS GRUB boot chain");
-        try bootconfig.installBiosBoot(allocator, io, &raw_img, &source_tree.view, .{
+        try bootconfig.installBiosBoot(allocator, io, &raw_img, try root_tree.ext4View(), .{
             .planned_partitions = planned_partitions,
             .architecture = architecture,
             .verity = report.verity,
@@ -394,7 +445,7 @@ pub fn build(
             .length = esp_partition.planned.length_bytes,
         });
         var populate_stage_bridge = PopulateStageBridge{ .sink = options.stage_sink };
-        _ = bootconfig.populateEsp(allocator, io, &esp_fs, &source_tree.view, .{
+        _ = bootconfig.populateEsp(allocator, io, &esp_fs, try root_tree.ext4View(), .{
             .planned_partitions = planned_partitions,
             .architecture = architecture,
             .verity = report.verity,
@@ -459,6 +510,116 @@ pub fn build(
     }
 
     return report;
+}
+
+fn validateBuildPathIsolation(
+    allocator: std.mem.Allocator,
+    io: Io,
+    options: BuildImageOptions,
+    output_format: Format,
+) !void {
+    const output_path = try std.fs.path.resolve(allocator, &.{options.output_path});
+    defer allocator.free(output_path);
+    const rootfs_scratch = try std.fmt.allocPrint(allocator, "{s}.build-image-rootfs.sqsh", .{output_path});
+    defer allocator.free(rootfs_scratch);
+    const root_tree_spool = try std.fmt.allocPrint(allocator, "{s}.build-image-root-tree.spool", .{output_path});
+    defer allocator.free(root_tree_spool);
+    const nested_prefix = try std.fmt.allocPrint(allocator, "{s}.build-image-nested", .{output_path});
+    defer allocator.free(nested_prefix);
+    const raw_build = if (output_format == .raw)
+        output_path
+    else
+        try std.fmt.allocPrint(allocator, "{s}.build-image.raw", .{output_path});
+    defer if (output_format != .raw) allocator.free(raw_build);
+
+    for ([_][]const u8{ options.iso_path, options.container_path }) |source| {
+        if (try buildSourceConflicts(
+            io,
+            source,
+            &.{ output_path, rootfs_scratch, root_tree_spool, raw_build },
+            nested_prefix,
+        )) return error.SourcePathConflict;
+    }
+    for (options.os.filesystem) |operation| switch (operation) {
+        .put_file => |file| switch (file.source) {
+            .inline_bytes => {},
+            .host_path => |path| {
+                if (try buildSourceConflicts(
+                    io,
+                    path,
+                    &.{ output_path, rootfs_scratch, root_tree_spool, raw_build },
+                    nested_prefix,
+                )) return error.SourcePathConflict;
+                const source_file = try Io.Dir.cwd().openFile(io, path, .{});
+                defer source_file.close(io);
+                if ((try source_file.stat(io)).kind != .file) return error.SourceNotRegularFile;
+            },
+        },
+        else => {},
+    };
+}
+
+fn buildSourceConflicts(
+    io: Io,
+    source_path: []const u8,
+    reserved_paths: []const []const u8,
+    nested_prefix_path: []const u8,
+) !bool {
+    const cwd = Io.Dir.cwd();
+    var source_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+    const source = source_buffer[0..try canonicalBuildPath(cwd, io, source_path, &source_buffer)];
+    for (reserved_paths) |reserved_path| {
+        var reserved_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+        const reserved = reserved_buffer[0..try canonicalBuildPath(cwd, io, reserved_path, &reserved_buffer)];
+        if (std.mem.eql(u8, source, reserved) or buildPathContains(source, reserved)) return true;
+    }
+
+    var nested_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+    const nested_prefix = nested_buffer[0..try canonicalBuildPath(cwd, io, nested_prefix_path, &nested_buffer)];
+    return buildPathContains(source, nested_prefix) or
+        (std.mem.startsWith(u8, source, nested_prefix) and
+            source.len > nested_prefix.len and source[nested_prefix.len] == '-');
+}
+
+fn canonicalBuildPath(
+    dir: Io.Dir,
+    io: Io,
+    path: []const u8,
+    buffer: *[Io.Dir.max_path_bytes]u8,
+) !usize {
+    var absolute_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+    const absolute_path = if (std.fs.path.isAbsolute(path))
+        path
+    else blk: {
+        const cwd_len = try dir.realPathFile(io, ".", &absolute_buffer);
+        const separator_len: usize = @intFromBool(cwd_len != 0 and !std.fs.path.isSep(absolute_buffer[cwd_len - 1]));
+        if (cwd_len + separator_len + path.len > absolute_buffer.len) return error.NameTooLong;
+        if (separator_len != 0) absolute_buffer[cwd_len] = std.fs.path.sep;
+        @memcpy(absolute_buffer[cwd_len + separator_len ..][0..path.len], path);
+        break :blk absolute_buffer[0 .. cwd_len + separator_len + path.len];
+    };
+    var candidate = absolute_path;
+    while (true) {
+        if (dir.realPathFile(io, candidate, buffer)) |len| {
+            const suffix = absolute_path[candidate.len..];
+            if (len + suffix.len > buffer.len) return error.NameTooLong;
+            @memcpy(buffer[len..][0..suffix.len], suffix);
+            return len + suffix.len;
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
+
+        const parent = std.fs.path.dirname(candidate) orelse return error.InvalidPath;
+        if (std.mem.eql(u8, parent, candidate)) return error.InvalidPath;
+        candidate = parent;
+    }
+}
+
+fn buildPathContains(parent: []const u8, candidate: []const u8) bool {
+    if (parent.len >= candidate.len or !std.mem.startsWith(u8, candidate, parent)) return false;
+    return std.fs.path.isSep(candidate[parent.len]) or
+        (std.fs.path.isSep(parent[parent.len - 1]) and parent.len == 1);
 }
 
 fn resolveOutputFormat(explicit: ?Format, output_path: []const u8) !Format {
@@ -756,7 +917,12 @@ fn extractIsoEntryToPath(
     const index = try reader.lookup(lookup_path);
     if (reader.getEntry(index).kind != .file) return error.InvalidRootfsPath;
 
-    const file = try Io.Dir.cwd().createFile(io, output_path, .{ .read = true, .truncate = true });
+    const file = try Io.Dir.cwd().createFile(io, output_path, .{
+        .read = true,
+        .truncate = true,
+        .exclusive = true,
+    });
+    errdefer Io.Dir.cwd().deleteFile(io, output_path) catch {};
     defer file.close(io);
 
     const buffer = try allocator.alloc(u8, scratch_copy_chunk_size);
@@ -1714,7 +1880,11 @@ fn extractSquashfsEntryToPath(
     const entry = reader.getEntry(index);
     if (entry.kind != .file) return error.NotAFile;
 
-    const file = try Io.Dir.cwd().createFile(io, output_path, .{ .read = true, .truncate = true });
+    const file = try Io.Dir.cwd().createFile(io, output_path, .{
+        .read = true,
+        .truncate = true,
+        .exclusive = true,
+    });
     defer file.close(io);
 
     const buffer = try allocator.alloc(u8, scratch_copy_chunk_size);
@@ -2311,6 +2481,57 @@ fn extractImageRegionToPath(
         try file.writePositionalAll(io, buffer[0..want], copied);
         copied += got;
     }
+}
+
+test "customization sources cannot alias output or internal scratch paths" {
+    var operations = [_]os_customization.FilesystemOperation{
+        .{ .put_file = .{
+            .path = "/etc/example",
+            .source = .{ .host_path = "output.qcow2.build-image-root-tree.spool" },
+        } },
+    };
+    var options = BuildImageOptions{
+        .iso_path = "input.iso",
+        .container_path = "container",
+        .output_path = "output.qcow2",
+        .size = 128 * mib,
+        .output_format = .qcow2,
+        .os = .{ .filesystem = &operations },
+    };
+    try std.testing.expectError(
+        error.SourcePathConflict,
+        validateBuildPathIsolation(std.testing.allocator, std.testing.io, options, .qcow2),
+    );
+
+    operations[0].put_file.source = .{ .host_path = "output.qcow2.build-image.raw" };
+    try std.testing.expectError(
+        error.SourcePathConflict,
+        validateBuildPathIsolation(std.testing.allocator, std.testing.io, options, .qcow2),
+    );
+
+    operations[0].put_file.source = .{ .host_path = "output.qcow2.build-image-nested-1.img" };
+    try std.testing.expectError(
+        error.SourcePathConflict,
+        validateBuildPathIsolation(std.testing.allocator, std.testing.io, options, .qcow2),
+    );
+
+    operations[0].put_file.source = .{ .host_path = "output.qcow2" };
+    try std.testing.expectError(
+        error.SourcePathConflict,
+        validateBuildPathIsolation(std.testing.allocator, std.testing.io, options, .raw),
+    );
+
+    const independent = try Io.Dir.cwd().createFile(std.testing.io, "independent-input", .{});
+    independent.close(std.testing.io);
+    defer Io.Dir.cwd().deleteFile(std.testing.io, "independent-input") catch {};
+    operations[0].put_file.source = .{ .host_path = "independent-input" };
+    try validateBuildPathIsolation(std.testing.allocator, std.testing.io, options, .raw);
+
+    options.iso_path = "output.qcow2.build-image-root-tree.spool";
+    try std.testing.expectError(
+        error.SourcePathConflict,
+        validateBuildPathIsolation(std.testing.allocator, std.testing.io, options, .raw),
+    );
 }
 
 test "build-image builds Gen2 VHD, VHDX, and qcow2 outputs from XZ squashfs + OCI layout" {
@@ -3447,6 +3668,85 @@ test "build-image does not install an azagent systemd unit when azagent is absen
     defer root_reader.deinit();
 
     try std.testing.expectError(error.NotFound, root_reader.readFileAlloc(io, allocator, azagent_unit_path));
+}
+
+test "build-image applies typed OS customization before generalization and ext4 population" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const iso_path = "test-build-image-customization.iso";
+    const oci_root = "test-build-image-customization-oci";
+    const output_path = "test-build-image-customization.raw";
+    defer Io.Dir.cwd().deleteFile(io, iso_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, oci_root) catch {};
+    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
+
+    const squashfs_bytes = try squashfs.buildSyntheticSquashfsImage(allocator, .{ .compression = .xz });
+    defer allocator.free(squashfs_bytes);
+    try writeMinimalIsoWithFile(allocator, io, iso_path, "ROOT.SQUASHFS;1", squashfs_bytes);
+    var fixture = try createBuildImageOciFixture(allocator, io, oci_root);
+    defer fixture.deinit(allocator);
+
+    const filesystem = [_]os_customization.FilesystemOperation{
+        .{ .put_file = .{ .path = "/etc/passwd", .source = .{ .inline_bytes = "root:x:0:0::/root:/bin/bash\n" } } },
+        .{ .put_file = .{ .path = "/etc/shadow", .source = .{ .inline_bytes = "root:!:19000:0:99999:7:::\n" }, .metadata = .{ .mode = 0o600 } } },
+        .{ .put_file = .{ .path = "/etc/group", .source = .{ .inline_bytes = "root:x:0:\n" } } },
+        .{ .put_file = .{ .path = "/etc/machine-id", .source = .{ .inline_bytes = "captured-machine-id\n" }, .metadata = .{ .mode = 0o444 } } },
+        .{ .put_file = .{ .path = "/etc/ssh/ssh_host_rsa_key", .source = .{ .inline_bytes = "captured-host-key" }, .metadata = .{ .mode = 0o600 } } },
+    };
+    const users = [_]os_customization.User{.{
+        .name = "alice",
+        .uid = 1000,
+        .ssh_authorized_keys = &.{"ssh-ed25519 AAAATEST alice@example"},
+    }};
+    const services = [_]os_customization.Service{.{ .name = "example.service", .state = .enabled }};
+    var report = try build(allocator, io, .{
+        .iso_path = iso_path,
+        .container_path = oci_root,
+        .output_path = output_path,
+        .output_format = .raw,
+        .generation = .gen2,
+        .size = 256 * mib,
+        .os = .{
+            .filesystem = &filesystem,
+            .hostname = "custom-vm",
+            .users = &users,
+            .services = &services,
+        },
+        .generalization = .{ .azure = .{ .reset_hostname = false } },
+    });
+    defer report.deinit(allocator);
+    try std.testing.expect(report.root_tree_digest != null);
+
+    var img = try Image.openPath(io, output_path);
+    defer img.close(io);
+    const root_partition = report.planned_partitions[1].planned;
+    const rootfs_scratch_path = try std.fmt.allocPrint(allocator, "{s}.test-rootfs.raw", .{output_path});
+    defer allocator.free(rootfs_scratch_path);
+    defer Io.Dir.cwd().deleteFile(io, rootfs_scratch_path) catch {};
+    try extractImageRegionToPath(allocator, io, &img, root_partition.offset_bytes, root_partition.length_bytes, rootfs_scratch_path);
+
+    const rootfs_scratch = try Io.Dir.cwd().openFile(io, rootfs_scratch_path, .{});
+    defer rootfs_scratch.close(io);
+    var root_reader = try ext4.open(io, rootfs_scratch, allocator, .{});
+    defer root_reader.deinit();
+    const hostname = try root_reader.readFileAlloc(io, allocator, "etc/hostname");
+    defer allocator.free(hostname);
+    try std.testing.expectEqualStrings("custom-vm\n", hostname);
+    const authorized_keys = try root_reader.readFileAlloc(io, allocator, "home/alice/.ssh/authorized_keys");
+    defer allocator.free(authorized_keys);
+    try std.testing.expectEqualStrings("ssh-ed25519 AAAATEST alice@example\n", authorized_keys);
+    const service_target = try root_reader.readLinkAlloc(
+        io,
+        allocator,
+        "etc/systemd/system/multi-user.target.wants/example.service",
+    );
+    defer allocator.free(service_target);
+    try std.testing.expectEqualStrings("/usr/lib/systemd/system/example.service", service_target);
+    try std.testing.expectError(error.NotFound, root_reader.readFileAlloc(io, allocator, "etc/ssh/ssh_host_rsa_key"));
+    const machine_id = try root_reader.readFileAlloc(io, allocator, "etc/machine-id");
+    defer allocator.free(machine_id);
+    try std.testing.expectEqual(@as(usize, 0), machine_id.len);
 }
 
 fn makeTestStubPe(allocator: std.mem.Allocator, machine: u16) ![]u8 {
