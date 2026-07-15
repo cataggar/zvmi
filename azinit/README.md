@@ -25,8 +25,15 @@ A minimal (~160 KB), statically-linked PID 1 replacement for real-boot testing o
 - Loops forever spawning an interactive shell on `/dev/ttyS0`, respawning it
   if it ever exits (PID 1 exiting panics the kernel), and reaping all other
   zombie children along the way.
-- If `/usr/sbin/azagent` (the guest provisioning agent, see `azagent/`, issue #112) is present, fork+execs it after networking is up so a `--skip-iso-rootfs` image can reach a provisioned login instead of only a bare shell. Immutable mode retains the original best-effort behavior: azagent runs once, and failure does not block the fallback serial shell or optional sshd. Persistent mode requires azagent and retries it every five seconds in a child supervisor while keeping the serial shell available.
-- If `/usr/sbin/sshd` is present, fork+execs it after azagent. In persistent mode, sshd does not start until azagent succeeds, ensuring account data, host keys, and `authorized_keys` exist first. This remains one hardcoded fork+exec rather than a general service supervisor and uses the configuration shipped by the container image.
+- Detects Azure before launching `azagent`. Automatic detection accepts either
+  a readable `ovf-env.xml` provisioning disc or DHCP option 245, and classifies
+  a completed DHCP lease with neither signal as non-Azure. Persistent mode
+  stores the result in `/var/lib/azagent/azure-environment`, bound to the
+  current DMI product UUID so moving the disk to a different VM forces
+  redetection. Failed DHCP or not-yet-readable media remains unknown and is
+  retried without repeatedly launching `azagent`.
+- If `/usr/sbin/azagent` (the guest provisioning agent, see `azagent/`, issue #112) is present, fork+execs it after networking is up so a `--skip-iso-rootfs` image can reach a provisioned login instead of only a bare shell. Immutable mode retains a single best-effort run when detection is inconclusive. Persistent mode retries every five seconds only after Azure is detected or forced, while keeping the serial shell available.
+- If `/usr/sbin/sshd` is present, fork+execs it after provisioning succeeds. In persistent mode, an existing provisioning sentinel also permits SSH to start when `azagent` is skipped, while a fresh non-Azure image remains serial-only. This remains one hardcoded fork+exec rather than a general service supervisor and uses the configuration shipped by the container image.
 
 ## Building
 
@@ -55,11 +62,13 @@ For a generalized Azure image, include `/usr/sbin/azagent`, `/usr/sbin/sshd`, `s
 ```
 zvmi build-image --iso <azurelinux.iso> --container <oci-layout-with-azinit-agent-sshd> \
   --generation 2 --size 768M --skip-iso-rootfs \
-  --extra-kernel-options "init=/sbin/init azinit.mode=persistent console=tty0 console=ttyS0,115200n8" \
+  --extra-kernel-options "init=/sbin/init azinit.mode=persistent azinit.azure=auto console=tty0 console=ttyS0,115200n8" \
   -o out.vhd -O vhd
 ```
 
 `init=/sbin/init` is required when the packaged OpenSSH dependency set includes systemd; otherwise the systemd-based initramfs selects `/usr/lib/systemd/systemd` directly instead of azinit. Persistent mode is intentionally incompatible with a read-only dm-verity root. If the root remount fails, azinit leaves provisioning and SSH disabled and retains serial-console access for diagnosis.
+
+`azinit.azure=auto` is the default. Use `azinit.azure=on` to force provisioning retries when Azure's early-boot signals are unavailable, or `azinit.azure=off` to suppress `azagent` explicitly. Overrides apply only to the current boot and do not replace the cached automatic decision. `zvmi azure deprovision` removes `/var/lib/azagent`, including both the provisioning sentinel and cached environment decision.
 
 Generalized Azure deployments must still provide `adminUsername`; use `g` for
 the project image convention. With the builder's `waagent.conf`, azagent mounts

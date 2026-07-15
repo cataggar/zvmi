@@ -306,6 +306,7 @@ test "findRootExt4Offset and deprovision work end to end on a partitioned disk i
         .{ .path = "var/lib", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
         .{ .path = "var/lib/azagent", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
         .{ .path = "var/lib/azagent/provisioned", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = "special-host".len, .bytes = "special-host" },
+        .{ .path = "var/lib/azagent/azure-environment", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = "v1 01234567-89ab-cdef-0123-456789abcdef azure\n".len, .bytes = "v1 01234567-89ab-cdef-0123-456789abcdef azure\n" },
         .{ .path = "home", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
         .{ .path = "home/azureuser", .kind = .directory, .mode = 0o700, .uid = 1000, .gid = 1000 },
         .{ .path = "home/azureuser/.ssh", .kind = .directory, .mode = 0o700, .uid = 1000, .gid = 1000 },

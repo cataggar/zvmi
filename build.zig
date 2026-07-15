@@ -218,22 +218,39 @@ pub fn build(b: *std.Build) void {
         .cpu_arch = .x86_64,
         .os_tag = .linux,
     });
+    const azinit_cdrom_mod = b.createModule(.{
+        .root_source_file = b.path("azagent/cdrom.zig"),
+        .target = azinit_target,
+        .optimize = .ReleaseSmall,
+    });
+    const azinit_mod = b.createModule(.{
+        .root_source_file = b.path("azinit/init.zig"),
+        .target = azinit_target,
+        .optimize = .ReleaseSmall,
+        .imports = &.{
+            .{ .name = "provisioning_media", .module = azinit_cdrom_mod },
+        },
+    });
     const azinit_exe = b.addExecutable(.{
         .name = "azinit",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("azinit/init.zig"),
-            .target = azinit_target,
-            .optimize = .ReleaseSmall,
-        }),
+        .root_module = azinit_mod,
         .linkage = .static,
     });
     b.installArtifact(azinit_exe);
 
+    const azinit_test_cdrom_mod = b.createModule(.{
+        .root_source_file = b.path("azagent/cdrom.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const azinit_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("azinit/init.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "provisioning_media", .module = azinit_test_cdrom_mod },
+            },
         }),
     });
     const run_azinit_tests = b.addRunArtifact(azinit_tests);
