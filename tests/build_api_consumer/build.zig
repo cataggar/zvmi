@@ -111,7 +111,8 @@ pub fn build(b: *std.Build) void {
             .basename = "preserved-fixture.qcow2",
         },
         .target_architecture = .aarch64,
-        .backend = .rebuild,
+        .backend = .unsafe_chroot,
+        .acknowledge_unsafe = true,
         .reproducibility = .{
             .seed = [_]u8{0x44} ** 32,
             .source_date_epoch = 1_735_689_600,
@@ -138,6 +139,19 @@ pub fn build(b: *std.Build) void {
             },
             .hostname = "rebuilt",
         },
+        .packages = .{
+            .actions = &.{.{ .install = &.{"dracut"} }},
+            .repositories = &.{.{
+                .id = "base",
+                .urls = &.{"https://packages.example.invalid"},
+                .trust = &.{.{ .inline_bytes = "test signing key" }},
+            }},
+        },
+        .initramfs = .{ .regenerate = .{
+            .generator = "dracut",
+            .kernels = &.{"6.12.0-test"},
+        } },
+        .guest_execution = .same_architecture,
     });
 
     const install_layout = b.addInstallFile(layout_image.path, "images/layout-fixture.qcow2");

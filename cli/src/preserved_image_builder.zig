@@ -29,6 +29,10 @@ const LoadedConfiguration = struct {
     operations: []const zvmi.customize.ExistingPathOperation,
     os: zvmi.customize.OsCustomization,
     generalization: zvmi.customize.GeneralizationPolicy,
+    acknowledge_unsafe: bool,
+    packages: zvmi.customize.PackagePolicy,
+    initramfs: zvmi.customize.InitramfsPolicy,
+    guest_execution: wire.GuestExecutionPolicy,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -144,9 +148,15 @@ pub fn main(init: std.process.Init) !void {
         } },
         .os = configuration.os,
         .existing_path_operations = configuration.operations,
+        .packages = configuration.packages,
+        .initramfs = configuration.initramfs,
+        .cross_architecture = switch (configuration.guest_execution) {
+            .same_architecture => .reject,
+        },
         .execution = .{
             .workspace_path = args.bundle_output_path,
             .backend = configuration.backend,
+            .acknowledge_unsafe = configuration.acknowledge_unsafe,
         },
         .generalization = configuration.generalization,
         .reproducibility = .{
@@ -386,13 +396,49 @@ fn loadConfiguration(
         allocator,
         .limited(16 * 1024 * 1024),
     );
+    defer allocator.free(bytes);
+    return parseConfiguration(allocator, bytes, source_paths);
+}
+
+fn parseConfiguration(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    source_paths: []const []const u8,
+) !LoadedConfiguration {
+    const header = try std.json.parseFromSlice(
+        struct { api_version: u32 = wire.previous_api_version },
+        allocator,
+        bytes,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer header.deinit();
+    return switch (header.value.api_version) {
+        wire.previous_api_version => loadV2Configuration(
+            allocator,
+            bytes,
+            source_paths,
+        ),
+        wire.api_version => loadV3Configuration(
+            allocator,
+            bytes,
+            source_paths,
+        ),
+        else => error.UnsupportedApiVersion,
+    };
+}
+
+fn loadV2Configuration(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    source_paths: []const []const u8,
+) !LoadedConfiguration {
     const parsed = try std.json.parseFromSlice(
-        wire.Configuration,
+        wire.ConfigurationV2,
         allocator,
         bytes,
         .{ .ignore_unknown_fields = false },
     );
-    try wire.validate(parsed.value, source_paths.len);
+    try wire.validateV2(parsed.value, source_paths.len);
     const customization = try customization_loader.map(
         allocator,
         parsed.value.customization,
@@ -410,6 +456,51 @@ fn loadConfiguration(
         .operations = try mapOperations(allocator, parsed.value.operations, source_paths),
         .os = customization.os,
         .generalization = customization.generalization,
+        .acknowledge_unsafe = false,
+        .packages = .{},
+        .initramfs = .unchanged,
+        .guest_execution = .same_architecture,
+    };
+}
+
+fn loadV3Configuration(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    source_paths: []const []const u8,
+) !LoadedConfiguration {
+    const parsed = try std.json.parseFromSlice(
+        wire.Configuration,
+        allocator,
+        bytes,
+        .{ .ignore_unknown_fields = false },
+    );
+    try wire.validate(parsed.value, source_paths.len);
+    const customization = try customization_loader.map(
+        allocator,
+        parsed.value.customization,
+        source_paths,
+    );
+    return .{
+        .backend = switch (parsed.value.backend) {
+            .native_edit => .native_edit,
+            .rebuild => .rebuild,
+            .unsafe_chroot => .unsafe_chroot,
+        },
+        .root_partition = switch (parsed.value.root_partition) {
+            .gpt_index => |index| .{ .gpt_index = index },
+            .mbr_index => |index| .{ .mbr_index = index },
+        },
+        .operations = try mapOperations(allocator, parsed.value.operations, source_paths),
+        .os = customization.os,
+        .generalization = customization.generalization,
+        .acknowledge_unsafe = parsed.value.acknowledge_unsafe,
+        .packages = try mapPackagePolicy(
+            allocator,
+            parsed.value.packages,
+            source_paths,
+        ),
+        .initramfs = try mapInitramfsPolicy(allocator, parsed.value.initramfs),
+        .guest_execution = parsed.value.guest_execution,
     };
 }
 
@@ -433,6 +524,88 @@ fn mapOperations(
         };
     }
     return mapped;
+}
+
+fn mapPackagePolicy(
+    allocator: std.mem.Allocator,
+    policy: wire.PackagePolicy,
+    source_paths: []const []const u8,
+) !zvmi.customize.PackagePolicy {
+    const actions = try allocator.alloc(
+        zvmi.customize.PackageAction,
+        policy.actions.len,
+    );
+    for (policy.actions, 0..) |action, index| {
+        actions[index] = switch (action) {
+            .install => |packages| .{ .install = packages },
+            .remove => |packages| .{ .remove = packages },
+            .update_all => .update_all,
+            .update_selected => |packages| .{ .update_selected = packages },
+        };
+    }
+    const repositories = try allocator.alloc(
+        zvmi.customize.PackageRepository,
+        policy.repositories.len,
+    );
+    for (policy.repositories, 0..) |repository, index| {
+        const trust = try allocator.alloc(
+            zvmi.customize.TrustSource,
+            repository.trust.len,
+        );
+        for (repository.trust, 0..) |source, source_index| {
+            if (source.source_index >= source_paths.len) {
+                return error.SourceIndexOutOfBounds;
+            }
+            trust[source_index] = .{
+                .host_path = source_paths[source.source_index],
+            };
+        }
+        repositories[index] = .{
+            .id = repository.id,
+            .urls = repository.urls,
+            .trust = trust,
+        };
+    }
+    return .{
+        .actions = actions,
+        .repositories = repositories,
+        .cache = switch (policy.cache) {
+            .online => .online,
+            .cache_only => .cache_only,
+        },
+        .lock = switch (policy.lock) {
+            .unlocked => .unlocked,
+            .snapshot => |snapshot| .{ .snapshot = snapshot },
+            .exact => |locks| exact: {
+                const mapped = try allocator.alloc(
+                    zvmi.customize.PackageVersionLock,
+                    locks.len,
+                );
+                for (locks, 0..) |lock, index| mapped[index] = .{
+                    .name = lock.name,
+                    .version = lock.version,
+                    .repository_id = lock.repository_id,
+                };
+                break :exact .{ .exact = mapped };
+            },
+        },
+    };
+}
+
+fn mapInitramfsPolicy(
+    allocator: std.mem.Allocator,
+    policy: wire.InitramfsPolicy,
+) !zvmi.customize.InitramfsPolicy {
+    return switch (policy) {
+        .unchanged => .unchanged,
+        .regenerate => |regenerate| .{ .regenerate = .{
+            .generator = if (regenerate.generator) |generator|
+                try allocator.dupe(u8, generator)
+            else
+                null,
+            .kernels = regenerate.kernels,
+        } },
+    };
 }
 
 fn parseArchitecture(value: []const u8) ?zvmi.customize.Architecture {
@@ -810,6 +983,84 @@ test "operation mapping permits customization sources in the shared index space"
         "existing-source",
         mapped[0].overwrite_file.source.host_path,
     );
+}
+
+test "configuration loader accepts v2 and v3 transport" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const v2_json =
+        \\{"backend":"rebuild","root_partition":{"gpt_index":1},"operations":[{"overwrite_file":{"path":"/etc/value","source_index":0}}]}
+    ;
+    const v2 = try parseConfiguration(
+        allocator,
+        v2_json,
+        &.{"replacement"},
+    );
+    try std.testing.expectEqual(
+        zvmi.customize.ExecutionBackend.rebuild,
+        v2.backend,
+    );
+    try std.testing.expectEqual(@as(usize, 0), v2.packages.actions.len);
+
+    const v3_json =
+        \\{"api_version":3,"backend":"unsafe_chroot","root_partition":{"mbr_index":1},"acknowledge_unsafe":true,"packages":{"actions":[{"install":["dracut"]}],"repositories":[{"id":"base","urls":["https://packages.example.invalid"],"trust":[{"source_index":0}]}]},"initramfs":{"regenerate":{"generator":"dracut","kernels":["6.12.0-test"]}}}
+    ;
+    const v3 = try parseConfiguration(
+        allocator,
+        v3_json,
+        &.{"trust-source"},
+    );
+    try std.testing.expectEqual(
+        zvmi.customize.ExecutionBackend.unsafe_chroot,
+        v3.backend,
+    );
+    try std.testing.expect(v3.acknowledge_unsafe);
+    try std.testing.expectEqualStrings(
+        "trust-source",
+        v3.packages.repositories[0].trust[0].host_path,
+    );
+    try std.testing.expectEqualStrings(
+        "dracut",
+        v3.initramfs.regenerate.generator.?,
+    );
+}
+
+test "package mapping resolves trust sources and execution policies" {
+    const policy = wire.PackagePolicy{
+        .actions = &.{
+            .{ .install = &.{ "dracut", "systemd" } },
+            .{ .remove = &.{"obsolete"} },
+        },
+        .repositories = &.{.{
+            .id = "base",
+            .urls = &.{"https://packages.example.invalid"},
+            .trust = &.{.{ .source_index = 1 }},
+        }},
+        .lock = .{ .exact = &.{.{
+            .name = "dracut",
+            .version = "1.0-1",
+            .repository_id = "base",
+        }} },
+    };
+    const mapped = try mapPackagePolicy(
+        std.testing.allocator,
+        policy,
+        &.{ "operation-source", "trust-source" },
+    );
+    defer {
+        std.testing.allocator.free(mapped.actions);
+        std.testing.allocator.free(mapped.repositories[0].trust);
+        std.testing.allocator.free(mapped.repositories);
+        std.testing.allocator.free(mapped.lock.exact);
+    }
+    try std.testing.expectEqualStrings(
+        "trust-source",
+        mapped.repositories[0].trust[0].host_path,
+    );
+    try std.testing.expectEqualStrings("obsolete", mapped.actions[1].remove[0]);
+    try std.testing.expectEqualStrings("1.0-1", mapped.lock.exact[0].version);
 }
 
 test "unsafe image basenames are rejected" {
