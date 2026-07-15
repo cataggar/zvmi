@@ -169,7 +169,35 @@ pub const PreservedOperation = union(enum) {
 pub const PreservedBackend = enum {
     native_edit,
     rebuild,
+    unsafe_chroot,
 };
+
+pub const PreservedPackageAction = preserved_image_wire.PackageAction;
+
+pub const PreservedTrustSource = union(enum) {
+    inline_bytes: []const u8,
+    path: std.Build.LazyPath,
+};
+
+pub const PreservedPackageRepository = struct {
+    id: []const u8,
+    urls: []const []const u8,
+    trust: []const PreservedTrustSource = &.{},
+};
+
+pub const PreservedPackageCachePolicy = preserved_image_wire.PackageCachePolicy;
+pub const PreservedPackageVersionLock = preserved_image_wire.PackageVersionLock;
+pub const PreservedPackageLockPolicy = preserved_image_wire.PackageLockPolicy;
+
+pub const PreservedPackagePolicy = struct {
+    actions: []const PreservedPackageAction = &.{},
+    repositories: []const PreservedPackageRepository = &.{},
+    cache: PreservedPackageCachePolicy = .online,
+    lock: PreservedPackageLockPolicy = .unlocked,
+};
+
+pub const PreservedInitramfsPolicy = preserved_image_wire.InitramfsPolicy;
+pub const PreservedGuestExecutionPolicy = preserved_image_wire.GuestExecutionPolicy;
 
 pub const PreservedOptions = struct {
     name: []const u8,
@@ -182,6 +210,10 @@ pub const PreservedOptions = struct {
     operations: []const PreservedOperation = &.{},
     os: OsCustomization = .{},
     generalization: GeneralizationPolicy = .none,
+    acknowledge_unsafe: bool = false,
+    packages: PreservedPackagePolicy = .{},
+    initramfs: PreservedInitramfsPolicy = .unchanged,
+    guest_execution: PreservedGuestExecutionPolicy = .same_architecture,
     verbose: bool = false,
 };
 
@@ -422,10 +454,41 @@ fn materializePreservedConfiguration(
         };
     }
 
+    const repositories = try b.allocator.alloc(
+        preserved_image_wire.PackageRepository,
+        options.packages.repositories.len,
+    );
+    for (options.packages.repositories, 0..) |repository, repository_index| {
+        const trust = try b.allocator.alloc(
+            preserved_image_wire.TrustSource,
+            repository.trust.len,
+        );
+        for (repository.trust, 0..) |trust_source, trust_index| {
+            const source: std.Build.LazyPath = switch (trust_source) {
+                .path => |path| path,
+                .inline_bytes => |bytes| inline_files.add(
+                    b.fmt("repository-{d}-trust-{d}", .{
+                        repository_index,
+                        trust_index,
+                    }),
+                    bytes,
+                ),
+            };
+            trust[trust_index] = .{ .source_index = sources.items.len };
+            try sources.append(source);
+        }
+        repositories[repository_index] = .{
+            .id = repository.id,
+            .urls = repository.urls,
+            .trust = trust,
+        };
+    }
+
     const configuration = preserved_image_wire.Configuration{
         .backend = switch (options.backend) {
             .native_edit => .native_edit,
             .rebuild => .rebuild,
+            .unsafe_chroot => .unsafe_chroot,
         },
         .root_partition = switch (options.root_partition) {
             .gpt_index => |index| .{ .gpt_index = index },
@@ -443,6 +506,15 @@ fn materializePreservedConfiguration(
             },
             .generalization = options.generalization,
         },
+        .acknowledge_unsafe = options.acknowledge_unsafe,
+        .packages = .{
+            .actions = options.packages.actions,
+            .repositories = repositories,
+            .cache = options.packages.cache,
+            .lock = options.packages.lock,
+        },
+        .initramfs = options.initramfs,
+        .guest_execution = options.guest_execution,
     };
     try preserved_image_wire.validate(configuration, sources.items.len);
     const json = try std.json.Stringify.valueAlloc(b.allocator, configuration, .{});
