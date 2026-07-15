@@ -1,0 +1,839 @@
+//! Host-native entry point for the preserved-image `std.Build` helper.
+
+const std = @import("std");
+const builtin = @import("builtin");
+const wire = @import("preserved_image_wire");
+const zvmi = @import("zvmi");
+
+const ParsedArgs = struct {
+    api_version: u32 = zvmi.customize.current_api_version,
+    architecture: zvmi.customize.Architecture,
+    disk_path: []const u8,
+    dependency_paths: []const []const u8,
+    configuration_path: []const u8,
+    operation_source_paths: []const []const u8,
+    bundle_output_path: []const u8,
+    image_basename: []const u8,
+    format: zvmi.customize.OutputFormat,
+    seed: zvmi.customize.Seed,
+    source_date_epoch: u64,
+    preflight_only: bool = false,
+    reuse_success: bool = false,
+    verbose: bool = false,
+};
+
+const LoadedConfiguration = struct {
+    root_partition: zvmi.customize.PartitionSelector,
+    operations: []const zvmi.customize.ExistingPathOperation,
+};
+
+pub fn main(init: std.process.Init) !void {
+    const arena = init.arena.allocator();
+    const argv = try init.minimal.args.toSlice(arena);
+    const args = parseArgs(arena, argv[1..]) catch |err| {
+        std.debug.print("zvmi-preserved-image-builder: invalid arguments: {t}\n", .{err});
+        std.process.exit(2);
+    };
+    if (!isBasename(args.image_basename) or isReservedBasename(args.image_basename)) {
+        std.debug.print("zvmi-preserved-image-builder: image output must be a non-reserved basename\n", .{});
+        std.process.exit(2);
+    }
+
+    const lock_path = try std.fmt.allocPrint(arena, "{s}.lock", .{args.bundle_output_path});
+    validateIsolation(arena, init.io, &args, lock_path) catch |err| {
+        std.debug.print("zvmi-preserved-image-builder: result paths overlap an input: {t}\n", .{err});
+        std.process.exit(2);
+    };
+    const dependency_closure_exact = validateDependencyClosure(
+        arena,
+        init.io,
+        &args,
+        lock_path,
+    ) catch |err| {
+        std.debug.print("zvmi-preserved-image-builder: invalid disk dependency closure: {t}\n", .{err});
+        std.process.exit(2);
+    };
+
+    const lock_file = acquireBundleLock(init.io, lock_path) catch |err| {
+        std.debug.print("zvmi-preserved-image-builder: cannot lock result bundle: {t}\n", .{err});
+        std.process.exit(1);
+    };
+    defer lock_file.close(init.io);
+
+    if (dependency_closure_exact and
+        args.reuse_success and
+        try hasReusableSuccess(init.io, arena, argv, &args))
+    {
+        return;
+    }
+
+    try resetBundle(init.io, args.bundle_output_path);
+    std.Io.Dir.cwd().createDirPath(init.io, args.bundle_output_path) catch |err| {
+        std.debug.print("zvmi-preserved-image-builder: cannot create result bundle: {t}\n", .{err});
+        std.process.exit(1);
+    };
+
+    const output_path = try std.fs.path.join(arena, &.{ args.bundle_output_path, args.image_basename });
+    const plan_output_path = try std.fs.path.join(arena, &.{ args.bundle_output_path, "plan.json" });
+    const diagnostics_output_path = try std.fs.path.join(arena, &.{ args.bundle_output_path, "diagnostics.json" });
+    const provenance_output_path = try std.fs.path.join(arena, &.{ args.bundle_output_path, "provenance.json" });
+    const reuse_key_output_path = try std.fs.path.join(arena, &.{ args.bundle_output_path, "reuse-key" });
+    const status_output_path = try std.fs.path.join(arena, &.{ args.bundle_output_path, "status" });
+    try writeBytes(init.io, plan_output_path, "null\n");
+    try writeBytes(init.io, diagnostics_output_path, "[]\n");
+    try writeBytes(init.io, provenance_output_path, "null\n");
+    try writeBytes(init.io, status_output_path, "failure\n");
+    if (!dependency_closure_exact) {
+        try writeRunnerDiagnostic(
+            arena,
+            init.io,
+            diagnostics_output_path,
+            .preflight,
+            .missing_capability,
+            "/input/disk/dependencies",
+            "the declared disk dependencies do not match the source image closure",
+            "declare every qcow2 backing and external-data file exactly once",
+            null,
+        );
+        return;
+    }
+    const reuse_key_before = try computeReuseKey(arena, init.io, argv, &args);
+
+    var keep_image = false;
+    defer if (!keep_image) std.Io.Dir.cwd().deleteFile(init.io, output_path) catch {};
+
+    const configuration = loadConfiguration(
+        arena,
+        init.io,
+        args.configuration_path,
+        args.operation_source_paths,
+    ) catch |err| {
+        try writeRunnerDiagnostic(
+            arena,
+            init.io,
+            diagnostics_output_path,
+            .validation,
+            .invalid_customization,
+            "/existing_path_operations",
+            "the preserved-image operation configuration is invalid",
+            "use the versioned configuration emitted by addPreservedImage",
+            err,
+        );
+        return;
+    };
+
+    const request = zvmi.customize.Request{
+        .api_version = args.api_version,
+        .target_architecture = args.architecture,
+        .input = .{ .disk = .{
+            .path = args.disk_path,
+            .dependencies = args.dependency_paths,
+        } },
+        .output = .{
+            .path = output_path,
+            .format = args.format,
+            .size = 0,
+            .size_policy = .preserve_source,
+        },
+        .storage = .{ .preserve = .{
+            .root_partition = configuration.root_partition,
+        } },
+        .existing_path_operations = configuration.operations,
+        .execution = .{
+            .workspace_path = args.bundle_output_path,
+            .backend = .native_edit,
+        },
+        .reproducibility = .{
+            .seed = args.seed,
+            .source_date_epoch = args.source_date_epoch,
+        },
+    };
+
+    const host_architecture: zvmi.customize.Architecture = switch (builtin.cpu.arch) {
+        .x86_64 => .x86_64,
+        .aarch64 => .aarch64,
+        else => {
+            try writeRunnerDiagnostic(
+                arena,
+                init.io,
+                diagnostics_output_path,
+                .resolution,
+                .incompatible_architecture,
+                "/architectures/host",
+                "the host architecture is unsupported",
+                "run the host-native builder on x86_64 or aarch64",
+                null,
+            );
+            return;
+        },
+    };
+
+    var resolved = try zvmi.customize.resolve(init.gpa, &request, .{
+        .host_architecture = host_architecture,
+    });
+    defer resolved.deinit(init.gpa);
+    if (resolved.plan) |*plan| try writePlan(init.gpa, init.io, plan_output_path, plan);
+    if (resolved.diagnostics.hasErrors()) {
+        try writeDiagnostics(init.gpa, init.io, diagnostics_output_path, resolved.diagnostics);
+        return;
+    }
+
+    if (args.preflight_only) {
+        var report = try zvmi.customize.preflight(
+            init.gpa,
+            init.io,
+            &resolved.plan.?,
+            zvmi.customize.Platform.system(),
+        );
+        defer report.deinit(init.gpa);
+        try writeDiagnostics(init.gpa, init.io, diagnostics_output_path, report.diagnostics);
+        if (!report.ready()) return;
+        if (!try inputsUnchanged(arena, init.io, argv, &args, reuse_key_before)) {
+            try writeRunnerDiagnostic(
+                arena,
+                init.io,
+                diagnostics_output_path,
+                .preflight,
+                .source_changed,
+                "/input",
+                "an input changed during preflight",
+                "retry with immutable build inputs",
+                null,
+            );
+            return;
+        }
+        try writeBytes(init.io, status_output_path, "success\n");
+        return;
+    }
+
+    var console = ConsoleEvents{ .verbose = args.verbose };
+    var outcome = try zvmi.customize.execute(
+        init.gpa,
+        init.io,
+        &resolved.plan.?,
+        zvmi.customize.Platform.system(),
+        .{ .context = &console, .emitFn = ConsoleEvents.emit },
+    );
+    defer outcome.deinit(init.gpa);
+    try writeDiagnostics(init.gpa, init.io, diagnostics_output_path, outcome.diagnostics);
+    const result = if (outcome.result) |*success| success else return;
+
+    if (!try inputsUnchanged(arena, init.io, argv, &args, reuse_key_before)) {
+        try writeRunnerDiagnostic(
+            arena,
+            init.io,
+            diagnostics_output_path,
+            .execution,
+            .source_changed,
+            "/input",
+            "an input changed during preserved-image execution",
+            "retry with immutable build inputs",
+            null,
+        );
+        return;
+    }
+    if (!std.mem.eql(u8, result.output_path, output_path)) {
+        try writeRunnerDiagnostic(
+            arena,
+            init.io,
+            diagnostics_output_path,
+            .execution,
+            .commit_failed,
+            "/output/path",
+            "the runtime published an unexpected output path",
+            "use the unmodified plan returned by resolve",
+            null,
+        );
+        return;
+    }
+    const output_stat = std.Io.Dir.cwd().statFile(init.io, output_path, .{}) catch |err| {
+        try writeRunnerDiagnostic(
+            arena,
+            init.io,
+            diagnostics_output_path,
+            .execution,
+            .commit_failed,
+            "/output/path",
+            "the runtime did not publish a readable image",
+            "inspect the execution diagnostics and retry",
+            err,
+        );
+        return;
+    };
+    if (output_stat.kind != .file) {
+        try writeRunnerDiagnostic(
+            arena,
+            init.io,
+            diagnostics_output_path,
+            .execution,
+            .commit_failed,
+            "/output/path",
+            "the runtime output is not a regular file",
+            "choose a regular-file image output",
+            null,
+        );
+        return;
+    }
+
+    try writeProvenance(init.gpa, init.io, provenance_output_path, result.provenance);
+    try writeReuseKey(init.io, reuse_key_output_path, reuse_key_before);
+    try writeBytes(init.io, status_output_path, "success\n");
+    keep_image = true;
+}
+
+fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs {
+    var api_version: u32 = zvmi.customize.current_api_version;
+    var architecture: ?zvmi.customize.Architecture = null;
+    var disk_path: ?[]const u8 = null;
+    var dependencies = std.array_list.Managed([]const u8).init(allocator);
+    errdefer dependencies.deinit();
+    var configuration_path: ?[]const u8 = null;
+    var operation_sources = std.array_list.Managed([]const u8).init(allocator);
+    errdefer operation_sources.deinit();
+    var bundle_output_path: ?[]const u8 = null;
+    var image_basename: ?[]const u8 = null;
+    var format: ?zvmi.customize.OutputFormat = null;
+    var seed: ?zvmi.customize.Seed = null;
+    var source_date_epoch: ?u64 = null;
+    var preflight_only = false;
+    var reuse_success = false;
+    var verbose = false;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--preflight-only")) {
+            preflight_only = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--reuse-success")) {
+            reuse_success = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--verbose")) {
+            verbose = true;
+            continue;
+        }
+
+        i += 1;
+        if (i >= args.len) return error.MissingArgumentValue;
+        const value = args[i];
+        if (std.mem.eql(u8, arg, "--api-version")) {
+            api_version = try std.fmt.parseInt(u32, value, 10);
+        } else if (std.mem.eql(u8, arg, "--architecture")) {
+            architecture = parseArchitecture(value) orelse return error.InvalidArchitecture;
+        } else if (std.mem.eql(u8, arg, "--disk")) {
+            disk_path = value;
+        } else if (std.mem.eql(u8, arg, "--disk-dependency")) {
+            try dependencies.append(value);
+        } else if (std.mem.eql(u8, arg, "--configuration")) {
+            configuration_path = value;
+        } else if (std.mem.eql(u8, arg, "--operation-source")) {
+            try operation_sources.append(value);
+        } else if (std.mem.eql(u8, arg, "--bundle-output")) {
+            bundle_output_path = value;
+        } else if (std.mem.eql(u8, arg, "--image-basename")) {
+            image_basename = value;
+        } else if (std.mem.eql(u8, arg, "-O")) {
+            format = parseFormat(value) orelse return error.InvalidFormat;
+        } else if (std.mem.eql(u8, arg, "--seed")) {
+            if (value.len != 64) return error.InvalidSeed;
+            var bytes: [32]u8 = undefined;
+            const decoded = try std.fmt.hexToBytes(&bytes, value);
+            if (decoded.len != bytes.len) return error.InvalidSeed;
+            seed = .{ .bytes = bytes };
+        } else if (std.mem.eql(u8, arg, "--source-date-epoch")) {
+            source_date_epoch = try std.fmt.parseInt(u64, value, 10);
+        } else {
+            return error.UnexpectedArgument;
+        }
+    }
+    if (preflight_only and reuse_success) return error.IncompatibleFlags;
+
+    return .{
+        .api_version = api_version,
+        .architecture = architecture orelse return error.MissingArchitecture,
+        .disk_path = disk_path orelse return error.MissingDisk,
+        .dependency_paths = try dependencies.toOwnedSlice(),
+        .configuration_path = configuration_path orelse return error.MissingConfiguration,
+        .operation_source_paths = try operation_sources.toOwnedSlice(),
+        .bundle_output_path = bundle_output_path orelse return error.MissingBundleOutput,
+        .image_basename = image_basename orelse return error.MissingImageBasename,
+        .format = format orelse return error.MissingFormat,
+        .seed = seed orelse return error.MissingSeed,
+        .source_date_epoch = source_date_epoch orelse return error.MissingSourceDateEpoch,
+        .preflight_only = preflight_only,
+        .reuse_success = reuse_success,
+        .verbose = verbose,
+    };
+}
+
+fn loadConfiguration(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    source_paths: []const []const u8,
+) !LoadedConfiguration {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        path,
+        allocator,
+        .limited(16 * 1024 * 1024),
+    );
+    const parsed = try std.json.parseFromSlice(
+        wire.Configuration,
+        allocator,
+        bytes,
+        .{ .ignore_unknown_fields = false },
+    );
+    try wire.validate(parsed.value, source_paths.len);
+    return .{
+        .root_partition = switch (parsed.value.root_partition) {
+            .gpt_index => |index| .{ .gpt_index = index },
+            .mbr_index => |index| .{ .mbr_index = index },
+        },
+        .operations = try mapOperations(allocator, parsed.value.operations, source_paths),
+    };
+}
+
+fn mapOperations(
+    allocator: std.mem.Allocator,
+    operations: []const wire.Operation,
+    source_paths: []const []const u8,
+) ![]const zvmi.customize.ExistingPathOperation {
+    const configuration = wire.Configuration{
+        .root_partition = .{ .gpt_index = 1 },
+        .operations = operations,
+    };
+    try wire.validate(configuration, source_paths.len);
+
+    const mapped = try allocator.alloc(zvmi.customize.ExistingPathOperation, operations.len);
+    for (operations, 0..) |operation, index| {
+        mapped[index] = switch (operation) {
+            .overwrite_file => |overwrite| .{ .overwrite_file = .{
+                .path = overwrite.path,
+                .source = .{ .host_path = source_paths[overwrite.source_index] },
+            } },
+            .remove_file => |path| .{ .remove_file = path },
+            .remove_tree => |path| .{ .remove_tree = path },
+        };
+    }
+    return mapped;
+}
+
+fn parseArchitecture(value: []const u8) ?zvmi.customize.Architecture {
+    if (std.mem.eql(u8, value, "x86_64")) return .x86_64;
+    if (std.mem.eql(u8, value, "aarch64")) return .aarch64;
+    return null;
+}
+
+fn parseFormat(value: []const u8) ?zvmi.customize.OutputFormat {
+    if (std.mem.eql(u8, value, "raw")) return .raw;
+    if (std.mem.eql(u8, value, "vhd")) return .vhd;
+    if (std.mem.eql(u8, value, "vhdx")) return .vhdx;
+    if (std.mem.eql(u8, value, "qcow2")) return .qcow2;
+    return null;
+}
+
+fn isBasename(path: []const u8) bool {
+    return path.len != 0 and
+        !std.fs.path.isAbsolute(path) and
+        std.mem.eql(u8, path, std.fs.path.basename(path)) and
+        !std.mem.eql(u8, path, ".") and
+        !std.mem.eql(u8, path, "..");
+}
+
+fn isReservedBasename(path: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(path, "status") or
+        std.ascii.eqlIgnoreCase(path, "plan.json") or
+        std.ascii.eqlIgnoreCase(path, "diagnostics.json") or
+        std.ascii.eqlIgnoreCase(path, "provenance.json") or
+        std.ascii.eqlIgnoreCase(path, "reuse-key");
+}
+
+fn validateIsolation(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    args: *const ParsedArgs,
+    lock_path: []const u8,
+) !void {
+    try validateInputIsolation(allocator, io, args.bundle_output_path, args.disk_path);
+    try validateInputIsolation(allocator, io, lock_path, args.disk_path);
+    for (args.dependency_paths) |path| {
+        try validateInputIsolation(allocator, io, args.bundle_output_path, path);
+        try validateInputIsolation(allocator, io, lock_path, path);
+    }
+    try validateInputIsolation(allocator, io, args.bundle_output_path, args.configuration_path);
+    try validateInputIsolation(allocator, io, lock_path, args.configuration_path);
+    for (args.operation_source_paths) |path| {
+        try validateInputIsolation(allocator, io, args.bundle_output_path, path);
+        try validateInputIsolation(allocator, io, lock_path, path);
+    }
+}
+
+fn validateDependencyClosure(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    args: *const ParsedArgs,
+    lock_path: []const u8,
+) !bool {
+    var image = try zvmi.Image.openPathReadOnly(io, args.disk_path);
+    defer image.close(io);
+    const discovered = try image.sourceDependencyPaths(allocator);
+    defer {
+        for (discovered) |path| allocator.free(path);
+        allocator.free(discovered);
+    }
+
+    for (discovered) |path| {
+        try validateInputIsolation(allocator, io, args.bundle_output_path, path);
+        try validateInputIsolation(allocator, io, lock_path, path);
+    }
+    return samePathSet(args.dependency_paths, discovered);
+}
+
+fn samePathSet(expected: []const []const u8, actual: []const []u8) bool {
+    if (expected.len != actual.len) return false;
+    for (expected) |expected_path| {
+        for (actual) |actual_path| {
+            if (std.mem.eql(u8, expected_path, actual_path)) break;
+        } else return false;
+    }
+    return true;
+}
+
+fn validateInputIsolation(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    result_path: []const u8,
+    input_path: []const u8,
+) !void {
+    if (try pathsOverlapCanonically(allocator, io, result_path, input_path)) {
+        return error.ResultPathOverlap;
+    }
+}
+
+fn pathsOverlapCanonically(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    first: []const u8,
+    second: []const u8,
+) !bool {
+    const canonical_first = try canonicalProspectivePath(allocator, io, first);
+    const canonical_second = try canonicalProspectivePath(allocator, io, second);
+    return pathOverlaps(canonical_first, canonical_second);
+}
+
+fn canonicalProspectivePath(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+) ![]const u8 {
+    const resolved = try std.fs.path.resolve(allocator, &.{path});
+    const absolute = if (std.fs.path.isAbsolute(resolved))
+        resolved
+    else blk: {
+        var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const cwd_len = try std.Io.Dir.cwd().realPathFile(io, ".", &cwd_buffer);
+        break :blk try std.fs.path.join(allocator, &.{ cwd_buffer[0..cwd_len], resolved });
+    };
+    var candidate: []const u8 = absolute;
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    while (true) {
+        if (std.Io.Dir.cwd().realPathFile(io, candidate, &buffer)) |len| {
+            return try std.mem.concat(allocator, u8, &.{ buffer[0..len], absolute[candidate.len..] });
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
+
+        const parent = std.fs.path.dirname(candidate) orelse return absolute;
+        if (std.mem.eql(u8, parent, candidate)) return absolute;
+        candidate = parent;
+    }
+}
+
+fn pathOverlaps(first: []const u8, second: []const u8) bool {
+    if (std.mem.eql(u8, first, second)) return true;
+    return pathContains(first, second) or pathContains(second, first);
+}
+
+fn pathContains(parent: []const u8, child: []const u8) bool {
+    if (!std.mem.startsWith(u8, child, parent) or child.len <= parent.len) return false;
+    return std.fs.path.isSep(parent[parent.len - 1]) or std.fs.path.isSep(child[parent.len]);
+}
+
+fn hasReusableSuccess(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+    args: *const ParsedArgs,
+) !bool {
+    const status_path = try std.fs.path.join(allocator, &.{ args.bundle_output_path, "status" });
+    const status = std.Io.Dir.cwd().readFileAlloc(io, status_path, allocator, .limited(64)) catch return false;
+    if (!std.mem.eql(u8, std.mem.trim(u8, status, " \r\n\t"), "success")) return false;
+
+    const required_files = [_][]const u8{
+        args.image_basename,
+        "plan.json",
+        "diagnostics.json",
+        "provenance.json",
+        "reuse-key",
+    };
+    for (required_files) |basename| {
+        const path = try std.fs.path.join(allocator, &.{ args.bundle_output_path, basename });
+        const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+        if (stat.kind != .file) return false;
+    }
+
+    const reuse_key_path = try std.fs.path.join(allocator, &.{ args.bundle_output_path, "reuse-key" });
+    const stored_key = std.Io.Dir.cwd().readFileAlloc(io, reuse_key_path, allocator, .limited(128)) catch return false;
+    const current_key = computeReuseKey(allocator, io, argv, args) catch return false;
+    const current_hex = std.fmt.bytesToHex(current_key, .lower);
+    return std.mem.eql(u8, std.mem.trim(u8, stored_key, " \r\n\t"), &current_hex);
+}
+
+fn inputsUnchanged(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+    args: *const ParsedArgs,
+    expected: [32]u8,
+) !bool {
+    const current = try computeReuseKey(allocator, io, argv, args);
+    return std.mem.eql(u8, &expected, &current);
+}
+
+fn computeReuseKey(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+    args: *const ParsedArgs,
+) ![32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("zvmi-preserved-image-builder-reuse-v1\x00");
+    for (argv[1..]) |arg| {
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, arg.len, .big);
+        hash.update(&length);
+        hash.update(arg);
+    }
+
+    try hashSource(&hash, allocator, io, argv[0]);
+    try hashSource(&hash, allocator, io, args.disk_path);
+    for (args.dependency_paths) |path| try hashSource(&hash, allocator, io, path);
+    try hashSource(&hash, allocator, io, args.configuration_path);
+    for (args.operation_source_paths) |path| try hashSource(&hash, allocator, io, path);
+
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    return digest;
+}
+
+fn hashSource(
+    hash: *std.crypto.hash.sha2.Sha256,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+) !void {
+    const digest = try zvmi.customize.hashSourcePath(allocator, io, path);
+    hash.update(&digest.bytes);
+}
+
+fn resetBundle(io: std.Io, path: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    const stat = cwd.statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    if (stat.kind == .directory) {
+        try cwd.deleteTree(io, path);
+    } else {
+        try cwd.deleteFile(io, path);
+    }
+}
+
+fn acquireBundleLock(io: std.Io, path: []const u8) !std.Io.File {
+    const cwd = std.Io.Dir.cwd();
+    if (std.fs.path.dirname(path)) |parent| try cwd.createDirPath(io, parent);
+    return cwd.createFile(io, path, .{
+        .read = true,
+        .truncate = false,
+        .lock = .exclusive,
+    });
+}
+
+fn writeReuseKey(io: std.Io, path: []const u8, key: [32]u8) !void {
+    const key_hex = std.fmt.bytesToHex(key, .lower);
+    var bytes: [key_hex.len + 1]u8 = undefined;
+    @memcpy(bytes[0..key_hex.len], &key_hex);
+    bytes[key_hex.len] = '\n';
+    try writeBytes(io, path, &bytes);
+}
+
+fn writePlan(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    plan: *const zvmi.customize.ResolvedPlan,
+) !void {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    try zvmi.customize.writePlanJson(plan, &output.writer);
+    try writeBytes(io, path, output.written());
+}
+
+fn writeDiagnostics(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    diagnostics: zvmi.customize.DiagnosticSet,
+) !void {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    try zvmi.customize.writeDiagnosticsJson(diagnostics, &output.writer);
+    try writeBytes(io, path, output.written());
+}
+
+fn writeRunnerDiagnostic(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    phase: zvmi.customize.DiagnosticPhase,
+    code: zvmi.customize.DiagnosticCode,
+    configuration_path: []const u8,
+    message: []const u8,
+    remediation: []const u8,
+    cause: ?anyerror,
+) !void {
+    var items = [_]zvmi.customize.Diagnostic{.{
+        .severity = .@"error",
+        .phase = phase,
+        .code = code,
+        .configuration_path = configuration_path,
+        .message = message,
+        .cause = if (cause) |err| .{ .error_name = @errorName(err) } else null,
+        .remediation = remediation,
+    }};
+    try writeDiagnostics(allocator, io, path, .{ .items = &items });
+}
+
+fn writeProvenance(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    provenance: zvmi.customize.Provenance,
+) !void {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    try zvmi.customize.writeProvenanceJson(provenance, &output.writer);
+    try writeBytes(io, path, output.written());
+}
+
+fn writeBytes(io: std.Io, path: []const u8, bytes: []const u8) !void {
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer file.close(io);
+    try file.writePositionalAll(io, bytes, 0);
+}
+
+const ConsoleEvents = struct {
+    verbose: bool,
+
+    fn emit(context: ?*anyopaque, event: zvmi.customize.ExecutionEvent) void {
+        const self: *ConsoleEvents = @ptrCast(@alignCast(context.?));
+        switch (event) {
+            .progress => |progress| if (self.verbose) {
+                std.debug.print("zvmi-preserved-image-builder: {s}\n", .{progress.message});
+            },
+            .diagnostic => {},
+        }
+    }
+};
+
+test "operation mapping preserves order and indexed sources" {
+    const operations = [_]wire.Operation{
+        .{ .overwrite_file = .{ .path = "/etc/first", .source_index = 1 } },
+        .{ .remove_file = "/etc/remove" },
+        .{ .overwrite_file = .{ .path = "/etc/second", .source_index = 0 } },
+        .{ .remove_tree = "/var/cache/old" },
+    };
+    const mapped = try mapOperations(
+        std.testing.allocator,
+        &operations,
+        &.{ "source-zero", "source-one" },
+    );
+    defer std.testing.allocator.free(mapped);
+
+    try std.testing.expectEqual(@as(usize, 4), mapped.len);
+    try std.testing.expect(mapped[0] == .overwrite_file);
+    try std.testing.expectEqualStrings("/etc/first", mapped[0].overwrite_file.path);
+    try std.testing.expectEqualStrings(
+        "source-one",
+        mapped[0].overwrite_file.source.host_path,
+    );
+    try std.testing.expect(mapped[1] == .remove_file);
+    try std.testing.expectEqualStrings("/etc/remove", mapped[1].remove_file);
+    try std.testing.expect(mapped[2] == .overwrite_file);
+    try std.testing.expectEqualStrings(
+        "source-zero",
+        mapped[2].overwrite_file.source.host_path,
+    );
+    try std.testing.expect(mapped[3] == .remove_tree);
+    try std.testing.expectEqualStrings("/var/cache/old", mapped[3].remove_tree);
+}
+
+test "unsafe image basenames are rejected" {
+    try std.testing.expect(isBasename("disk.qcow2"));
+    try std.testing.expect(!isBasename("../disk.qcow2"));
+    try std.testing.expect(!isBasename("nested/disk.qcow2"));
+    try std.testing.expect(isReservedBasename("STATUS"));
+    try std.testing.expect(isReservedBasename("provenance.json"));
+}
+
+test "dependency closure is checked before a bundle can be reset" {
+    const io = std.testing.io;
+    const bundle_path = "test-preserved-builder-bundle";
+    const base_path = bundle_path ++ "/base.raw";
+    const disk_path = "test-preserved-builder-overlay.qcow2";
+    const lock_path = bundle_path ++ ".lock";
+    defer std.Io.Dir.cwd().deleteTree(io, bundle_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, disk_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, lock_path) catch {};
+
+    try std.Io.Dir.cwd().createDirPath(io, bundle_path);
+    {
+        var base = try zvmi.Image.createExclusive(io, base_path, .qcow2, 4096, .{});
+        base.close(io);
+    }
+    {
+        var overlay = try zvmi.Image.createExclusive(io, disk_path, .qcow2, 4096, .{});
+        var backing_offset: [8]u8 = undefined;
+        std.mem.writeInt(u64, &backing_offset, 104, .big);
+        var backing_length: [4]u8 = undefined;
+        std.mem.writeInt(u32, &backing_length, base_path.len, .big);
+        try overlay.file.writePositionalAll(io, &backing_offset, 8);
+        try overlay.file.writePositionalAll(io, &backing_length, 16);
+        try overlay.file.writePositionalAll(io, base_path, 104);
+        overlay.close(io);
+    }
+
+    const args = ParsedArgs{
+        .architecture = .x86_64,
+        .disk_path = disk_path,
+        .dependency_paths = &.{},
+        .configuration_path = "unused.json",
+        .operation_source_paths = &.{},
+        .bundle_output_path = bundle_path,
+        .image_basename = "disk.raw",
+        .format = .raw,
+        .seed = .{ .bytes = [_]u8{0} ** 32 },
+        .source_date_epoch = 0,
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(
+        error.ResultPathOverlap,
+        validateDependencyClosure(arena.allocator(), io, &args, lock_path),
+    );
+    _ = try std.Io.Dir.cwd().statFile(io, base_path, .{});
+}

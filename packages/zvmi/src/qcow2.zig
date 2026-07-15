@@ -578,7 +578,15 @@ fn preadLayer(
                     if (backing_file == null) {
                         backing_file = try Io.Dir.cwd().openFile(io, backing_chain[0].path[0..backing_chain[0].path_len], .{ .mode = .read_only });
                     }
-                    _ = try preadLayer(backing_file.?, io, backing_chain[0].info, backing_chain[1..], buffer[total..][0..chunk], off);
+                    const got = try preadLayer(
+                        backing_file.?,
+                        io,
+                        backing_chain[0].info,
+                        backing_chain[1..],
+                        buffer[total..][0..chunk],
+                        off,
+                    );
+                    if (got < chunk) @memset(buffer[total + got ..][0 .. chunk - got], 0);
                 }
             },
         }
@@ -1177,6 +1185,49 @@ fn populateBackingChain(io: Io, info: *Info) OpenError!void {
         current_base_path = layer.path[0..layer.path_len];
         current_backing = parsed.backing_file_path[0..parsed.backing_file_len];
     }
+}
+
+/// Returns every host file, other than the top-level qcow2 itself, that can
+/// contribute guest-visible bytes. Paths are resolved by `openAtPath`.
+pub fn sourceDependencyPaths(
+    allocator: std.mem.Allocator,
+    info: Info,
+) std.mem.Allocator.Error![][]u8 {
+    var paths = std.array_list.Managed([]u8).init(allocator);
+    errdefer {
+        for (paths.items) |path| allocator.free(path);
+        paths.deinit();
+    }
+
+    if (info.data_file_len != 0) {
+        try appendUniqueOwnedPath(
+            &paths,
+            allocator,
+            info.data_file_path[0..info.data_file_len],
+        );
+    }
+    for (info.backing_chain[0..info.backing_depth]) |layer| {
+        try appendUniqueOwnedPath(&paths, allocator, layer.path[0..layer.path_len]);
+        if (layer.info.data_file_len != 0) {
+            try appendUniqueOwnedPath(
+                &paths,
+                allocator,
+                layer.info.data_file_path[0..layer.info.data_file_len],
+            );
+        }
+    }
+    return paths.toOwnedSlice();
+}
+
+fn appendUniqueOwnedPath(
+    paths: *std.array_list.Managed([]u8),
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) std.mem.Allocator.Error!void {
+    for (paths.items) |existing| {
+        if (std.mem.eql(u8, existing, path)) return;
+    }
+    try paths.append(try allocator.dupe(u8, path));
 }
 
 fn pathSeenInChain(info: Info, depth: u8, path: []const u8) bool {
@@ -1958,6 +2009,34 @@ test "openAtPath resolves recursive backing files" {
     try std.testing.expectEqualSlices(u8, "ROOT-CLUSTER-2", &root_buf);
 }
 
+test "pread zero-fills beyond a shorter backing image" {
+    const io = std.testing.io;
+    const base_path = "test-qcow2-short-backing-base.qcow2";
+    const overlay_path = "test-qcow2-short-backing-overlay.qcow2";
+    defer Io.Dir.cwd().deleteFile(io, base_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, overlay_path) catch {};
+
+    _ = try writeSingleClusterFixture(io, base_path, .{
+        .guest_cluster_index = 0,
+        .payload = "BASE",
+        .virtual_cluster_count = 1,
+    });
+    const overlay_fixture = try writeSingleClusterFixture(io, overlay_path, .{
+        .backing_file = base_path,
+        .guest_cluster_index = 2,
+        .payload = "OVERLAY",
+    });
+
+    const overlay_file = try Io.Dir.cwd().openFile(io, overlay_path, .{ .mode = .read_only });
+    defer overlay_file.close(io);
+    const overlay = try openAtPath(io, overlay_file, overlay_path);
+
+    var inherited: [64]u8 = [_]u8{0xaa} ** 64;
+    const got = try pread(overlay_file, io, overlay, &inherited, overlay_fixture.cluster_size);
+    try std.testing.expectEqual(inherited.len, got);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** inherited.len), &inherited);
+}
+
 test "pwrite copy-on-write preserves backing-file contents" {
     const io = std.testing.io;
     const base_path = "test-qcow2-backing-cow-base.qcow2";
@@ -2475,6 +2554,7 @@ const SingleClusterFixtureOptions = struct {
     guest_cluster_index: u32,
     payload: []const u8,
     payload_offset: u32 = 0,
+    virtual_cluster_count: u32 = 3,
 };
 
 const SingleClusterFixture = struct {
@@ -2572,9 +2652,10 @@ fn writeSingleClusterFixture(io: Io, path: []const u8, options: SingleClusterFix
     const l2_table_offset: u64 = 4 * cluster_size;
     const data_offset: u64 = 5 * cluster_size;
     const total_file_size: u64 = 6 * cluster_size;
-    const virtual_size: u64 = 3 * cluster_size;
+    const virtual_size: u64 = @as(u64, options.virtual_cluster_count) * cluster_size;
 
     std.debug.assert(options.payload_offset + options.payload.len <= cluster_size);
+    std.debug.assert(options.guest_cluster_index < options.virtual_cluster_count);
 
     const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
     defer file.close(io);

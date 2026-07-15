@@ -14,6 +14,12 @@ pub const ImageOutput = image_build.Output;
 pub const ImageOptions = image_build.Options;
 pub const ImageResult = image_build.Result;
 pub const addImage = image_build.add;
+pub const PreservedImageInput = image_build.PreservedInput;
+pub const PreservedImageRootPartition = image_build.PreservedRootPartition;
+pub const PreservedImageFileSource = image_build.PreservedFileSource;
+pub const PreservedImageOperation = image_build.PreservedOperation;
+pub const PreservedImageOptions = image_build.PreservedOptions;
+pub const addPreservedImage = image_build.addPreserved;
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -94,9 +100,8 @@ pub fn build(b: *std.Build) void {
     const cli_tests = b.addTest(.{ .root_module = cli_exe.root_module });
     const run_cli_tests = b.addRunArtifact(cli_tests);
 
-    // Host-only image builder used by the exported `addImage` build helper.
-    // It remains executable even when the dependency is configured for a
-    // foreign guest target.
+    // Host-only image builders used by the exported build helpers. They remain
+    // executable even when the dependency is configured for a foreign target.
     const host_zvmi_mod = b.createModule(.{
         .root_source_file = b.path("packages/zvmi/src/root.zig"),
         .target = b.graph.host,
@@ -114,6 +119,47 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(image_builder_exe);
+
+    const preserved_image_wire_mod = b.createModule(.{
+        .root_source_file = b.path("packages/zvmi/src/preserved_image_wire.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    const preserved_image_builder_exe = b.addExecutable(.{
+        .name = "zvmi-preserved-image-builder",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cli/src/preserved_image_builder.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zvmi", .module = host_zvmi_mod },
+                .{ .name = "preserved_image_wire", .module = preserved_image_wire_mod },
+            },
+        }),
+    });
+    b.installArtifact(preserved_image_builder_exe);
+    const preserved_image_builder_tests = b.addTest(.{
+        .root_module = preserved_image_builder_exe.root_module,
+    });
+    const run_preserved_image_builder_tests = b.addRunArtifact(
+        preserved_image_builder_tests,
+    );
+    const preserved_image_wire_tests = b.addTest(.{
+        .root_module = preserved_image_wire_mod,
+    });
+    const run_preserved_image_wire_tests = b.addRunArtifact(
+        preserved_image_wire_tests,
+    );
+    const preserved_image_builder_test_step = b.step(
+        "test-preserved-image-builder",
+        "Run preserved-image host builder and wire tests",
+    );
+    preserved_image_builder_test_step.dependOn(
+        &run_preserved_image_builder_tests.step,
+    );
+    preserved_image_builder_test_step.dependOn(
+        &run_preserved_image_wire_tests.step,
+    );
 
     const input_validator_mod = b.createModule(.{
         .root_source_file = b.path("cli/src/input_validator.zig"),
@@ -345,6 +391,16 @@ pub fn build(b: *std.Build) void {
     build_api_execution_diagnostics_check.setName("check external build.zig execution diagnostics");
     build_api_execution_diagnostics_check.setCwd(b.path("tests/build_api_consumer"));
 
+    const build_api_preserved_diagnostics_check = b.addSystemCommand(&.{
+        b.graph.zig_exe,
+        "build",
+        "preserved-diagnostics",
+    });
+    build_api_preserved_diagnostics_check.setName(
+        "check external preserved-image build.zig diagnostics",
+    );
+    build_api_preserved_diagnostics_check.setCwd(b.path("tests/build_api_consumer"));
+
     // ---- scripts/build_generalized_azurelinux4.zig: generalized Azure Linux 4
     // QCOW2 builder, replacing scripts/build-generalized-azurelinux4.py.
     // Linux-specific: the full pipeline (dnf, sudo chroot, qemu-img) is only
@@ -449,6 +505,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_wireserver_tests.step);
     test_step.dependOn(&run_azagent_tests.step);
     test_step.dependOn(&run_cli_tests.step);
+    test_step.dependOn(&run_preserved_image_builder_tests.step);
+    test_step.dependOn(&run_preserved_image_wire_tests.step);
     test_step.dependOn(&run_input_validator_tests.step);
     test_step.dependOn(&run_image_status_check_tests.step);
     test_step.dependOn(&run_qmp_mod_tests.step);
@@ -465,4 +523,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&build_api_consumer_check.step);
     test_step.dependOn(&build_api_diagnostics_check.step);
     test_step.dependOn(&build_api_execution_diagnostics_check.step);
+    test_step.dependOn(&build_api_preserved_diagnostics_check.step);
 }

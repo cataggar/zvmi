@@ -61,12 +61,13 @@ pub const Header = struct {
         return buf;
     }
 
-    pub const DecodeError = error{ BadSignature, BadHeaderChecksum };
+    pub const DecodeError = error{ BadSignature, InvalidHeaderSize, BadHeaderChecksum };
 
     pub fn decode(buf: *const [sector_size]u8) DecodeError!Header {
         if (!std.mem.eql(u8, buf[0..8], &signature)) return error.BadSignature;
 
         const hdr_size = std.mem.readInt(u32, buf[12..16], .little);
+        if (hdr_size < header_size or hdr_size > sector_size) return error.InvalidHeaderSize;
         const stored_crc = std.mem.readInt(u32, buf[16..20], .little);
 
         var checked = buf.*;
@@ -91,6 +92,9 @@ pub const Header = struct {
 };
 
 pub const PartitionEntry = struct {
+    /// Zero-based slot in the on-disk partition entry array when decoded.
+    /// Writers ignore this field.
+    table_index: u32 = 0,
     partition_type_guid: guid.Guid = guid.nil,
     unique_partition_guid: guid.Guid = guid.nil,
     first_lba: u64 = 0,
@@ -341,6 +345,8 @@ pub fn growLastPartition(
 
 pub const ReadError = error{
     UnsupportedPartitionEntrySize,
+    InvalidPartitionArrayBounds,
+    UnexpectedEndOfFile,
     BadPartitionArrayChecksum,
 } || Header.DecodeError || Image.PreadError || std.mem.Allocator.Error;
 
@@ -350,15 +356,36 @@ pub const ReadError = error{
 /// primary/backup reconciliation is a possible future enhancement).
 pub fn readGpt(img: Image, io: Io, allocator: std.mem.Allocator) ReadError!ParsedGpt {
     var header_buf: [sector_size]u8 = undefined;
-    _ = try img.pread(io, &header_buf, sector_size * 1);
+    if (try img.pread(io, &header_buf, sector_size * 1) != header_buf.len) {
+        return error.UnexpectedEndOfFile;
+    }
     const header = try Header.decode(&header_buf);
 
     if (header.partition_entry_size != partition_entry_size) return error.UnsupportedPartitionEntrySize;
 
-    const array_bytes_len: usize = @intCast(@as(u64, header.num_partition_entries) * header.partition_entry_size);
+    const array_bytes_u64 = std.math.mul(
+        u64,
+        header.num_partition_entries,
+        header.partition_entry_size,
+    ) catch return error.InvalidPartitionArrayBounds;
+    const array_offset = std.math.mul(
+        u64,
+        sector_size,
+        header.partition_entry_lba,
+    ) catch return error.InvalidPartitionArrayBounds;
+    const array_end = std.math.add(
+        u64,
+        array_offset,
+        array_bytes_u64,
+    ) catch return error.InvalidPartitionArrayBounds;
+    if (array_end > img.virtual_size) return error.InvalidPartitionArrayBounds;
+    const array_bytes_len = std.math.cast(usize, array_bytes_u64) orelse
+        return error.InvalidPartitionArrayBounds;
     const array_buf = try allocator.alloc(u8, array_bytes_len);
     defer allocator.free(array_buf);
-    _ = try img.pread(io, array_buf, sector_size * header.partition_entry_lba);
+    if (try img.pread(io, array_buf, array_offset) != array_buf.len) {
+        return error.UnexpectedEndOfFile;
+    }
 
     if (std.hash.crc.Crc32.hash(array_buf) != header.partition_array_crc32) {
         return error.BadPartitionArrayChecksum;
@@ -369,7 +396,9 @@ pub fn readGpt(img: Image, io: Io, allocator: std.mem.Allocator) ReadError!Parse
 
     var i: u32 = 0;
     while (i < header.num_partition_entries) : (i += 1) {
-        const entry = PartitionEntry.decode(array_buf[i * partition_entry_size ..][0..partition_entry_size]);
+        const entry_offset = @as(usize, i) * partition_entry_size;
+        var entry = PartitionEntry.decode(array_buf[entry_offset..][0..partition_entry_size]);
+        entry.table_index = i;
         if (!entry.isEmpty()) try list.append(entry);
     }
 
@@ -543,6 +572,47 @@ test "readGpt detects a corrupted partition array" {
     try img.pwrite(io, &one, sector_size * 2 + 5);
 
     try std.testing.expectError(error.BadPartitionArrayChecksum, readGpt(img, io, std.testing.allocator));
+}
+
+test "Header.decode rejects invalid header sizes before checksumming" {
+    var encoded = [_]u8{0} ** sector_size;
+    encoded[0..signature.len].* = signature;
+
+    std.mem.writeInt(u32, encoded[12..16], header_size - 1, .little);
+    try std.testing.expectError(error.InvalidHeaderSize, Header.decode(&encoded));
+
+    std.mem.writeInt(u32, encoded[12..16], sector_size + 1, .little);
+    try std.testing.expectError(error.InvalidHeaderSize, Header.decode(&encoded));
+}
+
+test "readGpt rejects truncated headers and partition arrays" {
+    const io = std.testing.io;
+    const header_path = "test-gpt-truncated-header.img";
+    const array_path = "test-gpt-truncated-array.img";
+    defer Io.Dir.cwd().deleteFile(io, header_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, array_path) catch {};
+
+    {
+        var img = try Image.create(io, header_path, .raw, sector_size, .{});
+        defer img.close(io);
+        try std.testing.expectError(error.UnexpectedEndOfFile, readGpt(img, io, std.testing.allocator));
+    }
+
+    {
+        var img = try Image.create(io, array_path, .raw, sector_size * 2, .{});
+        defer img.close(io);
+        const encoded = (Header{
+            .current_lba = 1,
+            .backup_lba = 1,
+            .first_usable_lba = 2,
+            .last_usable_lba = 2,
+            .disk_guid = guid.nil,
+            .partition_entry_lba = 2,
+            .partition_array_crc32 = 0,
+        }).encode();
+        try img.pwrite(io, &encoded, sector_size);
+        try std.testing.expectError(error.InvalidPartitionArrayBounds, readGpt(img, io, std.testing.allocator));
+    }
 }
 
 test "writeGpt rejects a layout that doesn't fit" {

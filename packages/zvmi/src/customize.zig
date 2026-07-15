@@ -1,7 +1,7 @@
 //! Versioned image-customization request, planning, preflight, execution, and
-//! provenance API. The current executor covers the native ISO+OCI fresh-image
-//! backend; later customization backends extend the typed policies through
-//! explicitly versioned contracts.
+//! provenance API. Native fresh construction and constrained native preserved
+//! disk editing are implemented. Broader mutation and guest-code backends are
+//! modeled explicitly and fail capability preflight until implemented.
 
 const std = @import("std");
 const Io = std.Io;
@@ -16,14 +16,22 @@ const gpt = @import("gpt.zig");
 const guid = @import("guid.zig");
 const image_mod = @import("image.zig");
 const layout = @import("layout.zig");
+const mbr = @import("mbr.zig");
 const os_customization = @import("os_customization.zig");
 const customization_wire = @import("customization_wire.zig");
+const preserved_image = @import("preserved_image.zig");
+const root_tree = @import("root_tree.zig");
 const verity = @import("verity.zig");
 
-pub const current_api_version: u32 = customization_wire.api_version;
-pub const plan_schema_version: u32 = 2;
-pub const provenance_schema_version: u32 = 2;
+pub const legacy_api_version: u32 = 2;
+pub const current_api_version: u32 = 3;
+pub const plan_schema_version: u32 = 3;
+pub const provenance_schema_version: u32 = 3;
 const mib: u64 = 1024 * 1024;
+
+comptime {
+    std.debug.assert(customization_wire.api_version == legacy_api_version);
+}
 
 pub const Architecture = bootconfig.Architecture;
 
@@ -71,6 +79,9 @@ pub const IsoOciInput = struct {
 
 pub const DiskInput = struct {
     path: []const u8,
+    /// Every qcow2 backing or external-data file, transitively. The native
+    /// editor verifies this declaration before creating its workspace.
+    dependencies: []const []const u8 = &.{},
 };
 
 pub const Input = union(enum) {
@@ -99,7 +110,15 @@ pub const OutputFormat = enum {
 pub const Output = struct {
     path: []const u8,
     format: OutputFormat,
-    size: u64,
+    /// Fresh images use `.explicit`; preserved images must use
+    /// `.preserve_source` with `size == 0`.
+    size: u64 = 0,
+    size_policy: OutputSizePolicy = .explicit,
+};
+
+pub const OutputSizePolicy = enum {
+    explicit,
+    preserve_source,
 };
 
 pub const FreshStorage = struct {
@@ -109,10 +128,23 @@ pub const FreshStorage = struct {
     skip_iso_rootfs: bool = false,
 };
 
+pub const PartitionSelector = preserved_image.PartitionSelector;
+
+pub const PreservedStorage = struct {
+    root_partition: PartitionSelector,
+};
+pub const PreserveStorage = PreservedStorage;
+pub const RootPartitionSelector = PartitionSelector;
+
 pub const StoragePolicy = union(enum) {
     fresh: FreshStorage,
-    preserve: void,
+    preserve: PreservedStorage,
 };
+
+pub const ExistingPathOperation = preserved_image.Operation;
+pub const ExistingPathFileSource = preserved_image.FileSource;
+pub const PreservedOperation = ExistingPathOperation;
+pub const PreservedFileSource = ExistingPathFileSource;
 
 pub const OsCustomization = os_customization.OsCustomization;
 pub const FilesystemOperation = os_customization.FilesystemOperation;
@@ -147,15 +179,121 @@ pub const AzureGeneralization = os_customization.AzureGeneralization;
 pub const GeneralizationPolicy = os_customization.GeneralizationPolicy;
 
 pub const ExecutionBackend = enum {
-    native,
-    chroot,
+    native_fresh,
+    native_edit,
+    rebuild,
+    unsafe_chroot,
     vm,
 };
 
 pub const ExecutionPolicy = struct {
     workspace_path: []const u8,
-    backend: ExecutionBackend = .native,
+    backend: ExecutionBackend = .native_fresh,
     overwrite: bool = false,
+    /// Required for scripts and for `unsafe_chroot`, which executes target
+    /// code on the host and is not a sandbox.
+    acknowledge_unsafe: bool = false,
+};
+
+pub const PackageAction = union(enum) {
+    install: []const []const u8,
+    remove: []const []const u8,
+    update_all,
+    update_selected: []const []const u8,
+};
+
+pub const TrustSource = union(enum) {
+    inline_bytes: []const u8,
+    host_path: []const u8,
+};
+
+pub const PackageRepository = struct {
+    id: []const u8,
+    urls: []const []const u8,
+    trust: []const TrustSource,
+};
+
+pub const PackageCachePolicy = enum {
+    online,
+    cache_only,
+};
+
+pub const PackageVersionLock = struct {
+    name: []const u8,
+    version: []const u8,
+    repository_id: []const u8,
+};
+
+pub const PackageLockPolicy = union(enum) {
+    unlocked,
+    snapshot: []const u8,
+    exact: []const PackageVersionLock,
+};
+
+pub const PackagePolicy = struct {
+    actions: []const PackageAction = &.{},
+    repositories: []const PackageRepository = &.{},
+    cache: PackageCachePolicy = .online,
+    lock: PackageLockPolicy = .unlocked,
+};
+
+pub const HookPhase = enum {
+    after_packages,
+    before_initramfs,
+    before_seal,
+    finalize,
+};
+
+pub const HookSource = union(enum) {
+    inline_script: []const u8,
+    host_path: []const u8,
+};
+
+pub const Hook = struct {
+    name: []const u8,
+    phase: HookPhase,
+    source: HookSource,
+    arguments: []const []const u8 = &.{},
+};
+
+pub const InitramfsPolicy = union(enum) {
+    unchanged,
+    regenerate: struct {
+        generator: ?[]const u8 = null,
+        kernels: []const []const u8 = &.{},
+    },
+};
+
+pub const SelinuxMode = enum {
+    enforcing,
+    permissive,
+    disabled,
+};
+
+pub const SelinuxPolicy = union(enum) {
+    unchanged,
+    configure: struct {
+        mode: SelinuxMode,
+        policy: ?[]const u8 = null,
+        relabel: bool = false,
+    },
+};
+
+pub const RunnerKind = enum {
+    qemu_user,
+    binfmt_misc,
+    vm,
+};
+
+pub const CompatibleRunner = struct {
+    kind: RunnerKind,
+    guest_architecture: Architecture,
+    command: ?[]const u8 = null,
+};
+
+pub const CrossArchitecturePolicy = union(enum) {
+    reject,
+    runner: CompatibleRunner,
 };
 
 pub const Reproducibility = struct {
@@ -170,11 +308,103 @@ pub const Request = struct {
     output: Output,
     storage: StoragePolicy,
     os: OsCustomization = .{},
+    existing_path_operations: []const ExistingPathOperation = &.{},
+    packages: PackagePolicy = .{},
+    hooks: []const Hook = &.{},
+    initramfs: InitramfsPolicy = .unchanged,
+    selinux: SelinuxPolicy = .unchanged,
+    cross_architecture: CrossArchitecturePolicy = .reject,
     boot_security: BootSecurityPolicy = .{},
     generalization: GeneralizationPolicy = .none,
     execution: ExecutionPolicy,
     reproducibility: Reproducibility,
 };
+
+pub const V2ExecutionBackend = enum {
+    native,
+    chroot,
+    vm,
+};
+
+pub const V2ExecutionPolicy = struct {
+    workspace_path: []const u8,
+    backend: V2ExecutionBackend = .native,
+    overwrite: bool = false,
+};
+
+pub const V2StoragePolicy = union(enum) {
+    fresh: FreshStorage,
+    preserve: void,
+};
+
+pub const V2Output = struct {
+    path: []const u8,
+    format: OutputFormat,
+    size: u64,
+};
+
+/// The frozen v2 request shape. It can only enter v3 through
+/// `adaptV2NativeFresh`; v3 validation never reinterprets `api_version = 2`.
+pub const RequestV2 = struct {
+    api_version: u32 = legacy_api_version,
+    target_architecture: ?Architecture = null,
+    input: Input,
+    output: V2Output,
+    storage: V2StoragePolicy,
+    os: OsCustomization = .{},
+    boot_security: BootSecurityPolicy = .{},
+    generalization: GeneralizationPolicy = .none,
+    execution: V2ExecutionPolicy,
+    reproducibility: Reproducibility,
+};
+
+pub const V2Request = RequestV2;
+
+pub const AdaptV2Error = error{
+    UnsupportedApiVersion,
+    UnsupportedV2Input,
+    UnsupportedV2Storage,
+    UnsupportedV2Backend,
+};
+
+pub fn adaptV2NativeFresh(request: *const RequestV2) AdaptV2Error!Request {
+    if (request.api_version != legacy_api_version) return error.UnsupportedApiVersion;
+    if (request.input != .iso_oci) return error.UnsupportedV2Input;
+    if (request.storage != .fresh) return error.UnsupportedV2Storage;
+    if (request.execution.backend != .native) return error.UnsupportedV2Backend;
+    return .{
+        .api_version = current_api_version,
+        .target_architecture = request.target_architecture,
+        .input = request.input,
+        .output = .{
+            .path = request.output.path,
+            .format = request.output.format,
+            .size = request.output.size,
+            .size_policy = .explicit,
+        },
+        .storage = .{ .fresh = request.storage.fresh },
+        .os = request.os,
+        .boot_security = request.boot_security,
+        .generalization = request.generalization,
+        .execution = .{
+            .workspace_path = request.execution.workspace_path,
+            .backend = .native_fresh,
+            .overwrite = request.execution.overwrite,
+        },
+        .reproducibility = request.reproducibility,
+    };
+}
+
+pub const adaptV2 = adaptV2NativeFresh;
+
+pub fn resolveV2NativeFresh(
+    allocator: Allocator,
+    request: *const RequestV2,
+    context: ResolveContext,
+) (Allocator.Error || AdaptV2Error)!ResolveOutcome {
+    const adapted = try adaptV2NativeFresh(request);
+    return resolve(allocator, &adapted, context);
+}
 
 pub const Severity = enum {
     info,
@@ -200,9 +430,12 @@ pub const DiagnosticCode = enum {
     invalid_storage,
     unsupported_storage,
     unsupported_output_format,
+    invalid_partition_selector,
     incompatible_boot_policy,
     unsupported_generalization,
     invalid_customization,
+    invalid_policy,
+    unsafe_acknowledgement_required,
     unsupported_execution_backend,
     incompatible_architecture,
     invalid_workspace,
@@ -269,7 +502,7 @@ pub fn validate(allocator: Allocator, request: *const Request) Allocator.Error!D
             .unsupported_api_version,
             "/api_version",
             "the request API version is not supported",
-            "set api_version to 1 or explicitly migrate the request",
+            "use the v3 request contract; v2 native-fresh requests must pass through adaptV2NativeFresh",
         ));
     }
     if (request.target_architecture == null) {
@@ -298,34 +531,119 @@ pub fn validate(allocator: Allocator, request: *const Request) Allocator.Error!D
                 ));
             }
         },
-        .disk => try diagnostics.append(validationError(
-            .unsupported_input,
-            "/input/disk",
-            "preserved disk inputs require the later existing-image backend",
-            "use an ISO+OCI input for the native backend or wait for the preserved-image backend",
-        )),
+        .disk => |input| if (input.path.len == 0) {
+            try diagnostics.append(validationError(
+                .missing_input_path,
+                "/input/disk/path",
+                "disk input path must not be empty",
+                null,
+            ));
+        } else for (input.dependencies, 0..) |dependency, index| {
+            if (dependency.len == 0) {
+                try diagnostics.append(validationError(
+                    .missing_input_path,
+                    "/input/disk/dependencies",
+                    "disk dependency paths must not be empty",
+                    null,
+                ));
+            }
+            for (input.dependencies[0..index]) |previous| {
+                if (std.mem.eql(u8, previous, dependency)) {
+                    try diagnostics.append(validationError(
+                        .invalid_policy,
+                        "/input/disk/dependencies",
+                        "disk dependency paths must be unique",
+                        null,
+                    ));
+                }
+            }
+        },
     }
 
     if (request.output.path.len == 0) {
         try diagnostics.append(validationError(.invalid_output, "/output/path", "output path must not be empty", null));
     }
-    if (request.output.size % 512 != 0) {
-        try diagnostics.append(validationError(.invalid_output, "/output/size", "output size must be a multiple of 512 bytes", null));
-    }
-    if (request.output.size > std.math.maxInt(u64) - mib) {
-        try diagnostics.append(validationError(.invalid_output, "/output/size", "output size is too large to align safely", null));
-    }
     if (request.output.format == .cosi) {
         try diagnostics.append(validationError(
             .unsupported_output_format,
             "/output/format",
-            "COSI is modeled but is not yet supported by the native ISO+OCI executor",
+            "COSI is not supported by the v3 native fresh or preserved-image executors",
             "select raw, vhd, vhdx, or qcow2",
         ));
     }
 
+    const preserved_backend = switch (request.execution.backend) {
+        .native_fresh => false,
+        .native_edit, .rebuild, .unsafe_chroot, .vm => true,
+    };
+    if (!preserved_backend) {
+        if (request.input != .iso_oci) {
+            try diagnostics.append(validationError(
+                .unsupported_input,
+                "/input",
+                "native_fresh requires an ISO+OCI input",
+                "select input.iso_oci or a preserved-image backend",
+            ));
+        }
+        if (request.storage != .fresh) {
+            try diagnostics.append(validationError(
+                .unsupported_storage,
+                "/storage",
+                "native_fresh requires fresh storage",
+                "select storage.fresh or a preserved-image backend",
+            ));
+        }
+        if (request.output.size_policy != .explicit) {
+            try diagnostics.append(validationError(
+                .invalid_output,
+                "/output/size_policy",
+                "native_fresh requires an explicit output size",
+                "set size_policy to explicit",
+            ));
+        }
+        if (request.existing_path_operations.len != 0) {
+            try diagnostics.append(validationError(
+                .invalid_customization,
+                "/existing_path_operations",
+                "existing-path operations require preserved storage",
+                "select native_edit with a disk input and preserved storage",
+            ));
+        }
+    } else {
+        if (request.input != .disk) {
+            try diagnostics.append(validationError(
+                .unsupported_input,
+                "/input",
+                "the selected preserved-image backend requires a disk input",
+                "select input.disk",
+            ));
+        }
+        if (request.storage != .preserve) {
+            try diagnostics.append(validationError(
+                .unsupported_storage,
+                "/storage",
+                "the selected preserved-image backend requires preserved storage",
+                "select storage.preserve with an explicit root partition",
+            ));
+        }
+        if (request.output.size_policy != .preserve_source or request.output.size != 0) {
+            try diagnostics.append(validationError(
+                .invalid_output,
+                "/output/size",
+                "preserved-image output must retain the source virtual size",
+                "set size to 0 and size_policy to preserve_source",
+            ));
+        }
+    }
+
     switch (request.storage) {
-        .fresh => |storage| {
+        .fresh => |storage| if (request.output.size_policy == .explicit) {
+            if (request.output.size % 512 != 0) {
+                try diagnostics.append(validationError(.invalid_output, "/output/size", "output size must be a multiple of 512 bytes", null));
+            }
+            if (request.output.size > std.math.maxInt(u64) - mib) {
+                try diagnostics.append(validationError(.invalid_output, "/output/size", "output size is too large to align safely", null));
+            }
             const minimum_size = switch (storage.generation) {
                 .gen1 => 2 * mib,
                 .gen2 => if (storage.esp_size > std.math.maxInt(u64) - 2 * mib)
@@ -379,23 +697,70 @@ pub fn validate(allocator: Allocator, request: *const Request) Allocator.Error!D
                 }
             }
         },
-        .preserve => try diagnostics.append(validationError(
-            .unsupported_storage,
-            "/storage/preserve",
-            "preserved storage requires the later existing-image mutation backend",
-            "use fresh storage for the native backend",
-        )),
+        .preserve => |storage| switch (storage.root_partition) {
+            .gpt_index => |index| if (index == 0) {
+                try diagnostics.append(validationError(
+                    .invalid_partition_selector,
+                    "/storage/preserve/root_partition/gpt_index",
+                    "GPT partition selectors are one-based",
+                    "select a GPT partition index of at least 1",
+                ));
+            },
+            .mbr_index => |index| if (index == 0 or index > 4) {
+                try diagnostics.append(validationError(
+                    .invalid_partition_selector,
+                    "/storage/preserve/root_partition/mbr_index",
+                    "MBR partition selectors are one-based and limited to the four primary entries",
+                    "select an MBR partition index from 1 through 4",
+                ));
+            },
+        },
     }
 
     try validateOsCustomization(&diagnostics, request.os);
-    try validateGeneralization(&diagnostics, request.generalization);
-    if (request.execution.backend != .native) {
+    try validateExistingPathOperations(&diagnostics, request.existing_path_operations);
+    try validatePackagePolicy(&diagnostics, request.packages);
+    try validateHooks(&diagnostics, request.hooks);
+    try validateInitramfsPolicy(&diagnostics, request.initramfs);
+    try validateSelinuxPolicy(&diagnostics, request.selinux);
+    try validateCrossArchitecturePolicy(&diagnostics, request.cross_architecture);
+    if (request.packages.actions.len > std.math.maxInt(u16) - 32 or
+        request.hooks.len > std.math.maxInt(u16) - 32 or
+        request.packages.actions.len + request.hooks.len > std.math.maxInt(u16) - 32)
+    {
         try diagnostics.append(validationError(
-            .unsupported_execution_backend,
-            "/execution/backend",
-            "only the unprivileged native backend is implemented",
-            "set execution.backend to native",
+            .invalid_policy,
+            "/",
+            "the request contains too many ordered package and hook operations",
+            "use fewer than 65504 package actions and hooks",
         ));
+    }
+    try validateGeneralization(&diagnostics, request.generalization);
+    if (request.execution.backend == .unsafe_chroot and !request.execution.acknowledge_unsafe) {
+        try diagnostics.append(validationError(
+            .unsafe_acknowledgement_required,
+            "/execution/backend",
+            "unsafe_chroot executes target code on the host and is not a sandbox",
+            "set execution.acknowledge_unsafe only after accepting unsafe host-code execution",
+        ));
+    }
+    if (request.hooks.len != 0) {
+        if (request.execution.backend != .unsafe_chroot and request.execution.backend != .vm) {
+            try diagnostics.append(validationError(
+                .unsupported_execution_backend,
+                "/execution/backend",
+                "scripts require an unsafe-capable backend",
+                "select unsafe_chroot or vm; unsafe_chroot is not a sandbox",
+            ));
+        }
+        if (!request.execution.acknowledge_unsafe) {
+            try diagnostics.append(validationError(
+                .unsafe_acknowledgement_required,
+                "/execution/acknowledge_unsafe",
+                "scripts require explicit acknowledgement of unsafe code execution",
+                "set acknowledge_unsafe only after reviewing every script",
+            ));
+        }
     }
     if (request.execution.workspace_path.len == 0) {
         try diagnostics.append(validationError(.invalid_workspace, "/execution/workspace_path", "workspace path must not be empty", null));
@@ -413,44 +778,299 @@ pub fn validate(allocator: Allocator, request: *const Request) Allocator.Error!D
             try diagnostics.append(validationError(
                 .path_conflict,
                 "/execution/workspace_path",
-                "the native workspace must be the output directory so publication is atomic",
+                "the workspace must be the output directory so publication is atomic",
                 "set workspace_path to the parent directory of output.path",
             ));
         }
     }
-    if (request.input == .iso_oci and request.output.path.len != 0) {
-        const input = request.input.iso_oci;
+    if (request.output.path.len != 0) {
         const output_path = try std.fs.path.resolve(allocator, &.{request.output.path});
         defer allocator.free(output_path);
-        const iso_path = if (input.iso_path.len != 0) try std.fs.path.resolve(allocator, &.{input.iso_path}) else null;
-        defer if (iso_path) |path| allocator.free(path);
-        const container_path = if (input.container_path.len != 0) try std.fs.path.resolve(allocator, &.{input.container_path}) else null;
-        defer if (container_path) |path| allocator.free(path);
-        if ((iso_path != null and
-            std.fs.path.isAbsolute(request.output.path) == std.fs.path.isAbsolute(input.iso_path) and
-            std.mem.eql(u8, output_path, iso_path.?)) or
-            (container_path != null and
-                std.fs.path.isAbsolute(request.output.path) == std.fs.path.isAbsolute(input.container_path) and
-                (std.mem.eql(u8, output_path, container_path.?) or pathContains(container_path.?, output_path))))
-        {
-            try diagnostics.append(validationError(
-                .path_conflict,
-                "/output/path",
-                "output path must not alias or be contained by a source path",
-                "choose an output directory outside the ISO and container inputs",
-            ));
+        switch (request.input) {
+            .iso_oci => |input| {
+                const iso_path = if (input.iso_path.len != 0) try std.fs.path.resolve(allocator, &.{input.iso_path}) else null;
+                defer if (iso_path) |path| allocator.free(path);
+                const container_path = if (input.container_path.len != 0) try std.fs.path.resolve(allocator, &.{input.container_path}) else null;
+                defer if (container_path) |path| allocator.free(path);
+                if ((iso_path != null and std.mem.eql(u8, output_path, iso_path.?)) or
+                    (container_path != null and
+                        (std.mem.eql(u8, output_path, container_path.?) or pathContains(container_path.?, output_path))))
+                {
+                    try diagnostics.append(validationError(
+                        .path_conflict,
+                        "/output/path",
+                        "output path must not alias or be contained by a source path",
+                        "choose an output directory outside the ISO and container inputs",
+                    ));
+                }
+            },
+            .disk => |input| {
+                if (input.path.len != 0) {
+                    const disk_path = try std.fs.path.resolve(allocator, &.{input.path});
+                    defer allocator.free(disk_path);
+                    if (std.mem.eql(u8, output_path, disk_path)) {
+                        try diagnostics.append(validationError(
+                            .path_conflict,
+                            "/output/path",
+                            "output path must not alias the preserved source disk",
+                            "choose a distinct transactional output path",
+                        ));
+                    }
+                }
+                for (input.dependencies) |dependency| {
+                    if (dependency.len == 0) continue;
+                    const dependency_path = try std.fs.path.resolve(
+                        allocator,
+                        &.{dependency},
+                    );
+                    defer allocator.free(dependency_path);
+                    if (std.mem.eql(u8, output_path, dependency_path)) {
+                        try diagnostics.append(validationError(
+                            .path_conflict,
+                            "/output/path",
+                            "output path must not alias a preserved disk dependency",
+                            "choose a distinct transactional output path",
+                        ));
+                    }
+                }
+            },
         }
     }
-    if (request.reproducibility.source_date_epoch > std.math.maxInt(u32)) {
+    if (request.storage == .fresh and request.reproducibility.source_date_epoch > std.math.maxInt(u32)) {
         try diagnostics.append(validationError(
             .invalid_reproducibility,
             "/reproducibility/source_date_epoch",
             "source_date_epoch exceeds the ext4 timestamp range",
             "use a value no greater than 4294967295",
         ));
+    } else if (request.reproducibility.source_date_epoch > std.math.maxInt(i64)) {
+        try diagnostics.append(validationError(
+            .invalid_reproducibility,
+            "/reproducibility/source_date_epoch",
+            "source_date_epoch exceeds the output metadata timestamp range",
+            "use a value no greater than 9223372036854775807",
+        ));
     }
 
     return .{ .items = try diagnostics.toOwnedSlice() };
+}
+
+fn validateExistingPathOperations(
+    diagnostics: *std.array_list.Managed(Diagnostic),
+    operations: []const ExistingPathOperation,
+) Allocator.Error!void {
+    for (operations) |operation| {
+        const path = switch (operation) {
+            .overwrite_file => |overwrite| overwrite.path,
+            .remove_file => |path| path,
+            .remove_tree => |path| path,
+        };
+        if (!validImagePath(path)) {
+            try diagnostics.append(validationError(
+                .invalid_customization,
+                "/existing_path_operations/path",
+                "existing-path operations require normalized absolute image paths",
+                null,
+            ));
+        }
+        if (operation == .overwrite_file) switch (operation.overwrite_file.source) {
+            .bytes => {},
+            .host_path => |source_path| if (source_path.len == 0) {
+                try diagnostics.append(validationError(
+                    .invalid_customization,
+                    "/existing_path_operations/overwrite_file/source/host_path",
+                    "edit source paths must not be empty",
+                    null,
+                ));
+            },
+        };
+    }
+}
+
+fn validatePackagePolicy(
+    diagnostics: *std.array_list.Managed(Diagnostic),
+    policy: PackagePolicy,
+) Allocator.Error!void {
+    var needs_repository = false;
+    for (policy.actions) |action| {
+        const names: []const []const u8 = switch (action) {
+            .install => |values| blk: {
+                needs_repository = true;
+                break :blk values;
+            },
+            .remove => |values| values,
+            .update_all => blk: {
+                needs_repository = true;
+                break :blk &.{};
+            },
+            .update_selected => |values| blk: {
+                needs_repository = true;
+                break :blk values;
+            },
+        };
+        for (names) |name| {
+            if (name.len == 0 or std.mem.indexOfAny(u8, name, "\r\n\x00") != null) {
+                try diagnostics.append(validationError(
+                    .invalid_policy,
+                    "/packages/actions",
+                    "package names must be non-empty single-line values",
+                    null,
+                ));
+            }
+        }
+    }
+    if (needs_repository and policy.repositories.len == 0) {
+        try diagnostics.append(validationError(
+            .invalid_policy,
+            "/packages/repositories",
+            "install and update actions require explicit repositories",
+            "declare repository URLs and trust sources; host repositories are never inherited",
+        ));
+    }
+    for (policy.repositories, 0..) |repository, index| {
+        if (!validConfigName(repository.id) or repository.urls.len == 0 or repository.trust.len == 0) {
+            try diagnostics.append(validationError(
+                .invalid_policy,
+                "/packages/repositories",
+                "repositories require a safe id, at least one URL, and explicit trust material",
+                null,
+            ));
+        }
+        for (policy.repositories[0..index]) |previous| {
+            if (std.mem.eql(u8, previous.id, repository.id)) {
+                try diagnostics.append(validationError(
+                    .invalid_policy,
+                    "/packages/repositories/id",
+                    "repository ids must be unique",
+                    null,
+                ));
+            }
+        }
+        for (repository.urls) |url| {
+            if (url.len == 0 or std.mem.indexOfAny(u8, url, "\r\n\x00") != null) {
+                try diagnostics.append(validationError(
+                    .invalid_policy,
+                    "/packages/repositories/urls",
+                    "repository URLs must be non-empty single-line values",
+                    null,
+                ));
+            }
+        }
+        for (repository.trust) |trust| switch (trust) {
+            .inline_bytes => |bytes| if (bytes.len == 0) {
+                try diagnostics.append(validationError(.invalid_policy, "/packages/repositories/trust", "inline trust material must not be empty", null));
+            },
+            .host_path => |path| if (path.len == 0) {
+                try diagnostics.append(validationError(.invalid_policy, "/packages/repositories/trust", "trust source paths must not be empty", null));
+            },
+        };
+    }
+    switch (policy.lock) {
+        .unlocked => {},
+        .snapshot => |snapshot| if (snapshot.len == 0) {
+            try diagnostics.append(validationError(.invalid_policy, "/packages/lock/snapshot", "snapshot identifiers must not be empty", null));
+        },
+        .exact => |locks| for (locks) |lock| {
+            if (lock.name.len == 0 or lock.version.len == 0 or lock.repository_id.len == 0) {
+                try diagnostics.append(validationError(.invalid_policy, "/packages/lock/exact", "exact locks require package, version, and repository id", null));
+            }
+        },
+    }
+}
+
+fn validateHooks(
+    diagnostics: *std.array_list.Managed(Diagnostic),
+    hooks: []const Hook,
+) Allocator.Error!void {
+    var previous_phase: ?HookPhase = null;
+    for (hooks, 0..) |hook, index| {
+        if (!validConfigName(hook.name)) {
+            try diagnostics.append(validationError(.invalid_policy, "/hooks/name", "hook names must be safe non-empty values", null));
+        }
+        if (previous_phase) |phase| {
+            if (@intFromEnum(hook.phase) < @intFromEnum(phase)) {
+                try diagnostics.append(validationError(
+                    .invalid_policy,
+                    "/hooks/phase",
+                    "hooks must be declared in nondecreasing phase order",
+                    "order hooks as after_packages, before_initramfs, before_seal, then finalize",
+                ));
+            }
+        }
+        previous_phase = hook.phase;
+        for (hooks[0..index]) |previous| {
+            if (std.mem.eql(u8, previous.name, hook.name)) {
+                try diagnostics.append(validationError(.invalid_policy, "/hooks/name", "hook names must be unique", null));
+            }
+        }
+        switch (hook.source) {
+            .inline_script => |script| if (script.len == 0) {
+                try diagnostics.append(validationError(.invalid_policy, "/hooks/source", "inline scripts must not be empty", null));
+            },
+            .host_path => |path| if (path.len == 0) {
+                try diagnostics.append(validationError(.invalid_policy, "/hooks/source", "hook source paths must not be empty", null));
+            },
+        }
+        for (hook.arguments) |argument| {
+            if (std.mem.indexOfScalar(u8, argument, 0) != null) {
+                try diagnostics.append(validationError(.invalid_policy, "/hooks/arguments", "hook arguments must not contain NUL", null));
+            }
+        }
+    }
+}
+
+fn validateInitramfsPolicy(
+    diagnostics: *std.array_list.Managed(Diagnostic),
+    policy: InitramfsPolicy,
+) Allocator.Error!void {
+    switch (policy) {
+        .unchanged => {},
+        .regenerate => |regenerate| {
+            if (regenerate.generator) |generator| {
+                if (generator.len == 0 or std.mem.indexOfAny(u8, generator, "\r\n\x00") != null) {
+                    try diagnostics.append(validationError(.invalid_policy, "/initramfs/regenerate/generator", "initramfs generators must be non-empty single-line values", null));
+                }
+            }
+            for (regenerate.kernels) |kernel| {
+                if (kernel.len == 0 or std.mem.indexOfAny(u8, kernel, "\r\n\x00") != null) {
+                    try diagnostics.append(validationError(.invalid_policy, "/initramfs/regenerate/kernels", "kernel selectors must be non-empty single-line values", null));
+                }
+            }
+        },
+    }
+}
+
+fn validateSelinuxPolicy(
+    diagnostics: *std.array_list.Managed(Diagnostic),
+    policy: SelinuxPolicy,
+) Allocator.Error!void {
+    switch (policy) {
+        .unchanged => {},
+        .configure => |configure| if (configure.policy) |name| {
+            if (!validConfigName(name)) {
+                try diagnostics.append(validationError(.invalid_policy, "/selinux/configure/policy", "SELinux policy names must be safe non-empty values", null));
+            }
+        },
+    }
+}
+
+fn validateCrossArchitecturePolicy(
+    diagnostics: *std.array_list.Managed(Diagnostic),
+    policy: CrossArchitecturePolicy,
+) Allocator.Error!void {
+    switch (policy) {
+        .reject => {},
+        .runner => |runner| if ((runner.kind == .qemu_user or runner.kind == .vm) and
+            (runner.command == null or runner.command.?.len == 0))
+        {
+            try diagnostics.append(validationError(
+                .invalid_policy,
+                "/cross_architecture/runner/command",
+                "qemu_user and vm runners require an explicit command",
+                null,
+            ));
+        },
+    }
 }
 
 fn validateOsCustomization(
@@ -848,17 +1468,45 @@ pub const Phase = enum {
     prepare,
     filesystem_changes,
     generalization_cleanup,
+    packages,
+    after_packages,
+    before_initramfs,
     initramfs,
+    before_seal,
+    selinux,
     bootloader_prepare,
     filesystem_finalize,
     verity_seal,
     bootloader_install,
     uki,
+    finalize,
     filesystem_close,
     output_conversion,
 };
 
-pub const Action = build_image.Stage;
+pub const Action = enum {
+    load_sources,
+    apply_filesystem_changes,
+    generalize_and_cleanup,
+    prepare_initramfs,
+    prepare_boot_configuration,
+    populate_filesystem,
+    seal_verity,
+    install_bootloader,
+    generate_uki,
+    check_and_close_filesystems,
+    convert_output,
+    load_preserved_source,
+    edit_existing_paths,
+    publish_standalone_output,
+    execute_package_action,
+    execute_hook,
+    regenerate_initramfs,
+    apply_selinux_policy,
+    rebuild_image,
+    execute_unsafe_chroot,
+    execute_vm,
+};
 
 pub const Operation = struct {
     id: u16,
@@ -871,12 +1519,38 @@ pub const CapabilityKind = enum {
     read_iso,
     read_container,
     read_customization_file,
+    read_disk,
+    read_disk_dependency,
+    disk_dependencies,
+    read_edit_source,
+    read_hook_source,
+    read_trust_source,
     write_workspace_parent,
     write_output_parent,
     output_absent,
     transaction_absent,
     path_isolation,
-    unprivileged_native_backend,
+    native_fresh,
+    native_edit,
+    partition_edit,
+    standalone_output,
+    rebuild,
+    unsafe_chroot,
+    vm,
+    package_management,
+    repository_access,
+    repository_trust,
+    package_cache,
+    package_lock,
+    script_execution,
+    guest_execution,
+    initramfs_regeneration,
+    selinux_policy,
+    selinux_relabel,
+    cross_architecture_runner,
+    arbitrary_filesystem_mutation,
+    boot_policy_mutation,
+    generalization,
     atomic_commit,
 };
 
@@ -903,10 +1577,29 @@ pub const GeneratedIdentifiers = struct {
     transaction_id: Uuid,
 };
 
-pub const ResolvedInput = struct {
+pub const OutputIdentifiers = struct {
+    output_unique_id: Uuid,
+    vhdx_header_sequence_base: u64,
+    vhdx_file_write_guid: Guid,
+    vhdx_data_write_guid: Guid,
+    vhdx_page83_guid: Guid,
+    vhdx_write_guid_seed: Seed,
+};
+
+pub const ResolvedIsoOciInput = struct {
     iso_path: []const u8,
     container_path: []const u8,
     rootfs_path_in_iso: []const u8,
+};
+
+pub const ResolvedDiskInput = struct {
+    path: []const u8,
+    dependencies: []const []const u8,
+};
+
+pub const ResolvedInput = union(enum) {
+    iso_oci: ResolvedIsoOciInput,
+    disk: ResolvedDiskInput,
 };
 
 pub const ResolvedOutput = struct {
@@ -914,13 +1607,23 @@ pub const ResolvedOutput = struct {
     format: OutputFormat,
     requested_size: u64,
     disk_size: u64,
+    size_policy: OutputSizePolicy,
 };
 
-pub const ResolvedStorage = struct {
+pub const ResolvedFreshStorage = struct {
     generation: azure.Generation,
     esp_size: u64,
     ext4_label: []const u8,
     skip_iso_rootfs: bool,
+};
+
+pub const ResolvedPreservedStorage = struct {
+    root_partition: PartitionSelector,
+};
+
+pub const ResolvedStorage = union(enum) {
+    fresh: ResolvedFreshStorage,
+    preserve: ResolvedPreservedStorage,
 };
 
 pub const ResolvedPlanData = struct {
@@ -931,13 +1634,21 @@ pub const ResolvedPlanData = struct {
     output: ResolvedOutput,
     storage: ResolvedStorage,
     os: OsCustomization,
+    existing_path_operations: []const ExistingPathOperation,
+    packages: PackagePolicy,
+    hooks: []const Hook,
+    initramfs: InitramfsPolicy,
+    selinux: SelinuxPolicy,
+    cross_architecture: CrossArchitecturePolicy,
     boot_security: BootSecurityPolicy,
     generalization: GeneralizationPolicy,
     execution: ExecutionPolicy,
     reproducibility: Reproducibility,
     transaction_path: []const u8,
     staging_output_path: []const u8,
-    generated: GeneratedIdentifiers,
+    transaction_id: Uuid,
+    output_identifiers: OutputIdentifiers,
+    generated: ?GeneratedIdentifiers,
     operations: []const Operation,
     required_capabilities: []const CapabilityRequirement,
     plan_hash: Digest,
@@ -980,7 +1691,7 @@ pub fn resolve(
     var resolution_diagnostics = std.array_list.Managed(Diagnostic).init(allocator);
     defer resolution_diagnostics.deinit();
     if (context.firmware_architecture) |architecture| {
-        if (architecture != target_architecture) {
+        if (request.execution.backend == .native_fresh and architecture != target_architecture) {
             try resolution_diagnostics.append(.{
                 .severity = .@"error",
                 .phase = .resolution,
@@ -992,35 +1703,74 @@ pub fn resolve(
         }
     }
     if (context.repository_architecture) |architecture| {
-        if (architecture != target_architecture) {
+        if ((request.execution.backend == .native_fresh or request.packages.actions.len != 0) and
+            architecture != target_architecture)
+        {
             try resolution_diagnostics.append(.{
                 .severity = .@"error",
                 .phase = .resolution,
                 .code = .incompatible_architecture,
                 .configuration_path = "/architectures/repository",
-                .message = "the native ISO+OCI backend requires target-architecture source content",
+                .message = "repository content must match the target image architecture",
                 .remediation = "set repository_architecture to the target image architecture",
             });
         }
     }
-    if (context.runner_architecture) |architecture| {
-        if (architecture != context.host_architecture) {
+
+    const needs_guest_execution = requiresGuestExecution(request);
+    var resolved_runner_architecture = context.runner_architecture orelse context.host_architecture;
+    if (needs_guest_execution and target_architecture != context.host_architecture) {
+        switch (request.cross_architecture) {
+            .reject => try resolution_diagnostics.append(.{
+                .severity = .@"error",
+                .phase = .resolution,
+                .code = .incompatible_architecture,
+                .configuration_path = "/cross_architecture",
+                .message = "cross-architecture guest execution requires an explicit compatible runner policy",
+                .remediation = "configure cross_architecture.runner for the target architecture",
+            }),
+            .runner => |runner| {
+                if (runner.guest_architecture != target_architecture) {
+                    try resolution_diagnostics.append(.{
+                        .severity = .@"error",
+                        .phase = .resolution,
+                        .code = .incompatible_architecture,
+                        .configuration_path = "/cross_architecture/runner/guest_architecture",
+                        .message = "the configured runner does not target the image architecture",
+                        .remediation = "set guest_architecture to the target architecture",
+                    });
+                }
+                if ((request.execution.backend == .vm and runner.kind != .vm) or
+                    (request.execution.backend == .unsafe_chroot and runner.kind == .vm))
+                {
+                    try resolution_diagnostics.append(.{
+                        .severity = .@"error",
+                        .phase = .resolution,
+                        .code = .incompatible_architecture,
+                        .configuration_path = "/cross_architecture/runner/kind",
+                        .message = "the configured runner kind is incompatible with the selected execution backend",
+                        .remediation = if (request.execution.backend == .vm)
+                            "select a vm runner for the VM backend"
+                        else
+                            "select qemu_user or binfmt_misc for unsafe_chroot",
+                    });
+                }
+                resolved_runner_architecture = runner.guest_architecture;
+            },
+        }
+    } else if (context.runner_architecture) |architecture| {
+        if (!needs_guest_execution and architecture != context.host_architecture) {
             try resolution_diagnostics.append(.{
                 .severity = .@"error",
                 .phase = .resolution,
                 .code = .incompatible_architecture,
                 .configuration_path = "/architectures/runner",
-                .message = "the native backend executes on the host architecture",
+                .message = "a request without guest execution uses the host architecture",
                 .remediation = "set runner_architecture to the host architecture",
             });
         }
     }
 
-    const input = request.input.iso_oci;
-    const checked_iso_path = try std.fs.path.resolve(allocator, &.{ context.base_path, input.iso_path });
-    defer allocator.free(checked_iso_path);
-    const checked_container_path = try std.fs.path.resolve(allocator, &.{ context.base_path, input.container_path });
-    defer allocator.free(checked_container_path);
     const checked_output_path = try std.fs.path.resolve(allocator, &.{ context.base_path, request.output.path });
     defer allocator.free(checked_output_path);
     const checked_workspace_path = try std.fs.path.resolve(allocator, &.{ context.base_path, request.execution.workspace_path });
@@ -1033,44 +1783,108 @@ pub fn resolve(
             .phase = .resolution,
             .code = .path_conflict,
             .configuration_path = "/execution/workspace_path",
-            .message = "the resolved native workspace must be the output directory so publication is atomic",
+            .message = "the resolved workspace must be the output directory so publication is atomic",
             .remediation = "resolve workspace_path to the parent directory of output.path",
         });
     }
-    if (std.mem.eql(u8, checked_output_path, checked_iso_path) or
-        std.mem.eql(u8, checked_output_path, checked_container_path) or
-        pathContains(checked_container_path, checked_output_path))
-    {
-        try resolution_diagnostics.append(.{
-            .severity = .@"error",
-            .phase = .resolution,
-            .code = .path_conflict,
-            .configuration_path = "/output/path",
-            .message = "the resolved output path must not alias or be contained by a source path",
-            .remediation = "resolve the output to a directory outside the ISO and container inputs",
-        });
+
+    switch (request.input) {
+        .iso_oci => |input| {
+            const checked_iso_path = try std.fs.path.resolve(allocator, &.{ context.base_path, input.iso_path });
+            defer allocator.free(checked_iso_path);
+            const checked_container_path = try std.fs.path.resolve(allocator, &.{ context.base_path, input.container_path });
+            defer allocator.free(checked_container_path);
+            if (std.mem.eql(u8, checked_output_path, checked_iso_path) or
+                std.mem.eql(u8, checked_output_path, checked_container_path) or
+                pathContains(checked_container_path, checked_output_path))
+            {
+                try resolution_diagnostics.append(.{
+                    .severity = .@"error",
+                    .phase = .resolution,
+                    .code = .path_conflict,
+                    .configuration_path = "/output/path",
+                    .message = "the resolved output path must not alias or be contained by a source path",
+                    .remediation = "resolve the output outside the ISO and container inputs",
+                });
+            }
+        },
+        .disk => |input| {
+            const checked_disk_path = try std.fs.path.resolve(allocator, &.{ context.base_path, input.path });
+            defer allocator.free(checked_disk_path);
+            if (std.mem.eql(u8, checked_output_path, checked_disk_path)) {
+                try resolution_diagnostics.append(.{
+                    .severity = .@"error",
+                    .phase = .resolution,
+                    .code = .path_conflict,
+                    .configuration_path = "/output/path",
+                    .message = "the resolved output must not alias the preserved source disk",
+                    .remediation = "resolve the output to a distinct path",
+                });
+            }
+            for (input.dependencies) |dependency| {
+                try checkResolvedSourceIsolation(
+                    allocator,
+                    &resolution_diagnostics,
+                    context.base_path,
+                    checked_output_path,
+                    dependency,
+                    "/input/disk/dependencies",
+                );
+            }
+        },
     }
+
     for (request.os.filesystem) |operation| switch (operation) {
         .put_file => |file| switch (file.source) {
             .inline_bytes => {},
             .host_path => |source_path| {
-                const checked_source_path = try std.fs.path.resolve(allocator, &.{ context.base_path, source_path });
-                defer allocator.free(checked_source_path);
-                if (std.mem.eql(u8, checked_output_path, checked_source_path) or
-                    pathContains(checked_source_path, checked_output_path))
-                {
-                    try resolution_diagnostics.append(.{
-                        .severity = .@"error",
-                        .phase = .resolution,
-                        .code = .path_conflict,
-                        .configuration_path = "/os/filesystem/put_file/source/host_path",
-                        .message = "the resolved output path must not alias or be contained by a customization source path",
-                        .remediation = "place customization sources outside the output location",
-                    });
-                }
+                try checkResolvedSourceIsolation(
+                    allocator,
+                    &resolution_diagnostics,
+                    context.base_path,
+                    checked_output_path,
+                    source_path,
+                    "/os/filesystem/put_file/source/host_path",
+                );
             },
         },
         else => {},
+    };
+    for (request.existing_path_operations) |operation| switch (operation) {
+        .overwrite_file => |overwrite| switch (overwrite.source) {
+            .bytes => {},
+            .host_path => |source_path| try checkResolvedSourceIsolation(
+                allocator,
+                &resolution_diagnostics,
+                context.base_path,
+                checked_output_path,
+                source_path,
+                "/existing_path_operations/overwrite_file/source/host_path",
+            ),
+        },
+        .remove_file, .remove_tree => {},
+    };
+    for (request.hooks) |hook| switch (hook.source) {
+        .inline_script => {},
+        .host_path => |source_path| try checkResolvedSourceIsolation(
+            allocator,
+            &resolution_diagnostics,
+            context.base_path,
+            checked_output_path,
+            source_path,
+            "/hooks/source/host_path",
+        ),
+    };
+    for (request.packages.repositories) |repository| for (repository.trust) |trust| switch (trust) {
+        .inline_bytes => {},
+        .host_path => |source_path| try checkResolvedSourceIsolation(
+            allocator,
+            &resolution_diagnostics,
+            context.base_path,
+            checked_output_path,
+            source_path,
+            "/packages/repositories/trust/host_path",
+        ),
     };
     if (resolution_diagnostics.items.len != 0) {
         allocator.free(diagnostics.items);
@@ -1084,20 +1898,13 @@ pub fn resolve(
     errdefer arena.deinit();
     const plan_allocator = arena.allocator();
 
-    const storage = request.storage.fresh;
-    const disk_size = if (request.output.format == .vhd)
-        azure.alignSizeToMib(request.output.size)
-    else
-        request.output.size;
-
-    const resolved_iso_path = try std.fs.path.resolve(plan_allocator, &.{ context.base_path, input.iso_path });
-    const resolved_container_path = try std.fs.path.resolve(plan_allocator, &.{ context.base_path, input.container_path });
     const resolved_output_path = try std.fs.path.resolve(plan_allocator, &.{ context.base_path, request.output.path });
     const resolved_workspace_path = try std.fs.path.resolve(plan_allocator, &.{ context.base_path, request.execution.workspace_path });
 
-    var generated = deriveIdentifiers(request.reproducibility.seed);
-    generated.transaction_id = deriveTransactionId(request.reproducibility.seed, resolved_output_path);
-    const transaction_hex = std.fmt.bytesToHex(generated.transaction_id.bytes, .lower);
+    var derived = deriveIdentifiers(request.reproducibility.seed);
+    const transaction_id = deriveTransactionId(request.reproducibility.seed, resolved_output_path);
+    derived.transaction_id = transaction_id;
+    const transaction_hex = std.fmt.bytesToHex(transaction_id.bytes, .lower);
     const transaction_name = try std.fmt.allocPrint(plan_allocator, ".zvmi-{s}", .{transaction_hex});
     const transaction_path = try std.fs.path.join(plan_allocator, &.{ resolved_workspace_path, transaction_name });
     const staging_output_path = try std.fs.path.join(plan_allocator, &.{ transaction_path, "output.img" });
@@ -1106,35 +1913,89 @@ pub fn resolve(
         .workspace_path = resolved_workspace_path,
         .backend = request.execution.backend,
         .overwrite = request.execution.overwrite,
+        .acknowledge_unsafe = request.execution.acknowledge_unsafe,
     };
-    const resolved_input = ResolvedInput{
-        .iso_path = resolved_iso_path,
-        .container_path = resolved_container_path,
-        .rootfs_path_in_iso = try plan_allocator.dupe(u8, input.rootfs_path_in_iso.?),
+    const resolved_input: ResolvedInput = switch (request.input) {
+        .iso_oci => |input| .{ .iso_oci = .{
+            .iso_path = try std.fs.path.resolve(plan_allocator, &.{ context.base_path, input.iso_path }),
+            .container_path = try std.fs.path.resolve(plan_allocator, &.{ context.base_path, input.container_path }),
+            .rootfs_path_in_iso = try plan_allocator.dupe(u8, input.rootfs_path_in_iso.?),
+        } },
+        .disk => |input| .{ .disk = .{
+            .path = try std.fs.path.resolve(plan_allocator, &.{ context.base_path, input.path }),
+            .dependencies = try resolvePaths(
+                plan_allocator,
+                context.base_path,
+                input.dependencies,
+            ),
+        } },
+    };
+    const disk_size = switch (request.storage) {
+        .fresh => if (request.output.format == .vhd)
+            azure.alignSizeToMib(request.output.size)
+        else
+            request.output.size,
+        .preserve => 0,
     };
     const resolved_output = ResolvedOutput{
         .path = resolved_output_path,
         .format = request.output.format,
         .requested_size = request.output.size,
         .disk_size = disk_size,
+        .size_policy = request.output.size_policy,
     };
-    const resolved_storage = ResolvedStorage{
-        .generation = storage.generation,
-        .esp_size = storage.esp_size,
-        .ext4_label = try plan_allocator.dupe(u8, storage.ext4_label),
-        .skip_iso_rootfs = storage.skip_iso_rootfs,
+    const resolved_storage: ResolvedStorage = switch (request.storage) {
+        .fresh => |storage| .{ .fresh = .{
+            .generation = storage.generation,
+            .esp_size = storage.esp_size,
+            .ext4_label = try plan_allocator.dupe(u8, storage.ext4_label),
+            .skip_iso_rootfs = storage.skip_iso_rootfs,
+        } },
+        .preserve => |storage| .{ .preserve = .{
+            .root_partition = storage.root_partition,
+        } },
     };
     const resolved_os = try dupeOsCustomization(plan_allocator, request.os, context.base_path);
+    const resolved_existing_operations = try dupeExistingPathOperations(
+        plan_allocator,
+        request.existing_path_operations,
+        context.base_path,
+    );
+    const resolved_packages = try dupePackagePolicy(plan_allocator, request.packages, context.base_path);
+    const resolved_hooks = try dupeHooks(plan_allocator, request.hooks, context.base_path);
+    const resolved_initramfs = try dupeInitramfsPolicy(plan_allocator, request.initramfs);
+    const resolved_selinux = try dupeSelinuxPolicy(plan_allocator, request.selinux);
+    const resolved_cross_architecture = try dupeCrossArchitecturePolicy(plan_allocator, request.cross_architecture);
     const resolved_generalization = try dupeGeneralization(plan_allocator, request.generalization);
     const resolved_boot = try dupeBootPolicy(plan_allocator, request.boot_security);
-    const operations = try buildOperations(plan_allocator, resolved_boot, resolved_storage.generation);
+    const operations = try buildOperations(
+        plan_allocator,
+        resolved_execution.backend,
+        resolved_boot,
+        resolved_storage,
+        resolved_packages,
+        resolved_hooks,
+        resolved_initramfs,
+        resolved_selinux,
+    );
     const capabilities = try buildCapabilities(
         plan_allocator,
         resolved_input,
         resolved_output,
+        resolved_storage,
         resolved_execution,
         transaction_path,
         resolved_os,
+        resolved_existing_operations,
+        resolved_packages,
+        resolved_hooks,
+        resolved_initramfs,
+        resolved_selinux,
+        resolved_generalization,
+        resolved_boot,
+        resolved_cross_architecture,
+        target_architecture,
+        context.host_architecture,
     );
 
     var data = ResolvedPlanData{
@@ -1144,19 +2005,27 @@ pub fn resolve(
             .image = target_architecture,
             .firmware = context.firmware_architecture orelse target_architecture,
             .repository = context.repository_architecture orelse target_architecture,
-            .runner = context.runner_architecture orelse context.host_architecture,
+            .runner = resolved_runner_architecture,
         },
         .input = resolved_input,
         .output = resolved_output,
         .storage = resolved_storage,
         .os = resolved_os,
+        .existing_path_operations = resolved_existing_operations,
+        .packages = resolved_packages,
+        .hooks = resolved_hooks,
+        .initramfs = resolved_initramfs,
+        .selinux = resolved_selinux,
+        .cross_architecture = resolved_cross_architecture,
         .boot_security = resolved_boot,
         .generalization = resolved_generalization,
         .execution = resolved_execution,
         .reproducibility = request.reproducibility,
         .transaction_path = transaction_path,
         .staging_output_path = staging_output_path,
-        .generated = generated,
+        .transaction_id = transaction_id,
+        .output_identifiers = outputIdentifiers(derived),
+        .generated = if (request.execution.backend == .native_fresh) derived else null,
         .operations = operations,
         .required_capabilities = capabilities,
         .plan_hash = .{ .bytes = [_]u8{0} ** 32 },
@@ -1170,6 +2039,39 @@ pub fn resolve(
         .diagnostics = diagnostics,
         .plan = .{ .arena = arena, .data = data_ptr },
     };
+}
+
+fn checkResolvedSourceIsolation(
+    allocator: Allocator,
+    diagnostics: *std.array_list.Managed(Diagnostic),
+    base_path: []const u8,
+    output_path: []const u8,
+    source_path: []const u8,
+    configuration_path: []const u8,
+) Allocator.Error!void {
+    const checked_source_path = try std.fs.path.resolve(allocator, &.{ base_path, source_path });
+    defer allocator.free(checked_source_path);
+    if (std.mem.eql(u8, output_path, checked_source_path) or
+        pathContains(checked_source_path, output_path))
+    {
+        try diagnostics.append(.{
+            .severity = .@"error",
+            .phase = .resolution,
+            .code = .path_conflict,
+            .configuration_path = configuration_path,
+            .message = "the resolved output path must not alias or be contained by a declared source path",
+            .remediation = "place declared sources outside the output location",
+        });
+    }
+}
+
+fn requiresGuestExecution(request: *const Request) bool {
+    return request.execution.backend == .unsafe_chroot or
+        request.execution.backend == .vm or
+        request.packages.actions.len != 0 or
+        request.hooks.len != 0 or
+        request.initramfs != .unchanged or
+        request.selinux != .unchanged;
 }
 
 fn dupeOsCustomization(
@@ -1263,6 +2165,162 @@ fn dupeOsCustomization(
     };
 }
 
+fn dupeExistingPathOperations(
+    allocator: Allocator,
+    operations: []const ExistingPathOperation,
+    base_path: ?[]const u8,
+) Allocator.Error![]const ExistingPathOperation {
+    const owned = try allocator.alloc(ExistingPathOperation, operations.len);
+    for (operations, 0..) |operation, index| {
+        owned[index] = switch (operation) {
+            .overwrite_file => |overwrite| .{ .overwrite_file = .{
+                .path = try allocator.dupe(u8, overwrite.path),
+                .source = switch (overwrite.source) {
+                    .bytes => |bytes| .{ .bytes = try allocator.dupe(u8, bytes) },
+                    .host_path => |path| .{ .host_path = if (base_path) |base|
+                        try std.fs.path.resolve(allocator, &.{ base, path })
+                    else
+                        try allocator.dupe(u8, path) },
+                },
+            } },
+            .remove_file => |path| .{ .remove_file = try allocator.dupe(u8, path) },
+            .remove_tree => |path| .{ .remove_tree = try allocator.dupe(u8, path) },
+        };
+    }
+    return owned;
+}
+
+fn resolvePaths(
+    allocator: Allocator,
+    base_path: []const u8,
+    values: []const []const u8,
+) Allocator.Error![]const []const u8 {
+    const owned = try allocator.alloc([]const u8, values.len);
+    for (values, 0..) |value, index| {
+        owned[index] = try std.fs.path.resolve(allocator, &.{ base_path, value });
+    }
+    return owned;
+}
+
+fn dupePackagePolicy(
+    allocator: Allocator,
+    policy: PackagePolicy,
+    base_path: ?[]const u8,
+) Allocator.Error!PackagePolicy {
+    const actions = try allocator.alloc(PackageAction, policy.actions.len);
+    for (policy.actions, 0..) |action, index| {
+        actions[index] = switch (action) {
+            .install => |packages| .{ .install = try dupeStrings(allocator, packages) },
+            .remove => |packages| .{ .remove = try dupeStrings(allocator, packages) },
+            .update_all => .update_all,
+            .update_selected => |packages| .{ .update_selected = try dupeStrings(allocator, packages) },
+        };
+    }
+    const repositories = try allocator.alloc(PackageRepository, policy.repositories.len);
+    for (policy.repositories, 0..) |repository, index| {
+        const trust = try allocator.alloc(TrustSource, repository.trust.len);
+        for (repository.trust, 0..) |source, source_index| {
+            trust[source_index] = switch (source) {
+                .inline_bytes => |bytes| .{ .inline_bytes = try allocator.dupe(u8, bytes) },
+                .host_path => |path| .{ .host_path = if (base_path) |base|
+                    try std.fs.path.resolve(allocator, &.{ base, path })
+                else
+                    try allocator.dupe(u8, path) },
+            };
+        }
+        repositories[index] = .{
+            .id = try allocator.dupe(u8, repository.id),
+            .urls = try dupeStrings(allocator, repository.urls),
+            .trust = trust,
+        };
+    }
+    const lock: PackageLockPolicy = switch (policy.lock) {
+        .unlocked => .unlocked,
+        .snapshot => |snapshot| .{ .snapshot = try allocator.dupe(u8, snapshot) },
+        .exact => |locks| blk: {
+            const owned = try allocator.alloc(PackageVersionLock, locks.len);
+            for (locks, 0..) |lock, index| {
+                owned[index] = .{
+                    .name = try allocator.dupe(u8, lock.name),
+                    .version = try allocator.dupe(u8, lock.version),
+                    .repository_id = try allocator.dupe(u8, lock.repository_id),
+                };
+            }
+            break :blk .{ .exact = owned };
+        },
+    };
+    return .{
+        .actions = actions,
+        .repositories = repositories,
+        .cache = policy.cache,
+        .lock = lock,
+    };
+}
+
+fn dupeHooks(
+    allocator: Allocator,
+    hooks: []const Hook,
+    base_path: ?[]const u8,
+) Allocator.Error![]const Hook {
+    const owned = try allocator.alloc(Hook, hooks.len);
+    for (hooks, 0..) |hook, index| {
+        owned[index] = .{
+            .name = try allocator.dupe(u8, hook.name),
+            .phase = hook.phase,
+            .source = switch (hook.source) {
+                .inline_script => |script| .{ .inline_script = try allocator.dupe(u8, script) },
+                .host_path => |path| .{ .host_path = if (base_path) |base|
+                    try std.fs.path.resolve(allocator, &.{ base, path })
+                else
+                    try allocator.dupe(u8, path) },
+            },
+            .arguments = try dupeStrings(allocator, hook.arguments),
+        };
+    }
+    return owned;
+}
+
+fn dupeInitramfsPolicy(
+    allocator: Allocator,
+    policy: InitramfsPolicy,
+) Allocator.Error!InitramfsPolicy {
+    return switch (policy) {
+        .unchanged => .unchanged,
+        .regenerate => |regenerate| .{ .regenerate = .{
+            .generator = if (regenerate.generator) |generator| try allocator.dupe(u8, generator) else null,
+            .kernels = try dupeStrings(allocator, regenerate.kernels),
+        } },
+    };
+}
+
+fn dupeSelinuxPolicy(
+    allocator: Allocator,
+    policy: SelinuxPolicy,
+) Allocator.Error!SelinuxPolicy {
+    return switch (policy) {
+        .unchanged => .unchanged,
+        .configure => |configure| .{ .configure = .{
+            .mode = configure.mode,
+            .policy = if (configure.policy) |name| try allocator.dupe(u8, name) else null,
+            .relabel = configure.relabel,
+        } },
+    };
+}
+
+fn dupeCrossArchitecturePolicy(
+    allocator: Allocator,
+    policy: CrossArchitecturePolicy,
+) Allocator.Error!CrossArchitecturePolicy {
+    return switch (policy) {
+        .reject => .reject,
+        .runner => |runner| .{ .runner = .{
+            .kind = runner.kind,
+            .guest_architecture = runner.guest_architecture,
+            .command = if (runner.command) |command| try allocator.dupe(u8, command) else null,
+        } },
+    };
+}
+
 fn dupeMetadata(allocator: Allocator, metadata: Metadata) Allocator.Error!Metadata {
     return .{
         .mode = metadata.mode,
@@ -1325,13 +2383,22 @@ fn dupeBootPolicy(allocator: Allocator, policy: BootSecurityPolicy) Allocator.Er
 
 fn buildOperations(
     allocator: Allocator,
+    backend: ExecutionBackend,
     policy: BootSecurityPolicy,
-    generation: azure.Generation,
+    storage: ResolvedStorage,
+    packages: PackagePolicy,
+    hooks: []const Hook,
+    initramfs: InitramfsPolicy,
+    selinux: SelinuxPolicy,
 ) Allocator.Error![]Operation {
-    var specs_buffer: [12]OperationSpec = undefined;
-    const specs = nativeOperationSpecs(policy, generation, &specs_buffer);
-    const operations = try allocator.alloc(Operation, specs.len);
-    for (specs, 0..) |spec, index| {
+    var specs = std.array_list.Managed(OperationSpec).init(allocator);
+    defer specs.deinit();
+    try appendBackendOperationSpecs(&specs, backend, storage);
+    try appendPreInitramfsOperationSpecs(&specs, packages, hooks);
+    try appendBackendFinalOperationSpecs(&specs, backend, policy, storage, hooks, initramfs, selinux);
+
+    const operations = try allocator.alloc(Operation, specs.items.len);
+    for (specs.items, 0..) |spec, index| {
         const dependencies = if (index == 0) &.{} else blk: {
             const ids = try allocator.alloc(u16, 1);
             ids[0] = @intCast(index - 1);
@@ -1352,37 +2419,127 @@ const OperationSpec = struct {
     action: Action,
 };
 
-fn nativeOperationSpecs(
+fn appendBackendOperationSpecs(
+    specs: *std.array_list.Managed(OperationSpec),
+    backend: ExecutionBackend,
+    storage: ResolvedStorage,
+) Allocator.Error!void {
+    switch (backend) {
+        .native_fresh => {
+            _ = storage.fresh;
+            try specs.append(.{ .phase = .prepare, .action = .load_sources });
+            try specs.append(.{ .phase = .filesystem_changes, .action = .apply_filesystem_changes });
+            try specs.append(.{ .phase = .generalization_cleanup, .action = .generalize_and_cleanup });
+        },
+        .native_edit => {
+            try specs.append(.{ .phase = .prepare, .action = .load_preserved_source });
+            try specs.append(.{ .phase = .filesystem_changes, .action = .edit_existing_paths });
+        },
+        .rebuild => try specs.append(.{ .phase = .filesystem_changes, .action = .rebuild_image }),
+        .unsafe_chroot => try specs.append(.{ .phase = .filesystem_changes, .action = .execute_unsafe_chroot }),
+        .vm => try specs.append(.{ .phase = .filesystem_changes, .action = .execute_vm }),
+    }
+}
+
+fn appendPreInitramfsOperationSpecs(
+    specs: *std.array_list.Managed(OperationSpec),
+    packages: PackagePolicy,
+    hooks: []const Hook,
+) Allocator.Error!void {
+    for (packages.actions) |_| try specs.append(.{ .phase = .packages, .action = .execute_package_action });
+    for (hooks) |hook| if (hook.phase == .after_packages) {
+        try specs.append(.{ .phase = .after_packages, .action = .execute_hook });
+    };
+    for (hooks) |hook| if (hook.phase == .before_initramfs) {
+        try specs.append(.{ .phase = .before_initramfs, .action = .execute_hook });
+    };
+}
+
+fn appendBackendFinalOperationSpecs(
+    specs: *std.array_list.Managed(OperationSpec),
+    backend: ExecutionBackend,
     policy: BootSecurityPolicy,
-    generation: azure.Generation,
-    buffer: *[12]OperationSpec,
-) []const OperationSpec {
-    var len: usize = 0;
-    appendOperationSpec(buffer, &len, .prepare, .load_sources);
-    appendOperationSpec(buffer, &len, .filesystem_changes, .apply_filesystem_changes);
-    appendOperationSpec(buffer, &len, .generalization_cleanup, .generalize_and_cleanup);
-    appendOperationSpec(buffer, &len, .initramfs, .prepare_initramfs);
-    if (generation == .gen1) appendOperationSpec(buffer, &len, .bootloader_prepare, .prepare_boot_configuration);
-    appendOperationSpec(buffer, &len, .filesystem_finalize, .populate_filesystem);
-    if (policy.verity) appendOperationSpec(buffer, &len, .verity_seal, .seal_verity);
-    if (generation == .gen2) appendOperationSpec(buffer, &len, .bootloader_prepare, .prepare_boot_configuration);
-    appendOperationSpec(buffer, &len, .bootloader_install, .install_bootloader);
-    if (policy.boot_mode != .bls_only) appendOperationSpec(buffer, &len, .uki, .generate_uki);
-    appendOperationSpec(buffer, &len, .filesystem_close, .check_and_close_filesystems);
-    appendOperationSpec(buffer, &len, .output_conversion, .convert_output);
-    return buffer[0..len];
+    storage: ResolvedStorage,
+    hooks: []const Hook,
+    initramfs: InitramfsPolicy,
+    selinux: SelinuxPolicy,
+) Allocator.Error!void {
+    switch (backend) {
+        .native_fresh => {
+            const generation = storage.fresh.generation;
+            try specs.append(.{ .phase = .initramfs, .action = .prepare_initramfs });
+            try appendInitramfsPolicySpec(specs, initramfs);
+            if (generation == .gen1) try specs.append(.{ .phase = .bootloader_prepare, .action = .prepare_boot_configuration });
+            try specs.append(.{ .phase = .filesystem_finalize, .action = .populate_filesystem });
+            try appendBeforeSealSpecs(specs, hooks, selinux);
+            if (policy.verity) try specs.append(.{ .phase = .verity_seal, .action = .seal_verity });
+            if (generation == .gen2) try specs.append(.{ .phase = .bootloader_prepare, .action = .prepare_boot_configuration });
+            try specs.append(.{ .phase = .bootloader_install, .action = .install_bootloader });
+            if (policy.boot_mode != .bls_only) try specs.append(.{ .phase = .uki, .action = .generate_uki });
+            try appendFinalizeHookSpecs(specs, hooks);
+            try specs.append(.{ .phase = .filesystem_close, .action = .check_and_close_filesystems });
+            try specs.append(.{ .phase = .output_conversion, .action = .convert_output });
+        },
+        .native_edit, .rebuild, .unsafe_chroot, .vm => {
+            try appendInitramfsPolicySpec(specs, initramfs);
+            try appendBeforeSealSpecs(specs, hooks, selinux);
+            try appendFinalizeHookSpecs(specs, hooks);
+            try specs.append(.{ .phase = .output_conversion, .action = .publish_standalone_output });
+        },
+    }
 }
 
-fn appendOperationSpec(buffer: *[12]OperationSpec, len: *usize, phase: Phase, action: Action) void {
-    buffer[len.*] = .{ .phase = phase, .action = action };
-    len.* += 1;
+fn appendInitramfsPolicySpec(
+    specs: *std.array_list.Managed(OperationSpec),
+    initramfs: InitramfsPolicy,
+) Allocator.Error!void {
+    if (initramfs != .unchanged) {
+        try specs.append(.{ .phase = .initramfs, .action = .regenerate_initramfs });
+    }
 }
 
-fn hasExpectedNativeOperations(plan: *const ResolvedPlan) bool {
-    var specs_buffer: [12]OperationSpec = undefined;
-    const specs = nativeOperationSpecs(plan.data.boot_security, plan.data.storage.generation, &specs_buffer);
-    if (plan.data.operations.len != specs.len) return false;
-    for (plan.data.operations, specs, 0..) |operation, spec, index| {
+fn appendBeforeSealSpecs(
+    specs: *std.array_list.Managed(OperationSpec),
+    hooks: []const Hook,
+    selinux: SelinuxPolicy,
+) Allocator.Error!void {
+    for (hooks) |hook| if (hook.phase == .before_seal) {
+        try specs.append(.{ .phase = .before_seal, .action = .execute_hook });
+    };
+    if (selinux != .unchanged) {
+        try specs.append(.{ .phase = .selinux, .action = .apply_selinux_policy });
+    }
+}
+
+fn appendFinalizeHookSpecs(
+    specs: *std.array_list.Managed(OperationSpec),
+    hooks: []const Hook,
+) Allocator.Error!void {
+    for (hooks) |hook| if (hook.phase == .finalize) {
+        try specs.append(.{ .phase = .finalize, .action = .execute_hook });
+    };
+}
+
+fn hasExpectedOperations(allocator: Allocator, plan: *const ResolvedPlan) Allocator.Error!bool {
+    var specs = std.array_list.Managed(OperationSpec).init(allocator);
+    defer specs.deinit();
+    try appendBackendOperationSpecs(
+        &specs,
+        plan.data.execution.backend,
+        plan.data.storage,
+    );
+    try appendPreInitramfsOperationSpecs(&specs, plan.data.packages, plan.data.hooks);
+    try appendBackendFinalOperationSpecs(
+        &specs,
+        plan.data.execution.backend,
+        plan.data.boot_security,
+        plan.data.storage,
+        plan.data.hooks,
+        plan.data.initramfs,
+        plan.data.selinux,
+    );
+    if (plan.data.operations.len != specs.items.len) return false;
+    for (plan.data.operations, specs.items, 0..) |operation, spec, index| {
         if (operation.id != index or operation.phase != spec.phase or operation.action != spec.action) return false;
         if (index == 0) {
             if (operation.depends_on.len != 0) return false;
@@ -1397,15 +2554,55 @@ fn buildCapabilities(
     allocator: Allocator,
     input: ResolvedInput,
     output: ResolvedOutput,
+    storage: ResolvedStorage,
     execution: ExecutionPolicy,
     transaction_path: []const u8,
     customization: OsCustomization,
+    existing_operations: []const ExistingPathOperation,
+    packages: PackagePolicy,
+    hooks: []const Hook,
+    initramfs: InitramfsPolicy,
+    selinux: SelinuxPolicy,
+    generalization_policy: GeneralizationPolicy,
+    boot_policy: BootSecurityPolicy,
+    cross_architecture: CrossArchitecturePolicy,
+    target_architecture: Architecture,
+    host_architecture: Architecture,
 ) Allocator.Error![]CapabilityRequirement {
     var capabilities = std.array_list.Managed(CapabilityRequirement).init(allocator);
     defer capabilities.deinit();
 
-    try capabilities.append(.{ .kind = .read_iso, .path = input.iso_path, .reason = "read the source ISO" });
-    try capabilities.append(.{ .kind = .read_container, .path = input.container_path, .reason = "read the source OCI layout or archive" });
+    switch (input) {
+        .iso_oci => |iso_oci| {
+            try capabilities.append(.{ .kind = .read_iso, .path = iso_oci.iso_path, .reason = "read the source ISO" });
+            try capabilities.append(.{ .kind = .read_container, .path = iso_oci.container_path, .reason = "read the source OCI layout or archive" });
+            try appendIsolationCapability(&capabilities, output.path, iso_oci.iso_path, "keep the output distinct from the source ISO");
+            try appendIsolationCapability(&capabilities, output.path, iso_oci.container_path, "keep the output outside the source container");
+        },
+        .disk => |disk| {
+            try capabilities.append(.{ .kind = .read_disk, .path = disk.path, .reason = "read the preserved source disk without write access" });
+            for (disk.dependencies) |dependency| {
+                try capabilities.append(.{
+                    .kind = .read_disk_dependency,
+                    .path = dependency,
+                    .reason = "read a declared qcow2 backing or external-data file",
+                });
+                try appendIsolationCapability(
+                    &capabilities,
+                    output.path,
+                    dependency,
+                    "keep the output distinct from every preserved disk dependency",
+                );
+            }
+            try capabilities.append(.{
+                .kind = .disk_dependencies,
+                .path = disk.path,
+                .related_path = output.path,
+                .reason = "read and isolate every qcow2 backing or external-data file",
+            });
+            try appendIsolationCapability(&capabilities, output.path, disk.path, "keep the output distinct from the preserved source disk");
+        },
+    }
     for (customization.filesystem) |operation| switch (operation) {
         .put_file => |file| switch (file.source) {
             .host_path => |path| {
@@ -1414,29 +2611,36 @@ fn buildCapabilities(
                     .path = path,
                     .reason = "read a declared customization file",
                 });
-                try capabilities.append(.{
-                    .kind = .path_isolation,
-                    .path = output.path,
-                    .related_path = path,
-                    .reason = "keep the output distinct from customization source files",
-                });
+                try appendIsolationCapability(&capabilities, output.path, path, "keep the output distinct from customization source files");
             },
             .inline_bytes => {},
         },
         else => {},
     };
-    try capabilities.append(.{
-        .kind = .path_isolation,
-        .path = output.path,
-        .related_path = input.iso_path,
-        .reason = "keep the output distinct from the source ISO",
-    });
-    try capabilities.append(.{
-        .kind = .path_isolation,
-        .path = output.path,
-        .related_path = input.container_path,
-        .reason = "keep the output outside the source container",
-    });
+    for (existing_operations) |operation| switch (operation) {
+        .overwrite_file => |overwrite| switch (overwrite.source) {
+            .bytes => {},
+            .host_path => |path| {
+                try capabilities.append(.{ .kind = .read_edit_source, .path = path, .reason = "read a declared existing-file replacement source" });
+                try appendIsolationCapability(&capabilities, output.path, path, "keep the output distinct from edit source files");
+            },
+        },
+        .remove_file, .remove_tree => {},
+    };
+    for (packages.repositories) |repository| for (repository.trust) |trust| switch (trust) {
+        .inline_bytes => {},
+        .host_path => |path| {
+            try capabilities.append(.{ .kind = .read_trust_source, .path = path, .reason = "read declared package trust material" });
+            try appendIsolationCapability(&capabilities, output.path, path, "keep the output distinct from package trust sources");
+        },
+    };
+    for (hooks) |hook| switch (hook.source) {
+        .inline_script => {},
+        .host_path => |path| {
+            try capabilities.append(.{ .kind = .read_hook_source, .path = path, .reason = "read a declared hook script" });
+            try appendIsolationCapability(&capabilities, output.path, path, "keep the output distinct from hook sources");
+        },
+    };
     try capabilities.append(.{
         .kind = .write_workspace_parent,
         .path = execution.workspace_path,
@@ -1451,9 +2655,123 @@ fn buildCapabilities(
         try capabilities.append(.{ .kind = .output_absent, .path = output.path, .reason = "preserve an existing output" });
     }
     try capabilities.append(.{ .kind = .transaction_absent, .path = transaction_path, .reason = "avoid colliding with another or stale transaction" });
-    try capabilities.append(.{ .kind = .unprivileged_native_backend, .path = "", .reason = "execute the selected rootless native backend" });
+    switch (execution.backend) {
+        .native_fresh => try capabilities.append(.{ .kind = .native_fresh, .path = "", .reason = "execute the selected rootless native-fresh backend" }),
+        .native_edit => {
+            try capabilities.append(.{ .kind = .native_edit, .path = "", .reason = "execute the rootless preserved-image editor" });
+            try capabilities.append(.{ .kind = .partition_edit, .path = "", .reason = "edit the explicitly selected existing partition" });
+            try capabilities.append(.{ .kind = .standalone_output, .path = output.path, .reason = "publish a standalone output with any backing chain flattened" });
+        },
+        .rebuild => {
+            try capabilities.append(.{ .kind = .rebuild, .path = "", .reason = "the rebuild backend is not implemented" });
+            try capabilities.append(.{ .kind = .standalone_output, .path = output.path, .reason = "publish a standalone rebuilt output" });
+        },
+        .unsafe_chroot => {
+            try capabilities.append(.{ .kind = .unsafe_chroot, .path = "", .reason = "unsafe host-code execution through chroot is not implemented and chroot is not a sandbox" });
+            try capabilities.append(.{ .kind = .guest_execution, .path = "", .reason = "execute target code on the host" });
+            try capabilities.append(.{ .kind = .standalone_output, .path = output.path, .reason = "publish a standalone output" });
+        },
+        .vm => {
+            try capabilities.append(.{ .kind = .vm, .path = "", .reason = "the VM customization backend is not implemented" });
+            try capabilities.append(.{ .kind = .guest_execution, .path = "", .reason = "execute target code in a VM" });
+            try capabilities.append(.{ .kind = .standalone_output, .path = output.path, .reason = "publish a standalone output" });
+        },
+    }
+    if (execution.backend != .native_fresh and hasOsCustomization(customization)) {
+        try capabilities.append(.{ .kind = .arbitrary_filesystem_mutation, .path = "", .reason = "general preserved-filesystem creation and metadata mutation are not implemented" });
+    }
+    if (packages.actions.len != 0) {
+        try capabilities.append(.{ .kind = .package_management, .path = "", .reason = "execute declared package actions" });
+        try capabilities.append(.{ .kind = .guest_execution, .path = "", .reason = "run the target package manager" });
+    }
+    if (packages.repositories.len != 0) {
+        try capabilities.append(.{ .kind = .repository_access, .path = "", .reason = "access only explicitly declared package repositories" });
+        try capabilities.append(.{ .kind = .repository_trust, .path = "", .reason = "install explicitly declared repository trust material" });
+    }
+    if (packages.cache == .cache_only) {
+        try capabilities.append(.{ .kind = .package_cache, .path = "", .reason = "satisfy package actions from the declared offline cache" });
+    }
+    if (packages.lock != .unlocked) {
+        try capabilities.append(.{ .kind = .package_lock, .path = "", .reason = "enforce the declared package snapshot or exact-version lock" });
+    }
+    if (hooks.len != 0) {
+        try capabilities.append(.{ .kind = .script_execution, .path = "", .reason = "execute explicitly acknowledged scripts using an unsafe-capable backend" });
+        try capabilities.append(.{ .kind = .guest_execution, .path = "", .reason = "execute target hook code" });
+    }
+    if (initramfs != .unchanged) {
+        try capabilities.append(.{ .kind = .initramfs_regeneration, .path = "", .reason = "regenerate initramfs with the declared policy" });
+        try capabilities.append(.{ .kind = .guest_execution, .path = "", .reason = "run the target initramfs generator" });
+    }
+    switch (selinux) {
+        .unchanged => {},
+        .configure => |configure| {
+            try capabilities.append(.{ .kind = .selinux_policy, .path = "", .reason = "apply the declared SELinux policy and mode" });
+            try capabilities.append(.{ .kind = .guest_execution, .path = "", .reason = "use target SELinux policy tooling" });
+            if (configure.relabel) {
+                try capabilities.append(.{ .kind = .selinux_relabel, .path = "", .reason = "relabel the preserved filesystem" });
+            }
+        },
+    }
+    if (execution.backend != .native_fresh and !isDefaultBootPolicy(boot_policy)) {
+        try capabilities.append(.{ .kind = .boot_policy_mutation, .path = "", .reason = "mutate preserved boot configuration" });
+    }
+    if (execution.backend != .native_fresh and generalization_policy != .none) {
+        try capabilities.append(.{ .kind = .generalization, .path = "", .reason = "apply preserved-image generalization" });
+    }
+    if (target_architecture != host_architecture and
+        (execution.backend == .unsafe_chroot or
+            execution.backend == .vm or
+            packages.actions.len != 0 or
+            hooks.len != 0 or
+            initramfs != .unchanged or
+            selinux != .unchanged))
+    {
+        const runner_path = switch (cross_architecture) {
+            .reject => "",
+            .runner => |runner| runner.command orelse "",
+        };
+        try capabilities.append(.{
+            .kind = .cross_architecture_runner,
+            .path = runner_path,
+            .reason = "execute target binaries only through the explicit compatible runner policy",
+        });
+    }
+    _ = storage;
     try capabilities.append(.{ .kind = .atomic_commit, .path = output.path, .reason = "publish output only after successful completion" });
     return try capabilities.toOwnedSlice();
+}
+
+fn appendIsolationCapability(
+    capabilities: *std.array_list.Managed(CapabilityRequirement),
+    output_path: []const u8,
+    source_path: []const u8,
+    reason: []const u8,
+) Allocator.Error!void {
+    try capabilities.append(.{
+        .kind = .path_isolation,
+        .path = output_path,
+        .related_path = source_path,
+        .reason = reason,
+    });
+}
+
+fn hasOsCustomization(customization: OsCustomization) bool {
+    return customization.filesystem.len != 0 or
+        customization.hostname != null or
+        customization.groups.len != 0 or
+        customization.users.len != 0 or
+        customization.services.len != 0 or
+        customization.kernel_modules.len != 0;
+}
+
+fn isDefaultBootPolicy(policy: BootSecurityPolicy) bool {
+    return policy.boot_mode == .bls_only and
+        !policy.verity and
+        policy.extra_kernel_options.len == 0 and
+        policy.uki.stub_source_path == null and
+        policy.uki.os_release_source_path == null and
+        policy.uki.splash_source_path == null and
+        std.mem.eql(u8, policy.uki.output_directory, "EFI/Linux");
 }
 
 fn deriveIdentifiers(seed: Seed) GeneratedIdentifiers {
@@ -1471,6 +2789,17 @@ fn deriveIdentifiers(seed: Seed) GeneratedIdentifiers {
         .vhdx_page83_guid = .{ .bytes = deriveGuid(seed, "vhdx-page83-guid") },
         .vhdx_write_guid_seed = .{ .bytes = derive(seed, "vhdx-write-guid-seed", 0) },
         .transaction_id = .{ .bytes = deriveUuid(seed, "transaction-id") },
+    };
+}
+
+fn outputIdentifiers(generated: GeneratedIdentifiers) OutputIdentifiers {
+    return .{
+        .output_unique_id = generated.output_unique_id,
+        .vhdx_header_sequence_base = generated.vhdx_header_sequence_base,
+        .vhdx_file_write_guid = generated.vhdx_file_write_guid,
+        .vhdx_data_write_guid = generated.vhdx_data_write_guid,
+        .vhdx_page83_guid = generated.vhdx_page83_guid,
+        .vhdx_write_guid_seed = generated.vhdx_write_guid_seed,
     };
 }
 
@@ -1536,7 +2865,7 @@ fn deriveNonzeroU32(seed: Seed, label: []const u8) u32 {
 
 fn hashPlan(plan: ResolvedPlanData) Digest {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("zvmi-resolved-plan-v1\x00");
+    hash.update("zvmi-resolved-plan-v3\x00");
     hashInt(&hash, plan.schema_version);
     hashInt(&hash, plan.request_api_version);
     hashInt(&hash, @intFromEnum(plan.architectures.host));
@@ -1544,18 +2873,40 @@ fn hashPlan(plan: ResolvedPlanData) Digest {
     hashInt(&hash, @intFromEnum(plan.architectures.firmware));
     hashInt(&hash, @intFromEnum(plan.architectures.repository));
     hashInt(&hash, @intFromEnum(plan.architectures.runner));
-    hashString(&hash, plan.input.iso_path);
-    hashString(&hash, plan.input.container_path);
-    hashString(&hash, plan.input.rootfs_path_in_iso);
+    hashInt(&hash, @intFromEnum(std.meta.activeTag(plan.input)));
+    switch (plan.input) {
+        .iso_oci => |input| {
+            hashString(&hash, input.iso_path);
+            hashString(&hash, input.container_path);
+            hashString(&hash, input.rootfs_path_in_iso);
+        },
+        .disk => |input| {
+            hashString(&hash, input.path);
+            hashStrings(&hash, input.dependencies);
+        },
+    }
     hashString(&hash, plan.output.path);
     hashInt(&hash, @intFromEnum(plan.output.format));
     hashInt(&hash, plan.output.requested_size);
     hashInt(&hash, plan.output.disk_size);
-    hashInt(&hash, @intFromEnum(plan.storage.generation));
-    hashInt(&hash, plan.storage.esp_size);
-    hashString(&hash, plan.storage.ext4_label);
-    hashBool(&hash, plan.storage.skip_iso_rootfs);
+    hashInt(&hash, @intFromEnum(plan.output.size_policy));
+    hashInt(&hash, @intFromEnum(std.meta.activeTag(plan.storage)));
+    switch (plan.storage) {
+        .fresh => |storage| {
+            hashInt(&hash, @intFromEnum(storage.generation));
+            hashInt(&hash, storage.esp_size);
+            hashString(&hash, storage.ext4_label);
+            hashBool(&hash, storage.skip_iso_rootfs);
+        },
+        .preserve => |storage| hashPartitionSelector(&hash, storage.root_partition),
+    }
     hashOsCustomization(&hash, plan.os);
+    hashExistingPathOperations(&hash, plan.existing_path_operations);
+    hashPackagePolicy(&hash, plan.packages);
+    hashHooks(&hash, plan.hooks);
+    hashInitramfsPolicy(&hash, plan.initramfs);
+    hashSelinuxPolicy(&hash, plan.selinux);
+    hashCrossArchitecturePolicy(&hash, plan.cross_architecture);
     hashInt(&hash, @intFromEnum(plan.boot_security.boot_mode));
     hashBool(&hash, plan.boot_security.verity);
     hashString(&hash, plan.boot_security.extra_kernel_options);
@@ -1567,29 +2918,35 @@ fn hashPlan(plan: ResolvedPlanData) Digest {
     hashString(&hash, plan.execution.workspace_path);
     hashInt(&hash, @intFromEnum(plan.execution.backend));
     hashBool(&hash, plan.execution.overwrite);
+    hashBool(&hash, plan.execution.acknowledge_unsafe);
     hash.update(&plan.reproducibility.seed.bytes);
     hashInt(&hash, plan.reproducibility.source_date_epoch);
     hashString(&hash, plan.transaction_path);
     hashString(&hash, plan.staging_output_path);
-    hash.update(&plan.generated.disk_guid.bytes);
-    hash.update(&plan.generated.esp_partition_guid.bytes);
-    hash.update(&plan.generated.root_partition_guid.bytes);
-    hash.update(&plan.generated.root_filesystem_uuid.bytes);
-    hashInt(&hash, plan.generated.mbr_disk_signature);
-    hash.update(&plan.generated.verity_salt.bytes);
-    hash.update(&plan.generated.output_unique_id.bytes);
-    hashInt(&hash, plan.generated.vhdx_header_sequence_base);
-    hash.update(&plan.generated.vhdx_file_write_guid.bytes);
-    hash.update(&plan.generated.vhdx_data_write_guid.bytes);
-    hash.update(&plan.generated.vhdx_page83_guid.bytes);
-    hash.update(&plan.generated.vhdx_write_guid_seed.bytes);
-    hash.update(&plan.generated.transaction_id.bytes);
+    hash.update(&plan.transaction_id.bytes);
+    hashOutputIdentifiers(&hash, plan.output_identifiers);
+    if (plan.generated) |generated| {
+        hash.update(&.{1});
+        hash.update(&generated.disk_guid.bytes);
+        hash.update(&generated.esp_partition_guid.bytes);
+        hash.update(&generated.root_partition_guid.bytes);
+        hash.update(&generated.root_filesystem_uuid.bytes);
+        hashInt(&hash, generated.mbr_disk_signature);
+        hash.update(&generated.verity_salt.bytes);
+        hashOutputIdentifiers(&hash, outputIdentifiers(generated));
+        hash.update(&generated.transaction_id.bytes);
+    } else {
+        hash.update(&.{0});
+    }
+    hashInt(&hash, plan.operations.len);
     for (plan.operations) |operation| {
         hashInt(&hash, operation.id);
         hashInt(&hash, @intFromEnum(operation.phase));
         hashInt(&hash, @intFromEnum(operation.action));
+        hashInt(&hash, operation.depends_on.len);
         for (operation.depends_on) |dependency| hashInt(&hash, dependency);
     }
+    hashInt(&hash, plan.required_capabilities.len);
     for (plan.required_capabilities) |capability| {
         hashInt(&hash, @intFromEnum(capability.kind));
         hashString(&hash, capability.path);
@@ -1675,6 +3032,143 @@ fn hashOsCustomization(hash: *std.crypto.hash.sha2.Sha256, customization: OsCust
         hashBool(hash, module.disabled);
         hashOptionalString(hash, module.options);
     }
+}
+
+fn hashExistingPathOperations(
+    hash: *std.crypto.hash.sha2.Sha256,
+    operations: []const ExistingPathOperation,
+) void {
+    hashInt(hash, operations.len);
+    for (operations) |operation| {
+        hashInt(hash, @intFromEnum(std.meta.activeTag(operation)));
+        switch (operation) {
+            .overwrite_file => |overwrite| {
+                hashString(hash, overwrite.path);
+                hashInt(hash, @intFromEnum(std.meta.activeTag(overwrite.source)));
+                switch (overwrite.source) {
+                    .bytes => |bytes| hashString(hash, bytes),
+                    .host_path => |path| hashString(hash, path),
+                }
+            },
+            .remove_file => |path| hashString(hash, path),
+            .remove_tree => |path| hashString(hash, path),
+        }
+    }
+}
+
+fn hashPackagePolicy(hash: *std.crypto.hash.sha2.Sha256, policy: PackagePolicy) void {
+    hashInt(hash, policy.actions.len);
+    for (policy.actions) |action| {
+        hashInt(hash, @intFromEnum(std.meta.activeTag(action)));
+        switch (action) {
+            .install => |packages| hashStrings(hash, packages),
+            .remove => |packages| hashStrings(hash, packages),
+            .update_all => {},
+            .update_selected => |packages| hashStrings(hash, packages),
+        }
+    }
+    hashInt(hash, policy.repositories.len);
+    for (policy.repositories) |repository| {
+        hashString(hash, repository.id);
+        hashStrings(hash, repository.urls);
+        hashInt(hash, repository.trust.len);
+        for (repository.trust) |trust| {
+            hashInt(hash, @intFromEnum(std.meta.activeTag(trust)));
+            switch (trust) {
+                .inline_bytes => |bytes| hashString(hash, bytes),
+                .host_path => |path| hashString(hash, path),
+            }
+        }
+    }
+    hashInt(hash, @intFromEnum(policy.cache));
+    hashInt(hash, @intFromEnum(std.meta.activeTag(policy.lock)));
+    switch (policy.lock) {
+        .unlocked => {},
+        .snapshot => |snapshot| hashString(hash, snapshot),
+        .exact => |locks| {
+            hashInt(hash, locks.len);
+            for (locks) |lock| {
+                hashString(hash, lock.name);
+                hashString(hash, lock.version);
+                hashString(hash, lock.repository_id);
+            }
+        },
+    }
+}
+
+fn hashHooks(hash: *std.crypto.hash.sha2.Sha256, hooks: []const Hook) void {
+    hashInt(hash, hooks.len);
+    for (hooks) |hook| {
+        hashString(hash, hook.name);
+        hashInt(hash, @intFromEnum(hook.phase));
+        hashInt(hash, @intFromEnum(std.meta.activeTag(hook.source)));
+        switch (hook.source) {
+            .inline_script => |script| hashString(hash, script),
+            .host_path => |path| hashString(hash, path),
+        }
+        hashStrings(hash, hook.arguments);
+    }
+}
+
+fn hashInitramfsPolicy(hash: *std.crypto.hash.sha2.Sha256, policy: InitramfsPolicy) void {
+    hashInt(hash, @intFromEnum(std.meta.activeTag(policy)));
+    switch (policy) {
+        .unchanged => {},
+        .regenerate => |regenerate| {
+            hashOptionalString(hash, regenerate.generator);
+            hashStrings(hash, regenerate.kernels);
+        },
+    }
+}
+
+fn hashSelinuxPolicy(hash: *std.crypto.hash.sha2.Sha256, policy: SelinuxPolicy) void {
+    hashInt(hash, @intFromEnum(std.meta.activeTag(policy)));
+    switch (policy) {
+        .unchanged => {},
+        .configure => |configure| {
+            hashInt(hash, @intFromEnum(configure.mode));
+            hashOptionalString(hash, configure.policy);
+            hashBool(hash, configure.relabel);
+        },
+    }
+}
+
+fn hashCrossArchitecturePolicy(
+    hash: *std.crypto.hash.sha2.Sha256,
+    policy: CrossArchitecturePolicy,
+) void {
+    hashInt(hash, @intFromEnum(std.meta.activeTag(policy)));
+    switch (policy) {
+        .reject => {},
+        .runner => |runner| {
+            hashInt(hash, @intFromEnum(runner.kind));
+            hashInt(hash, @intFromEnum(runner.guest_architecture));
+            hashOptionalString(hash, runner.command);
+        },
+    }
+}
+
+fn hashPartitionSelector(
+    hash: *std.crypto.hash.sha2.Sha256,
+    selector: PartitionSelector,
+) void {
+    hashInt(hash, @intFromEnum(std.meta.activeTag(selector)));
+    switch (selector) {
+        .gpt_index => |index| hashInt(hash, index),
+        .mbr_index => |index| hashInt(hash, index),
+    }
+}
+
+fn hashOutputIdentifiers(
+    hash: *std.crypto.hash.sha2.Sha256,
+    identifiers: OutputIdentifiers,
+) void {
+    hash.update(&identifiers.output_unique_id.bytes);
+    hashInt(hash, identifiers.vhdx_header_sequence_base);
+    hash.update(&identifiers.vhdx_file_write_guid.bytes);
+    hash.update(&identifiers.vhdx_data_write_guid.bytes);
+    hash.update(&identifiers.vhdx_page83_guid.bytes);
+    hash.update(&identifiers.vhdx_write_guid_seed.bytes);
 }
 
 fn hashMetadata(hash: *std.crypto.hash.sha2.Sha256, metadata: Metadata) void {
@@ -1822,7 +3316,35 @@ pub fn preflight(
     }
 
     for (requirements, 0..) |requirement, index| {
-        const state = platform.check(io, requirement);
+        const state: CapabilityState = switch (requirement.kind) {
+            .disk_dependencies => switch (plan.data.input) {
+                .disk => |disk| diskDependenciesAvailable(
+                    io,
+                    disk,
+                    plan.data.output.path,
+                ),
+                .iso_oci => .unsupported,
+            },
+            .rebuild,
+            .unsafe_chroot,
+            .vm,
+            .package_management,
+            .repository_access,
+            .repository_trust,
+            .package_cache,
+            .package_lock,
+            .script_execution,
+            .guest_execution,
+            .initramfs_regeneration,
+            .selinux_policy,
+            .selinux_relabel,
+            .cross_architecture_runner,
+            .arbitrary_filesystem_mutation,
+            .boot_policy_mutation,
+            .generalization,
+            => .unsupported,
+            else => platform.check(io, requirement),
+        };
         const owned_requirement = CapabilityRequirement{
             .kind = requirement.kind,
             .path = try report_allocator.dupe(u8, requirement.path),
@@ -1855,7 +3377,14 @@ fn systemCapabilityCheck(_: ?*anyopaque, io: Io, requirement: CapabilityRequirem
     return switch (requirement.kind) {
         .read_iso => if (isReadableKind(cwd, io, requirement.path, .file)) .available else .missing,
         .read_container => if (isReadablePath(cwd, io, requirement.path)) .available else .missing,
-        .read_customization_file => if (isReadableKind(cwd, io, requirement.path, .file)) .available else .missing,
+        .read_customization_file,
+        .read_disk,
+        .read_disk_dependency,
+        .read_edit_source,
+        .read_hook_source,
+        .read_trust_source,
+        => if (isReadableKind(cwd, io, requirement.path, .file)) .available else .missing,
+        .disk_dependencies => .unsupported,
         .write_workspace_parent => if (canCreatePath(cwd, io, requirement.path)) .available else .missing,
         .write_output_parent => if (canCreatePath(cwd, io, requirement.path)) .available else .missing,
         .output_absent, .transaction_absent => if (pathAbsent(cwd, io, requirement.path)) .available else .missing,
@@ -1864,8 +3393,70 @@ fn systemCapabilityCheck(_: ?*anyopaque, io: Io, requirement: CapabilityRequirem
                 break :blk .unsupported;
             break :blk if (overlaps) .missing else .available;
         },
-        .unprivileged_native_backend, .atomic_commit => .available,
+        .native_fresh,
+        .native_edit,
+        .partition_edit,
+        .standalone_output,
+        .atomic_commit,
+        => .available,
+        .rebuild,
+        .unsafe_chroot,
+        .vm,
+        .package_management,
+        .repository_access,
+        .repository_trust,
+        .package_cache,
+        .package_lock,
+        .script_execution,
+        .guest_execution,
+        .initramfs_regeneration,
+        .selinux_policy,
+        .selinux_relabel,
+        .cross_architecture_runner,
+        .arbitrary_filesystem_mutation,
+        .boot_policy_mutation,
+        .generalization,
+        => .unsupported,
     };
+}
+
+fn diskDependenciesAvailable(
+    io: Io,
+    disk: ResolvedDiskInput,
+    output_path: []const u8,
+) CapabilityState {
+    var image = image_mod.Image.openPathReadOnly(io, disk.path) catch |err| switch (err) {
+        error.FileNotFound => return .missing,
+        else => return .unsupported,
+    };
+    defer image.close(io);
+    const dependencies = image.sourceDependencyPaths(std.heap.page_allocator) catch return .unsupported;
+    defer {
+        for (dependencies) |path| std.heap.page_allocator.free(path);
+        std.heap.page_allocator.free(dependencies);
+    }
+    if (!samePathSet(disk.dependencies, dependencies)) return .missing;
+    for (disk.dependencies) |path| {
+        if (!isReadableKind(Io.Dir.cwd(), io, path, .file)) return .missing;
+        const overlaps = canonicalPathsOverlap(
+            Io.Dir.cwd(),
+            io,
+            output_path,
+            path,
+        ) orelse return .unsupported;
+        if (overlaps) return .missing;
+    }
+    return .available;
+}
+
+fn samePathSet(expected: []const []const u8, actual: []const []u8) bool {
+    if (expected.len != actual.len) return false;
+    for (expected) |expected_path| {
+        for (actual) |actual_path| {
+            if (std.mem.eql(u8, expected_path, actual_path)) break;
+        } else return false;
+    }
+    return true;
 }
 
 fn canonicalPathsOverlap(dir: Io.Dir, io: Io, first: []const u8, second: []const u8) ?bool {
@@ -1951,6 +3542,11 @@ pub const SourceKind = enum {
     iso,
     container,
     customization_file,
+    disk,
+    disk_dependency,
+    edit_source,
+    hook_source,
+    trust_source,
 };
 
 pub const SourceRecord = struct {
@@ -1978,6 +3574,12 @@ pub const ResolvedConfiguration = struct {
     output: ResolvedOutput,
     storage: ResolvedStorage,
     os: OsCustomization,
+    existing_path_operations: []const ExistingPathOperation,
+    packages: PackagePolicy,
+    hooks: []const Hook,
+    initramfs: InitramfsPolicy,
+    selinux: SelinuxPolicy,
+    cross_architecture: CrossArchitecturePolicy,
     boot_security: BootSecurityPolicy,
     generalization: GeneralizationPolicy,
     execution: ExecutionPolicy,
@@ -2017,6 +3619,17 @@ pub const PartitionStyleRecord = struct {
     message: []const u8,
 };
 
+pub const PreservedExecutionRecord = struct {
+    source_format: Format,
+    output_format: Format,
+    virtual_size: u64,
+    selected_partition: PartitionSelector,
+    partition_offset: u64,
+    partition_length: u64,
+    flattened_backing_chain: bool,
+    operation_count: usize,
+};
+
 pub const ExecutionRecord = struct {
     rootfs_path_in_iso: []const u8,
     root_tree_digest: ?Digest,
@@ -2025,6 +3638,7 @@ pub const ExecutionRecord = struct {
     vhd_alignment: ?azure.FixupResult,
     partition_style: ?PartitionStyleRecord,
     vhdx_metadata: ?VhdxMetadataRecord,
+    preserved: ?PreservedExecutionRecord,
 };
 
 pub const Provenance = struct {
@@ -2032,7 +3646,8 @@ pub const Provenance = struct {
     plan_hash: Digest,
     sources: []const SourceRecord,
     resolved: ResolvedConfiguration,
-    generated: GeneratedIdentifiers,
+    output_identifiers: OutputIdentifiers,
+    generated: ?GeneratedIdentifiers,
     reproducibility: Reproducibility,
     tools: []const ToolRecord,
     execution: ExecutionRecord,
@@ -2146,10 +3761,9 @@ fn failureOutcome(allocator: Allocator, diagnostics: []const Diagnostic) Allocat
 fn buildResult(
     allocator: Allocator,
     plan: *const ResolvedPlan,
-    report: ?*const build_image.BuildImageReport,
-    iso_digest: Digest,
-    container_digest: Digest,
-    customization_digests: []const SourceRecord,
+    fresh_report: ?*const build_image.BuildImageReport,
+    preserved_report: ?*const preserved_image.Report,
+    source_digests: []const SourceRecord,
     output_digest: Digest,
     output_file_size: u64,
 ) Allocator.Error!Result {
@@ -2158,17 +3772,21 @@ fn buildResult(
     const result_allocator = arena.allocator();
 
     const output_path = try result_allocator.dupe(u8, plan.data.output.path);
-    const input = ResolvedInput{
-        .iso_path = try result_allocator.dupe(u8, plan.data.input.iso_path),
-        .container_path = try result_allocator.dupe(u8, plan.data.input.container_path),
-        .rootfs_path_in_iso = try result_allocator.dupe(u8, plan.data.input.rootfs_path_in_iso),
+    const input: ResolvedInput = switch (plan.data.input) {
+        .iso_oci => |value| .{ .iso_oci = .{
+            .iso_path = try result_allocator.dupe(u8, value.iso_path),
+            .container_path = try result_allocator.dupe(u8, value.container_path),
+            .rootfs_path_in_iso = try result_allocator.dupe(u8, value.rootfs_path_in_iso),
+        } },
+        .disk => |value| .{ .disk = .{
+            .path = try result_allocator.dupe(u8, value.path),
+            .dependencies = try dupeStrings(result_allocator, value.dependencies),
+        } },
     };
-    const sources = try result_allocator.alloc(SourceRecord, 2 + customization_digests.len);
-    sources[0] = .{ .kind = .iso, .path = input.iso_path, .sha256 = iso_digest };
-    sources[1] = .{ .kind = .container, .path = input.container_path, .sha256 = container_digest };
-    for (customization_digests, 0..) |source, index| {
-        sources[index + 2] = .{
-            .kind = .customization_file,
+    const sources = try result_allocator.alloc(SourceRecord, source_digests.len);
+    for (source_digests, 0..) |source, index| {
+        sources[index] = .{
+            .kind = source.kind,
             .path = try result_allocator.dupe(u8, source.path),
             .sha256 = source.sha256,
         };
@@ -2178,23 +3796,41 @@ fn buildResult(
         .format = plan.data.output.format,
         .requested_size = plan.data.output.requested_size,
         .disk_size = plan.data.output.disk_size,
+        .size_policy = plan.data.output.size_policy,
     };
-    const resolved_storage = ResolvedStorage{
-        .generation = plan.data.storage.generation,
-        .esp_size = plan.data.storage.esp_size,
-        .ext4_label = try result_allocator.dupe(u8, plan.data.storage.ext4_label),
-        .skip_iso_rootfs = plan.data.storage.skip_iso_rootfs,
+    const resolved_storage: ResolvedStorage = switch (plan.data.storage) {
+        .fresh => |storage| .{ .fresh = .{
+            .generation = storage.generation,
+            .esp_size = storage.esp_size,
+            .ext4_label = try result_allocator.dupe(u8, storage.ext4_label),
+            .skip_iso_rootfs = storage.skip_iso_rootfs,
+        } },
+        .preserve => |storage| .{ .preserve = storage },
     };
     const resolved_execution = ExecutionPolicy{
         .workspace_path = try result_allocator.dupe(u8, plan.data.execution.workspace_path),
         .backend = plan.data.execution.backend,
         .overwrite = plan.data.execution.overwrite,
+        .acknowledge_unsafe = plan.data.execution.acknowledge_unsafe,
     };
     const resolved_boot = try dupeBootPolicy(result_allocator, plan.data.boot_security);
     const resolved_os = try dupeOsCustomization(result_allocator, plan.data.os, null);
+    const resolved_existing_operations = try dupeExistingPathOperations(
+        result_allocator,
+        plan.data.existing_path_operations,
+        null,
+    );
+    const resolved_packages = try dupePackagePolicy(result_allocator, plan.data.packages, null);
+    const resolved_hooks = try dupeHooks(result_allocator, plan.data.hooks, null);
+    const resolved_initramfs = try dupeInitramfsPolicy(result_allocator, plan.data.initramfs);
+    const resolved_selinux = try dupeSelinuxPolicy(result_allocator, plan.data.selinux);
+    const resolved_cross_architecture = try dupeCrossArchitecturePolicy(
+        result_allocator,
+        plan.data.cross_architecture,
+    );
     const resolved_generalization = try dupeGeneralization(result_allocator, plan.data.generalization);
     const operations = try dupeOperations(result_allocator, plan.data.operations);
-    const partitions = if (report) |build_report| blk: {
+    const partitions = if (fresh_report) |build_report| blk: {
         const records = try result_allocator.alloc(PartitionRecord, build_report.planned_partitions.len);
         for (build_report.planned_partitions, 0..) |partition, index| {
             records[index] = .{
@@ -2208,7 +3844,7 @@ fn buildResult(
         }
         break :blk records;
     } else &.{};
-    const verity_record = if (report) |build_report|
+    const verity_record = if (fresh_report) |build_report|
         if (build_report.verity) |verity_info| VerityRecord{
             .format = verity_info.format,
             .hash_algorithm = try result_allocator.dupe(u8, verity_info.hashAlgorithm),
@@ -2222,17 +3858,29 @@ fn buildResult(
         } else null
     else
         null;
-    const partition_style = if (report) |build_report|
+    const partition_style = if (fresh_report) |build_report|
         if (build_report.partition_style) |style| PartitionStyleRecord{
             .ok = style.ok,
             .message = try result_allocator.dupe(u8, style.message),
         } else null
     else
         null;
-    const actual_rootfs_path = if (report) |build_report|
+    const actual_rootfs_path = if (fresh_report) |build_report|
         try result_allocator.dupe(u8, build_report.rootfs_path_in_iso)
-    else
-        input.rootfs_path_in_iso;
+    else switch (input) {
+        .iso_oci => |iso_oci| iso_oci.rootfs_path_in_iso,
+        .disk => "",
+    };
+    const preserved_record = if (preserved_report) |report| PreservedExecutionRecord{
+        .source_format = report.source_format,
+        .output_format = report.output_format,
+        .virtual_size = report.virtual_size,
+        .selected_partition = plan.data.storage.preserve.root_partition,
+        .partition_offset = report.partition_offset,
+        .partition_length = report.partition_length,
+        .flattened_backing_chain = report.flattened_backing_chain,
+        .operation_count = report.operation_count,
+    } else null;
 
     return .{
         .arena = arena,
@@ -2246,25 +3894,32 @@ fn buildResult(
                 .output = resolved_output,
                 .storage = resolved_storage,
                 .os = resolved_os,
+                .existing_path_operations = resolved_existing_operations,
+                .packages = resolved_packages,
+                .hooks = resolved_hooks,
+                .initramfs = resolved_initramfs,
+                .selinux = resolved_selinux,
+                .cross_architecture = resolved_cross_architecture,
                 .boot_security = resolved_boot,
                 .generalization = resolved_generalization,
                 .execution = resolved_execution,
                 .operations = operations,
             },
+            .output_identifiers = plan.data.output_identifiers,
             .generated = plan.data.generated,
             .reproducibility = plan.data.reproducibility,
             .tools = &.{},
             .execution = .{
                 .rootfs_path_in_iso = actual_rootfs_path,
-                .root_tree_digest = if (report) |build_report|
+                .root_tree_digest = if (fresh_report) |build_report|
                     if (build_report.root_tree_digest) |digest| .{ .bytes = digest } else null
                 else
                     null,
                 .partitions = partitions,
                 .verity = verity_record,
-                .vhd_alignment = if (report) |build_report| build_report.vhd_alignment else null,
+                .vhd_alignment = if (fresh_report) |build_report| build_report.vhd_alignment else null,
                 .partition_style = partition_style,
-                .vhdx_metadata = if (report) |build_report|
+                .vhdx_metadata = if (fresh_report) |build_report|
                     if (build_report.vhdx_metadata) |metadata| .{
                         .header_sequence_number = metadata.header_sequence_number,
                         .file_write_guid = .{ .bytes = metadata.file_write_guid },
@@ -2273,6 +3928,7 @@ fn buildResult(
                     } else null
                 else
                     null,
+                .preserved = preserved_record,
             },
             .final_output = .{
                 .path = output_path,
@@ -2328,22 +3984,13 @@ pub fn execute(
         emitDiagnostics(event_sink, diagnostics.items);
         return try failureOutcome(allocator, diagnostics.items);
     }
-    const iso_digest_before = hashPath(allocator, io, plan.data.input.iso_path) catch |err| {
-        try appendFailure(&diagnostics, .source_hash_failed, .execution, "/input/iso_oci/iso_path", "failed to hash the source ISO", err);
+
+    const source_digests_before = hashPlanSources(allocator, io, plan) catch |err| {
+        try appendFailure(&diagnostics, .source_hash_failed, .execution, "/input", "failed to hash a declared source", err);
         emitDiagnostics(event_sink, diagnostics.items);
         return try failureOutcome(allocator, diagnostics.items);
     };
-    const container_digest_before = hashPath(allocator, io, plan.data.input.container_path) catch |err| {
-        try appendFailure(&diagnostics, .source_hash_failed, .execution, "/input/iso_oci/container_path", "failed to hash the source container", err);
-        emitDiagnostics(event_sink, diagnostics.items);
-        return try failureOutcome(allocator, diagnostics.items);
-    };
-    const customization_digests_before = hashCustomizationSources(allocator, io, plan.data.os) catch |err| {
-        try appendFailure(&diagnostics, .source_hash_failed, .execution, "/os/filesystem", "failed to hash a customization source file", err);
-        emitDiagnostics(event_sink, diagnostics.items);
-        return try failureOutcome(allocator, diagnostics.items);
-    };
-    defer allocator.free(customization_digests_before);
+    defer freeSourceRecords(allocator, source_digests_before);
 
     const cwd = Io.Dir.cwd();
     cwd.createDirPath(io, plan.data.execution.workspace_path) catch |err| {
@@ -2363,37 +4010,61 @@ pub fn execute(
         .event_sink = event_sink,
         .diagnostics = &diagnostics,
     };
-    var report = runPlan(allocator, io, plan, platform, event_sink, &bridge) catch |err| {
-        try appendFailure(&diagnostics, .execution_failed, .execution, "", "image execution failed", err);
-        if (cleanupTransaction(io, plan.data.transaction_path)) |diagnostic| try diagnostics.append(diagnostic);
-        emitDiagnostics(event_sink, diagnostics.items);
-        return try failureOutcome(allocator, diagnostics.items);
-    };
-    defer if (report) |*build_report| build_report.deinit(allocator);
+    var fresh_report: ?build_image.BuildImageReport = null;
+    defer if (fresh_report) |*report| report.deinit(allocator);
+    var preserved_report: ?preserved_image.Report = null;
+    switch (plan.data.execution.backend) {
+        .native_fresh => {
+            fresh_report = runPlan(allocator, io, plan, platform, event_sink, &bridge) catch |err| {
+                try appendFailure(&diagnostics, .execution_failed, .execution, "", "native-fresh execution failed", err);
+                if (cleanupTransaction(io, plan.data.transaction_path)) |diagnostic| try diagnostics.append(diagnostic);
+                emitDiagnostics(event_sink, diagnostics.items);
+                return try failureOutcome(allocator, diagnostics.items);
+            };
+        },
+        .native_edit => {
+            if (event_sink) |sink| sink.emit(.{ .progress = .{
+                .phase = .execution,
+                .message = "copy and edit preserved disk",
+            } });
+            preserved_report = preserved_image.edit(allocator, io, .{
+                .source_path = plan.data.input.disk.path,
+                .output_path = plan.data.staging_output_path,
+                .output_format = plan.data.output.format.imageFormat().?,
+                .root_partition = plan.data.storage.preserve.root_partition,
+                .operations = plan.data.existing_path_operations,
+                .expected_virtual_size = null,
+                .output_create_options = outputCreateOptions(plan),
+            }) catch |err| {
+                try appendFailure(&diagnostics, .execution_failed, .execution, "/existing_path_operations", "native preserved-image execution failed", err);
+                if (cleanupTransaction(io, plan.data.transaction_path)) |diagnostic| try diagnostics.append(diagnostic);
+                emitDiagnostics(event_sink, diagnostics.items);
+                return try failureOutcome(allocator, diagnostics.items);
+            };
+        },
+        .rebuild, .unsafe_chroot, .vm => {
+            try diagnostics.append(.{
+                .severity = .@"error",
+                .phase = .execution,
+                .code = .execution_failed,
+                .configuration_path = "/execution/backend",
+                .message = "the selected backend has no runtime implementation",
+                .remediation = "do not override its unsupported preflight capability",
+            });
+            if (cleanupTransaction(io, plan.data.transaction_path)) |diagnostic| try diagnostics.append(diagnostic);
+            emitDiagnostics(event_sink, diagnostics.items);
+            return try failureOutcome(allocator, diagnostics.items);
+        },
+    }
 
-    const iso_digest_after = hashPath(allocator, io, plan.data.input.iso_path) catch |err| {
-        try appendFailure(&diagnostics, .source_hash_failed, .execution, "/input/iso_oci/iso_path", "failed to verify the source ISO hash", err);
+    const source_digests_after = hashPlanSources(allocator, io, plan) catch |err| {
+        try appendFailure(&diagnostics, .source_hash_failed, .execution, "/input", "failed to verify a declared source hash", err);
         if (cleanupTransaction(io, plan.data.transaction_path)) |diagnostic| try diagnostics.append(diagnostic);
         emitDiagnostics(event_sink, diagnostics.items);
         return try failureOutcome(allocator, diagnostics.items);
     };
-    const container_digest_after = hashPath(allocator, io, plan.data.input.container_path) catch |err| {
-        try appendFailure(&diagnostics, .source_hash_failed, .execution, "/input/iso_oci/container_path", "failed to verify the source container hash", err);
-        if (cleanupTransaction(io, plan.data.transaction_path)) |diagnostic| try diagnostics.append(diagnostic);
-        emitDiagnostics(event_sink, diagnostics.items);
-        return try failureOutcome(allocator, diagnostics.items);
-    };
-    const customization_digests_after = hashCustomizationSources(allocator, io, plan.data.os) catch |err| {
-        try appendFailure(&diagnostics, .source_hash_failed, .execution, "/os/filesystem", "failed to verify a customization source hash", err);
-        if (cleanupTransaction(io, plan.data.transaction_path)) |diagnostic| try diagnostics.append(diagnostic);
-        emitDiagnostics(event_sink, diagnostics.items);
-        return try failureOutcome(allocator, diagnostics.items);
-    };
-    defer allocator.free(customization_digests_after);
-    if (!std.mem.eql(u8, &iso_digest_before.bytes, &iso_digest_after.bytes) or
-        !std.mem.eql(u8, &container_digest_before.bytes, &container_digest_after.bytes) or
-        !sourceRecordsEqual(customization_digests_before, customization_digests_after))
-    {
+    defer freeSourceRecords(allocator, source_digests_after);
+    if (!sourceRecordsEqual(source_digests_before, source_digests_after)) {
         try diagnostics.append(.{
             .severity = .@"error",
             .phase = .execution,
@@ -2423,10 +4094,9 @@ pub fn execute(
     var result = try buildResult(
         allocator,
         plan,
-        if (report) |*build_report| build_report else null,
-        iso_digest_before,
-        container_digest_before,
-        customization_digests_before,
+        if (fresh_report) |*report| report else null,
+        if (preserved_report) |*report| report else null,
+        source_digests_before,
         output_digest,
         output_file_size,
     );
@@ -2479,18 +4149,70 @@ fn hasValidPlanIntegrity(allocator: Allocator, plan: *const ResolvedPlan) Alloca
     const computed_hash = hashPlan(data.*);
     if (data.schema_version != plan_schema_version or
         data.request_api_version != current_api_version or
-        data.execution.backend != .native or
         data.output.format.imageFormat() == null or
-        !hasExpectedNativeOperations(plan) or
         !std.mem.eql(u8, &computed_hash.bytes, &data.plan_hash.bytes))
     {
         return false;
     }
-    if (data.storage.generation == .gen1 and data.architectures.image != .x86_64) return false;
+    var expected_generated = deriveIdentifiers(data.reproducibility.seed);
+    const expected_transaction_id = deriveTransactionId(data.reproducibility.seed, data.output.path);
+    expected_generated.transaction_id = expected_transaction_id;
+    if (!std.meta.eql(data.transaction_id, expected_transaction_id) or
+        !std.meta.eql(data.output_identifiers, outputIdentifiers(expected_generated)))
+    {
+        return false;
+    }
+    switch (data.execution.backend) {
+        .native_fresh => {
+            if (data.input != .iso_oci or data.storage != .fresh or data.generated == null or
+                data.output.size_policy != .explicit)
+            {
+                return false;
+            }
+            if (!std.meta.eql(data.generated.?, expected_generated)) return false;
+            if (data.storage.fresh.generation == .gen1 and data.architectures.image != .x86_64) return false;
+        },
+        .native_edit, .rebuild, .unsafe_chroot, .vm => {
+            if (data.input != .disk or data.storage != .preserve or data.generated != null or
+                data.output.size_policy != .preserve_source or data.output.requested_size != 0 or
+                data.output.disk_size != 0)
+            {
+                return false;
+            }
+        },
+    }
+    if (!try hasExpectedOperations(allocator, plan)) return false;
+    const needs_guest_execution = data.execution.backend == .unsafe_chroot or
+        data.execution.backend == .vm or
+        data.packages.actions.len != 0 or
+        data.hooks.len != 0 or
+        data.initramfs != .unchanged or
+        data.selinux != .unchanged;
+    if (needs_guest_execution and data.architectures.image != data.architectures.host) {
+        switch (data.cross_architecture) {
+            .reject => return false,
+            .runner => |runner| {
+                if (runner.guest_architecture != data.architectures.image or
+                    data.architectures.runner != data.architectures.image or
+                    (data.execution.backend == .vm and runner.kind != .vm) or
+                    (data.execution.backend == .unsafe_chroot and runner.kind == .vm))
+                {
+                    return false;
+                }
+            },
+        }
+    }
+    if (data.execution.backend == .unsafe_chroot and !data.execution.acknowledge_unsafe) return false;
+    if (data.hooks.len != 0 and
+        (!data.execution.acknowledge_unsafe or
+            (data.execution.backend != .unsafe_chroot and data.execution.backend != .vm)))
+    {
+        return false;
+    }
     const output_parent = std.fs.path.dirname(data.output.path) orelse ".";
     if (!std.mem.eql(u8, output_parent, data.execution.workspace_path)) return false;
 
-    const transaction_hex = std.fmt.bytesToHex(data.generated.transaction_id.bytes, .lower);
+    const transaction_hex = std.fmt.bytesToHex(data.transaction_id.bytes, .lower);
     const transaction_name = try std.fmt.allocPrint(allocator, ".zvmi-{s}", .{transaction_hex});
     defer allocator.free(transaction_name);
     const expected_transaction = try std.fs.path.join(allocator, &.{ data.execution.workspace_path, transaction_name });
@@ -2509,6 +4231,7 @@ fn runPlan(
     event_sink: ?EventSink,
     bridge: *BuildEventBridge,
 ) !?build_image.BuildImageReport {
+    if (plan.data.execution.backend != .native_fresh) return error.InvalidBackend;
     var stage_bridge = NativeStageBridge{ .operations = plan.data.operations };
     const stage_sink = build_image.StageSink{ .context = &stage_bridge, .advanceFn = NativeStageBridge.advance };
     if (platform.runFn) |run| {
@@ -2525,20 +4248,22 @@ fn runPlan(
 }
 
 fn buildOptionsFromPlan(plan: *const ResolvedPlan, bridge: *BuildEventBridge) build_image.BuildImageOptions {
-    const generated = plan.data.generated;
+    const generated = plan.data.generated.?;
+    const input = plan.data.input.iso_oci;
+    const storage = plan.data.storage.fresh;
     return .{
-        .iso_path = plan.data.input.iso_path,
-        .container_path = plan.data.input.container_path,
+        .iso_path = input.iso_path,
+        .container_path = input.container_path,
         .output_path = plan.data.staging_output_path,
         .size = plan.data.output.disk_size,
-        .generation = plan.data.storage.generation,
+        .generation = storage.generation,
         .output_format = plan.data.output.format.imageFormat().?,
-        .rootfs_path_in_iso = plan.data.input.rootfs_path_in_iso,
-        .skip_iso_rootfs = plan.data.storage.skip_iso_rootfs,
+        .rootfs_path_in_iso = input.rootfs_path_in_iso,
+        .skip_iso_rootfs = storage.skip_iso_rootfs,
         .os = plan.data.os,
         .generalization = plan.data.generalization,
-        .esp_size = plan.data.storage.esp_size,
-        .ext4_label = plan.data.storage.ext4_label,
+        .esp_size = storage.esp_size,
+        .ext4_label = storage.ext4_label,
         .verity = plan.data.boot_security.verity,
         .extra_kernel_options = plan.data.boot_security.extra_kernel_options,
         .boot_mode = plan.data.boot_security.boot_mode,
@@ -2581,7 +4306,7 @@ const NativeStageBridge = struct {
         const self: *NativeStageBridge = @ptrCast(@alignCast(context.?));
         if (self.next >= self.operations.len) return false;
         const operation = self.operations[self.next];
-        if (operation.action != stage) return false;
+        if (operation.action != actionForFreshStage(stage)) return false;
         for (operation.depends_on) |dependency| {
             if (dependency >= self.next) return false;
         }
@@ -2589,6 +4314,55 @@ const NativeStageBridge = struct {
         return true;
     }
 };
+
+fn actionForFreshStage(stage: build_image.Stage) Action {
+    return switch (stage) {
+        .load_sources => .load_sources,
+        .apply_filesystem_changes => .apply_filesystem_changes,
+        .generalize_and_cleanup => .generalize_and_cleanup,
+        .prepare_initramfs => .prepare_initramfs,
+        .prepare_boot_configuration => .prepare_boot_configuration,
+        .populate_filesystem => .populate_filesystem,
+        .seal_verity => .seal_verity,
+        .install_bootloader => .install_bootloader,
+        .generate_uki => .generate_uki,
+        .check_and_close_filesystems => .check_and_close_filesystems,
+        .convert_output => .convert_output,
+    };
+}
+
+fn freshStageForAction(action: Action) ?build_image.Stage {
+    return switch (action) {
+        .load_sources => .load_sources,
+        .apply_filesystem_changes => .apply_filesystem_changes,
+        .generalize_and_cleanup => .generalize_and_cleanup,
+        .prepare_initramfs => .prepare_initramfs,
+        .prepare_boot_configuration => .prepare_boot_configuration,
+        .populate_filesystem => .populate_filesystem,
+        .seal_verity => .seal_verity,
+        .install_bootloader => .install_bootloader,
+        .generate_uki => .generate_uki,
+        .check_and_close_filesystems => .check_and_close_filesystems,
+        .convert_output => .convert_output,
+        else => null,
+    };
+}
+
+fn outputCreateOptions(plan: *const ResolvedPlan) image_mod.CreateOptions {
+    const identifiers = plan.data.output_identifiers;
+    return .{
+        .vhd_subformat = .fixed,
+        .unique_id = identifiers.output_unique_id.bytes,
+        .timestamp_unix = @intCast(plan.data.reproducibility.source_date_epoch),
+        .vhdx = .{
+            .header_sequence_base = identifiers.vhdx_header_sequence_base,
+            .file_write_guid = identifiers.vhdx_file_write_guid.bytes,
+            .data_write_guid = identifiers.vhdx_data_write_guid.bytes,
+            .page83_guid = identifiers.vhdx_page83_guid.bytes,
+            .write_guid_seed = identifiers.vhdx_write_guid_seed.bytes,
+        },
+    };
+}
 
 const BuildEventBridge = struct {
     event_sink: ?EventSink,
@@ -2659,34 +4433,79 @@ const HashEntry = struct {
     kind: Io.File.Kind,
 };
 
-fn hashCustomizationSources(
+fn hashPlanSources(
     allocator: Allocator,
     io: Io,
-    customization: OsCustomization,
+    plan: *const ResolvedPlan,
 ) ![]SourceRecord {
     var records = std.array_list.Managed(SourceRecord).init(allocator);
-    errdefer records.deinit();
-    for (customization.filesystem) |operation| switch (operation) {
+    errdefer {
+        for (records.items) |record| allocator.free(record.path);
+        records.deinit();
+    }
+
+    switch (plan.data.input) {
+        .iso_oci => |input| {
+            try appendHashedSource(&records, allocator, io, .iso, input.iso_path);
+            try appendHashedSource(&records, allocator, io, .container, input.container_path);
+        },
+        .disk => |input| {
+            if (diskDependenciesAvailable(io, input, plan.data.output.path) != .available) {
+                return error.DiskDependencyMismatch;
+            }
+            try appendHashedSource(&records, allocator, io, .disk, input.path);
+            for (input.dependencies) |path| {
+                try appendHashedSource(&records, allocator, io, .disk_dependency, path);
+            }
+        },
+    }
+    for (plan.data.os.filesystem) |operation| switch (operation) {
         .put_file => |file| switch (file.source) {
             .inline_bytes => {},
-            .host_path => |path| {
-                var already_recorded = false;
-                for (records.items) |record| {
-                    if (std.mem.eql(u8, record.path, path)) {
-                        already_recorded = true;
-                        break;
-                    }
-                }
-                if (!already_recorded) try records.append(.{
-                    .kind = .customization_file,
-                    .path = path,
-                    .sha256 = try hashPath(allocator, io, path),
-                });
-            },
+            .host_path => |path| try appendHashedSource(&records, allocator, io, .customization_file, path),
         },
         else => {},
     };
+    for (plan.data.existing_path_operations) |operation| switch (operation) {
+        .overwrite_file => |overwrite| switch (overwrite.source) {
+            .bytes => {},
+            .host_path => |path| try appendHashedSource(&records, allocator, io, .edit_source, path),
+        },
+        .remove_file, .remove_tree => {},
+    };
+    for (plan.data.hooks) |hook| switch (hook.source) {
+        .inline_script => {},
+        .host_path => |path| try appendHashedSource(&records, allocator, io, .hook_source, path),
+    };
+    for (plan.data.packages.repositories) |repository| for (repository.trust) |trust| switch (trust) {
+        .inline_bytes => {},
+        .host_path => |path| try appendHashedSource(&records, allocator, io, .trust_source, path),
+    };
     return records.toOwnedSlice();
+}
+
+fn appendHashedSource(
+    records: *std.array_list.Managed(SourceRecord),
+    allocator: Allocator,
+    io: Io,
+    kind: SourceKind,
+    path: []const u8,
+) !void {
+    for (records.items) |record| {
+        if (record.kind == kind and std.mem.eql(u8, record.path, path)) return;
+    }
+    const owned_path = try allocator.dupe(u8, path);
+    errdefer allocator.free(owned_path);
+    try records.append(.{
+        .kind = kind,
+        .path = owned_path,
+        .sha256 = try hashPath(allocator, io, path),
+    });
+}
+
+fn freeSourceRecords(allocator: Allocator, records: []SourceRecord) void {
+    for (records) |record| allocator.free(record.path);
+    allocator.free(records);
 }
 
 fn sourceRecordsEqual(left: []const SourceRecord, right: []const SourceRecord) bool {
@@ -2810,6 +4629,335 @@ fn validRequest() Request {
             .source_date_epoch = 1_735_689_600,
         },
     };
+}
+
+const customize_test_disk_size: u64 = 32 * mib;
+const customize_test_partition_first_lba: u32 = 2048;
+const customize_test_partition_sectors: u32 = 48 * 1024;
+
+fn createCustomizeTestDisk(io: Io, path: []const u8, spool_path: []const u8) !void {
+    var image = try image_mod.Image.createExclusive(io, path, .raw, customize_test_disk_size, .{});
+    defer image.close(io);
+    const boot_record = mbr.singleLinuxPartitionMbr(
+        customize_test_partition_first_lba,
+        customize_test_partition_sectors,
+    ).encode();
+    try image.pwrite(io, &boot_record, 0);
+
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    var tree = try root_tree.RootTree.init(std.testing.allocator, io, spool_path, .{});
+    defer tree.deinit();
+    try tree.putDirectory("etc", .{ .mode = 0o755 });
+    try tree.putFileBytes("etc/config", "before\n", .{ .mode = 0o640, .uid = 12, .gid = 34 });
+    try tree.putFileBytes("etc/remove", "remove\n", .{ .mode = 0o644 });
+    try tree.putDirectory("var", .{ .mode = 0o755 });
+    try tree.putDirectory("var/drop", .{ .mode = 0o700 });
+    try tree.putFileBytes("var/drop/item", "drop\n", .{ .mode = 0o600 });
+    _ = try ext4.populate(io, image.file, std.testing.allocator, try tree.ext4View(), .{
+        .offset = @as(u64, customize_test_partition_first_lba) * mbr.sector_size,
+        .length = @as(u64, customize_test_partition_sectors) * mbr.sector_size,
+        .label = "customize-root",
+        .uuid = [_]u8{0x63} ** 16,
+        .timestamp = 1_735_689_600,
+    });
+}
+
+fn validNativeEditRequest(
+    source_path: []const u8,
+    output_path: []const u8,
+    workspace_path: []const u8,
+    operations: []const ExistingPathOperation,
+) Request {
+    return .{
+        .target_architecture = .x86_64,
+        .input = .{ .disk = .{ .path = source_path } },
+        .output = .{
+            .path = output_path,
+            .format = .raw,
+            .size_policy = .preserve_source,
+        },
+        .storage = .{ .preserve = .{
+            .root_partition = .{ .mbr_index = 1 },
+        } },
+        .existing_path_operations = operations,
+        .execution = .{
+            .workspace_path = workspace_path,
+            .backend = .native_edit,
+        },
+        .reproducibility = .{
+            .seed = .{ .bytes = [_]u8{0xA7} ** 32 },
+            .source_date_epoch = 1_735_689_600,
+        },
+    };
+}
+
+fn hasDiagnosticCode(diagnostics: DiagnosticSet, code: DiagnosticCode) bool {
+    for (diagnostics.items) |diagnostic| {
+        if (diagnostic.code == code) return true;
+    }
+    return false;
+}
+
+test "v2 native-fresh requests require the explicit adapter" {
+    var request_v2 = RequestV2{
+        .target_architecture = .x86_64,
+        .input = .{ .iso_oci = .{
+            .iso_path = "source.iso",
+            .container_path = "oci-layout",
+            .rootfs_path_in_iso = "images/rootfs.squashfs",
+        } },
+        .output = .{
+            .path = "output.raw",
+            .format = .raw,
+            .size = 128 * mib,
+        },
+        .storage = .{ .fresh = .{} },
+        .execution = .{ .workspace_path = "." },
+        .reproducibility = .{
+            .seed = .{ .bytes = [_]u8{0x19} ** 32 },
+            .source_date_epoch = 1_735_689_600,
+        },
+    };
+    const adapted = try adaptV2NativeFresh(&request_v2);
+    try std.testing.expectEqual(current_api_version, adapted.api_version);
+    try std.testing.expectEqual(ExecutionBackend.native_fresh, adapted.execution.backend);
+    try std.testing.expect(adapted.input == .iso_oci);
+    try std.testing.expect(adapted.storage == .fresh);
+    try std.testing.expectEqual(OutputSizePolicy.explicit, adapted.output.size_policy);
+
+    var disguised_v2 = adapted;
+    disguised_v2.api_version = legacy_api_version;
+    var diagnostics = try validate(std.testing.allocator, &disguised_v2);
+    defer diagnostics.deinit(std.testing.allocator);
+    try std.testing.expect(hasDiagnosticCode(diagnostics, .unsupported_api_version));
+
+    request_v2.execution.backend = .chroot;
+    try std.testing.expectError(error.UnsupportedV2Backend, adaptV2NativeFresh(&request_v2));
+    request_v2.execution.backend = .native;
+    request_v2.storage = .preserve;
+    try std.testing.expectError(error.UnsupportedV2Storage, adaptV2NativeFresh(&request_v2));
+}
+
+test "v3 validation models the backend and unsafe execution matrix" {
+    const no_operations: []const ExistingPathOperation = &.{};
+    var native_edit = validNativeEditRequest(
+        "source.raw",
+        "native-edit-work/output.raw",
+        "native-edit-work",
+        no_operations,
+    );
+    inline for (.{ ExecutionBackend.native_edit, .rebuild, .unsafe_chroot, .vm }) |backend| {
+        native_edit.execution.backend = backend;
+        native_edit.execution.acknowledge_unsafe = backend == .unsafe_chroot;
+        var diagnostics = try validate(std.testing.allocator, &native_edit);
+        defer diagnostics.deinit(std.testing.allocator);
+        try std.testing.expect(!diagnostics.hasErrors());
+    }
+
+    native_edit.execution.backend = .native_fresh;
+    var wrong_shape = try validate(std.testing.allocator, &native_edit);
+    defer wrong_shape.deinit(std.testing.allocator);
+    try std.testing.expect(hasDiagnosticCode(wrong_shape, .unsupported_input));
+    try std.testing.expect(hasDiagnosticCode(wrong_shape, .unsupported_storage));
+
+    native_edit.execution.backend = .native_edit;
+    native_edit.storage.preserve.root_partition = .{ .gpt_index = 0 };
+    var bad_partition = try validate(std.testing.allocator, &native_edit);
+    defer bad_partition.deinit(std.testing.allocator);
+    try std.testing.expect(hasDiagnosticCode(bad_partition, .invalid_partition_selector));
+
+    const hooks = [_]Hook{.{
+        .name = "unsafe-script",
+        .phase = .finalize,
+        .source = .{ .inline_script = "#!/bin/sh\ntrue\n" },
+    }};
+    native_edit.storage.preserve.root_partition = .{ .mbr_index = 1 };
+    native_edit.hooks = &hooks;
+    var unsafe_missing = try validate(std.testing.allocator, &native_edit);
+    defer unsafe_missing.deinit(std.testing.allocator);
+    try std.testing.expect(hasDiagnosticCode(unsafe_missing, .unsupported_execution_backend));
+    try std.testing.expect(hasDiagnosticCode(unsafe_missing, .unsafe_acknowledgement_required));
+
+    native_edit.execution.backend = .unsafe_chroot;
+    native_edit.execution.acknowledge_unsafe = true;
+    var unsafe_explicit = try validate(std.testing.allocator, &native_edit);
+    defer unsafe_explicit.deinit(std.testing.allocator);
+    try std.testing.expect(!unsafe_explicit.hasErrors());
+}
+
+test "cross-architecture guest execution requires an explicit compatible runner" {
+    const hooks = [_]Hook{.{
+        .name = "guest-script",
+        .phase = .finalize,
+        .source = .{ .inline_script = "#!/bin/sh\ntrue\n" },
+    }};
+    var request = validNativeEditRequest("source.raw", "output.raw", ".", &.{});
+    request.target_architecture = .aarch64;
+    request.execution.backend = .vm;
+    request.execution.acknowledge_unsafe = true;
+    request.hooks = &hooks;
+
+    var rejected = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer rejected.deinit(std.testing.allocator);
+    try std.testing.expect(rejected.plan == null);
+    try std.testing.expect(hasDiagnosticCode(rejected.diagnostics, .incompatible_architecture));
+
+    request.cross_architecture = .{ .runner = .{
+        .kind = .vm,
+        .guest_architecture = .aarch64,
+        .command = "qemu-system-aarch64",
+    } };
+    var accepted = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer accepted.deinit(std.testing.allocator);
+    try std.testing.expect(accepted.plan != null);
+    var saw_runner_capability = false;
+    for (accepted.plan.?.data.required_capabilities) |capability| {
+        saw_runner_capability = saw_runner_capability or capability.kind == .cross_architecture_runner;
+    }
+    try std.testing.expect(saw_runner_capability);
+}
+
+test "hook phases remain ordered in validation and resolved operations" {
+    const unordered_hooks = [_]Hook{
+        .{ .name = "final", .phase = .finalize, .source = .{ .inline_script = "true" } },
+        .{ .name = "early", .phase = .after_packages, .source = .{ .inline_script = "true" } },
+    };
+    var request = validNativeEditRequest("source.raw", "output.raw", ".", &.{});
+    request.execution.backend = .unsafe_chroot;
+    request.execution.acknowledge_unsafe = true;
+    request.hooks = &unordered_hooks;
+    var unordered = try validate(std.testing.allocator, &request);
+    defer unordered.deinit(std.testing.allocator);
+    try std.testing.expect(hasDiagnosticCode(unordered, .invalid_policy));
+
+    const ordered_hooks = [_]Hook{
+        .{ .name = "packages", .phase = .after_packages, .source = .{ .inline_script = "true" } },
+        .{ .name = "initramfs", .phase = .before_initramfs, .source = .{ .inline_script = "true" } },
+        .{ .name = "seal", .phase = .before_seal, .source = .{ .inline_script = "true" } },
+        .{ .name = "final", .phase = .finalize, .source = .{ .inline_script = "true" } },
+    };
+    request.hooks = &ordered_hooks;
+    var resolved = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer resolved.deinit(std.testing.allocator);
+    try std.testing.expect(resolved.plan != null);
+    var phases: [4]Phase = undefined;
+    var count: usize = 0;
+    for (resolved.plan.?.data.operations) |operation| {
+        if (operation.action == .execute_hook) {
+            phases[count] = operation.phase;
+            count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, phases.len), count);
+    try std.testing.expectEqualSlices(
+        Phase,
+        &.{ .after_packages, .before_initramfs, .before_seal, .finalize },
+        &phases,
+    );
+    try std.testing.expectEqual(
+        Action.publish_standalone_output,
+        resolved.plan.?.data.operations[resolved.plan.?.data.operations.len - 1].action,
+    );
+}
+
+test "unimplemented typed policies become semantic preflight requirements" {
+    const io = std.testing.io;
+    const source_path = "test-customize-policy-source.raw";
+    defer Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    {
+        const source = try Io.Dir.cwd().createFile(io, source_path, .{});
+        source.close(io);
+    }
+    const remove_packages = [_][]const u8{"old-package"};
+    const package_actions = [_]PackageAction{.{ .remove = &remove_packages }};
+    var request = validNativeEditRequest(source_path, "policy-output.raw", ".", &.{});
+    request.packages = .{
+        .actions = &package_actions,
+        .cache = .cache_only,
+        .lock = .{ .snapshot = "snapshot-2026-07-15" },
+    };
+    request.initramfs = .{ .regenerate = .{ .generator = "dracut" } };
+    request.selinux = .{ .configure = .{
+        .mode = .enforcing,
+        .policy = "targeted",
+        .relabel = true,
+    } };
+
+    var resolved = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer resolved.deinit(std.testing.allocator);
+    try std.testing.expect(resolved.plan != null);
+    var saw_package = false;
+    var saw_initramfs = false;
+    var saw_selinux = false;
+    var saw_relabel = false;
+    for (resolved.plan.?.data.required_capabilities) |capability| switch (capability.kind) {
+        .package_management => saw_package = true,
+        .initramfs_regeneration => saw_initramfs = true,
+        .selinux_policy => saw_selinux = true,
+        .selinux_relabel => saw_relabel = true,
+        else => {},
+    };
+    try std.testing.expect(saw_package and saw_initramfs and saw_selinux and saw_relabel);
+
+    var report = try preflight(std.testing.allocator, io, &resolved.plan.?, Platform.system());
+    defer report.deinit(std.testing.allocator);
+    try std.testing.expect(!report.ready());
+    for (report.capabilities) |capability| switch (capability.requirement.kind) {
+        .package_management, .initramfs_regeneration, .selinux_policy, .selinux_relabel => {
+            try std.testing.expectEqual(CapabilityState.unsupported, capability.state);
+        },
+        else => {},
+    };
+}
+
+test "unsupported preserved backends fail preflight before workspace mutation" {
+    const io = std.testing.io;
+    const source_path = "test-customize-unsupported-source.raw";
+    defer Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    {
+        const source = try Io.Dir.cwd().createFile(io, source_path, .{});
+        defer source.close(io);
+        try source.writePositionalAll(io, "readable-source", 0);
+    }
+
+    const cases = [_]struct {
+        backend: ExecutionBackend,
+        workspace: []const u8,
+        output: []const u8,
+    }{
+        .{ .backend = .rebuild, .workspace = "test-customize-rebuild-work", .output = "test-customize-rebuild-work/output.raw" },
+        .{ .backend = .unsafe_chroot, .workspace = "test-customize-chroot-work", .output = "test-customize-chroot-work/output.raw" },
+        .{ .backend = .vm, .workspace = "test-customize-vm-work", .output = "test-customize-vm-work/output.raw" },
+    };
+    for (cases) |case| {
+        defer Io.Dir.cwd().deleteTree(io, case.workspace) catch {};
+        var request = validNativeEditRequest(source_path, case.output, case.workspace, &.{});
+        request.execution.backend = case.backend;
+        request.execution.acknowledge_unsafe = case.backend == .unsafe_chroot;
+        var resolved = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+        defer resolved.deinit(std.testing.allocator);
+        try std.testing.expect(resolved.plan != null);
+
+        var report = try preflight(std.testing.allocator, io, &resolved.plan.?, Platform.system());
+        defer report.deinit(std.testing.allocator);
+        try std.testing.expect(!report.ready());
+        var saw_unsupported = false;
+        for (report.capabilities) |capability| {
+            if ((capability.requirement.kind == .rebuild or
+                capability.requirement.kind == .unsafe_chroot or
+                capability.requirement.kind == .vm) and capability.state == .unsupported)
+            {
+                saw_unsupported = true;
+            }
+        }
+        try std.testing.expect(saw_unsupported);
+
+        var outcome = try execute(std.testing.allocator, io, &resolved.plan.?, Platform.system(), null);
+        defer outcome.deinit(std.testing.allocator);
+        try std.testing.expect(outcome.result == null);
+        try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, case.workspace, .{}));
+        try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, case.output, .{}));
+    }
 }
 
 test "validation reports multiple problems without mutating the request" {
@@ -3036,7 +5184,7 @@ test "resolution is deterministic and encodes operation ordering" {
     try std.testing.expectEqual(Action.prepare_boot_configuration, operations[5].action);
     var stage_bridge = NativeStageBridge{ .operations = operations };
     for (operations) |operation| {
-        try std.testing.expect(NativeStageBridge.advance(&stage_bridge, operation.action));
+        try std.testing.expect(NativeStageBridge.advance(&stage_bridge, freshStageForAction(operation.action).?));
     }
     try std.testing.expectEqual(operations.len, stage_bridge.next);
     try std.testing.expect(!NativeStageBridge.advance(&stage_bridge, .convert_output));
@@ -3047,13 +5195,13 @@ test "resolution is deterministic and encodes operation ordering" {
     defer other.deinit(std.testing.allocator);
     try std.testing.expect(!std.mem.eql(
         u8,
-        &first.plan.?.data.generated.transaction_id.bytes,
-        &other.plan.?.data.generated.transaction_id.bytes,
+        &first.plan.?.data.transaction_id.bytes,
+        &other.plan.?.data.transaction_id.bytes,
     ));
     try std.testing.expectEqualSlices(
         u8,
-        &first.plan.?.data.generated.disk_guid.bytes,
-        &other.plan.?.data.generated.disk_guid.bytes,
+        &first.plan.?.data.generated.?.disk_guid.bytes,
+        &other.plan.?.data.generated.?.disk_guid.bytes,
     );
 
     var gen1_request = request;
@@ -3099,7 +5247,7 @@ test "planned metadata makes VHD and VHDX creation deterministic" {
     const request = validRequest();
     var resolved = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
     defer resolved.deinit(std.testing.allocator);
-    const generated = resolved.plan.?.data.generated;
+    const generated = resolved.plan.?.data.generated.?;
     const create_options = image_mod.CreateOptions{
         .vhd_subformat = .fixed,
         .unique_id = generated.output_unique_id.bytes,
@@ -3139,7 +5287,7 @@ test "preflight reports multiple missing capabilities" {
     const Fake = struct {
         fn check(_: ?*anyopaque, _: Io, requirement: CapabilityRequirement) CapabilityState {
             return switch (requirement.kind) {
-                .unprivileged_native_backend, .atomic_commit => .available,
+                .native_fresh, .atomic_commit => .available,
                 else => .missing,
             };
         }
@@ -3341,7 +5489,9 @@ test "successful execution commits output and emits provenance" {
             stage_sink: build_image.StageSink,
         ) !void {
             for (plan.data.operations) |operation| {
-                if (!stage_sink.advance(operation.action)) return error.InvalidOperationOrder;
+                if (!stage_sink.advance(freshStageForAction(operation.action) orelse return error.InvalidOperationOrder)) {
+                    return error.InvalidOperationOrder;
+                }
             }
             const file = try Io.Dir.cwd().createFile(run_io, plan.data.staging_output_path, .{});
             defer file.close(run_io);
@@ -3431,7 +5581,9 @@ test "execution rejects a customization source changed during the build" {
             stage_sink: build_image.StageSink,
         ) !void {
             for (plan.data.operations) |operation| {
-                if (!stage_sink.advance(operation.action)) return error.InvalidOperationOrder;
+                if (!stage_sink.advance(freshStageForAction(operation.action) orelse return error.InvalidOperationOrder)) {
+                    return error.InvalidOperationOrder;
+                }
             }
             const output = try Io.Dir.cwd().createFile(run_io, plan.data.staging_output_path, .{});
             defer output.close(run_io);
@@ -3471,6 +5623,363 @@ test "plan JSON renders identifiers as stable strings" {
     defer output.deinit();
     try writePlanJson(&resolved.plan.?, &output.writer);
     const json = output.written();
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"schema_version\": 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"schema_version\": 3") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"plan_hash\": \"") != null);
+}
+
+test "native-edit resolution is deterministic, deeply owned, and integrity checked" {
+    var disk_path = "native-edit-source.raw".*;
+    var edit_path = "native-edit-content.txt".*;
+    var guest_path = "/etc/config".*;
+    var inline_bytes = "inline".*;
+    const operations = [_]ExistingPathOperation{
+        .{ .overwrite_file = .{
+            .path = &guest_path,
+            .source = .{ .host_path = &edit_path },
+        } },
+        .{ .overwrite_file = .{
+            .path = "/etc/second",
+            .source = .{ .bytes = &inline_bytes },
+        } },
+    };
+    const request = validNativeEditRequest(&disk_path, "native-edit-output.raw", ".", &operations);
+    var first = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer first.deinit(std.testing.allocator);
+    var second = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer second.deinit(std.testing.allocator);
+    try std.testing.expect(first.plan != null);
+    try std.testing.expectEqualSlices(
+        u8,
+        &first.plan.?.data.plan_hash.bytes,
+        &second.plan.?.data.plan_hash.bytes,
+    );
+    try std.testing.expect(first.plan.?.data.input == .disk);
+    try std.testing.expect(first.plan.?.data.storage == .preserve);
+    try std.testing.expect(first.plan.?.data.generated == null);
+    try std.testing.expectEqual(@as(u64, 0), first.plan.?.data.output.disk_size);
+    try std.testing.expectEqual(@as(usize, 3), first.plan.?.data.operations.len);
+    try std.testing.expectEqual(Action.load_preserved_source, first.plan.?.data.operations[0].action);
+    try std.testing.expectEqual(Action.edit_existing_paths, first.plan.?.data.operations[1].action);
+    try std.testing.expectEqual(Action.publish_standalone_output, first.plan.?.data.operations[2].action);
+
+    disk_path[0] = 'X';
+    edit_path[0] = 'X';
+    guest_path[1] = 'X';
+    inline_bytes[0] = 'X';
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        first.plan.?.data.input.disk.path,
+        "native-edit-source.raw",
+    ));
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        first.plan.?.data.existing_path_operations[0].overwrite_file.source.host_path,
+        "native-edit-content.txt",
+    ));
+    try std.testing.expectEqualStrings(
+        "/etc/config",
+        first.plan.?.data.existing_path_operations[0].overwrite_file.path,
+    );
+    try std.testing.expectEqualStrings(
+        "inline",
+        first.plan.?.data.existing_path_operations[1].overwrite_file.source.bytes,
+    );
+    try std.testing.expect(try hasValidPlanIntegrity(std.testing.allocator, &first.plan.?));
+
+    const mutable_operations = @constCast(first.plan.?.data.operations);
+    const original_action = mutable_operations[1].action;
+    mutable_operations[1].action = .publish_standalone_output;
+    var tampered = try preflight(std.testing.allocator, std.testing.io, &first.plan.?, Platform.system());
+    defer tampered.deinit(std.testing.allocator);
+    try std.testing.expectEqual(DiagnosticCode.invalid_plan, tampered.diagnostics.items[0].code);
+    mutable_operations[1].action = original_action;
+}
+
+test "native-edit resolution rejects disk and edit source aliases" {
+    var disk_alias = validNativeEditRequest("alias.raw", "alias.raw", ".", &.{});
+    var disk_diagnostics = try validate(std.testing.allocator, &disk_alias);
+    defer disk_diagnostics.deinit(std.testing.allocator);
+    try std.testing.expect(hasDiagnosticCode(disk_diagnostics, .path_conflict));
+
+    const operations = [_]ExistingPathOperation{.{ .overwrite_file = .{
+        .path = "/etc/config",
+        .source = .{ .host_path = "alias.raw" },
+    } }};
+    disk_alias = validNativeEditRequest("source.raw", "alias.raw", ".", &operations);
+    var edit_alias = try resolve(std.testing.allocator, &disk_alias, .{ .host_architecture = .x86_64 });
+    defer edit_alias.deinit(std.testing.allocator);
+    try std.testing.expect(edit_alias.plan == null);
+    try std.testing.expect(hasDiagnosticCode(edit_alias.diagnostics, .path_conflict));
+}
+
+test "native-edit source hashing covers the disk and host edit sources" {
+    const io = std.testing.io;
+    const disk_path = "test-customize-hash-disk.raw";
+    const edit_path = "test-customize-hash-edit.txt";
+    defer Io.Dir.cwd().deleteFile(io, disk_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, edit_path) catch {};
+    for ([_]struct { path: []const u8, contents: []const u8 }{
+        .{ .path = disk_path, .contents = "disk" },
+        .{ .path = edit_path, .contents = "before" },
+    }) |source| {
+        const file = try Io.Dir.cwd().createFile(io, source.path, .{});
+        defer file.close(io);
+        try file.writePositionalAll(io, source.contents, 0);
+    }
+    const operations = [_]ExistingPathOperation{.{ .overwrite_file = .{
+        .path = "/etc/config",
+        .source = .{ .host_path = edit_path },
+    } }};
+    const request = validNativeEditRequest(disk_path, "hash-output.raw", ".", &operations);
+    var resolved = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer resolved.deinit(std.testing.allocator);
+    const before = try hashPlanSources(std.testing.allocator, io, &resolved.plan.?);
+    defer freeSourceRecords(std.testing.allocator, before);
+    try std.testing.expectEqual(@as(usize, 2), before.len);
+    try std.testing.expectEqual(SourceKind.disk, before[0].kind);
+    try std.testing.expectEqual(SourceKind.edit_source, before[1].kind);
+
+    {
+        const file = try Io.Dir.cwd().createFile(io, edit_path, .{ .truncate = true });
+        defer file.close(io);
+        try file.writePositionalAll(io, "after", 0);
+    }
+    const after = try hashPlanSources(std.testing.allocator, io, &resolved.plan.?);
+    defer freeSourceRecords(std.testing.allocator, after);
+    try std.testing.expect(!sourceRecordsEqual(before, after));
+    try std.testing.expectEqualSlices(u8, &before[0].sha256.bytes, &after[0].sha256.bytes);
+}
+
+test "native-edit tracks qcow2 backing files and rejects output aliases" {
+    const io = std.testing.io;
+    const raw_path = "test-customize-backing-base.raw";
+    const base_path = "test-customize-backing-base.qcow2";
+    const overlay_path = "test-customize-backing-overlay.qcow2";
+    const spool_path = "test-customize-backing-root.spool";
+    const workspace_path = "test-customize-backing-work";
+    const output_path = workspace_path ++ "/output.raw";
+    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, base_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, overlay_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, workspace_path) catch {};
+    try createCustomizeTestDisk(io, raw_path, spool_path);
+    {
+        var raw = try image_mod.Image.openPathReadOnly(io, raw_path);
+        defer raw.close(io);
+        var base = try image_mod.Image.createExclusive(
+            io,
+            base_path,
+            .qcow2,
+            customize_test_disk_size,
+            .{},
+        );
+        defer base.close(io);
+        try image_mod.copyAll(io, raw, &base, std.testing.allocator);
+    }
+    {
+        var overlay = try image_mod.Image.createExclusive(
+            io,
+            overlay_path,
+            .qcow2,
+            customize_test_disk_size,
+            .{},
+        );
+        overlay.close(io);
+        const file = try Io.Dir.cwd().openFile(io, overlay_path, .{ .mode = .read_write });
+        defer file.close(io);
+        var header: [104]u8 = undefined;
+        if (try file.readPositionalAll(io, &header, 0) != header.len) {
+            return error.UnexpectedEndOfFile;
+        }
+        const backing_offset = std.mem.readInt(u32, header[100..104], .big);
+        std.mem.writeInt(u64, header[8..16], backing_offset, .big);
+        std.mem.writeInt(u32, header[16..20], base_path.len, .big);
+        try file.writePositionalAll(io, &header, 0);
+        try file.writePositionalAll(io, base_path, backing_offset);
+    }
+
+    const operations = [_]ExistingPathOperation{.{ .overwrite_file = .{
+        .path = "/etc/config",
+        .source = .{ .bytes = "backing\n" },
+    } }};
+    var request = validNativeEditRequest(
+        overlay_path,
+        output_path,
+        workspace_path,
+        &operations,
+    );
+    request.input.disk.dependencies = &.{base_path};
+    var resolved = try resolve(
+        std.testing.allocator,
+        &request,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer resolved.deinit(std.testing.allocator);
+    var ready = try preflight(
+        std.testing.allocator,
+        io,
+        &resolved.plan.?,
+        Platform.system(),
+    );
+    defer ready.deinit(std.testing.allocator);
+    try std.testing.expect(ready.ready());
+
+    var outcome = try execute(
+        std.testing.allocator,
+        io,
+        &resolved.plan.?,
+        Platform.system(),
+        null,
+    );
+    defer outcome.deinit(std.testing.allocator);
+    try std.testing.expect(outcome.result != null);
+    try std.testing.expectEqual(@as(usize, 2), outcome.result.?.provenance.sources.len);
+    try std.testing.expectEqual(SourceKind.disk, outcome.result.?.provenance.sources[0].kind);
+    try std.testing.expectEqual(
+        SourceKind.disk_dependency,
+        outcome.result.?.provenance.sources[1].kind,
+    );
+    try std.testing.expect(
+        outcome.result.?.provenance.execution.preserved.?.flattened_backing_chain,
+    );
+
+    var alias_request = validNativeEditRequest(
+        overlay_path,
+        base_path,
+        ".",
+        &operations,
+    );
+    alias_request.input.disk.dependencies = &.{base_path};
+    alias_request.execution.overwrite = true;
+    var alias_resolved = try resolve(
+        std.testing.allocator,
+        &alias_request,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer alias_resolved.deinit(std.testing.allocator);
+    try std.testing.expect(alias_resolved.plan == null);
+    try std.testing.expect(hasDiagnosticCode(alias_resolved.diagnostics, .path_conflict));
+
+    const undeclared_request = validNativeEditRequest(
+        overlay_path,
+        "test-customize-backing-undeclared.raw",
+        ".",
+        &operations,
+    );
+    var undeclared_resolved = try resolve(
+        std.testing.allocator,
+        &undeclared_request,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer undeclared_resolved.deinit(std.testing.allocator);
+    var undeclared_preflight = try preflight(
+        std.testing.allocator,
+        io,
+        &undeclared_resolved.plan.?,
+        Platform.system(),
+    );
+    defer undeclared_preflight.deinit(std.testing.allocator);
+    try std.testing.expect(!undeclared_preflight.ready());
+    var saw_dependency_conflict = false;
+    for (undeclared_preflight.capabilities) |capability| {
+        if (capability.requirement.kind == .disk_dependencies and
+            capability.state == .missing)
+        {
+            saw_dependency_conflict = true;
+        }
+    }
+    try std.testing.expect(saw_dependency_conflict);
+}
+
+test "native-edit execution preserves source size and emits preserved provenance" {
+    const io = std.testing.io;
+    const source_path = "test-customize-native-edit-source.raw";
+    const edit_path = "test-customize-native-edit-content.txt";
+    const spool_path = "test-customize-native-edit-root.spool";
+    const workspace_path = "test-customize-native-edit-work";
+    const output_path = workspace_path ++ "/output.raw";
+    defer Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, edit_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, workspace_path) catch {};
+    try createCustomizeTestDisk(io, source_path, spool_path);
+    {
+        const edit_source = try Io.Dir.cwd().createFile(io, edit_path, .{});
+        defer edit_source.close(io);
+        try edit_source.writePositionalAll(io, "after\n", 0);
+    }
+    const source_before = try hashPath(std.testing.allocator, io, source_path);
+    const operations = [_]ExistingPathOperation{
+        .{ .overwrite_file = .{
+            .path = "/etc/config",
+            .source = .{ .host_path = edit_path },
+        } },
+        .{ .remove_file = "/etc/remove" },
+        .{ .remove_tree = "/var/drop" },
+    };
+    const request = validNativeEditRequest(source_path, output_path, workspace_path, &operations);
+    var resolved = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer resolved.deinit(std.testing.allocator);
+    var preflight_report = try preflight(std.testing.allocator, io, &resolved.plan.?, Platform.system());
+    defer preflight_report.deinit(std.testing.allocator);
+    try std.testing.expect(preflight_report.ready());
+
+    var outcome = try execute(std.testing.allocator, io, &resolved.plan.?, Platform.system(), null);
+    defer outcome.deinit(std.testing.allocator);
+    try std.testing.expect(outcome.result != null);
+    try std.testing.expect(!outcome.diagnostics.hasErrors());
+    const result = &outcome.result.?;
+    try std.testing.expectEqual(provenance_schema_version, result.provenance.schema_version);
+    try std.testing.expect(result.provenance.generated == null);
+    try std.testing.expectEqual(@as(usize, 2), result.provenance.sources.len);
+    try std.testing.expectEqual(SourceKind.disk, result.provenance.sources[0].kind);
+    try std.testing.expectEqual(SourceKind.edit_source, result.provenance.sources[1].kind);
+    const preserved = result.provenance.execution.preserved.?;
+    try std.testing.expectEqual(Format.raw, preserved.source_format);
+    try std.testing.expectEqual(Format.raw, preserved.output_format);
+    try std.testing.expectEqual(customize_test_disk_size, preserved.virtual_size);
+    try std.testing.expectEqual(
+        @as(u64, customize_test_partition_first_lba) * mbr.sector_size,
+        preserved.partition_offset,
+    );
+    try std.testing.expectEqual(
+        @as(u64, customize_test_partition_sectors) * mbr.sector_size,
+        preserved.partition_length,
+    );
+    try std.testing.expect(!preserved.flattened_backing_chain);
+    try std.testing.expectEqual(@as(usize, operations.len), preserved.operation_count);
+    try std.testing.expect(std.meta.eql(
+        PartitionSelector{ .mbr_index = 1 },
+        preserved.selected_partition,
+    ));
+    try std.testing.expectEqual(customize_test_disk_size, result.provenance.final_output.size);
+    try std.testing.expectEqualSlices(
+        u8,
+        &source_before.bytes,
+        &(try hashPath(std.testing.allocator, io, source_path)).bytes,
+    );
+
+    var output = try image_mod.Image.openPathReadOnly(io, output_path);
+    defer output.close(io);
+    try std.testing.expectEqual(customize_test_disk_size, output.virtual_size);
+    var output_reader = try ext4.open(io, output.file, std.testing.allocator, .{
+        .offset = @as(u64, customize_test_partition_first_lba) * mbr.sector_size,
+    });
+    defer output_reader.deinit();
+    const output_config = try output_reader.readFileAlloc(io, std.testing.allocator, "/etc/config");
+    defer std.testing.allocator.free(output_config);
+    try std.testing.expectEqualStrings("after\n", output_config);
+    try std.testing.expectError(error.NotFound, output_reader.statPath(io, "/etc/remove"));
+    try std.testing.expectError(error.NotFound, output_reader.statPath(io, "/var/drop"));
+
+    var source = try image_mod.Image.openPathReadOnly(io, source_path);
+    defer source.close(io);
+    var source_reader = try ext4.open(io, source.file, std.testing.allocator, .{
+        .offset = @as(u64, customize_test_partition_first_lba) * mbr.sector_size,
+    });
+    defer source_reader.deinit();
+    const source_config = try source_reader.readFileAlloc(io, std.testing.allocator, "/etc/config");
+    defer std.testing.allocator.free(source_config);
+    try std.testing.expectEqualStrings("before\n", source_config);
 }

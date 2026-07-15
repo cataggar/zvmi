@@ -235,6 +235,47 @@ Use `.container = .{ .archive = ... }` for a docker/podman save tarball. OCI lay
 
 `addImage` accepts ordered file/directory/symlink/removal/metadata operations, hostname, groups, users and SSH keys, systemd service state, kernel-module settings, and Azure generalization. File inputs may be inline bytes or tracked `LazyPath` values; plaintext passwords are intentionally not representable, so callers must lock an account or provide a crypt-style pre-hashed value. The helper also returns `plan_path`, `diagnostics_path`, and `provenance_path` from image execution, plus `preflight_plan_path`, `preflight_diagnostics_path`, and `preflight_provenance_path` from a separate non-cacheable capability check. The preflight artifacts remain consumable even when its status gate blocks image execution; unavailable plan or provenance documents contain JSON `null`, while diagnostics explains the failure. Preflight and execution use separate build-cache bundle paths, so their plan hashes intentionally differ; execution repeats preflight against its exact resolved plan before mutation. Successful execution bundles are reused only when a content key covering the host builder, complete request arguments, ISO, container, customization document, and tracked files still matches; failed or stale bundles are cleared and retried instead of becoming permanent cache hits. The target architecture, rootfs path, deterministic seed, and source timestamp are explicit inputs; the resolved plan records generated identifiers and operation ordering, while provenance records source, final root-tree, and output SHA-256 hashes.
 
+To transactionally edit an existing image, use the typed `addPreservedImage` helper:
+
+```zig
+const preserved = zvmi.addPreservedImage(b, dependency, .{
+    .name = "updated-appliance",
+    .input = .{
+        .disk = b.path("inputs/appliance.qcow2"),
+        .dependencies = &.{
+            b.path("inputs/base.qcow2"),
+            b.path("inputs/base-data.raw"),
+        },
+    },
+    .root_partition = .{ .gpt_index = 2 },
+    .output = .{
+        .format = .qcow2,
+        .basename = "updated-appliance.qcow2",
+    },
+    .target_architecture = .x86_64,
+    .reproducibility = .{
+        .seed = [_]u8{0x24} ** 32,
+        .source_date_epoch = 1_735_689_600,
+    },
+    .operations = &.{
+        .{ .overwrite_file = .{
+            .path = "/etc/appliance.conf",
+            .source = .{ .path = b.path("config/appliance.conf") },
+        } },
+        .{ .overwrite_file = .{
+            .path = "/etc/build-id",
+            .source = .{ .inline_bytes = "release-24\n" },
+        } },
+        .{ .remove_file = "/etc/obsolete.conf" },
+        .{ .remove_tree = "/var/cache/obsolete" },
+    },
+});
+```
+
+The disk, every transitive qcow2 backing or external-data file, the generated operation configuration, and every replacement are tracked `LazyPath` inputs; inline bytes are materialized through `WriteFiles`. Runtime preflight opens the disk read-only and requires the declared dependency set to exactly match its actual transitive qcow2 closure. The host-native runner preserves the source virtual size, flattens qcow2 dependencies into a standalone output, and returns the same result, preflight, and status-gate artifacts as `addImage`, including when the dependency was configured for a foreign target. GPT and MBR selectors are one-based.
+
+The current native editor only overwrites existing regular files, removes existing non-directories, and recursively removes existing directories in zvmi-compatible ext4 filesystems. It does not create paths, change metadata, support arbitrary ext4 layouts, resize partitions, run package managers, or execute guest code.
+
 ## Runtime customization API
 
 The library exposes the same versioned request-plan runtime used by `addImage`:
@@ -286,11 +327,15 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
-`resolve` is deterministic and does not inspect or mutate the host. The native backend requires `workspace_path` to be the parent directory of `output.path`, keeping all planned scratch state on the destination filesystem for atomic publication. `preflight` returns all missing capabilities, and `execute` repeats preflight before mutation, stages the image in a planned transaction directory, verifies that source hashes remain unchanged, and atomically publishes the final output. Validation, preflight, and execution diagnostics are structured and independently owned; successful results include source hashes, resolved configuration, generated identifiers, observed partition, VHDX, and verity metadata, and the final artifact hash.
+`resolve` is deterministic and does not inspect or mutate the host. The `native_fresh` and `native_edit` backends require `workspace_path` to be the parent directory of `output.path`, keeping all planned scratch state on the destination filesystem for atomic publication. `preflight` returns all missing capabilities, and `execute` repeats preflight before mutation, stages the image in a planned transaction directory, verifies that source hashes remain unchanged, and atomically publishes the final output. Validation, preflight, and execution diagnostics are structured and independently owned; successful results include source hashes, resolved configuration, generated or preserved-image metadata, and the final artifact hash.
 
-`customize.current_api_version` identifies the request contract; the owned-tree customization surface is API v2. Incompatible request changes require a new API version, and unsupported versions produce an `unsupported_api_version` diagnostic rather than being migrated implicitly. Plan and provenance JSON have independent `schema_version` fields so artifact consumers can reject or migrate formats separately. Serialization adapters must convert older inputs to a current typed `Request` before calling `resolve`.
+`customize.current_api_version` identifies the v3 request contract. `adaptV2NativeFresh` explicitly converts the frozen v2 ISO+OCI/native request shape; v3 validation never silently reinterprets a request labeled as v2. Plan and provenance JSON have independent `schema_version` fields so artifact consumers can reject or migrate formats separately.
+
+The v3 contract also models `rebuild`, `unsafe_chroot`, and `vm` backends plus package actions and repositories, ordered hooks, initramfs regeneration, SELinux policy, and cross-architecture runners. These policies derive semantic capabilities and fail preflight before workspace creation until their executors exist. `unsafe_chroot` and scripts require explicit unsafe-code acknowledgement; chroot is not a sandbox.
 
 `zvmi.root_tree.RootTree` is the lower-level owned filesystem API. It spools bounded file and symlink content independently of ISO, SquashFS, OCI, or ext4 reader lifetimes; owns paths and POSIX metadata; applies deterministic replacement and recursive removal; and exposes a stable manifest digest. `ext4View()` adapts a validated tree to `zvmi.ext4.populate`, while `populateFat32()` either requires FAT-representable metadata or applies the caller's explicit lossy POSIX-metadata policy. Unsupported hardlinks, special files, timestamps, or metadata are rejected rather than silently discarded.
+
+`zvmi.preserved_image.edit` is the lower-level transactional API for an existing raw, VHD, VHDX, or qcow2 disk. It copies guest-visible bytes into exclusive raw staging, flattens qcow2 backing chains, edits an explicitly selected one-based GPT or MBR partition, converts to a standalone output, and publishes without replacing an existing destination. The source and its backing files are opened read-only. This initial native editor deliberately supports only overwriting existing regular files, deleting existing non-directory entries, and recursively deleting existing directories in zvmi-compatible ext4 layouts; path creation, metadata changes, arbitrary ext4 layouts, partition resizing, package operations, and guest-code execution remain unsupported.
 
 ## CI
 

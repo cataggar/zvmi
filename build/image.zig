@@ -1,5 +1,7 @@
 const std = @import("std");
 const customization_wire = @import("../packages/zvmi/src/customization_wire.zig");
+const customize = @import("../packages/zvmi/src/customize.zig");
+const preserved_image_wire = @import("../packages/zvmi/src/preserved_image_wire.zig");
 
 pub const Format = enum {
     raw,
@@ -135,6 +137,46 @@ pub const Options = struct {
     verbose: bool = false,
 };
 
+pub const PreservedInput = struct {
+    disk: std.Build.LazyPath,
+    /// Every transitive qcow2 backing and external-data file.
+    dependencies: []const std.Build.LazyPath = &.{},
+};
+
+pub const PreservedRootPartition = union(enum) {
+    /// One-based slot in the GPT partition entry array.
+    gpt_index: u32,
+    /// One-based slot in the four-entry MBR partition table.
+    mbr_index: u8,
+};
+
+pub const PreservedFileSource = union(enum) {
+    inline_bytes: []const u8,
+    path: std.Build.LazyPath,
+};
+
+pub const OverwriteExistingFile = struct {
+    path: []const u8,
+    source: PreservedFileSource,
+};
+
+pub const PreservedOperation = union(enum) {
+    overwrite_file: OverwriteExistingFile,
+    remove_file: []const u8,
+    remove_tree: []const u8,
+};
+
+pub const PreservedOptions = struct {
+    name: []const u8,
+    input: PreservedInput,
+    root_partition: PreservedRootPartition,
+    output: Output,
+    target_architecture: Architecture,
+    reproducibility: Reproducibility,
+    operations: []const PreservedOperation = &.{},
+    verbose: bool = false,
+};
+
 pub const Result = struct {
     path: std.Build.LazyPath,
     plan_path: std.Build.LazyPath,
@@ -156,6 +198,8 @@ pub fn add(
     dependency: *std.Build.Dependency,
     options: Options,
 ) Result {
+    validateBuildName(options.name);
+    validateOutputBasename(options.output.basename);
     const container: TrackedContainer = switch (options.input.container) {
         .oci_layout => |layout| blk: {
             const validate = b.addRunArtifact(dependency.artifact("zvmi-input-validator"));
@@ -183,6 +227,7 @@ pub fn add(
     const preflight_check = b.addRunArtifact(dependency.artifact("zvmi-image-status-check"));
     preflight_check.setName(b.fmt("check image preflight {s}", .{options.name}));
     preflight_check.addDirectoryArg(preflight_bundle);
+    preflight_check.addFileInput(preflight_bundle.path(b, "status"));
 
     const run = b.addRunArtifact(dependency.artifact("zvmi-image-builder"));
     run.setName(b.fmt("build image {s}", .{options.name}));
@@ -198,6 +243,8 @@ pub fn add(
     const status_check = b.addRunArtifact(dependency.artifact("zvmi-image-status-check"));
     status_check.setName(b.fmt("check image result {s}", .{options.name}));
     status_check.addDirectoryArg(bundle);
+    status_check.addFileInput(bundle.path(b, "status"));
+    status_check.addFileInput(bundle.path(b, "provenance.json"));
     status_check.addArg(options.output.basename);
     const output = status_check.addOutputFileArg(options.output.basename);
 
@@ -211,6 +258,184 @@ pub fn add(
         .preflight_provenance_path = preflight_bundle.path(b, "provenance.json"),
         .step = status_check,
     };
+}
+
+pub fn addPreserved(
+    b: *std.Build,
+    dependency: *std.Build.Dependency,
+    options: PreservedOptions,
+) Result {
+    validateBuildName(options.name);
+    validateOutputBasename(options.output.basename);
+    const configuration = materializePreservedConfiguration(b, options) catch
+        @panic("failed to materialize preserved-image configuration");
+
+    const preflight = b.addRunArtifact(dependency.artifact("zvmi-preserved-image-builder"));
+    preflight.setName(b.fmt("preflight preserved image {s}", .{options.name}));
+    preflight.has_side_effects = true;
+    configurePreservedRequest(b, preflight, options, configuration);
+    preflight.addArg("--preflight-only");
+    preflight.addArgs(&.{ "--image-basename", options.output.basename });
+    preflight.addArg("--bundle-output");
+    const preflight_bundle = preflight.addOutputDirectoryArg(
+        b.fmt("{s}-preserved-preflight-result", .{options.name}),
+    );
+
+    const preflight_check = b.addRunArtifact(dependency.artifact("zvmi-image-status-check"));
+    preflight_check.setName(b.fmt("check preserved image preflight {s}", .{options.name}));
+    preflight_check.addDirectoryArg(preflight_bundle);
+    preflight_check.addFileInput(preflight_bundle.path(b, "status"));
+
+    const run = b.addRunArtifact(dependency.artifact("zvmi-preserved-image-builder"));
+    run.setName(b.fmt("build preserved image {s}", .{options.name}));
+    run.has_side_effects = true;
+    run.step.dependOn(&preflight_check.step);
+    configurePreservedRequest(b, run, options, configuration);
+    run.addArg("--reuse-success");
+    run.addArgs(&.{ "--image-basename", options.output.basename });
+    run.addArg("--bundle-output");
+    const bundle = run.addOutputDirectoryArg(
+        b.fmt("{s}-preserved-result", .{options.name}),
+    );
+
+    const status_check = b.addRunArtifact(dependency.artifact("zvmi-image-status-check"));
+    status_check.setName(b.fmt("check preserved image result {s}", .{options.name}));
+    status_check.addDirectoryArg(bundle);
+    status_check.addFileInput(bundle.path(b, "status"));
+    status_check.addFileInput(bundle.path(b, "provenance.json"));
+    status_check.addArg(options.output.basename);
+    const output = status_check.addOutputFileArg(options.output.basename);
+
+    return .{
+        .path = output,
+        .plan_path = bundle.path(b, "plan.json"),
+        .diagnostics_path = bundle.path(b, "diagnostics.json"),
+        .provenance_path = bundle.path(b, "provenance.json"),
+        .preflight_plan_path = preflight_bundle.path(b, "plan.json"),
+        .preflight_diagnostics_path = preflight_bundle.path(b, "diagnostics.json"),
+        .preflight_provenance_path = preflight_bundle.path(b, "provenance.json"),
+        .step = status_check,
+    };
+}
+
+fn validateBuildName(name: []const u8) void {
+    if (name.len == 0 or
+        std.mem.indexOfScalar(u8, name, 0) != null or
+        std.fs.path.isAbsolute(name) or
+        !std.mem.eql(u8, name, std.fs.path.basename(name)) or
+        std.mem.eql(u8, name, ".") or
+        std.mem.eql(u8, name, ".."))
+    {
+        @panic("image build name must be a non-empty path component");
+    }
+}
+
+fn validateOutputBasename(name: []const u8) void {
+    validateBuildName(name);
+    if (std.ascii.eqlIgnoreCase(name, "status") or
+        std.ascii.eqlIgnoreCase(name, "plan.json") or
+        std.ascii.eqlIgnoreCase(name, "diagnostics.json") or
+        std.ascii.eqlIgnoreCase(name, "provenance.json") or
+        std.ascii.eqlIgnoreCase(name, "reuse-key"))
+    {
+        @panic("image output basename conflicts with a result-bundle artifact");
+    }
+}
+
+const MaterializedPreservedConfiguration = struct {
+    path: std.Build.LazyPath,
+    sources: []const std.Build.LazyPath,
+};
+
+fn materializePreservedConfiguration(
+    b: *std.Build,
+    options: PreservedOptions,
+) !MaterializedPreservedConfiguration {
+    const operations = try b.allocator.alloc(
+        preserved_image_wire.Operation,
+        options.operations.len,
+    );
+    var sources = std.array_list.Managed(std.Build.LazyPath).init(b.allocator);
+    errdefer sources.deinit();
+    const inline_files = b.addWriteFiles();
+    inline_files.step.name = b.fmt(
+        "materialize inline preserved-image replacements for {s}",
+        .{options.name},
+    );
+
+    for (options.operations, 0..) |operation, index| {
+        operations[index] = switch (operation) {
+            .overwrite_file => |overwrite| blk: {
+                const source: std.Build.LazyPath = switch (overwrite.source) {
+                    .path => |path| path,
+                    .inline_bytes => |bytes| inline_files.add(
+                        b.fmt("inline-{d}", .{index}),
+                        bytes,
+                    ),
+                };
+                const source_index = sources.items.len;
+                try sources.append(source);
+                break :blk .{ .overwrite_file = .{
+                    .path = overwrite.path,
+                    .source_index = source_index,
+                } };
+            },
+            .remove_file => |path| .{ .remove_file = path },
+            .remove_tree => |path| .{ .remove_tree = path },
+        };
+    }
+
+    const configuration = preserved_image_wire.Configuration{
+        .root_partition = switch (options.root_partition) {
+            .gpt_index => |index| .{ .gpt_index = index },
+            .mbr_index => |index| .{ .mbr_index = index },
+        },
+        .operations = operations,
+    };
+    try preserved_image_wire.validate(configuration, sources.items.len);
+    const json = try std.json.Stringify.valueAlloc(b.allocator, configuration, .{});
+    const config_files = b.addWriteFiles();
+    config_files.step.name = b.fmt(
+        "write preserved-image configuration for {s}",
+        .{options.name},
+    );
+    return .{
+        .path = config_files.add("preserved-image.json", json),
+        .sources = try sources.toOwnedSlice(),
+    };
+}
+
+fn configurePreservedRequest(
+    b: *std.Build,
+    run: *std.Build.Step.Run,
+    options: PreservedOptions,
+    configuration: MaterializedPreservedConfiguration,
+) void {
+    run.addArg("--disk");
+    run.addFileArg(options.input.disk);
+    for (options.input.dependencies) |dependency| {
+        run.addArg("--disk-dependency");
+        run.addFileArg(dependency);
+    }
+    run.addArg("--configuration");
+    run.addFileArg(configuration.path);
+    for (configuration.sources) |source| {
+        run.addArg("--operation-source");
+        run.addFileArg(source);
+    }
+    run.addArgs(&.{ "-O", options.output.format.cliName() });
+    run.addArgs(&.{ "--architecture", options.target_architecture.cliName() });
+    const seed_hex = std.fmt.bytesToHex(options.reproducibility.seed, .lower);
+    run.addArgs(&.{ "--seed", b.fmt("{s}", .{seed_hex}) });
+    run.addArgs(&.{
+        "--source-date-epoch",
+        b.fmt("{d}", .{options.reproducibility.source_date_epoch}),
+    });
+    run.addArgs(&.{
+        "--api-version",
+        b.fmt("{d}", .{customize.current_api_version}),
+    });
+    if (options.verbose) run.addArg("--verbose");
 }
 
 fn configureRequest(
@@ -233,7 +458,7 @@ fn configureRequest(
     const seed_hex = std.fmt.bytesToHex(options.reproducibility.seed, .lower);
     run.addArgs(&.{ "--seed", b.fmt("{s}", .{seed_hex}) });
     run.addArgs(&.{ "--source-date-epoch", b.fmt("{d}", .{options.reproducibility.source_date_epoch}) });
-    run.addArgs(&.{ "--api-version", b.fmt("{d}", .{customization_wire.api_version}) });
+    run.addArgs(&.{ "--api-version", b.fmt("{d}", .{customize.current_api_version}) });
     run.addArgs(&.{ "--rootfs-path", options.rootfs_path_in_iso });
     if (options.skip_iso_rootfs) run.addArg("--skip-iso-rootfs");
     if (options.esp_size) |size| run.addArgs(&.{ "--esp-size", b.fmt("{d}", .{size}) });
