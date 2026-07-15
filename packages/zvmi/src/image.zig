@@ -42,6 +42,9 @@ pub const CreateOptions = struct {
     /// uploads require *fixed* VHDs -- pass `.fixed` explicitly (the future
     /// `zvmi build-image`/`azure fixup` commands do this automatically).
     vhd_subformat: VhdSubformat = .dynamic,
+    unique_id: ?[16]u8 = null,
+    timestamp_unix: ?i64 = null,
+    vhdx: vhdx.CreateOptions = .{},
 };
 
 pub const Info = struct {
@@ -199,7 +202,7 @@ pub const Image = struct {
     /// Creates a brand-new image file of the given format and virtual size.
     /// `size` must be a multiple of the 512-byte sector size.
     pub fn create(io: Io, path: []const u8, format: Format, size: u64, options: CreateOptions) CreateError!Image {
-        if (size % 512 != 0) return error.SizeNotSectorAligned;
+        try validateCreate(format, size, options);
 
         const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
         errdefer file.close(io);
@@ -212,25 +215,47 @@ pub const Image = struct {
             .vhd => switch (options.vhd_subformat) {
                 .fixed => {
                     try file.setLength(io, size + vhd.footer_size);
-                    const footer = vhd.Footer.forFixedDisk(size, randomUuid(io), nowUnix(io));
+                    const footer = vhd.Footer.forFixedDisk(
+                        size,
+                        options.unique_id orelse randomUuid(io),
+                        options.timestamp_unix orelse nowUnix(io),
+                    );
                     const encoded = footer.encode();
                     try file.writePositionalAll(io, &encoded, size);
                     return .{ .file = file, .format = .vhd, .data_offset = 0, .virtual_size = size };
                 },
-                .dynamic => return try createDynamic(io, file, size),
+                .dynamic => return try createDynamic(io, file, size, options),
             },
             .qcow2 => {
                 const qcow2_info = try qcow2.create(io, file, size);
                 return .{ .file = file, .format = .qcow2, .data_offset = 0, .virtual_size = size, .qcow2 = qcow2_info };
             },
             .vhdx => {
-                const vhdx_info = try vhdx.create(io, file, size);
+                const vhdx_info = try vhdx.createWithOptions(io, file, size, options.vhdx);
                 return .{ .file = file, .format = .vhdx, .data_offset = 0, .virtual_size = size, .vhdx = vhdx_info };
             },
         }
     }
 
-    fn createDynamic(io: Io, file: Io.File, size: u64) CreateError!Image {
+    fn validateCreate(format: Format, size: u64, options: CreateOptions) CreateError!void {
+        if (size % 512 != 0) return error.SizeNotSectorAligned;
+        switch (format) {
+            .raw => {},
+            .vhd => switch (options.vhd_subformat) {
+                .fixed => if (size > std.math.maxInt(u64) - vhd.footer_size) return error.ImageTooLarge,
+                .dynamic => {
+                    const total_sectors = size / 512;
+                    const sectors_per_block = vhd.default_block_size / 512;
+                    const entries = std.math.divCeil(u64, total_sectors, sectors_per_block) catch unreachable;
+                    if (entries > std.math.maxInt(u32)) return error.ImageTooLarge;
+                },
+            },
+            .qcow2 => try qcow2.validateCreateSize(size),
+            .vhdx => try vhdx.validateCreateOptions(size, options.vhdx),
+        }
+    }
+
+    fn createDynamic(io: Io, file: Io.File, size: u64, options: CreateOptions) CreateError!Image {
         const block_size: u32 = vhd.default_block_size;
         const bitmap_size = vhd.bitmapSize(block_size);
         const total_sectors = size / 512;
@@ -241,7 +266,12 @@ pub const Image = struct {
         const bat_bytes_len: u64 = @as(u64, max_table_entries) * 4;
         const free_offset = alignUp(bat_offset + bat_bytes_len, 512);
 
-        const footer = vhd.Footer.forDynamicDisk(size, vhd.footer_size, randomUuid(io), nowUnix(io));
+        const footer = vhd.Footer.forDynamicDisk(
+            size,
+            vhd.footer_size,
+            options.unique_id orelse randomUuid(io),
+            options.timestamp_unix orelse nowUnix(io),
+        );
         const footer_bytes = footer.encode();
         try file.writePositionalAll(io, &footer_bytes, 0);
 
@@ -717,6 +747,36 @@ test "create raw image, then open and read back zeros" {
     var buf: [16]u8 = undefined;
     _ = try opened.pread(io, &buf, 0);
     try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 16), &buf);
+}
+
+test "invalid create options do not truncate an existing image" {
+    const io = std.testing.io;
+    const path = "test-image-invalid-create.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    {
+        const file = try Io.Dir.cwd().createFile(io, path, .{});
+        defer file.close(io);
+        try file.writePositionalAll(io, "preserve-me", 0);
+    }
+
+    try std.testing.expectError(
+        error.HeaderSequenceOverflow,
+        Image.create(io, path, .vhdx, 512, .{
+            .vhdx = .{ .header_sequence_base = std.math.maxInt(u64) },
+        }),
+    );
+    try std.testing.expectError(
+        error.ImageTooLarge,
+        Image.create(io, path, .vhd, std.math.maxInt(u64) / 512 * 512, .{
+            .vhd_subformat = .fixed,
+        }),
+    );
+
+    const file = try Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var bytes: ["preserve-me".len]u8 = undefined;
+    _ = try file.readPositionalAll(io, &bytes, 0);
+    try std.testing.expectEqualStrings("preserve-me", &bytes);
 }
 
 test "create fixed vhd image, then open and recover virtual size" {

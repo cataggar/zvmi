@@ -111,7 +111,18 @@ pub fn splitPartition(total_bytes: u64, data_block_size: u32, hash_block_size: u
     while (lo <= hi) {
         const mid = lo + (hi - lo) / 2;
         const tree_blocks = hashTreeBlockCount(mid, hash_block_size);
-        const used_bytes = mid * data_block_size + tree_blocks * hash_block_size;
+        const data_bytes = std.math.mul(u64, mid, data_block_size) catch {
+            hi = mid - 1;
+            continue;
+        };
+        const tree_bytes = std.math.mul(u64, tree_blocks, hash_block_size) catch {
+            hi = mid - 1;
+            continue;
+        };
+        const used_bytes = std.math.add(u64, data_bytes, tree_bytes) catch {
+            hi = mid - 1;
+            continue;
+        };
         if (used_bytes <= total_bytes) {
             best = mid;
             lo = mid + 1;
@@ -129,6 +140,12 @@ pub fn splitPartition(total_bytes: u64, data_block_size: u32, hash_block_size: u
         .hash_tree_size = hash_tree_size,
         .data_blocks = best,
     };
+}
+
+test "splitPartition handles maximum-size inputs without arithmetic overflow" {
+    const split = try splitPartition(std.math.maxInt(u64), default_data_block_size, default_hash_block_size);
+    const used = try std.math.add(u64, split.data_size, split.hash_tree_size);
+    try std.testing.expect(used <= std.math.maxInt(u64));
 }
 
 pub fn generateFromBytes(allocator: std.mem.Allocator, data: []const u8, options: GenerateOptions) GenerateError!GeneratedTree {

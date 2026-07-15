@@ -70,6 +70,21 @@ pub const UkiOptions = struct {
     output_directory: []const u8 = "EFI/Linux",
 };
 
+pub const PopulateStage = enum {
+    prepare,
+    bootloader,
+    uki,
+};
+
+pub const PopulateStageSink = struct {
+    context: ?*anyopaque = null,
+    advanceFn: *const fn (context: ?*anyopaque, stage: PopulateStage) bool,
+
+    fn advance(self: PopulateStageSink, stage: PopulateStage) bool {
+        return self.advanceFn(self.context, stage);
+    }
+};
+
 pub const PopulateOptions = struct {
     /// The planned partitions plus the on-disk identifiers used to reference
     /// them from generated kernel command lines.
@@ -122,6 +137,7 @@ pub const PopulateOptions = struct {
     /// `.uki_only` or `.bls_and_uki`.
     uki: UkiOptions = .{},
     grub_timeout_seconds: u32 = 1,
+    stage_sink: ?PopulateStageSink = null,
 };
 
 pub const PopulateReport = struct {
@@ -148,6 +164,7 @@ pub const PopulateError = std.mem.Allocator.Error || fat32.MutationError ||
     MissingRootPartition,
     MissingUkiStub,
     UnexpectedSourceLength,
+    InvalidOperationOrder,
 };
 
 pub const InstallBiosOptions = struct {
@@ -364,6 +381,9 @@ pub fn populateEsp(
     source: *SourceTreeView,
     options: PopulateOptions,
 ) PopulateError!PopulateReport {
+    if (options.stage_sink) |sink| {
+        if (!sink.advance(.prepare)) return error.InvalidOperationOrder;
+    }
     var plan = try buildBootPlan(allocator, source, .{
         .planned_partitions = options.planned_partitions,
         .architecture = options.architecture,
@@ -385,6 +405,9 @@ pub fn populateEsp(
     const secure_boot_plan = try buildSecureBootCopyPlan(allocator, plan.scan.secure_boot_files, copy_plan, plan.architecture, options.boot_mode);
     defer freeCopyPlan(allocator, secure_boot_plan);
 
+    if (options.stage_sink) |sink| {
+        if (!sink.advance(.bootloader)) return error.InvalidOperationOrder;
+    }
     for (copy_plan) |entry| try copyIntoFat32(allocator, io, esp, entry);
     for (secure_boot_plan) |entry| try copyIntoFat32(allocator, io, esp, entry);
 
@@ -424,10 +447,12 @@ pub fn populateEsp(
         }
     }
 
-    const uki_count = if (options.boot_mode.includesUki())
-        try generateUkis(allocator, io, esp, source, plan.architecture, plan.boot_entries, plan.rootPartuuidText(), options)
-    else
-        0;
+    const uki_count = if (options.boot_mode.includesUki()) blk: {
+        if (options.stage_sink) |sink| {
+            if (!sink.advance(.uki)) return error.InvalidOperationOrder;
+        }
+        break :blk try generateUkis(allocator, io, esp, source, plan.architecture, plan.boot_entries, plan.rootPartuuidText(), options);
+    } else 0;
 
     return .{
         .architecture = plan.architecture,
@@ -2285,11 +2310,26 @@ test "populateEsp copies MOK assets and emits UKIs when requested" {
     });
     tree.bind();
 
+    const StageRecorder = struct {
+        stages: [3]PopulateStage = undefined,
+        len: usize = 0,
+
+        fn advance(context: ?*anyopaque, stage: PopulateStage) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (self.len == self.stages.len) return false;
+            self.stages[self.len] = stage;
+            self.len += 1;
+            return true;
+        }
+    };
+    var stage_recorder = StageRecorder{};
     const report = try populateEsp(std.testing.allocator, io, &esp, &tree.view, .{
         .planned_partitions = &planned,
         .boot_mode = .bls_and_uki,
         .extra_kernel_options = "quiet splash",
+        .stage_sink = .{ .context = &stage_recorder, .advanceFn = StageRecorder.advance },
     });
+    try std.testing.expectEqualSlices(PopulateStage, &.{ .prepare, .bootloader, .uki }, stage_recorder.stages[0..stage_recorder.len]);
     try std.testing.expectEqual(@as(usize, 4), report.copied_efi_file_count);
     try std.testing.expectEqual(@as(usize, 3), report.copied_secure_boot_file_count);
     try std.testing.expectEqual(@as(usize, 1), report.bls_entry_count);

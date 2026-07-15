@@ -99,6 +99,7 @@ pub const OpenError = error{
     MissingFileParameters,
     MissingVirtualDiskSize,
     MissingLogicalSectorSize,
+    InvalidMetadataTable,
     UnsupportedLogicalSectorSize,
     DifferencingNotSupported,
     InvalidBlockSize,
@@ -107,6 +108,7 @@ pub const OpenError = error{
 pub const CreateError = error{
     SizeNotSectorAligned,
     ImageTooLarge,
+    HeaderSequenceOverflow,
 } || Io.File.WritePositionalError || Io.File.SetLengthError;
 
 pub const PreadError = error{
@@ -118,12 +120,14 @@ pub const PwriteError = error{
     WritePastEndOfImage,
     UnsupportedBlockState,
     InvalidBatEntry,
+    HeaderSequenceOverflow,
 } || Io.File.ReadPositionalError || Io.File.WritePositionalError || Io.File.SetLengthError || Io.File.StatError;
 
 pub const ResizeError = error{
     ShrinkNotSupported,
     ImageTooLarge,
     MissingVirtualDiskSize,
+    HeaderSequenceOverflow,
 } || OpenError || Io.File.ReadPositionalError || Io.File.WritePositionalError || Io.File.SetLengthError || Io.File.StatError;
 
 /// Everything `Image` and the direct VHDX read/write helpers need to translate
@@ -140,6 +144,19 @@ pub const Info = struct {
     log_offset: u64,
     log_length: u32,
     header_sequence_number: u64,
+    file_write_guid: guid.Guid,
+    data_write_guid: guid.Guid,
+    page83_guid: guid.Guid,
+    deterministic_write_guid_seed: ?[32]u8 = null,
+    deterministic_write_index: u64 = 0,
+};
+
+pub const CreateOptions = struct {
+    header_sequence_base: ?u64 = null,
+    file_write_guid: ?guid.Guid = null,
+    data_write_guid: ?guid.Guid = null,
+    page83_guid: ?guid.Guid = null,
+    write_guid_seed: ?[32]u8 = null,
 };
 
 /// Parses the file signature, active header, region table, and metadata table,
@@ -162,6 +179,7 @@ pub fn open(io: Io, file: Io.File) OpenError!Info {
     const virtual_size = try readVirtualDiskSize(io, file, region.metadata_offset);
     const logical_sector_size = try readLogicalSectorSize(io, file, region.metadata_offset);
     if (logical_sector_size != default_logical_sector_size) return error.UnsupportedLogicalSectorSize;
+    const page83_guid = try readMetadataGuid(io, file, region.metadata_offset, page83_data_guid);
 
     const chunk_ratio = max_sectors_per_block * logical_sector_size / params.block_size;
 
@@ -175,6 +193,9 @@ pub fn open(io: Io, file: Io.File) OpenError!Info {
         .log_offset = header.log_offset,
         .log_length = header.log_length,
         .header_sequence_number = header.sequence_number,
+        .file_write_guid = header.file_write_guid,
+        .data_write_guid = header.data_write_guid,
+        .page83_guid = page83_guid,
     };
 }
 
@@ -182,8 +203,20 @@ pub fn open(io: Io, file: Io.File) OpenError!Info {
 /// redundant headers/region tables, a metadata region, and an all-not-present
 /// BAT sized for `size`.
 pub fn create(io: Io, file: Io.File, size: u64) CreateError!Info {
+    return createWithOptions(io, file, size, .{});
+}
+
+pub fn validateCreateOptions(size: u64, options: CreateOptions) CreateError!void {
     if (size % default_logical_sector_size != 0) return error.SizeNotSectorAligned;
     if (size > max_image_size) return error.ImageTooLarge;
+    if (options.header_sequence_base) |base| {
+        if (base > std.math.maxInt(u64) - 3) return error.HeaderSequenceOverflow;
+    }
+}
+
+pub fn createWithOptions(io: Io, file: Io.File, size: u64, options: CreateOptions) CreateError!Info {
+    try validateCreateOptions(size, options);
+    const header_sequence_base = options.header_sequence_base orelse randomHeaderSequenceBase(io);
 
     const block_size = default_block_size;
     const chunk_ratio = max_sectors_per_block * default_logical_sector_size / block_size;
@@ -196,17 +229,19 @@ pub fn create(io: Io, file: Io.File, size: u64) CreateError!Info {
     try file.setLength(io, initial_file_size);
     try writeFileIdentifier(file, io);
 
-    const header_sequence_base = randomU64(io);
+    const file_write_guid = options.file_write_guid orelse randomGuid(io);
+    const data_write_guid = options.data_write_guid orelse randomGuid(io);
+    const page83_guid = options.page83_guid orelse randomGuid(io);
     try writeHeaders(file, io, .{
         .sequence_base = header_sequence_base,
         .log_offset = header_section_end,
         .log_length = default_log_size,
-        .file_write_guid = randomGuid(io),
-        .data_write_guid = randomGuid(io),
+        .file_write_guid = file_write_guid,
+        .data_write_guid = data_write_guid,
         .log_guid = guid.nil,
     });
     try writeRegionTables(file, io, bat_offset, bat_length, metadata_offset);
-    try writeMetadataRegion(file, io, size, block_size, metadata_offset);
+    try writeMetadataRegion(file, io, size, block_size, metadata_offset, page83_guid);
 
     return .{
         .virtual_size = size,
@@ -218,6 +253,10 @@ pub fn create(io: Io, file: Io.File, size: u64) CreateError!Info {
         .log_offset = header_section_end,
         .log_length = default_log_size,
         .header_sequence_number = header_sequence_base + 1,
+        .file_write_guid = file_write_guid,
+        .data_write_guid = data_write_guid,
+        .page83_guid = page83_guid,
+        .deterministic_write_guid_seed = options.write_guid_seed,
     };
 }
 
@@ -262,6 +301,7 @@ pub fn pwrite(file: Io.File, io: Io, info: *Info, buffer: []const u8, offset: u6
     const write_end = std.math.add(u64, offset, buffer.len) catch return error.WritePastEndOfImage;
     if (write_end > info.virtual_size) return error.WritePastEndOfImage;
     if (buffer.len == 0) return;
+    try ensureHeaderSequenceAvailable(info.*);
 
     try ensureBatCapacityForSize(file, io, info, info.virtual_size);
 
@@ -306,6 +346,7 @@ pub fn resize(file: Io.File, io: Io, info: *Info, new_size: u64) ResizeError!voi
     if (new_size < info.virtual_size) return error.ShrinkNotSupported;
     if (new_size == info.virtual_size) return;
     if (new_size > max_image_size) return error.ImageTooLarge;
+    try ensureHeaderSequenceAvailable(info.*);
 
     try ensureBatCapacityForSize(file, io, info, new_size);
 
@@ -342,6 +383,8 @@ const HeaderInfo = struct {
     sequence_number: u64,
     log_offset: u64,
     log_length: u32,
+    file_write_guid: guid.Guid,
+    data_write_guid: guid.Guid,
 };
 
 fn readOneHeader(io: Io, file: Io.File, offset: u64) ?HeaderInfo {
@@ -360,6 +403,8 @@ fn readOneHeader(io: Io, file: Io.File, offset: u64) ?HeaderInfo {
 
     return .{
         .sequence_number = std.mem.readInt(u64, buf[8..16], .little),
+        .file_write_guid = buf[16..32].*,
+        .data_write_guid = buf[32..48].*,
         .log_length = std.mem.readInt(u32, buf[68..72], .little),
         .log_offset = std.mem.readInt(u64, buf[72..80], .little),
     };
@@ -461,6 +506,15 @@ fn readLogicalSectorSize(io: Io, file: Io.File, metadata_region_offset: u64) Ope
     return std.mem.readInt(u32, &buf, .little);
 }
 
+fn readMetadataGuid(io: Io, file: Io.File, metadata_region_offset: u64, item_guid: guid.Guid) OpenError!guid.Guid {
+    const item = (try findMetadataItem(io, file, metadata_region_offset, item_guid)) orelse
+        return error.MissingMetadataRegion;
+    if (item.length != 16) return error.InvalidMetadataTable;
+    var value: guid.Guid = undefined;
+    _ = try file.readPositionalAll(io, &value, item.file_offset);
+    return value;
+}
+
 const HeaderWriteInfo = struct {
     sequence_base: u64,
     log_offset: u64,
@@ -506,9 +560,27 @@ fn writeOneHeader(
     try file.writePositionalAll(io, &buf, offset);
 }
 
-fn updateHeaders(file: Io.File, io: Io, info: *Info, generate_data_write_guid: bool) Io.File.WritePositionalError!void {
-    const file_write_guid = randomGuid(io);
-    const data_write_guid = if (generate_data_write_guid) randomGuid(io) else guid.nil;
+fn ensureHeaderSequenceAvailable(info: Info) error{HeaderSequenceOverflow}!void {
+    if (info.header_sequence_number > std.math.maxInt(u64) - 2) return error.HeaderSequenceOverflow;
+}
+
+fn updateHeaders(
+    file: Io.File,
+    io: Io,
+    info: *Info,
+    generate_data_write_guid: bool,
+) (Io.File.WritePositionalError || error{HeaderSequenceOverflow})!void {
+    try ensureHeaderSequenceAvailable(info.*);
+    const file_write_guid = if (info.deterministic_write_guid_seed) |seed|
+        derivedWriteGuid(seed, "file", info.deterministic_write_index)
+    else
+        randomGuid(io);
+    const data_write_guid = if (!generate_data_write_guid)
+        guid.nil
+    else if (info.deterministic_write_guid_seed) |seed|
+        derivedWriteGuid(seed, "data", info.deterministic_write_index)
+    else
+        randomGuid(io);
     try writeHeaders(file, io, .{
         .sequence_base = info.header_sequence_number + 1,
         .log_offset = info.log_offset,
@@ -518,6 +590,9 @@ fn updateHeaders(file: Io.File, io: Io, info: *Info, generate_data_write_guid: b
         .log_guid = guid.nil,
     });
     info.header_sequence_number += 2;
+    info.file_write_guid = file_write_guid;
+    info.data_write_guid = data_write_guid;
+    info.deterministic_write_index += 1;
 }
 
 fn writeRegionTables(file: Io.File, io: Io, bat_offset: u64, bat_length: u64, metadata_offset: u64) Io.File.WritePositionalError!void {
@@ -540,7 +615,14 @@ fn writeRegionTables(file: Io.File, io: Io, bat_offset: u64, bat_length: u64, me
     try file.writePositionalAll(io, &buf, region_table2_offset);
 }
 
-fn writeMetadataRegion(file: Io.File, io: Io, virtual_size: u64, block_size: u32, metadata_offset: u64) Io.File.WritePositionalError!void {
+fn writeMetadataRegion(
+    file: Io.File,
+    io: Io,
+    virtual_size: u64,
+    block_size: u32,
+    metadata_offset: u64,
+    page83_guid: guid.Guid,
+) Io.File.WritePositionalError!void {
     var table: [header_block_size]u8 = [_]u8{0} ** header_block_size;
     table[0..8].* = metadata_signature;
     std.mem.writeInt(u16, table[10..12], 5, .little);
@@ -556,7 +638,7 @@ fn writeMetadataRegion(file: Io.File, io: Io, virtual_size: u64, block_size: u32
     std.mem.writeInt(u32, items[0..4], block_size, .little);
     std.mem.writeInt(u32, items[4..8], 0, .little);
     std.mem.writeInt(u64, items[8..16], virtual_size, .little);
-    items[16..32].* = randomGuid(io);
+    items[16..32].* = page83_guid;
     std.mem.writeInt(u32, items[32..36], default_logical_sector_size, .little);
     std.mem.writeInt(u32, items[36..40], default_physical_sector_size, .little);
     try file.writePositionalAll(io, &items, metadata_offset + metadata_item_base_offset);
@@ -647,10 +729,13 @@ fn divCeil(numerator: u64, denominator: u64) u64 {
     return std.math.divCeil(u64, numerator, denominator) catch unreachable;
 }
 
-fn randomU64(io: Io) u64 {
-    var buf: [8]u8 = undefined;
-    Io.random(io, &buf);
-    return std.mem.readInt(u64, &buf, .little);
+fn randomHeaderSequenceBase(io: Io) u64 {
+    while (true) {
+        var buf: [8]u8 = undefined;
+        Io.random(io, &buf);
+        const value = std.mem.readInt(u64, &buf, .little);
+        if (value <= std.math.maxInt(u64) - 3) return value;
+    }
 }
 
 fn randomGuid(io: Io) guid.Guid {
@@ -659,6 +744,23 @@ fn randomGuid(io: Io) guid.Guid {
     bytes[7] = (bytes[7] & 0x0F) | 0x40; // version 4 in mixed-endian GUID layout
     bytes[8] = (bytes[8] & 0x3F) | 0x80; // variant 10
     return bytes;
+}
+
+fn derivedWriteGuid(seed: [32]u8, kind: []const u8, index: u64) guid.Guid {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("zvmi-vhdx-write-guid-v1\x00");
+    hash.update(kind);
+    var index_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &index_bytes, index, .big);
+    hash.update(&index_bytes);
+    hash.update(&seed);
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+
+    var value: guid.Guid = digest[0..16].*;
+    value[7] = (value[7] & 0x0F) | 0x40;
+    value[8] = (value[8] & 0x3F) | 0x80;
+    return value;
 }
 
 test "batIndexForBlock matches QEMU's vhdx_block_translate interleaving" {
@@ -699,7 +801,7 @@ test "create, write, resize, and reopen vhdx images" {
     const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
     defer file.close(io);
 
-    var info = try create(io, file, initial_size);
+    var info = try createWithOptions(io, file, initial_size, .{});
     const initial_bat_length = info.bat_length;
     try std.testing.expectEqual(initial_size, info.virtual_size);
     try std.testing.expectEqual(default_block_size, info.block_size);
@@ -729,4 +831,30 @@ test "create, write, resize, and reopen vhdx images" {
     var zero_buf: [64]u8 = undefined;
     _ = try pread(file, io, reopened, &zero_buf, @as(u64, default_block_size));
     try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 64), &zero_buf);
+}
+
+test "create rejects an overflowing header sequence before modifying the file" {
+    const io = std.testing.io;
+    const path = "test-vhdx-sequence-overflow.vhdx";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true });
+    defer file.close(io);
+
+    try std.testing.expectError(
+        error.HeaderSequenceOverflow,
+        createWithOptions(io, file, default_logical_sector_size, .{
+            .header_sequence_base = std.math.maxInt(u64),
+        }),
+    );
+    try std.testing.expectEqual(@as(u64, 0), (try file.stat(io)).size);
+
+    var info = try createWithOptions(io, file, default_logical_sector_size, .{
+        .header_sequence_base = 0,
+    });
+    const initial_file_size = (try file.stat(io)).size;
+    info.header_sequence_number = std.math.maxInt(u64) - 1;
+    try std.testing.expectError(error.HeaderSequenceOverflow, pwrite(file, io, &info, "x", 0));
+    try std.testing.expectError(error.HeaderSequenceOverflow, resize(file, io, &info, 2 * default_logical_sector_size));
+    try std.testing.expectEqual(initial_file_size, (try file.stat(io)).size);
+    try std.testing.expectEqual(@as(u64, default_logical_sector_size), info.virtual_size);
 }

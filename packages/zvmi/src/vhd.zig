@@ -124,7 +124,7 @@ pub const Footer = struct {
         const total_sectors = size / 512;
         return .{
             .data_offset = 0xFFFF_FFFF_FFFF_FFFF,
-            .timestamp = @intCast(@max(0, now_unix - timestamp_base)),
+            .timestamp = timestampFromUnix(now_unix),
             .original_size = size,
             .current_size = size,
             .geometry = calculateGeometry(total_sectors),
@@ -140,13 +140,19 @@ pub const Footer = struct {
         const total_sectors = size / 512;
         return .{
             .data_offset = header_offset,
-            .timestamp = @intCast(@max(0, now_unix - timestamp_base)),
+            .timestamp = timestampFromUnix(now_unix),
             .original_size = size,
             .current_size = size,
             .geometry = calculateGeometry(total_sectors),
             .disk_type = .dynamic,
             .unique_id = unique_id,
         };
+    }
+
+    fn timestampFromUnix(now_unix: i64) u32 {
+        const since_epoch = std.math.sub(i64, now_unix, timestamp_base) catch return std.math.maxInt(u32);
+        if (since_epoch <= 0) return 0;
+        return @intCast(@min(@as(i64, std.math.maxInt(u32)), since_epoch));
     }
 
     /// Imported VHDs historically disagree on which footer field defines the

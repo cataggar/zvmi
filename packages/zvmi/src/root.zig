@@ -34,6 +34,7 @@ pub const layout = @import("layout.zig");
 pub const oci = @import("oci.zig");
 pub const cosi = @import("cosi.zig");
 pub const build_image = @import("build_image.zig");
+pub const customize = @import("customize.zig");
 pub const verity = @import("verity.zig");
 const image_mod = @import("image.zig");
 const size_mod = @import("size.zig");
