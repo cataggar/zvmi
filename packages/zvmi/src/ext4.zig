@@ -255,6 +255,8 @@ pub const OpenError = std.mem.Allocator.Error || Io.File.ReadPositionalError || 
     UnsupportedFeatures,
     UnsupportedInodeSize,
     UnsupportedRevision,
+    SourceReadFailed,
+    UnexpectedEndOfFile,
 };
 
 pub const ReadError = std.mem.Allocator.Error || Io.File.ReadPositionalError || error{
@@ -267,6 +269,8 @@ pub const ReadError = std.mem.Allocator.Error || Io.File.ReadPositionalError || 
     UnsupportedInodeLayout,
     FileTooLarge,
     XattrNotFound,
+    SourceReadFailed,
+    UnexpectedEndOfFile,
 };
 
 pub const ResizeError = PopulateError || OpenError || Io.File.ReadPositionalError || Io.File.WritePositionalError ||
@@ -387,6 +391,45 @@ const WriterPlan = struct {
     }
 };
 
+const PreparedPopulate = struct {
+    writer: WriterPlan,
+    layout: Layout,
+
+    fn deinit(self: *PreparedPopulate, allocator: std.mem.Allocator) void {
+        self.writer.deinit(allocator);
+        allocator.free(self.layout.groups);
+        self.* = undefined;
+    }
+
+    fn filesystemInfo(self: *const PreparedPopulate) FilesystemInfo {
+        return .{
+            .block_count = self.layout.total_blocks,
+            .free_block_count = countFreeBlocks(self.layout.groups),
+            .inode_count = self.layout.group_count * self.layout.inodes_per_group,
+            .free_inode_count = countFreeInodes(
+                self.layout.groups,
+                self.layout.inodes_per_group,
+            ),
+            .group_count = self.layout.group_count,
+            .feature_compat = writer_feature_compat,
+            .feature_incompat = writer_feature_incompat,
+            .feature_ro_compat = self.writer.feature_ro_compat,
+        };
+    }
+};
+
+/// Validates and plans the exact ext4 population operation without creating
+/// or modifying a file.
+pub fn preflightPopulate(
+    allocator: std.mem.Allocator,
+    tree: *FileTreeView,
+    options: PopulateOptions,
+) PopulateError!FilesystemInfo {
+    var prepared = try preparePopulate(allocator, tree, options);
+    defer prepared.deinit(allocator);
+    return prepared.filesystemInfo();
+}
+
 /// Formats a fresh ext4 filesystem inside `file[options.offset .. options.offset + options.length)`,
 /// writes the supplied tree, and returns the resulting geometry/feature bits.
 pub fn populate(
@@ -396,15 +439,12 @@ pub fn populate(
     tree: *FileTreeView,
     options: PopulateOptions,
 ) PopulateError!FilesystemInfo {
-    if (options.block_size != default_block_size) return error.UnsupportedBlockSize;
-    if (options.length == 0 or options.length % options.block_size != 0) return error.InvalidRange;
-    if (options.label.len > 16) return error.LabelTooLong;
-
-    const total_blocks64 = options.length / options.block_size;
-    const total_blocks = std.math.cast(u32, total_blocks64) orelse return error.FilesystemTooLarge;
+    var prepared = try preparePopulate(allocator, tree, options);
+    defer prepared.deinit(allocator);
 
     const stat = try file.stat(io);
-    if (stat.size < options.offset + options.length) {
+    const range_end = options.offset + options.length;
+    if (stat.size < range_end) {
         // `stat.size` reads back as 0 for a block-device special file (real
         // hardware, e.g. formatting a resource disk directly rather than a
         // disk-image regular file -- see azagent/resource_disk.zig), so
@@ -415,40 +455,61 @@ pub fn populate(
         // propagated. A regular file that's genuinely too small to hold
         // the requested range fails for a different reason (`FileTooBig`,
         // `NoSpaceLeft`, etc., surfaced normally by the writes below).
-        file.setLength(io, options.offset + options.length) catch |err| switch (err) {
+        file.setLength(io, range_end) catch |err| switch (err) {
             error.NonResizable => {},
             else => return err,
         };
     }
 
-    var plan = try buildPlan(allocator, tree, options);
-    defer plan.deinit(allocator);
+    try writeNodeData(io, file, prepared.writer.nodes, options);
+    try zeroUnusedInodeTableBlocks(io, file, prepared.layout, options.offset);
+    try writeBitmaps(io, file, prepared.layout, options.offset);
+    try writeInodes(io, file, prepared.writer.nodes, prepared.layout, options);
+    try writeGroupDescriptorTables(
+        io,
+        file,
+        prepared.layout,
+        options.offset,
+        options.uuid orelse [_]u8{0} ** 16,
+    );
+    try writeSuperblocks(io, file, prepared.layout, prepared.writer, options);
 
-    var layout = try buildLayout(allocator, total_blocks, plan.nodes.len, plan.data_blocks_needed);
-    defer allocator.free(layout.groups);
+    return prepared.filesystemInfo();
+}
 
-    assignInodesToGroups(plan.nodes, layout.groups, layout.inodes_per_group);
-    const free_blocks_before = countFreeBlocks(layout.groups);
-    if (plan.data_blocks_needed > free_blocks_before) return error.NotEnoughSpace;
+fn preparePopulate(
+    allocator: std.mem.Allocator,
+    tree: *FileTreeView,
+    options: PopulateOptions,
+) PopulateError!PreparedPopulate {
+    if (options.block_size != default_block_size) return error.UnsupportedBlockSize;
+    if (options.length == 0 or options.length % options.block_size != 0) {
+        return error.InvalidRange;
+    }
+    _ = std.math.add(u64, options.offset, options.length) catch
+        return error.InvalidRange;
+    if (options.label.len > 16) return error.LabelTooLong;
 
-    try allocateNodeBlocks(allocator, plan.nodes, &layout);
-    try writeNodeData(io, file, plan.nodes, options);
-    try zeroUnusedInodeTableBlocks(io, file, layout, options.offset);
-    try writeBitmaps(io, file, layout, options.offset);
-    try writeInodes(io, file, plan.nodes, layout, options);
-    try writeGroupDescriptorTables(io, file, layout, options.offset, options.uuid orelse [_]u8{0} ** 16);
-    try writeSuperblocks(io, file, layout, plan, options);
+    const total_blocks64 = options.length / options.block_size;
+    const total_blocks = std.math.cast(u32, total_blocks64) orelse
+        return error.FilesystemTooLarge;
 
-    return .{
-        .block_count = layout.total_blocks,
-        .free_block_count = countFreeBlocks(layout.groups),
-        .inode_count = layout.group_count * layout.inodes_per_group,
-        .free_inode_count = countFreeInodes(layout.groups, layout.inodes_per_group),
-        .group_count = layout.group_count,
-        .feature_compat = writer_feature_compat,
-        .feature_incompat = writer_feature_incompat,
-        .feature_ro_compat = plan.feature_ro_compat,
-    };
+    var writer = try buildPlan(allocator, tree, options);
+    errdefer writer.deinit(allocator);
+    var layout = try buildLayout(
+        allocator,
+        total_blocks,
+        writer.nodes.len,
+        writer.data_blocks_needed,
+    );
+    errdefer allocator.free(layout.groups);
+
+    assignInodesToGroups(writer.nodes, layout.groups, layout.inodes_per_group);
+    if (writer.data_blocks_needed > countFreeBlocks(layout.groups)) {
+        return error.NotEnoughSpace;
+    }
+    try allocateNodeBlocks(allocator, writer.nodes, &layout);
+    return .{ .writer = writer, .layout = layout };
 }
 
 /// Grow an ext4 filesystem in place by extending the final block group or
@@ -581,11 +642,45 @@ pub const OpenOptions = struct {
     offset: u64 = 0,
 };
 
+fn readSourceAll(
+    io: Io,
+    file: Io.File,
+    source: ?ReadOnlySource,
+    buffer: []u8,
+    offset: u64,
+) (Io.File.ReadPositionalError || error{ SourceReadFailed, UnexpectedEndOfFile })!void {
+    var done: usize = 0;
+    while (done < buffer.len) {
+        const count = if (source) |read_source|
+            read_source.read_at_fn(read_source.ctx, io, buffer[done..], offset + done) catch
+                return error.SourceReadFailed
+        else
+            try file.readPositionalAll(io, buffer[done..], offset + done);
+        if (count == 0 or count > buffer.len - done) return error.UnexpectedEndOfFile;
+        done += count;
+    }
+}
+
+/// A read-only positional byte source used when ext4 lives in a virtual disk
+/// view (for example, a qcow2 backing chain) rather than directly in `file`.
+/// Callback errors are deliberately collapsed to `error.SourceReadFailed`.
+pub const ReadOnlySource = struct {
+    ctx: *const anyopaque,
+    read_at_fn: *const fn (
+        ctx: *const anyopaque,
+        io: Io,
+        buffer: []u8,
+        offset: u64,
+    ) anyerror!usize,
+};
+
 pub const Reader = struct {
     file: Io.File,
+    read_only_source: ?ReadOnlySource,
     allocator: std.mem.Allocator,
     offset: u64,
     uuid: [16]u8,
+    label: [16]u8,
     block_size: u32,
     total_blocks: u32,
     total_inodes: u32,
@@ -598,12 +693,37 @@ pub const Reader = struct {
     groups: []ReaderGroup,
 
     pub fn open(io: Io, file: Io.File, allocator: std.mem.Allocator, options: OpenOptions) OpenError!Reader {
+        return openInternal(io, file, null, allocator, options);
+    }
+
+    /// Opens ext4 through a guest-visible read-only byte source. `file` is
+    /// retained only for API/layout compatibility and is never read while the
+    /// supplied source is present.
+    pub fn openReadOnlySource(
+        io: Io,
+        file: Io.File,
+        source: ReadOnlySource,
+        allocator: std.mem.Allocator,
+        options: OpenOptions,
+    ) OpenError!Reader {
+        return openInternal(io, file, source, allocator, options);
+    }
+
+    fn openInternal(
+        io: Io,
+        file: Io.File,
+        source: ?ReadOnlySource,
+        allocator: std.mem.Allocator,
+        options: OpenOptions,
+    ) OpenError!Reader {
         var sb: [superblock_size]u8 = undefined;
-        _ = try file.readPositionalAll(io, &sb, options.offset + superblock_offset);
+        try readSourceAll(io, file, source, &sb, options.offset + superblock_offset);
         if (readInt(u16, sb[0x38..0x3A]) != super_magic) return error.BadMagic;
         if (readInt(u32, sb[0x4C..0x50]) != rev_dynamic) return error.UnsupportedRevision;
 
-        const block_size = @as(u32, 1024) << @intCast(readInt(u32, sb[0x18..0x1C]));
+        const log_block_size = readInt(u32, sb[0x18..0x1C]);
+        if (log_block_size > 2) return error.UnsupportedBlockSize;
+        const block_size = @as(u32, 1024) << @intCast(log_block_size);
         if (block_size != default_block_size) return error.UnsupportedBlockSize;
 
         const incompat = readInt(u32, sb[0x60..0x64]);
@@ -615,6 +735,7 @@ pub const Reader = struct {
 
         var uuid: [16]u8 = undefined;
         @memcpy(&uuid, sb[0x68..0x78]);
+        const label = sb[0x78..0x88].*;
 
         const desc_size = blk: {
             const raw = readInt(u16, sb[0xFE..0x100]);
@@ -628,6 +749,9 @@ pub const Reader = struct {
         const inodes_per_group = readInt(u32, sb[0x28..0x2C]);
         const inode_size_on_disk = readInt(u16, sb[0x58..0x5A]);
         if (inode_size_on_disk < inode_size or inode_size_on_disk > max_supported_reader_inode_size) return error.UnsupportedInodeSize;
+        if (total_blocks == 0 or blocks_per_group == 0 or inodes_per_group == 0) {
+            return error.UnsupportedFeatures;
+        }
         const group_count = blocksToGroups(total_blocks, blocks_per_group);
 
         const groups = try allocator.alloc(ReaderGroup, group_count);
@@ -638,7 +762,7 @@ pub const Reader = struct {
         const gdt = try allocator.alloc(u8, gdt_storage_bytes);
         defer allocator.free(gdt);
         @memset(gdt, 0);
-        _ = try file.readPositionalAll(io, gdt, options.offset + @as(u64, block_size));
+        try readSourceAll(io, file, source, gdt, options.offset + @as(u64, block_size));
         var group_index: u32 = 0;
         while (group_index < group_count) : (group_index += 1) {
             const base = @as(usize, group_index) * desc_size;
@@ -646,14 +770,22 @@ pub const Reader = struct {
                 .block_bitmap_block = readInt(u32, gdt[base + 0 .. base + 4]),
                 .inode_bitmap_block = readInt(u32, gdt[base + 4 .. base + 8]),
                 .inode_table_block = readInt(u32, gdt[base + 8 .. base + 12]),
+                .free_block_count = readInt(u16, gdt[base + 12 .. base + 14]),
+                .free_inode_count = readInt(u16, gdt[base + 14 .. base + 16]),
+                .used_directory_count = readInt(u16, gdt[base + 16 .. base + 18]),
+                .block_bitmap_checksum = readInt(u16, gdt[base + 0x18 .. base + 0x1A]),
+                .inode_bitmap_checksum = readInt(u16, gdt[base + 0x1A .. base + 0x1C]),
+                .descriptor_checksum = readInt(u16, gdt[base + 0x1E .. base + 0x20]),
             };
         }
 
         return .{
             .file = file,
+            .read_only_source = source,
             .allocator = allocator,
             .offset = options.offset,
             .uuid = uuid,
+            .label = label,
             .block_size = block_size,
             .total_blocks = total_blocks,
             .total_inodes = total_inodes,
@@ -827,7 +959,7 @@ pub const Reader = struct {
             const within_block: usize = @intCast(logical_offset % self.block_size);
             const physical_block = findPhysicalBlock(extents, logical_block) orelse return error.UnsupportedInodeLayout;
             const chunk = @min(remaining, @as(usize, self.block_size) - within_block);
-            _ = try self.file.readPositionalAll(io, buffer[done .. done + chunk], self.blockOffset(physical_block) + within_block);
+            try self.readAll(io, buffer[done .. done + chunk], self.blockOffset(physical_block) + within_block);
             done += chunk;
             remaining -= chunk;
             logical_offset += chunk;
@@ -860,7 +992,7 @@ pub const Reader = struct {
 
         const block = try allocator.alloc(u8, self.block_size);
         defer allocator.free(block);
-        _ = try self.file.readPositionalAll(io, block, self.blockOffset(inode.file_acl_block));
+        try self.readAll(io, block, self.blockOffset(inode.file_acl_block));
         if (readInt(u32, block[0..4]) != ext4_xattr_magic) return error.UnsupportedInodeLayout;
 
         var xattrs = std.array_list.Managed(OwnedXattr).init(allocator);
@@ -880,11 +1012,14 @@ pub const Reader = struct {
             const value_off = readInt(u16, block[cursor + 2 .. cursor + 4]);
             const value_size = readInt(u32, block[cursor + 8 .. cursor + 12]);
             const entry_len = alignUpU16(@as(u16, @intCast(16 + name_len)), 4);
+            const value_end = std.math.add(u64, value_off, value_size) catch
+                return error.UnsupportedInodeLayout;
+            if (cursor + entry_len > block.len or value_end > block.len) return error.UnsupportedInodeLayout;
+            if (cursor + 16 + name_len > block.len) return error.UnsupportedInodeLayout;
             const short_name = block[cursor + 16 .. cursor + 16 + name_len];
-            if (cursor + entry_len > block.len or value_off + value_size > block.len) return error.UnsupportedInodeLayout;
             try xattrs.append(.{
                 .name = try joinXattrName(allocator, name_index, short_name),
-                .value = try allocator.dupe(u8, block[value_off .. value_off + value_size]),
+                .value = try allocator.dupe(u8, block[value_off..@intCast(value_end)]),
             });
             cursor += entry_len;
         }
@@ -899,12 +1034,20 @@ pub const Reader = struct {
         const inode_offset = self.blockOffset(group.inode_table_block) + @as(u64, index_in_group) * self.inode_size;
 
         var buf: [max_supported_reader_inode_size]u8 = [_]u8{0} ** max_supported_reader_inode_size;
-        _ = try self.file.readPositionalAll(io, buf[0..self.inode_size], inode_offset);
+        try self.readAll(io, buf[0..self.inode_size], inode_offset);
         return ParsedInode.fromBytes(inode_number, buf[0..self.inode_size]);
     }
 
     fn blockOffset(self: Reader, block_number: u64) u64 {
         return self.offset + block_number * self.block_size;
+    }
+
+    fn readAll(self: Reader, io: Io, buffer: []u8, offset: u64) ReadError!void {
+        readSourceAll(io, self.file, self.read_only_source, buffer, offset) catch |err| switch (err) {
+            error.SourceReadFailed => return error.SourceReadFailed,
+            error.UnexpectedEndOfFile => return error.UnexpectedEndOfFile,
+            else => return err,
+        };
     }
 
     fn readInodeExtentsAlloc(self: Reader, io: Io, allocator: std.mem.Allocator, inode: ParsedInode) ReadError![]Extent {
@@ -944,7 +1087,7 @@ pub const Reader = struct {
         while (entry_index < header.entries) : (entry_index += 1) {
             const base = extent_header_size + entry_index * extent_entry_size;
             const child = decodeExtentIndex(node_bytes[base .. base + extent_entry_size]);
-            _ = try self.file.readPositionalAll(io, &child_block, self.blockOffset(child.leaf_block));
+            try self.readAll(io, &child_block, self.blockOffset(child.leaf_block));
             try self.appendExtentTreeEntries(
                 io,
                 extents,
@@ -975,7 +1118,7 @@ pub const Reader = struct {
             const within_block: usize = @intCast(logical_offset % self.block_size);
             const physical_block = findPhysicalBlock(extents, logical_block) orelse return error.UnsupportedInodeLayout;
             const chunk = @min(remaining, @as(usize, self.block_size) - within_block);
-            _ = try self.file.readPositionalAll(io, buffer[done .. done + chunk], self.blockOffset(physical_block) + within_block);
+            try self.readAll(io, buffer[done .. done + chunk], self.blockOffset(physical_block) + within_block);
             done += chunk;
             remaining -= chunk;
             logical_offset += chunk;
@@ -986,6 +1129,16 @@ pub const Reader = struct {
 
 pub fn open(io: Io, file: Io.File, allocator: std.mem.Allocator, options: OpenOptions) OpenError!Reader {
     return Reader.open(io, file, allocator, options);
+}
+
+pub fn openReadOnlySource(
+    io: Io,
+    file: Io.File,
+    source: ReadOnlySource,
+    allocator: std.mem.Allocator,
+    options: OpenOptions,
+) OpenError!Reader {
+    return Reader.openReadOnlySource(io, file, source, allocator, options);
 }
 
 pub const EditOptions = struct {
@@ -1703,6 +1856,12 @@ const ReaderGroup = struct {
     block_bitmap_block: u32,
     inode_bitmap_block: u32,
     inode_table_block: u32,
+    free_block_count: u16,
+    free_inode_count: u16,
+    used_directory_count: u16,
+    block_bitmap_checksum: u16,
+    inode_bitmap_checksum: u16,
+    descriptor_checksum: u16,
 };
 
 const ParsedInode = struct {
@@ -1712,6 +1871,11 @@ const ParsedInode = struct {
     uid: u32,
     gid: u32,
     size: u64,
+    atime: u32,
+    ctime: u32,
+    mtime: u32,
+    deletion_time: u32,
+    sector_count: u32,
     generation: u32,
     flags: u32,
     file_acl_block: u32,
@@ -1730,6 +1894,11 @@ const ParsedInode = struct {
             .uid = readInt(u16, buf[2..4]) | (@as(u32, readInt(u16, buf[120..122])) << 16),
             .gid = readInt(u16, buf[24..26]) | (@as(u32, readInt(u16, buf[122..124])) << 16),
             .size = readInt(u32, buf[4..8]) | (@as(u64, readInt(u32, buf[108..112])) << 32),
+            .atime = readInt(u32, buf[8..12]),
+            .ctime = readInt(u32, buf[12..16]),
+            .mtime = readInt(u32, buf[16..20]),
+            .deletion_time = readInt(u32, buf[20..24]),
+            .sector_count = readInt(u32, buf[28..32]),
             .generation = readInt(u32, buf[100..104]),
             .flags = readInt(u32, buf[32..36]),
             .file_acl_block = readInt(u32, buf[104..108]),
@@ -1756,6 +1925,1141 @@ const ParsedInode = struct {
         return self.kind == .symlink and self.size < 60 and (self.flags & inode_flag_extents) == 0;
     }
 };
+
+/// The only ext4 source profile accepted by the rootless rebuild importer.
+/// It is intentionally the exact feature/layout subset emitted by this
+/// module's writer, not a promise to ingest general ext4 filesystems.
+pub const StrictProfile = enum {
+    zvmi_ext4_v1,
+};
+
+pub const StrictFilesystemIdentity = struct {
+    profile: StrictProfile = .zvmi_ext4_v1,
+    uuid: [16]u8,
+    /// Exact on-disk 16-byte volume-name field, including embedded/trailing
+    /// NUL bytes.
+    label: [16]u8,
+    block_size: u32,
+    filesystem_length: u64,
+    global_timestamp: u32,
+};
+
+pub const StrictScanOptions = struct {
+    /// The selected partition must be exactly this long. Padding or trailers
+    /// after the ext4 block range are rejected.
+    expected_length: u64,
+    max_nodes: usize = 1_000_000,
+    max_path_bytes: usize = 4096,
+    max_component_bytes: usize = 255,
+    max_file_bytes: u64 = 16 * 1024 * 1024 * 1024,
+    max_total_bytes: u64 = 64 * 1024 * 1024 * 1024,
+    max_xattrs_per_node: usize = 256,
+    max_xattr_bytes_per_node: usize = 1024 * 1024,
+    max_scan_metadata_bytes: usize = 256 * 1024 * 1024,
+};
+
+const StrictContent = struct {
+    reader: *Reader,
+    io: Io,
+    inode: ParsedInode,
+};
+
+const StrictEntry = struct {
+    path: []u8,
+    inode: ParsedInode,
+    xattrs: []OwnedXattr,
+    xattr_views: []Xattr,
+    content: StrictContent,
+};
+
+/// An exhaustively validated, deterministic tree view. Paths/xattrs are
+/// owned, while file bytes remain in the read-only source until a caller
+/// imports the view into its own spool.
+pub const StrictTree = struct {
+    allocator: std.mem.Allocator,
+    entries: []StrictEntry,
+    identity: StrictFilesystemIdentity,
+    iteration_index: usize = 0,
+    view: FileTreeView = undefined,
+
+    pub fn deinit(self: *StrictTree) void {
+        for (self.entries) |entry| {
+            self.allocator.free(entry.path);
+            freeXattrs(self.allocator, entry.xattrs);
+            self.allocator.free(entry.xattr_views);
+        }
+        self.allocator.free(self.entries);
+        self.* = undefined;
+    }
+
+    pub fn nodeCount(self: *const StrictTree) usize {
+        return self.entries.len;
+    }
+
+    pub fn fileTreeView(self: *StrictTree) *FileTreeView {
+        self.iteration_index = 0;
+        self.view = .{
+            .ctx = self,
+            .next_fn = strictTreeNext,
+            .reset_fn = strictTreeReset,
+        };
+        return &self.view;
+    }
+};
+
+fn strictTreeReset(ctx: *anyopaque) void {
+    const tree: *StrictTree = @ptrCast(@alignCast(ctx));
+    tree.iteration_index = 0;
+}
+
+fn strictTreeNext(ctx: *anyopaque) FileTreeView.IteratorError!?FileTreeView.Entry {
+    const tree: *StrictTree = @ptrCast(@alignCast(ctx));
+    if (tree.iteration_index == tree.entries.len) return null;
+    const entry = &tree.entries[tree.iteration_index];
+    tree.iteration_index += 1;
+    return .{
+        .path = entry.path,
+        .kind = entry.inode.kind,
+        .mode = entry.inode.mode,
+        .uid = entry.inode.uid,
+        .gid = entry.inode.gid,
+        .size = if (entry.inode.kind == .directory) 0 else entry.inode.size,
+        .content = if (entry.inode.kind == .directory) null else .{
+            .ctx = &entry.content,
+            .read_at_fn = strictContentReadAt,
+        },
+        .xattrs = entry.xattr_views,
+    };
+}
+
+fn strictContentReadAt(
+    ctx: *const anyopaque,
+    buffer: []u8,
+    offset: u64,
+) FileTreeView.ContentError!usize {
+    const content: *const StrictContent = @ptrCast(@alignCast(ctx));
+    return content.reader.preadInode(content.io, content.inode, buffer, offset) catch
+        return error.ReadFailed;
+}
+
+/// Validates every allocated inode/block and returns a deterministic view of
+/// the guest-visible tree. No files are created and the source is never
+/// opened for writing.
+pub fn scanWriterCompatible(
+    reader: *Reader,
+    io: Io,
+    allocator: std.mem.Allocator,
+    options: StrictScanOptions,
+) !StrictTree {
+    var scanner = try StrictScanner.init(reader, io, allocator, options);
+    defer scanner.deinit();
+    try scanner.scan();
+    const entries = try scanner.entries.toOwnedSlice();
+    return .{
+        .allocator = allocator,
+        .entries = entries,
+        .identity = scanner.identity,
+    };
+}
+
+const StrictChild = struct {
+    inode: u32,
+    kind: Kind,
+    name: []u8,
+};
+
+const StrictExtentResult = struct {
+    extents: []Extent,
+    index_block_count: u32,
+};
+
+const StrictScanner = struct {
+    reader: *Reader,
+    io: Io,
+    allocator: std.mem.Allocator,
+    options: StrictScanOptions,
+    identity: StrictFilesystemIdentity,
+    entries: std.array_list.Managed(StrictEntry),
+    visited_inodes: []u8,
+    allocated_inodes: []u8,
+    owned_blocks: []u8,
+    allocated_blocks: []u8,
+    directories_per_group: []u32,
+    total_content_bytes: u64 = 0,
+    visited_inode_count: usize = 0,
+    super_free_blocks: u32,
+    super_free_inodes: u32,
+
+    fn init(
+        reader: *Reader,
+        io: Io,
+        allocator: std.mem.Allocator,
+        options: StrictScanOptions,
+    ) !StrictScanner {
+        const identity_and_counts = try validateStrictSuperblock(reader, io, options.expected_length);
+        const inode_bitmap_len = bitmapByteLength(reader.total_inodes);
+        const block_bitmap_len = bitmapByteLength(reader.total_blocks);
+        const bitmap_bytes = std.math.mul(
+            usize,
+            std.math.add(usize, inode_bitmap_len, block_bitmap_len) catch
+                return error.ScanMetadataLimitExceeded,
+            2,
+        ) catch return error.ScanMetadataLimitExceeded;
+        const directory_count_bytes = std.math.mul(usize, reader.groups.len, @sizeOf(u32)) catch
+            return error.ScanMetadataLimitExceeded;
+        const scan_metadata_bytes = std.math.add(
+            usize,
+            bitmap_bytes,
+            directory_count_bytes,
+        ) catch return error.ScanMetadataLimitExceeded;
+        if (scan_metadata_bytes > options.max_scan_metadata_bytes) {
+            return error.ScanMetadataLimitExceeded;
+        }
+        const visited = try allocator.alloc(u8, inode_bitmap_len);
+        errdefer allocator.free(visited);
+        const allocated_inodes = try allocator.alloc(u8, inode_bitmap_len);
+        errdefer allocator.free(allocated_inodes);
+        const owned_blocks = try allocator.alloc(u8, block_bitmap_len);
+        errdefer allocator.free(owned_blocks);
+        const allocated_blocks = try allocator.alloc(u8, block_bitmap_len);
+        errdefer allocator.free(allocated_blocks);
+        const directories = try allocator.alloc(u32, reader.groups.len);
+        errdefer allocator.free(directories);
+        @memset(visited, 0);
+        @memset(allocated_inodes, 0);
+        @memset(owned_blocks, 0);
+        @memset(allocated_blocks, 0);
+        @memset(directories, 0);
+        return .{
+            .reader = reader,
+            .io = io,
+            .allocator = allocator,
+            .options = options,
+            .identity = identity_and_counts.identity,
+            .entries = .init(allocator),
+            .visited_inodes = visited,
+            .allocated_inodes = allocated_inodes,
+            .owned_blocks = owned_blocks,
+            .allocated_blocks = allocated_blocks,
+            .directories_per_group = directories,
+            .super_free_blocks = identity_and_counts.free_blocks,
+            .super_free_inodes = identity_and_counts.free_inodes,
+        };
+    }
+
+    fn deinit(self: *StrictScanner) void {
+        for (self.entries.items) |entry| {
+            self.allocator.free(entry.path);
+            freeXattrs(self.allocator, entry.xattrs);
+            self.allocator.free(entry.xattr_views);
+        }
+        self.entries.deinit();
+        self.allocator.free(self.visited_inodes);
+        self.allocator.free(self.allocated_inodes);
+        self.allocator.free(self.owned_blocks);
+        self.allocator.free(self.allocated_blocks);
+        self.allocator.free(self.directories_per_group);
+    }
+
+    fn scan(self: *StrictScanner) !void {
+        try self.loadAndValidateBitmaps();
+        try self.scanNode(root_inode, root_inode, "", .directory, true);
+
+        var inode_number: u32 = 1;
+        while (inode_number <= self.reader.total_inodes) : (inode_number += 1) {
+            const expected = inode_number <= first_non_reserved_inode - 1 or
+                bitmapIsSet(self.visited_inodes, inode_number - 1);
+            if (bitmapIsSet(self.allocated_inodes, inode_number - 1) != expected) {
+                return error.UnsupportedAllocatedInode;
+            }
+        }
+
+        var block_number: u32 = 0;
+        while (block_number < self.reader.total_blocks) : (block_number += 1) {
+            if (bitmapIsSet(self.allocated_blocks, block_number) !=
+                bitmapIsSet(self.owned_blocks, block_number))
+            {
+                return error.UnsupportedAllocatedBlock;
+            }
+        }
+
+        for (self.reader.groups, 0..) |group, index| {
+            if (group.used_directory_count != self.directories_per_group[index]) {
+                return error.InvalidDirectoryCount;
+            }
+        }
+    }
+
+    fn loadAndValidateBitmaps(self: *StrictScanner) !void {
+        const group_count: u32 = @intCast(self.reader.groups.len);
+        const gdt_bytes = @as(usize, group_count) * group_desc_size;
+        const gdt_storage_bytes = @as(usize, blocksForBytes(gdt_bytes, self.reader.block_size)) *
+            self.reader.block_size;
+        const gdt = try self.allocator.alloc(u8, gdt_storage_bytes);
+        defer self.allocator.free(gdt);
+        try self.reader.readAll(self.io, gdt, self.reader.offset + self.reader.block_size);
+        var primary_superblock: [superblock_size]u8 = undefined;
+        try self.reader.readAll(
+            self.io,
+            &primary_superblock,
+            self.reader.offset + superblock_offset,
+        );
+
+        const gdt_blocks = @max(@as(u32, 1), blocksForBytes(
+            @as(u64, group_count) * group_desc_size,
+            self.reader.block_size,
+        ));
+        const inode_table_blocks = divCeil(
+            self.reader.inodes_per_group * inode_size,
+            self.reader.block_size,
+        );
+        var total_free_blocks: u32 = 0;
+        var total_free_inodes: u32 = 0;
+
+        for (self.reader.groups, 0..) |group, index| {
+            const group_index: u32 = @intCast(index);
+            const start_block = @as(u64, group_index) * self.reader.blocks_per_group;
+            const block_count = @min(
+                self.reader.blocks_per_group,
+                self.reader.total_blocks - @as(u32, @intCast(start_block)),
+            );
+            const has_super_copy = group_index == 0 or isSparseSuperGroup(group_index);
+            const super_gdt_blocks: u32 = if (has_super_copy) 1 + gdt_blocks else 0;
+            const reserved_block_count = super_gdt_blocks + 2 + inode_table_blocks;
+            if (reserved_block_count >= block_count or
+                group.block_bitmap_block != start_block + super_gdt_blocks or
+                group.inode_bitmap_block != start_block + super_gdt_blocks + 1 or
+                group.inode_table_block != start_block + super_gdt_blocks + 2)
+            {
+                return error.UnsupportedGroupLayout;
+            }
+            if (group_index != 0 and has_super_copy) {
+                var backup_superblock: [superblock_size]u8 = undefined;
+                try self.reader.readAll(
+                    self.io,
+                    &backup_superblock,
+                    self.reader.blockOffset(start_block),
+                );
+                var expected_superblock = primary_superblock;
+                writeInt(u16, expected_superblock[0x5A..0x5C], @intCast(group_index));
+                setSuperblockChecksum(&expected_superblock);
+                if (!std.mem.eql(u8, &backup_superblock, &expected_superblock)) {
+                    return error.InvalidBackupSuperblock;
+                }
+
+                const backup_gdt = try self.allocator.alloc(u8, gdt_storage_bytes);
+                defer self.allocator.free(backup_gdt);
+                try self.reader.readAll(
+                    self.io,
+                    backup_gdt,
+                    self.reader.blockOffset(start_block + 1),
+                );
+                if (!std.mem.eql(u8, backup_gdt, gdt)) {
+                    return error.InvalidBackupGroupDescriptors;
+                }
+            }
+
+            const desc_base = index * group_desc_size;
+            var descriptor: [group_desc_size]u8 = undefined;
+            @memcpy(&descriptor, gdt[desc_base .. desc_base + group_desc_size]);
+            const stored_descriptor_checksum = readInt(u16, descriptor[0x1E..0x20]);
+            writeInt(u16, descriptor[0x1E..0x20], 0);
+            var group_le = std.mem.nativeToLittle(u32, group_index);
+            const expected_descriptor_checksum: u16 = @truncate(ext4Crc32c(&.{
+                &self.reader.uuid,
+                std.mem.asBytes(&group_le),
+                &descriptor,
+            }));
+            if (stored_descriptor_checksum != expected_descriptor_checksum or
+                stored_descriptor_checksum != group.descriptor_checksum)
+            {
+                return error.BadGroupDescriptorChecksum;
+            }
+
+            var block_bitmap: [default_block_size]u8 = undefined;
+            var inode_bitmap: [default_block_size]u8 = undefined;
+            try self.reader.readAll(
+                self.io,
+                &block_bitmap,
+                self.reader.blockOffset(group.block_bitmap_block),
+            );
+            try self.reader.readAll(
+                self.io,
+                &inode_bitmap,
+                self.reader.blockOffset(group.inode_bitmap_block),
+            );
+            if (@as(u16, @truncate(bitmapChecksum(
+                self.reader.uuid,
+                &block_bitmap,
+                default_blocks_per_group / 8,
+            ))) != group.block_bitmap_checksum or
+                @as(u16, @truncate(bitmapChecksum(
+                    self.reader.uuid,
+                    &inode_bitmap,
+                    self.reader.inodes_per_group / 8,
+                ))) != group.inode_bitmap_checksum)
+            {
+                return error.BadBitmapChecksum;
+            }
+
+            var allocated_in_group: u32 = 0;
+            var bit: u32 = 0;
+            while (bit < block_count) : (bit += 1) {
+                if (!bitmapIsSet(&block_bitmap, bit)) continue;
+                allocated_in_group += 1;
+                bitmapSet(self.allocated_blocks, @as(u32, @intCast(start_block)) + bit);
+            }
+            while (bit < default_block_size * 8) : (bit += 1) {
+                if (!bitmapIsSet(&block_bitmap, bit)) return error.InvalidBlockBitmapTail;
+            }
+            if (group.free_block_count != block_count - allocated_in_group) {
+                return error.InvalidFreeBlockCount;
+            }
+            total_free_blocks += group.free_block_count;
+
+            var allocated_inode_count: u32 = 0;
+            bit = 0;
+            while (bit < self.reader.inodes_per_group) : (bit += 1) {
+                if (!bitmapIsSet(&inode_bitmap, bit)) continue;
+                allocated_inode_count += 1;
+                bitmapSet(
+                    self.allocated_inodes,
+                    group_index * self.reader.inodes_per_group + bit,
+                );
+            }
+            while (bit < default_block_size * 8) : (bit += 1) {
+                if (!bitmapIsSet(&inode_bitmap, bit)) return error.InvalidInodeBitmapTail;
+            }
+            if (group.free_inode_count != self.reader.inodes_per_group - allocated_inode_count) {
+                return error.InvalidFreeInodeCount;
+            }
+            total_free_inodes += group.free_inode_count;
+
+            bit = 0;
+            while (bit < reserved_block_count) : (bit += 1) {
+                try self.markOwnedBlock(@as(u32, @intCast(start_block)) + bit);
+            }
+        }
+        if (total_free_blocks != self.super_free_blocks or
+            total_free_inodes != self.super_free_inodes)
+        {
+            return error.InvalidSuperblockFreeCount;
+        }
+    }
+
+    fn scanNode(
+        self: *StrictScanner,
+        inode_number: u32,
+        parent_inode_number: u32,
+        path: []const u8,
+        expected_kind: Kind,
+        is_root: bool,
+    ) !void {
+        if (inode_number == 0 or inode_number > self.reader.total_inodes) {
+            return error.InvalidDirectoryInode;
+        }
+        if (bitmapIsSet(self.visited_inodes, inode_number - 1)) return error.InodeAlias;
+        bitmapSet(self.visited_inodes, inode_number - 1);
+        self.visited_inode_count += 1;
+        if (!bitmapIsSet(self.allocated_inodes, inode_number - 1)) {
+            return error.DirectoryReferencesFreeInode;
+        }
+        const visible_count = self.visited_inode_count - 1;
+        if (visible_count > self.options.max_nodes) return error.NodeLimitExceeded;
+
+        const inode = try self.reader.readInode(self.io, inode_number);
+        if (inode.kind != expected_kind) return error.DirectoryFileTypeMismatch;
+        try self.validateInodeRaw(inode);
+        if (inode.atime != self.identity.global_timestamp or
+            inode.mtime != self.identity.global_timestamp or
+            inode.ctime != self.identity.global_timestamp)
+        {
+            return error.DivergentInodeTimestamp;
+        }
+        if (inode.deletion_time != 0 or inode.generation != 0) {
+            return error.UnsupportedInodeMetadata;
+        }
+        if (inode.size > self.options.max_file_bytes) return error.FileLimitExceeded;
+        if (!is_root) try validateStrictPath(path, self.options);
+
+        const fast_symlink = inode.kind == .symlink and inode.size < 60;
+        const allowed_flags: u32 = switch (inode.kind) {
+            .directory => inode_flag_extents | inode_flag_index,
+            .file => inode_flag_extents,
+            .symlink => if (fast_symlink) 0 else inode_flag_extents,
+        };
+        if (inode.flags & ~allowed_flags != 0 or
+            (inode.flags & inode_flag_extents != 0) != !fast_symlink or
+            (inode.kind != .directory and inode.flags & inode_flag_index != 0))
+        {
+            return error.UnsupportedInodeFlags;
+        }
+
+        var data_block_count: u32 = 0;
+        var index_block_count: u32 = 0;
+        if (fast_symlink) {
+            for (inode.block_bytes[@intCast(inode.size)..]) |byte| {
+                if (byte != 0) return error.UnsupportedFastSymlinkLayout;
+            }
+        } else {
+            const extent_result = try self.strictExtents(inode);
+            defer self.allocator.free(extent_result.extents);
+            data_block_count = blocksForBytes(inode.size, self.reader.block_size);
+            index_block_count = extent_result.index_block_count;
+            try self.validateAndOwnDataExtents(extent_result.extents, data_block_count);
+        }
+
+        const xattrs = try self.strictXattrs(inode);
+        var xattrs_owned = true;
+        defer if (xattrs_owned) freeXattrs(self.allocator, xattrs);
+        const xattr_block_count: u32 = if (inode.file_acl_block == 0) 0 else 1;
+        const expected_sectors = std.math.mul(
+            u32,
+            data_block_count + index_block_count + xattr_block_count,
+            sectors_per_block,
+        ) catch return error.UnsupportedInodeLayout;
+        if (inode.sector_count != expected_sectors) return error.UnsupportedInodeBlockCount;
+
+        if (is_root) {
+            if (inode.kind != .directory or inode.mode != 0o755 or inode.uid != 0 or
+                inode.gid != 0 or xattrs.len != 0)
+            {
+                return error.NoncanonicalRootMetadata;
+            }
+        } else {
+            self.total_content_bytes = std.math.add(
+                u64,
+                self.total_content_bytes,
+                if (inode.kind == .directory) 0 else inode.size,
+            ) catch return error.TotalContentLimitExceeded;
+            if (self.total_content_bytes > self.options.max_total_bytes) {
+                return error.TotalContentLimitExceeded;
+            }
+            try self.appendEntry(path, inode, xattrs);
+            xattrs_owned = false;
+        }
+
+        if (inode.kind != .directory) {
+            if (inode.link_count != 1) return error.UnsupportedHardlink;
+            return;
+        }
+        if (inode.size == 0 or inode.size % self.reader.block_size != 0) {
+            return error.UnsupportedDirectoryLayout;
+        }
+        const group_index = (inode.inode - 1) / self.reader.inodes_per_group;
+        self.directories_per_group[group_index] += 1;
+
+        const children = try self.readStrictDirectory(inode, parent_inode_number);
+        defer freeStrictChildren(self.allocator, children);
+        var subdirectory_count: u32 = 0;
+        for (children) |child| {
+            if (child.kind == .directory) subdirectory_count += 1;
+        }
+        if (inode.link_count != 2 + subdirectory_count) return error.InvalidDirectoryLinkCount;
+
+        for (children) |child| {
+            const child_path = if (path.len == 0)
+                try self.allocator.dupe(u8, child.name)
+            else
+                try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ path, child.name });
+            defer self.allocator.free(child_path);
+            try self.scanNode(child.inode, inode.inode, child_path, child.kind, false);
+        }
+    }
+
+    fn validateInodeRaw(self: *StrictScanner, inode: ParsedInode) !void {
+        var raw: [inode_size]u8 = undefined;
+        const group_index = (inode.inode - 1) / self.reader.inodes_per_group;
+        const index_in_group = (inode.inode - 1) % self.reader.inodes_per_group;
+        const group = self.reader.groups[group_index];
+        const inode_offset = self.reader.blockOffset(group.inode_table_block) +
+            @as(u64, index_in_group) * self.reader.inode_size;
+        try self.reader.readAll(self.io, &raw, inode_offset);
+        const stored_checksum = readInt(u16, raw[124..126]);
+        var checked = raw;
+        setInodeChecksum(&checked, self.reader.uuid, inode.inode);
+        if (stored_checksum != readInt(u16, checked[124..126])) return error.BadInodeChecksum;
+        if (!allZero(raw[112..120]) or !allZero(raw[126..128])) {
+            return error.UnsupportedInodeMetadata;
+        }
+    }
+
+    fn strictExtents(self: *StrictScanner, inode: ParsedInode) !StrictExtentResult {
+        var extents = std.array_list.Managed(Extent).init(self.allocator);
+        errdefer extents.deinit();
+        var index_block_count: u32 = 0;
+        try self.appendStrictExtentNode(
+            inode,
+            inode.block_bytes[0..],
+            max_inline_extents,
+            null,
+            false,
+            &extents,
+            &index_block_count,
+        );
+        return .{
+            .extents = try extents.toOwnedSlice(),
+            .index_block_count = index_block_count,
+        };
+    }
+
+    fn appendStrictExtentNode(
+        self: *StrictScanner,
+        inode: ParsedInode,
+        node_bytes: []const u8,
+        capacity: usize,
+        expected_depth: ?u16,
+        external: bool,
+        extents: *std.array_list.Managed(Extent),
+        index_block_count: *u32,
+    ) !void {
+        const header = try parseExtentHeader(node_bytes[0..extent_header_size]);
+        if (header.max != capacity or header.entries > header.max or
+            header.depth > max_supported_extent_depth or header.generation != 0)
+        {
+            return error.UnsupportedExtentLayout;
+        }
+        if (expected_depth) |depth| {
+            if (header.depth != depth) return error.UnsupportedExtentLayout;
+        }
+        if (header.depth > 0 and header.entries == 0) return error.UnsupportedExtentLayout;
+
+        if (external) {
+            const tail_offset = extentTailOffset(header.max);
+            if (tail_offset + extent_tail_size > node_bytes.len) return error.UnsupportedExtentLayout;
+            const stored_checksum = readInt(u32, node_bytes[tail_offset .. tail_offset + 4]);
+            const checked = try self.allocator.dupe(u8, node_bytes);
+            defer self.allocator.free(checked);
+            setExtentBlockChecksum(checked, self.reader.uuid, inode.inode, inode.generation);
+            if (stored_checksum != readInt(u32, checked[tail_offset .. tail_offset + 4])) {
+                return error.BadExtentChecksum;
+            }
+        }
+        const unused_start = extent_header_size + @as(usize, header.entries) * extent_entry_size;
+        const unused_end = if (external)
+            extentTailOffset(header.max)
+        else
+            extent_header_size + capacity * extent_entry_size;
+        if (!allZero(node_bytes[unused_start..unused_end])) {
+            return error.UnsupportedExtentLayout;
+        }
+
+        if (header.depth == 0) {
+            var index: usize = 0;
+            while (index < header.entries) : (index += 1) {
+                const base = extent_header_size + index * extent_entry_size;
+                const raw_count = readInt(u16, node_bytes[base + 4 .. base + 6]);
+                if (raw_count == 0 or raw_count > 0x8000) return error.UnsupportedExtent;
+                const extent = decodeExtent(node_bytes[base .. base + extent_entry_size]);
+                if (extents.items.len > 0) {
+                    const previous = extents.items[extents.items.len - 1];
+                    const previous_end = std.math.add(
+                        u32,
+                        previous.logical_block,
+                        previous.block_count,
+                    ) catch return error.UnsupportedExtent;
+                    if (extent.logical_block < previous_end) return error.UnsupportedExtent;
+                }
+                try extents.append(extent);
+            }
+            return;
+        }
+
+        var previous_key: ?u32 = null;
+        var index: usize = 0;
+        while (index < header.entries) : (index += 1) {
+            const base = extent_header_size + index * extent_entry_size;
+            const child = decodeExtentIndex(node_bytes[base .. base + extent_entry_size]);
+            if (!allZero(node_bytes[base + 10 .. base + 12]) or
+                (previous_key != null and child.logical_block <= previous_key.?))
+            {
+                return error.UnsupportedExtentLayout;
+            }
+            previous_key = child.logical_block;
+            const child_block = std.math.cast(u32, child.leaf_block) orelse
+                return error.UnsupportedExtent;
+            try self.markOwnedBlock(child_block);
+            index_block_count.* = std.math.add(u32, index_block_count.*, 1) catch
+                return error.UnsupportedExtentLayout;
+            var block: [default_block_size]u8 = undefined;
+            try self.reader.readAll(self.io, &block, self.reader.blockOffset(child.leaf_block));
+            const before = extents.items.len;
+            try self.appendStrictExtentNode(
+                inode,
+                &block,
+                extentEntriesPerBlock(self.reader.block_size),
+                header.depth - 1,
+                true,
+                extents,
+                index_block_count,
+            );
+            if (extents.items.len == before or
+                extents.items[before].logical_block != child.logical_block)
+            {
+                return error.UnsupportedExtentLayout;
+            }
+        }
+    }
+
+    fn validateAndOwnDataExtents(
+        self: *StrictScanner,
+        extents: []const Extent,
+        expected_blocks: u32,
+    ) !void {
+        var logical: u32 = 0;
+        for (extents) |extent| {
+            if (extent.logical_block != logical) return error.SparseFileUnsupported;
+            const end = std.math.add(u64, extent.start_block, extent.block_count) catch
+                return error.UnsupportedExtent;
+            if (extent.start_block == 0 or end > self.reader.total_blocks) {
+                return error.UnsupportedExtent;
+            }
+            var block: u16 = 0;
+            while (block < extent.block_count) : (block += 1) {
+                try self.markOwnedBlock(@intCast(extent.start_block + block));
+            }
+            logical = std.math.add(u32, logical, extent.block_count) catch
+                return error.UnsupportedExtent;
+        }
+        if (logical != expected_blocks) return error.SparseFileUnsupported;
+    }
+
+    fn strictXattrs(self: *StrictScanner, inode: ParsedInode) ![]OwnedXattr {
+        if (inode.file_acl_block == 0) return self.allocator.alloc(OwnedXattr, 0);
+        try self.markOwnedBlock(inode.file_acl_block);
+        var raw: [default_block_size]u8 = undefined;
+        try self.reader.readAll(
+            self.io,
+            &raw,
+            self.reader.blockOffset(inode.file_acl_block),
+        );
+        const xattrs = try self.reader.readInodeXattrsAlloc(self.io, self.allocator, inode);
+        errdefer freeXattrs(self.allocator, xattrs);
+        if (xattrs.len > self.options.max_xattrs_per_node) return error.XattrLimitExceeded;
+        var total_bytes: usize = 0;
+        for (xattrs, 0..) |xattr, index| {
+            _ = try splitXattrName(xattr.name);
+            total_bytes = std.math.add(
+                usize,
+                total_bytes,
+                xattr.name.len + xattr.value.len,
+            ) catch return error.XattrLimitExceeded;
+            for (xattrs[index + 1 ..]) |other| {
+                if (std.mem.eql(u8, xattr.name, other.name)) return error.DuplicateXattr;
+            }
+        }
+        if (total_bytes > self.options.max_xattr_bytes_per_node) {
+            return error.XattrLimitExceeded;
+        }
+        const canonical = try buildXattrBlock(self.allocator, xattrs, self.reader.block_size);
+        defer self.allocator.free(canonical);
+        setXattrBlockChecksum(canonical, self.reader.uuid, inode.file_acl_block);
+        if (!std.mem.eql(u8, &raw, canonical)) return error.UnsupportedXattrLayout;
+        return xattrs;
+    }
+
+    fn appendEntry(
+        self: *StrictScanner,
+        path: []const u8,
+        inode: ParsedInode,
+        xattrs: []OwnedXattr,
+    ) !void {
+        const owned_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned_path);
+        const views = try self.allocator.alloc(Xattr, xattrs.len);
+        errdefer self.allocator.free(views);
+        for (xattrs, 0..) |xattr, index| {
+            views[index] = .{ .name = xattr.name, .value = xattr.value };
+        }
+        try self.entries.append(.{
+            .path = owned_path,
+            .inode = inode,
+            .xattrs = xattrs,
+            .xattr_views = views,
+            .content = .{
+                .reader = self.reader,
+                .io = self.io,
+                .inode = inode,
+            },
+        });
+    }
+
+    fn readStrictDirectory(
+        self: *StrictScanner,
+        inode: ParsedInode,
+        expected_parent: u32,
+    ) ![]StrictChild {
+        var children = std.array_list.Managed(StrictChild).init(self.allocator);
+        errdefer {
+            for (children.items) |child| self.allocator.free(child.name);
+            children.deinit();
+        }
+        var dot_count: u8 = 0;
+        var dotdot_count: u8 = 0;
+        var block: [default_block_size]u8 = undefined;
+        const directory_block_count = inode.size / self.reader.block_size;
+        var logical_block: u32 = 0;
+        while (logical_block < directory_block_count) : (logical_block += 1) {
+            const got = try self.reader.preadInode(
+                self.io,
+                inode,
+                &block,
+                @as(u64, logical_block) * self.reader.block_size,
+            );
+            if (got != block.len) return error.UnexpectedEndOfFile;
+            try self.validateDirectoryBlock(
+                inode,
+                &block,
+                logical_block,
+            );
+            var offset: usize = 0;
+            while (offset < block.len) {
+                if (offset + 8 > block.len) return error.BadDirectoryEntry;
+                const child_inode = readInt(u32, block[offset .. offset + 4]);
+                const rec_len = readInt(u16, block[offset + 4 .. offset + 6]);
+                const name_len = block[offset + 6];
+                const file_type = block[offset + 7];
+                if (rec_len < 8 or rec_len % dir_entry_alignment != 0 or
+                    offset + rec_len > block.len or name_len > rec_len - 8)
+                {
+                    return error.BadDirectoryEntry;
+                }
+                const name = block[offset + 8 .. offset + 8 + name_len];
+                if (child_inode != 0) {
+                    const kind: Kind = switch (file_type) {
+                        dir_ft_reg => .file,
+                        dir_ft_dir => .directory,
+                        dir_ft_symlink => .symlink,
+                        else => return error.UnsupportedDirectoryFileType,
+                    };
+                    if (std.mem.eql(u8, name, ".")) {
+                        if (kind != .directory or child_inode != inode.inode) {
+                            return error.InvalidDotEntry;
+                        }
+                        dot_count += 1;
+                    } else if (std.mem.eql(u8, name, "..")) {
+                        if (kind != .directory or child_inode != expected_parent) {
+                            return error.InvalidDotDotEntry;
+                        }
+                        dotdot_count += 1;
+                    } else {
+                        try validateStrictComponent(name, self.options);
+                        try children.append(.{
+                            .inode = child_inode,
+                            .kind = kind,
+                            .name = try self.allocator.dupe(u8, name),
+                        });
+                    }
+                }
+                offset += rec_len;
+            }
+        }
+        if (dot_count != 1 or dotdot_count != 1) return error.InvalidDirectoryDots;
+        sortStrictChildren(children.items);
+        if (children.items.len > 1) {
+            for (children.items[1..], children.items[0 .. children.items.len - 1]) |current, previous| {
+                if (std.mem.eql(u8, current.name, previous.name)) {
+                    return error.DuplicateDirectoryEntry;
+                }
+            }
+        }
+        try self.validateCanonicalDirectory(inode, expected_parent, children.items);
+        return children.toOwnedSlice();
+    }
+
+    fn validateCanonicalDirectory(
+        self: *StrictScanner,
+        inode: ParsedInode,
+        parent_inode: u32,
+        children: []const StrictChild,
+    ) !void {
+        var linear_specs = std.array_list.Managed(DirEntrySpec).init(self.allocator);
+        defer linear_specs.deinit();
+        try linear_specs.append(.{ .inode = inode.inode, .kind = .directory, .name = "." });
+        try linear_specs.append(.{ .inode = parent_inode, .kind = .directory, .name = ".." });
+
+        const child_specs = try self.allocator.alloc(DirEntrySpec, children.len);
+        defer self.allocator.free(child_specs);
+        for (children, 0..) |child, index| {
+            child_specs[index] = .{
+                .inode = child.inode,
+                .kind = child.kind,
+                .name = child.name,
+            };
+            try linear_specs.append(child_specs[index]);
+        }
+
+        const linear = try buildLinearDirectoryBytes(
+            self.allocator,
+            linear_specs.items,
+            self.reader.block_size,
+        );
+        const expected_indexed = linear.len > self.reader.block_size and children.len != 0;
+        if ((inode.flags & inode_flag_index != 0) != expected_indexed) {
+            self.allocator.free(linear);
+            return error.UnsupportedDirectoryLayout;
+        }
+
+        var index_block_count: u32 = 0;
+        const canonical = if (expected_indexed) canonical: {
+            self.allocator.free(linear);
+            const indexed = try buildIndexedDirectoryBytes(
+                self.allocator,
+                inode.inode,
+                parent_inode,
+                child_specs,
+                self.reader.block_size,
+            );
+            index_block_count = indexed.index_block_count;
+            break :canonical indexed.bytes;
+        } else linear;
+        defer self.allocator.free(canonical);
+        if (canonical.len != inode.size) return error.UnsupportedDirectoryLayout;
+
+        var block_index: usize = 0;
+        while (block_index < canonical.len / self.reader.block_size) : (block_index += 1) {
+            const block = canonical[block_index * self.reader.block_size .. (block_index + 1) * self.reader.block_size];
+            if (expected_indexed and block_index < index_block_count) {
+                const count_offset: usize = if (block_index == 0) 32 else 8;
+                const limit = readInt(u16, block[count_offset .. count_offset + 2]);
+                const count = readInt(u16, block[count_offset + 2 .. count_offset + 4]);
+                setDxChecksum(
+                    block,
+                    count_offset,
+                    count,
+                    limit,
+                    self.reader.uuid,
+                    inode.inode,
+                    inode.generation,
+                );
+            } else {
+                setDirectoryLeafChecksum(
+                    block,
+                    self.reader.uuid,
+                    inode.inode,
+                    inode.generation,
+                );
+            }
+
+            var actual: [default_block_size]u8 = undefined;
+            const got = try self.reader.preadInode(
+                self.io,
+                inode,
+                &actual,
+                @as(u64, block_index) * self.reader.block_size,
+            );
+            if (got != actual.len) return error.UnexpectedEndOfFile;
+            if (!std.mem.eql(u8, block, &actual)) {
+                return error.UnsupportedDirectoryLayout;
+            }
+        }
+    }
+
+    fn validateDirectoryBlock(
+        self: *StrictScanner,
+        inode: ParsedInode,
+        block: []const u8,
+        logical_block: u32,
+    ) !void {
+        const tail = block[block.len - 12 ..];
+        const is_leaf = readInt(u32, tail[0..4]) == 0 and
+            readInt(u16, tail[4..6]) == 12 and
+            tail[6] == 0 and tail[7] == dir_ft_checksum;
+        if (is_leaf) {
+            const stored = readInt(u32, tail[8..12]);
+            const checked = try self.allocator.dupe(u8, block);
+            defer self.allocator.free(checked);
+            setDirectoryLeafChecksum(
+                checked,
+                self.reader.uuid,
+                inode.inode,
+                inode.generation,
+            );
+            if (stored != readInt(u32, checked[checked.len - 4 ..])) {
+                return error.BadDirectoryChecksum;
+            }
+            return;
+        }
+        if (inode.flags & inode_flag_index == 0) return error.UnsupportedDirectoryLayout;
+
+        const count_offset: usize = if (logical_block == 0) 32 else 8;
+        const expected_limit = if (logical_block == 0)
+            dxRootLimit(self.reader.block_size)
+        else
+            dxNodeLimit(self.reader.block_size);
+        if (logical_block == 0 and
+            (block[28] != dx_hash_half_md4 or block[29] != 8 or
+                block[30] > max_supported_extent_depth or block[31] != 0))
+        {
+            return error.UnsupportedDirectoryLayout;
+        }
+        const limit = readInt(u16, block[count_offset .. count_offset + 2]);
+        const count = readInt(u16, block[count_offset + 2 .. count_offset + 4]);
+        if (limit != expected_limit or count == 0 or count > limit) {
+            return error.UnsupportedDirectoryLayout;
+        }
+        const tail_offset = count_offset + @as(usize, limit) * 8;
+        const used_end = count_offset + @as(usize, count) * 8;
+        if (tail_offset + 8 > block.len or
+            !allZero(block[used_end..tail_offset]) or
+            !allZero(block[tail_offset .. tail_offset + 4]))
+        {
+            return error.UnsupportedDirectoryLayout;
+        }
+        const stored = readInt(u32, block[tail_offset + 4 .. tail_offset + 8]);
+        const checked = try self.allocator.dupe(u8, block);
+        defer self.allocator.free(checked);
+        setDxChecksum(
+            checked,
+            count_offset,
+            count,
+            limit,
+            self.reader.uuid,
+            inode.inode,
+            inode.generation,
+        );
+        if (stored != readInt(u32, checked[tail_offset + 4 .. tail_offset + 8])) {
+            return error.BadDirectoryChecksum;
+        }
+    }
+
+    fn markOwnedBlock(self: *StrictScanner, block: u32) !void {
+        if (block >= self.reader.total_blocks) return error.BlockOutsideFilesystem;
+        if (bitmapIsSet(self.owned_blocks, block)) return error.OverlappingBlockOwnership;
+        bitmapSet(self.owned_blocks, block);
+    }
+};
+
+fn validateStrictSuperblock(
+    reader: *Reader,
+    io: Io,
+    expected_length: u64,
+) !struct {
+    identity: StrictFilesystemIdentity,
+    free_blocks: u32,
+    free_inodes: u32,
+} {
+    var sb: [superblock_size]u8 = undefined;
+    try reader.readAll(io, &sb, reader.offset + superblock_offset);
+    const filesystem_length = std.math.mul(
+        u64,
+        reader.total_blocks,
+        reader.block_size,
+    ) catch return error.InvalidFilesystemLength;
+    if (filesystem_length != expected_length) return error.FilesystemLengthMismatch;
+
+    const stored_checksum = readInt(u32, sb[0x3FC..0x400]);
+    var checked = sb;
+    setSuperblockChecksum(&checked);
+    if (stored_checksum != readInt(u32, checked[0x3FC..0x400])) {
+        return error.BadSuperblockChecksum;
+    }
+
+    const timestamp = readInt(u32, sb[0x2C..0x30]);
+    if (timestamp != readInt(u32, sb[0x30..0x34]) or
+        timestamp != readInt(u32, sb[0x40..0x44]) or
+        timestamp != readInt(u32, sb[0x108..0x10C]))
+    {
+        return error.DivergentSuperblockTimestamp;
+    }
+    if (reader.feature_compat != writer_feature_compat or
+        reader.feature_incompat != writer_feature_incompat or
+        reader.feature_ro_compat & ~(writer_feature_ro_compat_base | feature_ro_compat_large_file) != 0 or
+        reader.feature_ro_compat & writer_feature_ro_compat_base != writer_feature_ro_compat_base or
+        reader.block_size != default_block_size or
+        reader.blocks_per_group != default_blocks_per_group or
+        reader.inode_size != inode_size or
+        reader.total_blocks == 0 or
+        reader.inodes_per_group == 0 or
+        reader.inodes_per_group > default_block_size * 8 or
+        reader.inodes_per_group % (default_block_size / inode_size) != 0 or
+        reader.total_inodes != reader.groups.len * reader.inodes_per_group or
+        readInt(u32, sb[0x08..0x0C]) != 0 or
+        readInt(u32, sb[0x14..0x18]) != 0 or
+        readInt(u32, sb[0x18..0x1C]) != 2 or
+        readInt(u32, sb[0x1C..0x20]) != 2 or
+        readInt(u32, sb[0x24..0x28]) != default_blocks_per_group or
+        readInt(u16, sb[0x3A..0x3C]) != state_clean or
+        readInt(u16, sb[0x3C..0x3E]) != errors_continue or
+        readInt(u32, sb[0x48..0x4C]) != creator_os_linux or
+        readInt(u32, sb[0x54..0x58]) != first_non_reserved_inode or
+        readInt(u16, sb[0x5A..0x5C]) != 0 or
+        readInt(u8, sb[0xFC..0xFD]) != dx_hash_half_md4 or
+        readInt(u16, sb[0xFE..0x100]) != group_desc_size or
+        readInt(u8, sb[0x175..0x176]) != super_checksum_type_crc32c)
+    {
+        return error.UnsupportedWriterProfile;
+    }
+
+    return .{
+        .identity = .{
+            .uuid = reader.uuid,
+            .label = reader.label,
+            .block_size = reader.block_size,
+            .filesystem_length = filesystem_length,
+            .global_timestamp = timestamp,
+        },
+        .free_blocks = readInt(u32, sb[0x0C..0x10]),
+        .free_inodes = readInt(u32, sb[0x10..0x14]),
+    };
+}
+
+fn validateStrictPath(path: []const u8, options: StrictScanOptions) !void {
+    if (path.len == 0 or path.len > options.max_path_bytes or
+        path[0] == '/' or path[path.len - 1] == '/')
+    {
+        return error.InvalidImportedPath;
+    }
+    var components = std.mem.splitScalar(u8, path, '/');
+    while (components.next()) |component| try validateStrictComponent(component, options);
+}
+
+fn validateStrictComponent(component: []const u8, options: StrictScanOptions) !void {
+    if (component.len == 0 or component.len > options.max_component_bytes or
+        component.len > 255 or std.mem.eql(u8, component, ".") or
+        std.mem.eql(u8, component, "..") or
+        std.mem.indexOfScalar(u8, component, 0) != null or
+        std.mem.indexOfScalar(u8, component, '/') != null)
+    {
+        return error.InvalidImportedPath;
+    }
+}
+
+fn bitmapByteLength(bit_count: u32) usize {
+    return (@as(usize, bit_count) + 7) / 8;
+}
+
+fn bitmapIsSet(bitmap: []const u8, index: u32) bool {
+    return bitmap[index / 8] & (@as(u8, 1) << @intCast(index % 8)) != 0;
+}
+
+fn bitmapSet(bitmap: []u8, index: u32) void {
+    bitmap[index / 8] |= @as(u8, 1) << @intCast(index % 8);
+}
+
+fn allZero(bytes: []const u8) bool {
+    for (bytes) |byte| if (byte != 0) return false;
+    return true;
+}
+
+fn strictChildLess(lhs: StrictChild, rhs: StrictChild) bool {
+    return std.mem.order(u8, lhs.name, rhs.name) == .lt;
+}
+
+fn sortStrictChildren(children: []StrictChild) void {
+    var index: usize = 1;
+    while (index < children.len) : (index += 1) {
+        var cursor = index;
+        while (cursor > 0 and strictChildLess(children[cursor], children[cursor - 1])) : (cursor -= 1) {
+            std.mem.swap(StrictChild, &children[cursor], &children[cursor - 1]);
+        }
+    }
+}
+
+fn freeStrictChildren(allocator: std.mem.Allocator, children: []StrictChild) void {
+    for (children) |child| allocator.free(child.name);
+    allocator.free(children);
+}
 
 fn buildPlan(allocator: std.mem.Allocator, tree: *FileTreeView, options: PopulateOptions) PopulateError!WriterPlan {
     var entries_list = std.array_list.Managed(OwnedEntry).init(allocator);
@@ -3764,6 +5068,86 @@ test "reader exposes inode link counts" {
     try std.testing.expectEqual(@as(u16, 3), parent_inode.link_count);
 }
 
+test "strict writer-compatible scan exposes deterministic owned view" {
+    const io = std.testing.io;
+    const path = "test-ext4-strict-scan.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const attrs = [_]Xattr{.{ .name = "user.test", .value = "value" }};
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "etc", .kind = .directory, .mode = 0o750, .uid = 1, .gid = 2 },
+        .{ .path = "etc/file", .kind = .file, .mode = 0o640, .uid = 3, .gid = 4, .size = 4, .bytes = "test", .xattrs = &attrs },
+        .{ .path = "link", .kind = .symlink, .mode = 0o777, .uid = 5, .gid = 6, .size = 8, .bytes = "etc/file" },
+    });
+    tree.bind();
+
+    const length = 160 * 1024 * 1024;
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{
+        .length = length,
+        .label = "strict",
+        .uuid = [_]u8{0x5A} ** 16,
+        .timestamp = 1_717_171_717,
+    });
+
+    var reader = try open(io, file, std.testing.allocator, .{});
+    defer reader.deinit();
+    var scanned = try scanWriterCompatible(&reader, io, std.testing.allocator, .{
+        .expected_length = length,
+    });
+    defer scanned.deinit();
+    try std.testing.expectEqual(@as(usize, 3), scanned.nodeCount());
+    try std.testing.expectEqual(@as(u32, 1_717_171_717), scanned.identity.global_timestamp);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0x5A} ** 16), &scanned.identity.uuid);
+
+    const view = scanned.fileTreeView();
+    const first = (try view.next()).?;
+    try std.testing.expectEqualStrings("etc", first.path);
+    const second = (try view.next()).?;
+    try std.testing.expectEqualStrings("etc/file", second.path);
+    try std.testing.expectEqual(@as(usize, 1), second.xattrs.len);
+}
+
+test "strict writer-compatible scan rejects divergent inode timestamps" {
+    const io = std.testing.io;
+    const path = "test-ext4-strict-timestamp.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "file", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 4, .bytes = "test" },
+    });
+    tree.bind();
+    const length = 8 * 1024 * 1024;
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{
+        .length = length,
+        .uuid = [_]u8{0x33} ** 16,
+        .timestamp = 1_717_171_717,
+    });
+
+    var reader = try open(io, file, std.testing.allocator, .{});
+    defer reader.deinit();
+    const inode_number = try reader.lookupPath(io, "/file");
+    const group_index = (inode_number - 1) / reader.inodes_per_group;
+    const index_in_group = (inode_number - 1) % reader.inodes_per_group;
+    const inode_offset = reader.blockOffset(reader.groups[group_index].inode_table_block) +
+        @as(u64, index_in_group) * reader.inode_size;
+    var raw: [inode_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &raw, inode_offset);
+    writeInt(u32, raw[8..12], 1_717_171_718);
+    setInodeChecksum(&raw, reader.uuid, inode_number);
+    try file.writePositionalAll(io, &raw, inode_offset);
+
+    try std.testing.expectError(
+        error.DivergentInodeTimestamp,
+        scanWriterCompatible(&reader, io, std.testing.allocator, .{
+            .expected_length = length,
+        }),
+    );
+}
+
 test "reader opens read-only-safe 64-byte group descriptor ext4 images" {
     const io = std.testing.io;
     const path = "test-ext4-reader-64byte-gdt.img";
@@ -3976,6 +5360,38 @@ test "large directories use htree indexing" {
     try std.testing.expectEqual(dx_hash_half_md4, root_block[28]);
     try std.testing.expectEqual(@as(u8, 0), root_block[30]);
     try std.testing.expect(readInt(u16, root_block[34..36]) > 1);
+
+    {
+        var strict = try scanWriterCompatible(&reader, io, std.testing.allocator, .{
+            .expected_length = 32 * 1024 * 1024,
+        });
+        defer strict.deinit();
+        try std.testing.expectEqual(@as(usize, 301), strict.nodeCount());
+    }
+
+    writeInt(u32, root_block[36..40], readInt(u32, root_block[36..40]) + 1);
+    const limit = readInt(u16, root_block[32..34]);
+    const count = readInt(u16, root_block[34..36]);
+    setDxChecksum(
+        &root_block,
+        32,
+        count,
+        limit,
+        reader.uuid,
+        dir_inode.inode,
+        dir_inode.generation,
+    );
+    try file.writePositionalAll(
+        io,
+        &root_block,
+        extents[0].start_block * default_block_size,
+    );
+    try std.testing.expectError(
+        error.UnsupportedDirectoryLayout,
+        scanWriterCompatible(&reader, io, std.testing.allocator, .{
+            .expected_length = 32 * 1024 * 1024,
+        }),
+    );
 }
 
 test "very large directories use multi-level htree indexing" {

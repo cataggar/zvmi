@@ -43,15 +43,38 @@ pub const Device = struct {
 
 const Content = struct {
     io: Io,
-    file: Io.File,
-    offset: u64,
     size: u64,
     sha256: [32]u8,
+    source: union(enum) {
+        spooled: struct {
+            file: Io.File,
+            offset: u64,
+        },
+        memory: []u8,
+        borrowed: ext4.FileTreeView.ContentReader,
+        host_path: []u8,
+    },
 
     pub fn readAt(self: Content, buffer: []u8, offset: u64) !usize {
         if (offset >= self.size) return 0;
         const wanted: usize = @intCast(@min(@as(u64, buffer.len), self.size - offset));
-        return self.file.readPositionalAll(self.io, buffer[0..wanted], self.offset + offset);
+        return switch (self.source) {
+            .spooled => |spooled| spooled.file.readPositionalAll(
+                self.io,
+                buffer[0..wanted],
+                spooled.offset + offset,
+            ),
+            .memory => |bytes| blk: {
+                @memcpy(buffer[0..wanted], bytes[@intCast(offset)..][0..wanted]);
+                break :blk wanted;
+            },
+            .borrowed => |reader| reader.readAt(buffer[0..wanted], offset),
+            .host_path => |path| blk: {
+                const file = try Io.Dir.cwd().openFile(self.io, path, .{});
+                defer file.close(self.io);
+                break :blk try file.readPositionalAll(self.io, buffer[0..wanted], offset);
+            },
+        };
     }
 };
 
@@ -126,8 +149,9 @@ pub const FatPopulateOptions = struct {
 pub const RootTree = struct {
     allocator: Allocator,
     io: Io,
-    spool_path: []u8,
-    spool: Io.File,
+    spool_path: ?[]u8,
+    spool: ?Io.File,
+    storage: enum { spooled, memory },
     spool_len: u64 = 0,
     nodes: std.array_list.Managed(Node),
     limits: Limits,
@@ -154,6 +178,24 @@ pub const RootTree = struct {
             .io = io,
             .spool_path = owned_path,
             .spool = spool,
+            .storage = .spooled,
+            .nodes = .init(allocator),
+            .limits = limits,
+            .view = .{
+                .ctx = undefined,
+                .next_fn = nextExt4,
+                .reset_fn = resetExt4,
+            },
+        };
+    }
+
+    pub fn initMemory(allocator: Allocator, io: Io, limits: Limits) RootTree {
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .spool_path = null,
+            .spool = null,
+            .storage = .memory,
             .nodes = .init(allocator),
             .limits = limits,
             .view = .{
@@ -167,9 +209,11 @@ pub const RootTree = struct {
     pub fn deinit(self: *RootTree) void {
         for (self.nodes.items) |*node| self.freeNode(node);
         self.nodes.deinit();
-        self.spool.close(self.io);
-        Io.Dir.cwd().deleteFile(self.io, self.spool_path) catch {};
-        self.allocator.free(self.spool_path);
+        if (self.spool) |spool| spool.close(self.io);
+        if (self.spool_path) |path| {
+            Io.Dir.cwd().deleteFile(self.io, path) catch {};
+            self.allocator.free(path);
+        }
         self.* = undefined;
     }
 
@@ -240,6 +284,18 @@ pub const RootTree = struct {
         defer file.close(self.io);
         const stat = try file.stat(self.io);
         if (stat.kind != .file) return error.SourceNotRegularFile;
+        if (self.storage == .memory) {
+            const old_spool_len = self.spool_len;
+            const content = self.referenceHostFile(file, source_path, stat.size) catch |err| {
+                try self.rollbackSpool(old_spool_len);
+                return err;
+            };
+            self.putNode(path, .file, metadata, .{ .content = content }) catch |err| {
+                try self.rollbackSpool(old_spool_len);
+                return err;
+            };
+            return;
+        }
         var reader = FileReader{ .io = self.io, .file = file };
         try self.putFileReader(path, stat.size, .{
             .ctx = &reader,
@@ -352,6 +408,21 @@ pub const RootTree = struct {
     }
 
     pub fn importExt4View(self: *RootTree, source: *ext4.FileTreeView) !void {
+        try self.importExt4ViewMode(source, .owned);
+    }
+
+    /// Imports only paths and metadata while retaining read-only content
+    /// readers supplied by `source`. The source must outlive this tree.
+    pub fn importExt4ViewBorrowed(self: *RootTree, source: *ext4.FileTreeView) !void {
+        if (self.storage != .memory) return error.BorrowedImportRequiresMemoryTree;
+        try self.importExt4ViewMode(source, .borrowed);
+    }
+
+    fn importExt4ViewMode(
+        self: *RootTree,
+        source: *ext4.FileTreeView,
+        mode: enum { owned, borrowed },
+    ) !void {
         source.reset();
         while (try source.next()) |entry| {
             const metadata = Metadata{
@@ -362,25 +433,46 @@ pub const RootTree = struct {
             };
             switch (entry.kind) {
                 .directory => try self.putDirectory(entry.path, metadata),
-                .file => try self.putFileReader(
-                    entry.path,
-                    entry.size,
-                    entry.content orelse if (entry.size == 0) emptyContentReader() else return error.MissingContent,
-                    metadata,
-                ),
+                .file => {
+                    const content = entry.content orelse if (entry.size == 0)
+                        emptyContentReader()
+                    else
+                        return error.MissingContent;
+                    if (mode == .owned) {
+                        try self.putFileReader(entry.path, entry.size, content, metadata);
+                    } else {
+                        try self.putBorrowedContent(
+                            entry.path,
+                            .file,
+                            entry.size,
+                            content,
+                            metadata,
+                        );
+                    }
+                },
                 .symlink => {
                     const content = entry.content orelse return error.MissingContent;
-                    if (entry.size > self.limits.max_file_bytes) return error.FileLimitExceeded;
-                    try validatePath(entry.path, self.limits);
-                    const old_spool_len = self.spool_len;
-                    const owned = self.spoolContent(entry.size, content) catch |err| {
-                        try self.rollbackSpool(old_spool_len);
-                        return err;
-                    };
-                    self.putNode(entry.path, .symlink, metadata, .{ .content = owned }) catch |err| {
-                        try self.rollbackSpool(old_spool_len);
-                        return err;
-                    };
+                    if (mode == .owned) {
+                        if (entry.size > self.limits.max_file_bytes) return error.FileLimitExceeded;
+                        try validatePath(entry.path, self.limits);
+                        const old_spool_len = self.spool_len;
+                        const owned = self.spoolContent(entry.size, content) catch |err| {
+                            try self.rollbackSpool(old_spool_len);
+                            return err;
+                        };
+                        self.putNode(entry.path, .symlink, metadata, .{ .content = owned }) catch |err| {
+                            try self.rollbackSpool(old_spool_len);
+                            return err;
+                        };
+                    } else {
+                        try self.putBorrowedContent(
+                            entry.path,
+                            .symlink,
+                            entry.size,
+                            content,
+                            metadata,
+                        );
+                    }
                 },
             }
         }
@@ -613,13 +705,22 @@ pub const RootTree = struct {
         const end = std.math.add(u64, start, size) catch return error.SpoolLimitExceeded;
         if (end > self.limits.max_spool_bytes) return error.SpoolLimitExceeded;
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        const memory = if (self.storage == .memory) memory: {
+            const length = std.math.cast(usize, size) orelse return error.SpoolLimitExceeded;
+            break :memory try self.allocator.alloc(u8, length);
+        } else null;
+        errdefer if (memory) |bytes| self.allocator.free(bytes);
         var buffer: [64 * 1024]u8 = undefined;
         var offset: u64 = 0;
         while (offset < size) {
             const wanted: usize = @intCast(@min(@as(u64, buffer.len), size - offset));
             const got = reader.readAt(buffer[0..wanted], offset) catch return error.SourceReadFailed;
             if (got == 0 or got > wanted) return error.UnexpectedSourceLength;
-            try self.spool.writePositionalAll(self.io, buffer[0..got], start + offset);
+            if (memory) |bytes| {
+                @memcpy(bytes[@intCast(offset)..][0..got], buffer[0..got]);
+            } else {
+                try self.spool.?.writePositionalAll(self.io, buffer[0..got], start + offset);
+            }
             hash.update(buffer[0..got]);
             offset += got;
         }
@@ -628,16 +729,70 @@ pub const RootTree = struct {
         self.spool_len = end;
         return .{
             .io = self.io,
-            .file = self.spool,
-            .offset = start,
             .size = size,
             .sha256 = digest,
+            .source = if (memory) |bytes|
+                .{ .memory = bytes }
+            else
+                .{ .spooled = .{ .file = self.spool.?, .offset = start } },
         };
     }
 
     fn rollbackSpool(self: *RootTree, length: u64) !void {
-        try self.spool.setLength(self.io, length);
+        if (self.spool) |spool| try spool.setLength(self.io, length);
         self.spool_len = length;
+    }
+
+    fn putBorrowedContent(
+        self: *RootTree,
+        path: []const u8,
+        kind: Kind,
+        size: u64,
+        reader: ext4.FileTreeView.ContentReader,
+        metadata: Metadata,
+    ) !void {
+        if (size > self.limits.max_file_bytes) return error.FileLimitExceeded;
+        try validatePath(path, self.limits);
+        const old_spool_len = self.spool_len;
+        const end = std.math.add(u64, old_spool_len, size) catch
+            return error.SpoolLimitExceeded;
+        if (end > self.limits.max_spool_bytes) return error.SpoolLimitExceeded;
+        const digest = try hashContentReader(reader, size);
+        self.spool_len = end;
+        self.putNode(path, kind, metadata, .{ .content = .{
+            .io = self.io,
+            .size = size,
+            .sha256 = digest,
+            .source = .{ .borrowed = reader },
+        } }) catch |err| {
+            try self.rollbackSpool(old_spool_len);
+            return err;
+        };
+    }
+
+    fn referenceHostFile(
+        self: *RootTree,
+        file: Io.File,
+        path: []const u8,
+        size: u64,
+    ) !Content {
+        if (size > self.limits.max_file_bytes) return error.FileLimitExceeded;
+        const end = std.math.add(u64, self.spool_len, size) catch
+            return error.SpoolLimitExceeded;
+        if (end > self.limits.max_spool_bytes) return error.SpoolLimitExceeded;
+        var file_reader = FileReader{ .io = self.io, .file = file };
+        const digest = try hashContentReader(.{
+            .ctx = &file_reader,
+            .read_at_fn = FileReader.readAt,
+        }, size);
+        const owned_path = try self.allocator.dupe(u8, path);
+        self.spool_len = end;
+        return .{
+            .io = self.io,
+            .size = size,
+            .sha256 = digest,
+            .source = .{ .host_path = owned_path },
+        };
     }
 
     fn dupeXattrs(self: *RootTree, source: []const ext4.Xattr) ![]ext4.OwnedXattr {
@@ -812,7 +967,12 @@ pub const RootTree = struct {
     fn freePayload(self: *RootTree, payload: Payload) void {
         switch (payload) {
             .hardlink_target => |target| self.allocator.free(target),
-            .none, .content, .device => {},
+            .content => |content| switch (content.source) {
+                .memory => |bytes| self.allocator.free(bytes),
+                .host_path => |path| self.allocator.free(path),
+                .spooled, .borrowed => {},
+            },
+            .none, .device => {},
         }
     }
 
@@ -856,6 +1016,26 @@ pub const RootTree = struct {
         return content.readAt(buffer, offset) catch error.ReadFailed;
     }
 };
+
+fn hashContentReader(
+    reader: ext4.FileTreeView.ContentReader,
+    size: u64,
+) ![32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < size) {
+        const wanted: usize = @intCast(@min(@as(u64, buffer.len), size - offset));
+        const got = reader.readAt(buffer[0..wanted], offset) catch
+            return error.SourceReadFailed;
+        if (got == 0 or got > wanted) return error.UnexpectedSourceLength;
+        hash.update(buffer[0..got]);
+        offset += got;
+    }
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    return digest;
+}
 
 fn validatePath(path: []const u8, limits: Limits) !void {
     if (path.len == 0 or path.len > limits.max_path_bytes or path[0] == '/') return error.InvalidPath;

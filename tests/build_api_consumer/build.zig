@@ -111,6 +111,7 @@ pub fn build(b: *std.Build) void {
             .basename = "preserved-fixture.qcow2",
         },
         .target_architecture = .aarch64,
+        .backend = .rebuild,
         .reproducibility = .{
             .seed = [_]u8{0x44} ** 32,
             .source_date_epoch = 1_735_689_600,
@@ -126,6 +127,16 @@ pub fn build(b: *std.Build) void {
                 .source = .{ .path = b.path("fixtures/custom.conf") },
             } },
             .{ .remove_tree = "/var/cache/obsolete" },
+        },
+        .os = .{
+            .filesystem = &.{
+                .{ .put_file = .{
+                    .path = "/etc/rebuilt.conf",
+                    .source = .{ .inline_bytes = "source=rebuild\n" },
+                } },
+                .{ .put_directory = .{ .path = "/opt/rebuilt" } },
+            },
+            .hostname = "rebuilt",
         },
     });
 

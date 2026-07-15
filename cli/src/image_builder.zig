@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const customization_loader = @import("customization_loader.zig");
 const zvmi = @import("zvmi");
 
 const ParsedArgs = struct {
@@ -139,7 +140,7 @@ pub fn main(init: std.process.Init) !void {
     try writeBytes(init.io, diagnostics_output_path, "[]\n");
     try writeBytes(init.io, provenance_output_path, "null\n");
 
-    const customization = loadCustomization(
+    const customization = customization_loader.load(
         arena,
         init.io,
         args.customization_path,
@@ -397,147 +398,6 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs
         .reuse_success = reuse_success,
         .verbose = verbose,
     };
-}
-
-const LoadedCustomization = struct {
-    os: zvmi.customize.OsCustomization,
-    generalization: zvmi.customize.GeneralizationPolicy,
-};
-
-fn loadCustomization(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    config_path: ?[]const u8,
-    source_paths: []const []const u8,
-) !LoadedCustomization {
-    const path = config_path orelse {
-        if (source_paths.len != 0) return error.CustomizationSourcesWithoutConfig;
-        return .{ .os = .{}, .generalization = .none };
-    };
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024));
-    const parsed = try std.json.parseFromSlice(
-        zvmi.customization_wire.Configuration,
-        allocator,
-        bytes,
-        .{ .ignore_unknown_fields = false },
-    );
-    const wire = parsed.value;
-
-    const filesystem = try allocator.alloc(zvmi.customize.FilesystemOperation, wire.os.filesystem.len);
-    for (wire.os.filesystem, 0..) |operation, index| {
-        filesystem[index] = switch (operation) {
-            .put_file => |file| .{ .put_file = .{
-                .path = file.path,
-                .source = .{ .host_path = if (file.source_index < source_paths.len)
-                    source_paths[file.source_index]
-                else
-                    return error.CustomizationSourceIndexOutOfBounds },
-                .metadata = try convertMetadata(allocator, file.metadata),
-            } },
-            .put_directory => |directory| .{ .put_directory = .{
-                .path = directory.path,
-                .metadata = try convertMetadata(allocator, directory.metadata),
-            } },
-            .put_symlink => |link| .{ .put_symlink = .{
-                .path = link.path,
-                .target = link.target,
-                .metadata = try convertMetadata(allocator, link.metadata),
-            } },
-            .remove => |remove_path| .{ .remove = remove_path },
-            .set_metadata => |change| .{ .set_metadata = .{
-                .path = change.path,
-                .mode = change.mode,
-                .uid = change.uid,
-                .gid = change.gid,
-                .xattrs = if (change.xattrs) |xattrs| try convertXattrs(allocator, xattrs) else null,
-            } },
-        };
-    }
-    const groups = try allocator.alloc(zvmi.customize.Group, wire.os.groups.len);
-    for (wire.os.groups, 0..) |group, index| groups[index] = .{
-        .name = group.name,
-        .gid = group.gid,
-        .members = group.members,
-    };
-    const users = try allocator.alloc(zvmi.customize.User, wire.os.users.len);
-    for (wire.os.users, 0..) |user, index| users[index] = .{
-        .name = user.name,
-        .uid = user.uid,
-        .gid = user.gid,
-        .primary_group = user.primary_group,
-        .secondary_groups = user.secondary_groups,
-        .home = user.home,
-        .shell = user.shell,
-        .password = switch (user.password) {
-            .locked => .locked,
-            .prehashed => |value| .{ .prehashed = value },
-        },
-        .ssh_authorized_keys = user.ssh_authorized_keys,
-        .passwordless_sudo = user.passwordless_sudo,
-    };
-    const services = try allocator.alloc(zvmi.customize.Service, wire.os.services.len);
-    for (wire.os.services, 0..) |service, index| services[index] = .{
-        .name = service.name,
-        .state = switch (service.state) {
-            .enabled => .enabled,
-            .disabled => .disabled,
-        },
-    };
-    const modules = try allocator.alloc(zvmi.customize.KernelModule, wire.os.kernel_modules.len);
-    for (wire.os.kernel_modules, 0..) |module, index| modules[index] = .{
-        .name = module.name,
-        .load = module.load,
-        .disabled = module.disabled,
-        .options = module.options,
-    };
-    return .{
-        .os = .{
-            .filesystem = filesystem,
-            .hostname = wire.os.hostname,
-            .groups = groups,
-            .users = users,
-            .services = services,
-            .kernel_modules = modules,
-        },
-        .generalization = switch (wire.generalization) {
-            .none => .none,
-            .azure => |options| .{ .azure = .{
-                .reset_hostname = options.reset_hostname,
-                .clear_machine_id = options.clear_machine_id,
-                .remove_ssh_host_keys = options.remove_ssh_host_keys,
-                .remove_agent_state = options.remove_agent_state,
-                .remove_dhcp_leases = options.remove_dhcp_leases,
-                .remove_logs = options.remove_logs,
-                .remove_caches = options.remove_caches,
-                .clear_random_seed = options.clear_random_seed,
-                .remove_users = options.remove_users,
-            } },
-        },
-    };
-}
-
-fn convertMetadata(
-    allocator: std.mem.Allocator,
-    metadata: zvmi.customization_wire.Metadata,
-) !zvmi.customize.Metadata {
-    return .{
-        .mode = metadata.mode,
-        .uid = metadata.uid,
-        .gid = metadata.gid,
-        .xattrs = try convertXattrs(allocator, metadata.xattrs),
-    };
-}
-
-fn convertXattrs(
-    allocator: std.mem.Allocator,
-    xattrs: []const zvmi.customization_wire.Xattr,
-) ![]const zvmi.ext4.Xattr {
-    const converted = try allocator.alloc(zvmi.ext4.Xattr, xattrs.len);
-    for (xattrs, 0..) |xattr, index| converted[index] = .{
-        .name = xattr.name,
-        .value = xattr.value,
-    };
-    return converted;
 }
 
 fn parseArchitecture(value: []const u8) ?zvmi.customize.Architecture {

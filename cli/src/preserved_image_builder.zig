@@ -2,8 +2,9 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const wire = @import("preserved_image_wire");
+const customization_loader = @import("customization_loader.zig");
 const zvmi = @import("zvmi");
+const wire = zvmi.preserved_image_wire;
 
 const ParsedArgs = struct {
     api_version: u32 = zvmi.customize.current_api_version,
@@ -23,8 +24,11 @@ const ParsedArgs = struct {
 };
 
 const LoadedConfiguration = struct {
+    backend: zvmi.customize.ExecutionBackend,
     root_partition: zvmi.customize.PartitionSelector,
     operations: []const zvmi.customize.ExistingPathOperation,
+    os: zvmi.customize.OsCustomization,
+    generalization: zvmi.customize.GeneralizationPolicy,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -138,11 +142,13 @@ pub fn main(init: std.process.Init) !void {
         .storage = .{ .preserve = .{
             .root_partition = configuration.root_partition,
         } },
+        .os = configuration.os,
         .existing_path_operations = configuration.operations,
         .execution = .{
             .workspace_path = args.bundle_output_path,
-            .backend = .native_edit,
+            .backend = configuration.backend,
         },
+        .generalization = configuration.generalization,
         .reproducibility = .{
             .seed = args.seed,
             .source_date_epoch = args.source_date_epoch,
@@ -387,12 +393,23 @@ fn loadConfiguration(
         .{ .ignore_unknown_fields = false },
     );
     try wire.validate(parsed.value, source_paths.len);
+    const customization = try customization_loader.map(
+        allocator,
+        parsed.value.customization,
+        source_paths,
+    );
     return .{
+        .backend = switch (parsed.value.backend) {
+            .native_edit => .native_edit,
+            .rebuild => .rebuild,
+        },
         .root_partition = switch (parsed.value.root_partition) {
             .gpt_index => |index| .{ .gpt_index = index },
             .mbr_index => |index| .{ .mbr_index = index },
         },
         .operations = try mapOperations(allocator, parsed.value.operations, source_paths),
+        .os = customization.os,
+        .generalization = customization.generalization,
     };
 }
 
@@ -401,18 +418,15 @@ fn mapOperations(
     operations: []const wire.Operation,
     source_paths: []const []const u8,
 ) ![]const zvmi.customize.ExistingPathOperation {
-    const configuration = wire.Configuration{
-        .root_partition = .{ .gpt_index = 1 },
-        .operations = operations,
-    };
-    try wire.validate(configuration, source_paths.len);
-
     const mapped = try allocator.alloc(zvmi.customize.ExistingPathOperation, operations.len);
     for (operations, 0..) |operation, index| {
         mapped[index] = switch (operation) {
             .overwrite_file => |overwrite| .{ .overwrite_file = .{
                 .path = overwrite.path,
-                .source = .{ .host_path = source_paths[overwrite.source_index] },
+                .source = .{ .host_path = if (overwrite.source_index < source_paths.len)
+                    source_paths[overwrite.source_index]
+                else
+                    return error.SourceIndexOutOfBounds },
             } },
             .remove_file => |path| .{ .remove_file = path },
             .remove_tree => |path| .{ .remove_tree = path },
@@ -780,6 +794,22 @@ test "operation mapping preserves order and indexed sources" {
     );
     try std.testing.expect(mapped[3] == .remove_tree);
     try std.testing.expectEqualStrings("/var/cache/old", mapped[3].remove_tree);
+}
+
+test "operation mapping permits customization sources in the shared index space" {
+    const operations = [_]wire.Operation{
+        .{ .overwrite_file = .{ .path = "/etc/existing", .source_index = 0 } },
+    };
+    const mapped = try mapOperations(
+        std.testing.allocator,
+        &operations,
+        &.{ "existing-source", "customization-source" },
+    );
+    defer std.testing.allocator.free(mapped);
+    try std.testing.expectEqualStrings(
+        "existing-source",
+        mapped[0].overwrite_file.source.host_path,
+    );
 }
 
 test "unsafe image basenames are rejected" {

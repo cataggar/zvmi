@@ -253,6 +253,7 @@ const preserved = zvmi.addPreservedImage(b, dependency, .{
         .basename = "updated-appliance.qcow2",
     },
     .target_architecture = .x86_64,
+    .backend = .rebuild,
     .reproducibility = .{
         .seed = [_]u8{0x24} ** 32,
         .source_date_epoch = 1_735_689_600,
@@ -269,12 +270,22 @@ const preserved = zvmi.addPreservedImage(b, dependency, .{
         .{ .remove_file = "/etc/obsolete.conf" },
         .{ .remove_tree = "/var/cache/obsolete" },
     },
+    .os = .{
+        .filesystem = &.{
+            .{ .put_file = .{
+                .path = "/etc/new-appliance.conf",
+                .source = .{ .inline_bytes = "created-by=rebuild\n" },
+            } },
+            .{ .put_directory = .{ .path = "/opt/appliance" } },
+        },
+        .hostname = "updated-appliance",
+    },
 });
 ```
 
 The disk, every transitive qcow2 backing or external-data file, the generated operation configuration, and every replacement are tracked `LazyPath` inputs; inline bytes are materialized through `WriteFiles`. Runtime preflight opens the disk read-only and requires the declared dependency set to exactly match its actual transitive qcow2 closure. The host-native runner preserves the source virtual size, flattens qcow2 dependencies into a standalone output, and returns the same result, preflight, and status-gate artifacts as `addImage`, including when the dependency was configured for a foreign target. GPT and MBR selectors are one-based.
 
-The current native editor only overwrites existing regular files, removes existing non-directories, and recursively removes existing directories in zvmi-compatible ext4 filesystems. It does not create paths, change metadata, support arbitrary ext4 layouts, resize partitions, run package managers, or execute guest code.
+`addPreservedImage` defaults to `.backend = .native_edit`, which only overwrites existing regular files, removes existing non-directories, and recursively removes existing directories. Select `.backend = .rebuild` to strictly import a writer-compatible `zvmi_ext4_v1` filesystem into owned storage, create/remove files, directories, and symlinks, change represented metadata, apply the pure OS customization model, and generalize the image before rebuilding only the selected partition. Rebuild preserves the ext4 UUID, exact label field, geometry, global timestamp, supported node contents/metadata/xattrs, and every byte outside the selected filesystem; it rejects arbitrary ext4 features, hardlinks, special or sparse files, divergent timestamps, noncanonical root metadata, and partition padding rather than discarding them. Neither backend resizes partitions, runs package managers, regenerates initramfs, or executes guest code.
 
 ## Runtime customization API
 
@@ -327,15 +338,15 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
-`resolve` is deterministic and does not inspect or mutate the host. The `native_fresh` and `native_edit` backends require `workspace_path` to be the parent directory of `output.path`, keeping all planned scratch state on the destination filesystem for atomic publication. `preflight` returns all missing capabilities, and `execute` repeats preflight before mutation, stages the image in a planned transaction directory, verifies that source hashes remain unchanged, and atomically publishes the final output. Validation, preflight, and execution diagnostics are structured and independently owned; successful results include source hashes, resolved configuration, generated or preserved-image metadata, and the final artifact hash.
+`resolve` is deterministic and does not inspect or mutate the host. The `native_fresh`, `native_edit`, and strict `rebuild` backends require `workspace_path` to be the parent directory of `output.path`, keeping all planned scratch state on the destination filesystem for atomic publication. `preflight` returns all missing capabilities, and `execute` repeats preflight before mutation, stages the image in a planned transaction directory, verifies that source hashes remain unchanged, and atomically publishes the final output. Validation, preflight, and execution diagnostics are structured and independently owned; successful results include source hashes, resolved configuration, generated or preserved-image metadata, source/final rebuild tree manifests, and the final artifact hash.
 
 `customize.current_api_version` identifies the v3 request contract. `adaptV2NativeFresh` explicitly converts the frozen v2 ISO+OCI/native request shape; v3 validation never silently reinterprets a request labeled as v2. Plan and provenance JSON have independent `schema_version` fields so artifact consumers can reject or migrate formats separately.
 
-The v3 contract also models `rebuild`, `unsafe_chroot`, and `vm` backends plus package actions and repositories, ordered hooks, initramfs regeneration, SELinux policy, and cross-architecture runners. These policies derive semantic capabilities and fail preflight before workspace creation until their executors exist. `unsafe_chroot` and scripts require explicit unsafe-code acknowledgement; chroot is not a sandbox.
+The v3 contract implements rootless `native_fresh`, constrained `native_edit`, and strict writer-compatible `rebuild`. It also models `unsafe_chroot` and `vm` backends plus package actions and repositories, ordered hooks, initramfs regeneration, SELinux policy, and cross-architecture runners. Those guest-code policies derive semantic capabilities and fail preflight before workspace creation until their executors exist. `unsafe_chroot` and scripts require explicit unsafe-code acknowledgement; chroot is not a sandbox.
 
 `zvmi.root_tree.RootTree` is the lower-level owned filesystem API. It spools bounded file and symlink content independently of ISO, SquashFS, OCI, or ext4 reader lifetimes; owns paths and POSIX metadata; applies deterministic replacement and recursive removal; and exposes a stable manifest digest. `ext4View()` adapts a validated tree to `zvmi.ext4.populate`, while `populateFat32()` either requires FAT-representable metadata or applies the caller's explicit lossy POSIX-metadata policy. Unsupported hardlinks, special files, timestamps, or metadata are rejected rather than silently discarded.
 
-`zvmi.preserved_image.edit` is the lower-level transactional API for an existing raw, VHD, VHDX, or qcow2 disk. It copies guest-visible bytes into exclusive raw staging, flattens qcow2 backing chains, edits an explicitly selected one-based GPT or MBR partition, converts to a standalone output, and publishes without replacing an existing destination. The source and its backing files are opened read-only. This initial native editor deliberately supports only overwriting existing regular files, deleting existing non-directory entries, and recursively deleting existing directories in zvmi-compatible ext4 layouts; path creation, metadata changes, arbitrary ext4 layouts, partition resizing, package operations, and guest-code execution remain unsupported.
+`zvmi.preserved_image.edit` is the lower-level constrained existing-path API, while `zvmi.preserved_image.rebuild` performs the strict full-tree rebuild described above. Both accept raw, VHD, VHDX, or qcow2 disks, copy guest-visible bytes into exclusive raw staging, flatten qcow2 backing chains, operate on an explicitly selected one-based GPT or MBR partition, convert to a standalone output, and publish without replacing an existing destination. Sources and backing files are opened read-only.
 
 ## CI
 
