@@ -92,6 +92,43 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const foreign_dependency = b.dependencyFromBuildZig(zvmi, .{
+        .target = b.resolveTargetQuery(.{
+            .cpu_arch = .aarch64,
+            .os_tag = .linux,
+        }),
+        .optimize = .ReleaseSafe,
+    });
+    const preserved_image = zvmi.addPreservedImage(b, foreign_dependency, .{
+        .name = "preserved-fixture",
+        .input = .{
+            .disk = b.path("fixtures/os.iso"),
+            .dependencies = &.{b.path("fixtures/container.tar")},
+        },
+        .root_partition = .{ .gpt_index = 2 },
+        .output = .{
+            .format = .qcow2,
+            .basename = "preserved-fixture.qcow2",
+        },
+        .target_architecture = .aarch64,
+        .reproducibility = .{
+            .seed = [_]u8{0x44} ** 32,
+            .source_date_epoch = 1_735_689_600,
+        },
+        .operations = &.{
+            .{ .overwrite_file = .{
+                .path = "/etc/inline.conf",
+                .source = .{ .inline_bytes = "source=preserved-inline\n" },
+            } },
+            .{ .remove_file = "/etc/obsolete.conf" },
+            .{ .overwrite_file = .{
+                .path = "/etc/tracked.conf",
+                .source = .{ .path = b.path("fixtures/custom.conf") },
+            } },
+            .{ .remove_tree = "/var/cache/obsolete" },
+        },
+    });
+
     const install_layout = b.addInstallFile(layout_image.path, "images/layout-fixture.qcow2");
     const install_archive = b.addInstallFile(archive_image.path, "images/archive-fixture.vhd");
     const install_plan = b.addInstallFile(layout_image.plan_path, "images/layout-fixture.plan.json");
@@ -116,4 +153,14 @@ pub fn build(b: *std.Build) void {
     );
     const execution_diagnostics_step = b.step("execution-diagnostics", "Produce structured diagnostics for a retryable execution failure");
     execution_diagnostics_step.dependOn(&install_execution_diagnostics.step);
+
+    const install_preserved_diagnostics = b.addInstallFile(
+        preserved_image.preflight_diagnostics_path,
+        "images/preserved-fixture.diagnostics.json",
+    );
+    const preserved_diagnostics_step = b.step(
+        "preserved-diagnostics",
+        "Exercise preserved-image preflight with a foreign dependency target",
+    );
+    preserved_diagnostics_step.dependOn(&install_preserved_diagnostics.step);
 }

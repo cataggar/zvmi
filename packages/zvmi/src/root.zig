@@ -36,6 +36,7 @@ pub const cosi = @import("cosi.zig");
 pub const build_image = @import("build_image.zig");
 pub const customize = @import("customize.zig");
 pub const root_tree = @import("root_tree.zig");
+pub const preserved_image = @import("preserved_image.zig");
 pub const os_customization = @import("os_customization.zig");
 pub const customization_wire = @import("customization_wire.zig");
 pub const verity = @import("verity.zig");

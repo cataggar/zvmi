@@ -98,9 +98,30 @@ pub const Image = struct {
         return openFileWithPath(io, file, path);
     }
 
+    /// Opens an image and all path-relative backing files without write access.
+    /// Mutating methods on the returned image fail through the underlying
+    /// read-only file handle.
+    pub fn openPathReadOnly(io: Io, path: []const u8) OpenError!Image {
+        const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+        errdefer file.close(io);
+        return openFileWithPath(io, file, path);
+    }
+
     /// Takes ownership of `file` (closing the returned `Image` closes it).
     pub fn openFile(io: Io, file: Io.File) OpenError!Image {
         return openFileWithPath(io, file, null);
+    }
+
+    /// Lists path-resolved host files, excluding the top-level image, that
+    /// contribute guest-visible data. Only qcow2 currently has dependencies.
+    pub fn sourceDependencyPaths(
+        self: Image,
+        allocator: std.mem.Allocator,
+    ) std.mem.Allocator.Error![][]u8 {
+        if (self.qcow2) |qcow_info| {
+            return qcow2.sourceDependencyPaths(allocator, qcow_info);
+        }
+        return allocator.alloc([]u8, 0);
     }
 
     fn openFileWithPath(io: Io, file: Io.File, path: ?[]const u8) OpenError!Image {
@@ -202,9 +223,31 @@ pub const Image = struct {
     /// Creates a brand-new image file of the given format and virtual size.
     /// `size` must be a multiple of the 512-byte sector size.
     pub fn create(io: Io, path: []const u8, format: Format, size: u64, options: CreateOptions) CreateError!Image {
+        return createPath(io, path, format, size, options, false);
+    }
+
+    /// Creates a brand-new image without following or truncating an existing
+    /// path. Intended for transactional scratch and output artifacts.
+    pub fn createExclusive(io: Io, path: []const u8, format: Format, size: u64, options: CreateOptions) CreateError!Image {
+        return createPath(io, path, format, size, options, true);
+    }
+
+    fn createPath(
+        io: Io,
+        path: []const u8,
+        format: Format,
+        size: u64,
+        options: CreateOptions,
+        exclusive: bool,
+    ) CreateError!Image {
         try validateCreate(format, size, options);
 
-        const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+        const file = try Io.Dir.cwd().createFile(io, path, .{
+            .read = true,
+            .truncate = true,
+            .exclusive = exclusive,
+        });
+        errdefer if (exclusive) Io.Dir.cwd().deleteFile(io, path) catch {};
         errdefer file.close(io);
 
         switch (format) {
@@ -777,6 +820,23 @@ test "invalid create options do not truncate an existing image" {
     var bytes: ["preserve-me".len]u8 = undefined;
     _ = try file.readPositionalAll(io, &bytes, 0);
     try std.testing.expectEqualStrings("preserve-me", &bytes);
+}
+
+test "exclusive creation removes a file when initialization fails" {
+    const io = std.testing.io;
+    const path = "test-image-failed-exclusive-create.vhd";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const result = Image.createExclusive(io, path, .vhd, @as(u64, 1) << 63, .{
+        .vhd_subformat = .fixed,
+    });
+    if (result) |image_value| {
+        var image = image_value;
+        image.close(io);
+        return error.TestUnexpectedResult;
+    } else |_| {}
+
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, path, .{}));
 }
 
 test "create fixed vhd image, then open and recover virtual size" {
