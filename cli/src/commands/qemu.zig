@@ -859,10 +859,15 @@ fn parseGhrPackagePathsAlloc(
     defer parsed.deinit();
 
     const relative_binary = for (parsed.value.bins) |bin_path| {
-        if (isQemuSystemX86_64Name(std.fs.path.basename(bin_path))) break bin_path;
+        if (isQemuSystemX86_64Name(portableBasename(bin_path))) break bin_path;
     } else return error.QemuBinaryMissingFromGhrMetadata;
 
-    const binary_path = try std.fs.path.join(allocator, &.{ tool_dir, relative_binary });
+    const native_relative_binary = try allocator.dupe(u8, relative_binary);
+    defer allocator.free(native_relative_binary);
+    for (native_relative_binary) |*byte| {
+        if (byte.* == '/' or byte.* == '\\') byte.* = std.fs.path.sep;
+    }
+    const binary_path = try std.fs.path.join(allocator, &.{ tool_dir, native_relative_binary });
     errdefer allocator.free(binary_path);
     const package_root = std.fs.path.dirname(binary_path) orelse
         return error.InvalidGhrMetadata;
@@ -872,6 +877,16 @@ fn parseGhrPackagePathsAlloc(
         .binary_path = binary_path,
         .data_dir = data_dir,
     };
+}
+
+fn portableBasename(path: []const u8) []const u8 {
+    const slash = std.mem.lastIndexOfScalar(u8, path, '/');
+    const backslash = std.mem.lastIndexOfScalar(u8, path, '\\');
+    const separator = if (slash) |slash_index|
+        if (backslash) |backslash_index| @max(slash_index, backslash_index) else slash_index
+    else
+        backslash orelse return path;
+    return path[separator + 1 ..];
 }
 
 fn isQemuSystemX86_64Name(name: []const u8) bool {
