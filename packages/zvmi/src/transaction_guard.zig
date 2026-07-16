@@ -41,6 +41,14 @@ pub const Lease = struct {
         self.active = false;
         try delete_result;
     }
+
+    /// Drops the process lock but intentionally leaves the active marker so
+    /// publication and recursive cleanup remain blocked for manual recovery.
+    pub fn abandon(self: *Lease, io: Io) void {
+        if (!self.active) return;
+        self.lock_file.close(io);
+        self.active = false;
+    }
 };
 
 pub const CommitBarrier = struct {
@@ -134,4 +142,43 @@ fn statePath(
     buffer: *[Io.Dir.max_path_bytes]u8,
 ) ![]const u8 {
     return std.fmt.bufPrint(buffer, "{s}{s}", .{ transaction_path, suffix });
+}
+
+test "lease release permits sealing while abandonment retains recovery marker" {
+    const io = std.testing.io;
+    const transaction_path = "test-transaction-guard";
+    defer Io.Dir.cwd().deleteTree(io, transaction_path) catch {};
+    var lock_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+    const lock_path = try statePath(
+        transaction_path,
+        lock_suffix,
+        &lock_buffer,
+    );
+    defer Io.Dir.cwd().deleteFile(io, lock_path) catch {};
+    var sealed_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+    const sealed_path = try statePath(
+        transaction_path,
+        sealed_suffix,
+        &sealed_buffer,
+    );
+    defer Io.Dir.cwd().deleteFile(io, sealed_path) catch {};
+
+    try Io.Dir.cwd().createDir(io, transaction_path, .default_dir);
+    var released = try acquire(io, transaction_path);
+    try std.testing.expect(try hasActiveLease(io, transaction_path));
+    try released.release(io);
+    try std.testing.expect(!try hasActiveLease(io, transaction_path));
+    var barrier = try seal(io, transaction_path);
+    barrier.release(io);
+    try Io.Dir.cwd().deleteTree(io, transaction_path);
+    try finishCleanup(io, transaction_path);
+
+    try Io.Dir.cwd().createDir(io, transaction_path, .default_dir);
+    var abandoned = try acquire(io, transaction_path);
+    abandoned.abandon(io);
+    try std.testing.expect(try hasActiveLease(io, transaction_path));
+    try std.testing.expectError(
+        error.ActiveBackendLease,
+        seal(io, transaction_path),
+    );
 }

@@ -27,7 +27,7 @@ const verity = @import("verity.zig");
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
 pub const plan_schema_version: u32 = 4;
-pub const provenance_schema_version: u32 = 4;
+pub const provenance_schema_version: u32 = 5;
 const mib: u64 = 1024 * 1024;
 
 comptime {
@@ -2676,7 +2676,7 @@ fn buildCapabilities(
             try capabilities.append(.{ .kind = .standalone_output, .path = output.path, .reason = "publish a standalone rebuilt output" });
         },
         .unsafe_chroot => {
-            try capabilities.append(.{ .kind = .unsafe_chroot, .path = "", .reason = "unsafe host-code execution through chroot is not implemented and chroot is not a sandbox" });
+            try capabilities.append(.{ .kind = .unsafe_chroot, .path = "", .reason = "run the Linux-only privileged same-architecture chroot executor; chroot is not a sandbox" });
             try capabilities.append(.{ .kind = .guest_execution, .path = "", .reason = "execute target code on the host" });
             try capabilities.append(.{ .kind = .standalone_output, .path = output.path, .reason = "publish a standalone output" });
         },
@@ -3287,6 +3287,18 @@ pub const Platform = struct {
         event_sink: ?EventSink,
         stage_sink: build_image.StageSink,
     ) anyerror!void = null,
+    unsafeChrootCheckFn: ?*const fn (
+        context: ?*anyopaque,
+        io: Io,
+        plan: *const ResolvedPlan,
+    ) CapabilityState = null,
+    unsafeChrootRunFn: ?*const fn (
+        context: ?*anyopaque,
+        allocator: Allocator,
+        io: Io,
+        plan: *const ResolvedPlan,
+        target: preserved_image.RawMutationTarget,
+    ) anyerror!UnsafeChrootRuntimeReport = null,
 
     pub fn system() Platform {
         return .{ .checkFn = systemCapabilityCheck };
@@ -3294,6 +3306,15 @@ pub const Platform = struct {
 
     fn check(self: Platform, io: Io, requirement: CapabilityRequirement) CapabilityState {
         return self.checkFn(self.context, io, requirement);
+    }
+
+    fn checkUnsafeChroot(
+        self: Platform,
+        io: Io,
+        plan: *const ResolvedPlan,
+    ) CapabilityState {
+        const check_fn = self.unsafeChrootCheckFn orelse return .unsupported;
+        return check_fn(self.context, io, plan);
     }
 };
 
@@ -3355,21 +3376,22 @@ pub fn preflight(
             .arbitrary_filesystem_mutation,
             .generalization,
             => if (plan.data.execution.backend == .rebuild) .available else .unsupported,
-            .unsafe_chroot,
             .vm,
-            .package_management,
-            .repository_access,
-            .repository_trust,
             .package_cache,
             .package_lock,
             .script_execution,
-            .guest_execution,
-            .initramfs_regeneration,
             .selinux_policy,
             .selinux_relabel,
             .cross_architecture_runner,
             .boot_policy_mutation,
             => .unsupported,
+            .unsafe_chroot,
+            .package_management,
+            .repository_access,
+            .repository_trust,
+            .guest_execution,
+            .initramfs_regeneration,
+            => unsafeChrootCapabilityState(platform, io, plan),
             else => platform.check(io, requirement),
         };
         const owned_requirement = CapabilityRequirement{
@@ -3397,6 +3419,109 @@ pub fn preflight(
         .capabilities = checks,
         .diagnostics = .{ .items = diagnostic_buffer[0..diagnostic_count] },
     };
+}
+
+fn unsafeChrootCapabilityState(
+    platform: Platform,
+    io: Io,
+    plan: *const ResolvedPlan,
+) CapabilityState {
+    const data = plan.data;
+    if (data.execution.backend != .unsafe_chroot or
+        data.architectures.host != data.architectures.image or
+        !data.execution.acknowledge_unsafe or
+        data.input != .disk or
+        data.storage != .preserve or
+        data.existing_path_operations.len != 0 or
+        hasOsCustomization(data.os) or
+        data.generalization != .none or
+        data.hooks.len != 0 or
+        data.selinux != .unchanged or
+        !isDefaultBootPolicy(data.boot_security) or
+        data.packages.cache != .online or
+        data.packages.lock != .unlocked)
+    {
+        return .unsupported;
+    }
+    for (data.packages.actions) |action| {
+        const names = switch (action) {
+            .install => |values| values,
+            .remove => |values| values,
+            .update_all, .update_selected => return .unsupported,
+        };
+        if (names.len == 0) return .unsupported;
+        for (names) |name| {
+            if (!validUnsafePackageName(name)) return .unsupported;
+        }
+    }
+    for (data.packages.repositories) |repository| {
+        if (!validUnsafeRepositoryId(repository.id)) return .unsupported;
+    }
+    switch (data.initramfs) {
+        .unchanged => {},
+        .regenerate => |regenerate| {
+            if (regenerate.kernels.len == 0) return .unsupported;
+            for (regenerate.kernels) |kernel| {
+                if (!validUnsafeKernelRelease(kernel)) return .unsupported;
+            }
+            if (regenerate.generator) |generator| {
+                if (!std.mem.eql(u8, generator, "dracut")) return .unsupported;
+            }
+        },
+    }
+    return platform.checkUnsafeChroot(io, plan);
+}
+
+fn validUnsafeRepositoryId(id: []const u8) bool {
+    if (id.len == 0 or !std.ascii.isAlphanumeric(id[0])) return false;
+    for (id[1..]) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and
+            byte != '.' and
+            byte != '_' and
+            byte != '-')
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn validUnsafePackageName(name: []const u8) bool {
+    if (name.len == 0 or !std.ascii.isAlphanumeric(name[0])) return false;
+    if (name.len >= 4 and
+        std.ascii.eqlIgnoreCase(name[name.len - 4 ..], ".rpm"))
+    {
+        return false;
+    }
+    for (name[1..]) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and
+            byte != '.' and
+            byte != '_' and
+            byte != '+' and
+            byte != '-' and
+            byte != '~' and
+            byte != '^')
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn validUnsafeKernelRelease(kernel: []const u8) bool {
+    if (kernel.len == 0 or !std.ascii.isAlphanumeric(kernel[0])) return false;
+    for (kernel[1..]) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and
+            byte != '.' and
+            byte != '_' and
+            byte != '+' and
+            byte != '-' and
+            byte != '~')
+        {
+            return false;
+        }
+    }
+    return true;
 }
 
 fn systemCapabilityCheck(_: ?*anyopaque, io: Io, requirement: CapabilityRequirement) CapabilityState {
@@ -3616,6 +3741,17 @@ pub const ToolRecord = struct {
     command: []const []const u8,
 };
 
+pub const UnsafeChrootRuntimeReport = struct {
+    arena: std.heap.ArenaAllocator,
+    tools: []const ToolRecord,
+    installed_packages: []const []const u8,
+
+    pub fn deinit(self: *UnsafeChrootRuntimeReport) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const ArtifactRecord = struct {
     path: []const u8,
     format: OutputFormat,
@@ -3683,6 +3819,7 @@ pub const PreservedExecutionRecord = struct {
     partition_length: u64,
     flattened_backing_chain: bool,
     operation_count: usize,
+    installed_packages: []const []const u8,
     rebuild: ?PreservedRebuildRecord,
 };
 
@@ -3836,6 +3973,7 @@ fn buildResult(
     fresh_report: ?*const build_image.BuildImageReport,
     preserved_report: ?*const preserved_image.Report,
     rebuild_report: ?*const preserved_image.RebuildReport,
+    unsafe_report: ?*const UnsafeChrootRuntimeReport,
     source_digests: []const SourceRecord,
     output_digest: Digest,
     output_file_size: u64,
@@ -3961,6 +4099,10 @@ fn buildResult(
             .partition_length = partition_length,
             .flattened_backing_chain = flattened,
             .operation_count = operation_count,
+            .installed_packages = if (unsafe_report) |report|
+                try dupeStrings(result_allocator, report.installed_packages)
+            else
+                &.{},
             .rebuild = if (rebuild_report) |report| .{
                 .profile = report.strict_profile,
                 .ext4_uuid = .{ .bytes = report.ext4_uuid },
@@ -3978,6 +4120,17 @@ fn buildResult(
             } else null,
         };
     } else null;
+    const tools = if (unsafe_report) |report| blk: {
+        const owned = try result_allocator.alloc(ToolRecord, report.tools.len);
+        for (report.tools, 0..) |tool, index| {
+            owned[index] = .{
+                .name = try result_allocator.dupe(u8, tool.name),
+                .version = try result_allocator.dupe(u8, tool.version),
+                .command = try dupeStrings(result_allocator, tool.command),
+            };
+        }
+        break :blk owned;
+    } else &.{};
 
     return .{
         .arena = arena,
@@ -4005,7 +4158,7 @@ fn buildResult(
             .output_identifiers = plan.data.output_identifiers,
             .generated = plan.data.generated,
             .reproducibility = plan.data.reproducibility,
-            .tools = &.{},
+            .tools = tools,
             .execution = .{
                 .rootfs_path_in_iso = actual_rootfs_path,
                 .root_tree_digest = if (fresh_report) |build_report|
@@ -4113,6 +4266,8 @@ pub fn execute(
     defer if (fresh_report) |*report| report.deinit(allocator);
     var preserved_report: ?preserved_image.Report = null;
     var rebuild_report: ?preserved_image.RebuildReport = null;
+    var unsafe_report: ?UnsafeChrootRuntimeReport = null;
+    defer if (unsafe_report) |*report| report.deinit();
     switch (plan.data.execution.backend) {
         .native_fresh => {
             fresh_report = runPlan(allocator, io, plan, platform, event_sink, &bridge) catch |err| {
@@ -4165,7 +4320,46 @@ pub fn execute(
                 return try failureOutcome(allocator, diagnostics.items);
             };
         },
-        .unsafe_chroot, .vm => {
+        .unsafe_chroot => {
+            if (event_sink) |sink| sink.emit(.{ .progress = .{
+                .phase = .execution,
+                .message = "run package and initramfs policy in an isolated unsafe chroot worker",
+            } });
+            var hook_context = UnsafeChrootHookContext{
+                .platform = platform,
+                .plan = plan,
+            };
+            defer if (hook_context.report) |*report| report.deinit();
+            const raw_report = preserved_image.transactRaw(allocator, io, .{
+                .source_path = plan.data.input.disk.path,
+                .output_path = plan.data.staging_output_path,
+                .output_format = plan.data.output.format.imageFormat().?,
+                .root_partition = plan.data.storage.preserve.root_partition,
+                .require_linux_partition = true,
+                .output_create_options = outputCreateOptions(plan),
+            }, .{
+                .context = &hook_context,
+                .runFn = runUnsafeChrootHook,
+            }) catch |err| {
+                try appendFailure(&diagnostics, .execution_failed, .execution, "/execution/backend", "unsafe chroot preserved-image execution failed", err);
+                if (cleanupTransaction(io, plan.data.transaction_path)) |diagnostic| try diagnostics.append(diagnostic);
+                emitDiagnostics(event_sink, diagnostics.items);
+                return try failureOutcome(allocator, diagnostics.items);
+            };
+            unsafe_report = hook_context.report;
+            hook_context.report = null;
+            preserved_report = .{
+                .source_format = raw_report.source_format,
+                .output_format = raw_report.output_format,
+                .virtual_size = raw_report.virtual_size,
+                .partition_offset = raw_report.partition_offset,
+                .partition_length = raw_report.partition_length,
+                .flattened_backing_chain = raw_report.flattened_backing_chain,
+                .operation_count = plan.data.packages.actions.len +
+                    @intFromBool(plan.data.initramfs != .unchanged),
+            };
+        },
+        .vm => {
             try diagnostics.append(.{
                 .severity = .@"error",
                 .phase = .execution,
@@ -4241,6 +4435,7 @@ pub fn execute(
         if (fresh_report) |*report| report else null,
         if (preserved_report) |*report| report else null,
         if (rebuild_report) |*report| report else null,
+        if (unsafe_report) |*report| report else null,
         source_digests_before,
         output_digest,
         output_file_size,
@@ -4289,6 +4484,30 @@ pub fn execute(
         .diagnostics = final_diagnostics,
         .result = result,
     };
+}
+
+const UnsafeChrootHookContext = struct {
+    platform: Platform,
+    plan: *const ResolvedPlan,
+    report: ?UnsafeChrootRuntimeReport = null,
+};
+
+fn runUnsafeChrootHook(
+    context_ptr: ?*anyopaque,
+    allocator: Allocator,
+    io: Io,
+    target: preserved_image.RawMutationTarget,
+) !void {
+    const context: *UnsafeChrootHookContext = @ptrCast(@alignCast(context_ptr.?));
+    const run_fn = context.platform.unsafeChrootRunFn orelse
+        return error.UnsafeChrootRunnerUnavailable;
+    context.report = try run_fn(
+        context.platform.context,
+        allocator,
+        io,
+        context.plan,
+        target,
+    );
 }
 
 fn hasValidPlanIntegrity(allocator: Allocator, plan: *const ResolvedPlan) Allocator.Error!bool {
@@ -4864,6 +5083,272 @@ fn hasDiagnosticCode(diagnostics: DiagnosticSet, code: DiagnosticCode) bool {
         if (diagnostic.code == code) return true;
     }
     return false;
+}
+
+test "unsafe chroot platform executes the supported preserved subset" {
+    const io = std.testing.io;
+    const source_path = "test-customize-unsafe-source.raw";
+    const spool_path = "test-customize-unsafe-spool";
+    const workspace_path = "test-customize-unsafe-work";
+    const output_path = workspace_path ++ "/output.raw";
+    defer Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, workspace_path) catch {};
+    try createCustomizeTestDisk(io, source_path, spool_path);
+    try Io.Dir.cwd().createDirPath(io, workspace_path);
+
+    const actions = [_]PackageAction{.{ .remove = &.{"obsolete"} }};
+    var request = validNativeEditRequest(
+        source_path,
+        output_path,
+        workspace_path,
+        &.{},
+    );
+    request.execution.backend = .unsafe_chroot;
+    request.execution.acknowledge_unsafe = true;
+    request.packages.actions = &actions;
+
+    const FakeUnsafe = struct {
+        fn check(
+            _: ?*anyopaque,
+            _: Io,
+            _: *const ResolvedPlan,
+        ) CapabilityState {
+            return .available;
+        }
+
+        fn run(
+            context_ptr: ?*anyopaque,
+            allocator: Allocator,
+            _: Io,
+            plan: *const ResolvedPlan,
+            target: preserved_image.RawMutationTarget,
+        ) !UnsafeChrootRuntimeReport {
+            const called: *bool = @ptrCast(@alignCast(context_ptr.?));
+            called.* = true;
+            try std.testing.expect(target.partition.length != 0);
+            try std.testing.expectEqual(
+                @as(usize, 1),
+                plan.data.packages.actions.len,
+            );
+            return .{
+                .arena = std.heap.ArenaAllocator.init(allocator),
+                .tools = &.{.{
+                    .name = "tdnf",
+                    .version = "tdnf 3.5.0",
+                    .command = &.{ "/usr/bin/tdnf", "remove", "obsolete" },
+                }},
+                .installed_packages = &.{"base-files-0:1.0-1.x86_64"},
+            };
+        }
+    };
+
+    var called = false;
+    var platform = Platform.system();
+    platform.context = &called;
+    platform.unsafeChrootCheckFn = FakeUnsafe.check;
+    platform.unsafeChrootRunFn = FakeUnsafe.run;
+    var resolved = try resolve(
+        std.testing.allocator,
+        &request,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer resolved.deinit(std.testing.allocator);
+    var report = try preflight(
+        std.testing.allocator,
+        io,
+        &resolved.plan.?,
+        platform,
+    );
+    defer report.deinit(std.testing.allocator);
+    try std.testing.expect(report.ready());
+
+    var outcome = try execute(
+        std.testing.allocator,
+        io,
+        &resolved.plan.?,
+        platform,
+        null,
+    );
+    defer outcome.deinit(std.testing.allocator);
+    try std.testing.expect(called);
+    try std.testing.expect(outcome.result != null);
+    try std.testing.expect(!outcome.diagnostics.hasErrors());
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        outcome.result.?.provenance.tools.len,
+    );
+    try std.testing.expectEqualStrings(
+        "tdnf 3.5.0",
+        outcome.result.?.provenance.tools[0].version,
+    );
+    try std.testing.expectEqualStrings(
+        "base-files-0:1.0-1.x86_64",
+        outcome.result.?.provenance.execution.preserved.?.installed_packages[0],
+    );
+    _ = try Io.Dir.cwd().statFile(io, output_path, .{});
+}
+
+test "unsafe chroot preflight accepts only the implemented policy subset" {
+    const Check = struct {
+        fn available(
+            _: ?*anyopaque,
+            _: Io,
+            _: *const ResolvedPlan,
+        ) CapabilityState {
+            return .available;
+        }
+
+        fn state(
+            request: *const Request,
+            host_architecture: Architecture,
+        ) !CapabilityState {
+            var resolved = try resolve(
+                std.testing.allocator,
+                request,
+                .{ .host_architecture = host_architecture },
+            );
+            defer resolved.deinit(std.testing.allocator);
+            try std.testing.expect(resolved.plan != null);
+            var platform = Platform.system();
+            platform.unsafeChrootCheckFn = available;
+            return unsafeChrootCapabilityState(
+                platform,
+                std.testing.io,
+                &resolved.plan.?,
+            );
+        }
+    };
+
+    const install = [_]PackageAction{.{ .install = &.{"dracut"} }};
+    const update = [_]PackageAction{.update_all};
+    const invalid_package = [_]PackageAction{.{ .install = &.{"payload.rpm"} }};
+    const valid_repository = [_]PackageRepository{.{
+        .id = "base",
+        .urls = &.{"https://packages.example.invalid"},
+        .trust = &.{.{ .inline_bytes = "test key" }},
+    }};
+    const invalid_repository = [_]PackageRepository{.{
+        .id = "*",
+        .urls = &.{"https://packages.example.invalid"},
+        .trust = &.{.{ .inline_bytes = "test key" }},
+    }};
+    var baseline = validNativeEditRequest(
+        "source.raw",
+        "unsafe-policy-work/output.raw",
+        "unsafe-policy-work",
+        &.{},
+    );
+    baseline.execution.backend = .unsafe_chroot;
+    baseline.execution.acknowledge_unsafe = true;
+    baseline.packages = .{
+        .actions = &install,
+        .repositories = &valid_repository,
+    };
+    baseline.initramfs = .{ .regenerate = .{
+        .generator = "dracut",
+        .kernels = &.{"6.12.0-test"},
+    } };
+    try std.testing.expectEqual(
+        CapabilityState.available,
+        try Check.state(&baseline, .x86_64),
+    );
+
+    var request = baseline;
+    request.packages.actions = &invalid_package;
+    try std.testing.expectEqual(
+        CapabilityState.unsupported,
+        try Check.state(&request, .x86_64),
+    );
+
+    request = baseline;
+    request.packages.repositories = &invalid_repository;
+    try std.testing.expectEqual(
+        CapabilityState.unsupported,
+        try Check.state(&request, .x86_64),
+    );
+
+    request = baseline;
+    request.initramfs = .{ .regenerate = .{
+        .generator = "dracut",
+        .kernels = &.{"../../etc/passwd"},
+    } };
+    try std.testing.expectEqual(
+        CapabilityState.unsupported,
+        try Check.state(&request, .x86_64),
+    );
+
+    request = baseline;
+    request.packages.cache = .cache_only;
+    try std.testing.expectEqual(
+        CapabilityState.unsupported,
+        try Check.state(&request, .x86_64),
+    );
+
+    request = baseline;
+    request.packages.lock = .{ .snapshot = "snapshot-1" };
+    try std.testing.expectEqual(
+        CapabilityState.unsupported,
+        try Check.state(&request, .x86_64),
+    );
+
+    request = baseline;
+    request.packages.actions = &update;
+    try std.testing.expectEqual(
+        CapabilityState.unsupported,
+        try Check.state(&request, .x86_64),
+    );
+
+    request = baseline;
+    request.target_architecture = .aarch64;
+    request.cross_architecture = .{ .runner = .{
+        .kind = .qemu_user,
+        .guest_architecture = .aarch64,
+        .command = "qemu-aarch64",
+    } };
+    try std.testing.expectEqual(
+        CapabilityState.unsupported,
+        try Check.state(&request, .x86_64),
+    );
+
+    const existing_operations = [_]ExistingPathOperation{.{
+        .overwrite_file = .{
+            .path = "/etc/hostname",
+            .source = .{ .bytes = "guest\n" },
+        },
+    }};
+    request = baseline;
+    request.existing_path_operations = &existing_operations;
+    try std.testing.expectEqual(
+        CapabilityState.unsupported,
+        try Check.state(&request, .x86_64),
+    );
+
+    request = baseline;
+    request.os.hostname = "guest";
+    try std.testing.expectEqual(
+        CapabilityState.unsupported,
+        try Check.state(&request, .x86_64),
+    );
+
+    request = baseline;
+    request.generalization = .{ .azure = .{} };
+    try std.testing.expectEqual(
+        CapabilityState.unsupported,
+        try Check.state(&request, .x86_64),
+    );
+
+    const hooks = [_]Hook{.{
+        .name = "unsupported",
+        .phase = .finalize,
+        .source = .{ .inline_script = "true" },
+    }};
+    request = baseline;
+    request.hooks = &hooks;
+    try std.testing.expectEqual(
+        CapabilityState.unsupported,
+        try Check.state(&request, .x86_64),
+    );
 }
 
 test "v2 native-fresh requests require the explicit adapter" {

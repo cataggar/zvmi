@@ -38,6 +38,9 @@ const LoadedConfiguration = struct {
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const argv = try init.minimal.args.toSlice(arena);
+    if (argv.len == 3 and std.mem.eql(u8, argv[1], "--unsafe-chroot-worker")) {
+        return zvmi.unsafe_chroot.workerMain(init, argv[2]);
+    }
     const args = parseArgs(arena, argv[1..]) catch |err| {
         std.debug.print("zvmi-preserved-image-builder: invalid arguments: {t}\n", .{err});
         std.process.exit(2);
@@ -75,7 +78,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    try resetBundle(init.io, args.bundle_output_path);
+    try resetBundle(arena, init.io, args.bundle_output_path);
     std.Io.Dir.cwd().createDirPath(init.io, args.bundle_output_path) catch |err| {
         std.debug.print("zvmi-preserved-image-builder: cannot create result bundle: {t}\n", .{err});
         std.process.exit(1);
@@ -188,6 +191,9 @@ pub fn main(init: std.process.Init) !void {
         .host_architecture = host_architecture,
     });
     defer resolved.deinit(init.gpa);
+    const self_exe = try std.process.executablePathAlloc(init.io, arena);
+    var unsafe_context = UnsafeRuntimeContext{ .self_exe = self_exe };
+    const platform = unsafePlatform(&unsafe_context);
     if (resolved.plan) |*plan| try writePlan(init.gpa, init.io, plan_output_path, plan);
     if (resolved.diagnostics.hasErrors()) {
         try writeDiagnostics(init.gpa, init.io, diagnostics_output_path, resolved.diagnostics);
@@ -199,7 +205,7 @@ pub fn main(init: std.process.Init) !void {
             init.gpa,
             init.io,
             &resolved.plan.?,
-            zvmi.customize.Platform.system(),
+            platform,
         );
         defer report.deinit(init.gpa);
         try writeDiagnostics(init.gpa, init.io, diagnostics_output_path, report.diagnostics);
@@ -227,7 +233,7 @@ pub fn main(init: std.process.Init) !void {
         init.gpa,
         init.io,
         &resolved.plan.?,
-        zvmi.customize.Platform.system(),
+        platform,
         .{ .context = &console, .emitFn = ConsoleEvents.emit },
     );
     defer outcome.deinit(init.gpa);
@@ -827,17 +833,102 @@ fn hashSource(
     hash.update(&digest.bytes);
 }
 
-fn resetBundle(io: std.Io, path: []const u8) !void {
+const UnsafeRuntimeContext = struct {
+    self_exe: []const u8,
+    availability: ?zvmi.customize.CapabilityState = null,
+};
+
+fn unsafePlatform(context: *UnsafeRuntimeContext) zvmi.customize.Platform {
+    var platform = zvmi.customize.Platform.system();
+    platform.context = context;
+    platform.unsafeChrootCheckFn = checkUnsafeChroot;
+    platform.unsafeChrootRunFn = runUnsafeChroot;
+    return platform;
+}
+
+fn checkUnsafeChroot(
+    context_ptr: ?*anyopaque,
+    io: std.Io,
+    _: *const zvmi.customize.ResolvedPlan,
+) zvmi.customize.CapabilityState {
+    const context: *UnsafeRuntimeContext = @ptrCast(@alignCast(context_ptr.?));
+    if (context.availability == null) {
+        context.availability = zvmi.unsafe_chroot.available(io);
+    }
+    return context.availability.?;
+}
+
+fn runUnsafeChroot(
+    context_ptr: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    plan: *const zvmi.customize.ResolvedPlan,
+    target: zvmi.preserved_image.RawMutationTarget,
+) !zvmi.customize.UnsafeChrootRuntimeReport {
+    const context: *UnsafeRuntimeContext = @ptrCast(@alignCast(context_ptr.?));
+    return zvmi.unsafe_chroot.runParent(allocator, io, .{
+        .self_exe = context.self_exe,
+        .transaction_path = plan.data.transaction_path,
+        .plan = plan,
+        .target = target,
+    });
+}
+
+fn resetBundle(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+) !void {
     const cwd = std.Io.Dir.cwd();
     const stat = cwd.statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
     if (stat.kind == .directory) {
+        var dir = try cwd.openDir(io, path, .{ .iterate = true });
+        defer dir.close(io);
+        var walker = try dir.walk(allocator);
+        defer walker.deinit();
+        while (try walker.next(io)) |entry| {
+            if (std.mem.eql(
+                u8,
+                entry.basename,
+                zvmi.unsafe_chroot.active_lease_basename,
+            )) {
+                return error.MutationResourcesActive;
+            }
+        }
         try cwd.deleteTree(io, path);
     } else {
         try cwd.deleteFile(io, path);
     }
+}
+
+test "bundle reset preserves transactions with active backend resources" {
+    const io = std.testing.io;
+    const bundle_path = "test-active-bundle";
+    const transaction_path = bundle_path ++ "/transaction";
+    defer std.Io.Dir.cwd().deleteTree(io, bundle_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, transaction_path);
+    var marker_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const marker_path = try zvmi.unsafe_chroot.activeLeasePath(
+        transaction_path,
+        &marker_buffer,
+    );
+    try writeBytes(io, marker_path, "");
+
+    try std.testing.expectError(
+        error.MutationResourcesActive,
+        resetBundle(std.testing.allocator, io, bundle_path),
+    );
+    _ = try std.Io.Dir.cwd().statFile(io, transaction_path, .{});
+
+    try std.Io.Dir.cwd().deleteFile(io, marker_path);
+    try resetBundle(std.testing.allocator, io, bundle_path);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().statFile(io, bundle_path, .{}),
+    );
 }
 
 fn acquireBundleLock(io: std.Io, path: []const u8) !std.Io.File {
