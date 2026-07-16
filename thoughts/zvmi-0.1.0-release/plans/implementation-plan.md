@@ -16,7 +16,15 @@ minisign because this repository has no configured Actions signing secrets.
 
 - [x] Phase 1: Prepare version metadata and a CLI-only build step.
 - [x] Phase 2: Add the tag-triggered GitHub Release workflow.
-- [ ] Phase 3: Document, validate, tag, and verify `v0.1.0`.
+- [x] Phase 3: Document, validate, tag, and verify `v0.1.0`.
+
+## Release Result
+
+- Release preparation: [PR #169](https://github.com/cataggar/zvmi/pull/169)
+- Tag: [`v0.1.0`](https://github.com/cataggar/zvmi/releases/tag/v0.1.0)
+- Tagged commit: `0a312bdd30d94e0f608db7ffe6b841b676308b58`
+- Release workflow: [run 29511598589](https://github.com/cataggar/zvmi/actions/runs/29511598589)
+- Boot-smoke workflow: [run 29511598914](https://github.com/cataggar/zvmi/actions/runs/29511598914)
 
 ## Current State Analysis
 
