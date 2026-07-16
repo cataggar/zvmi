@@ -524,7 +524,9 @@ zig build test-freebsd15-aarch64-boot
 
 The test clearly skips when `ZVMI_FREEBSD15_AARCH64_IMAGE` is absent. When enabled, it boots two independent disposable overlays with fresh NoCloud seeds, proves each injected SSH key works, verifies the generalized agent/network/swap/account/identity state, reboots and reconnects to each guest, and powers off cleanly. Each guest's SSH host fingerprint and host UUID must remain stable across its reboot, while both values must differ between the two guests.
 
-Azure Arm64 support remains experimental and is not implied by local QEMU acceptance. The upstream virtual size is 6,477,643,776 bytes and is not 1 MiB-aligned, so do not blindly extend and convert it to a fixed VHD: the backup GPT must be relocated correctly first. Real Azure Arm64 Gen2 validation and the release workflow remain tracked by issue #145.
+The manually dispatched **Rebuild FreeBSD 15.1 AArch64 release image** GitHub Actions workflow runs on a native `ubuntu-24.04-arm` hosted runner, caches the digest-pinned upstream source, builds and validates the generalized image, runs the dual-instance acceptance, and creates the versioned `FreeBSD15.1-aarch64-20260716` release with the QCOW2, checksum file, and complete source/build provenance. Build and test jobs have read-only repository access; a separate publication job receives the write token and refuses to use an existing release or tag.
+
+Azure Arm64 support remains experimental and is not implied by local QEMU acceptance. The upstream virtual size is 6,477,643,776 bytes and is not 1 MiB-aligned, so do not blindly extend and convert it to a fixed VHD: the backup GPT must be relocated correctly first. Correctly aligned fixed-VHD derivation and real Azure Arm64 Gen2 validation remain tracked by issue #145.
 
 ### Booting the release image with QEMU
 

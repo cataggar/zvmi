@@ -1,0 +1,182 @@
+name: Rebuild FreeBSD 15.1 AArch64 release image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: freebsd15-aarch64-release-image
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: FreeBSD15.1-aarch64-20260716
+  RELEASE_TITLE: FreeBSD 15.1 AArch64 - 20260716
+  ASSET_NAME: FreeBSD-15.1-RELEASE-arm64-aarch64-generalized.qcow2
+  SOURCE_NAME: FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz
+  SOURCE_URL: https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/aarch64/Latest/FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz
+  SOURCE_SHA256: 9722aea499610802de9a14bb645707fc4f6df49ff765cd9ce372b783c4693963
+  VIRTUAL_SIZE: 6477643776
+  WORK_DIR: .scratch/generalized-freebsd15-aarch64
+
+jobs:
+  rebuild:
+    name: build and validate release asset
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    outputs:
+      source_commit: ${{ steps.bundle.outputs.source_commit }}
+    steps:
+      - name: Check out latest main
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          ghr-version: 0.6.6
+          tools: |
+            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Install image build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends curl jq openssh-client qemu-efi-aarch64 qemu-system-arm qemu-utils xorriso xz-utils
+          test -x /usr/bin/qemu-system-aarch64
+          test -r /usr/share/AAVMF/AAVMF_CODE.fd
+          test -r /usr/share/AAVMF/AAVMF_VARS.fd
+
+      - name: Cache verified FreeBSD source
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ env.WORK_DIR }}/${{ env.SOURCE_NAME }}
+          key: freebsd-15.1-aarch64-basic-cloudinit-ufs-${{ env.SOURCE_SHA256 }}
+
+      - name: Build generalized QCOW2
+        run: |
+          mkdir -p dist
+          set -o pipefail
+          zig build generalized-freebsd15-aarch64 -- \
+            --work-dir "$GITHUB_WORKSPACE/$WORK_DIR" \
+            --output "$GITHUB_WORKSPACE/dist/$ASSET_NAME" \
+            --qemu /usr/bin/qemu-system-aarch64 \
+            --xorriso /usr/bin/xorriso \
+            --timeout 3600 2>&1 | tee "$RUNNER_TEMP/freebsd15-aarch64-build.log"
+
+      - name: Validate release image
+        run: |
+          qemu-img check "dist/$ASSET_NAME"
+          image_info=$(qemu-img info --output=json "dist/$ASSET_NAME")
+          test "$(jq -r '.format' <<<"$image_info")" = qcow2
+          test "$(jq -r '."virtual-size"' <<<"$image_info")" = "$VIRTUAL_SIZE"
+          test "$(jq -r '."backing-filename" // ""' <<<"$image_info")" = ""
+          test "$(jq -r '."format-specific".data."compression-type"' <<<"$image_info")" = zstd
+          zig build run -- check "dist/$ASSET_NAME"
+          sha256sum "dist/$ASSET_NAME"
+
+      - name: Run dual-instance QEMU acceptance
+        env:
+          ZVMI_FREEBSD15_AARCH64_IMAGE: ${{ github.workspace }}/dist/${{ env.ASSET_NAME }}
+          ZVMI_FREEBSD15_AARCH64_QEMU: /usr/bin/qemu-system-aarch64
+        run: zig build test-freebsd15-aarch64-boot
+
+      - name: Prepare versioned release bundle
+        id: bundle
+        run: |
+          asset_sha256=$(sha256sum "dist/$ASSET_NAME" | awk '{print $1}')
+          asset_bytes=$(stat --format='%s' "dist/$ASSET_NAME")
+          source_bytes=$(stat --format='%s' "$WORK_DIR/$SOURCE_NAME")
+          source_sha256=$(sha256sum "$WORK_DIR/$SOURCE_NAME" | awk '{print $1}')
+          source_commit=$(git rev-parse HEAD)
+          qemu_version=$(/usr/bin/qemu-system-aarch64 --version | head -n 1)
+
+          test "$source_sha256" = "$SOURCE_SHA256"
+          echo "$asset_sha256  $ASSET_NAME" > "dist/$ASSET_NAME.sha256"
+          echo "source_commit=$source_commit" >> "$GITHUB_OUTPUT"
+
+          cat > "dist/release-notes.md" <<EOF
+          Generalized FreeBSD 15.1-RELEASE AArch64 image built with zvmi from current \`main\`. The canonical release asset is a standalone zstd-compressed QCOW2 validated under AArch64 UEFI QEMU with two independent NoCloud-provisioned guests.
+
+          - Asset: \`$ASSET_NAME\`
+          - Virtual disk size: $VIRTUAL_SIZE bytes
+          - File size: $asset_bytes bytes
+          - SHA-256: \`$asset_sha256\`
+          - Source commit: \`$source_commit\`
+          - QEMU acceptance: \`$qemu_version\` on GitHub-hosted \`ubuntu-24.04-arm\`
+
+          Provenance:
+
+          - Source URL: \`$SOURCE_URL\`
+          - Source file: \`$SOURCE_NAME\`
+          - Source file size: $source_bytes bytes
+          - Source SHA-256: \`$source_sha256\`
+          - Azure agent package: \`azure-agent-2.15.0.1\`
+
+          The acceptance test proves injected-key SSH, agent/network/swap/account configuration, reboot and reconnect, stable per-guest identity, distinct SSH host fingerprints and host UUIDs across two guests, and clean shutdown. Azure Arm64 support remains experimental; this QCOW2 is not directly uploadable to Azure, and the correctly aligned fixed-VHD derivation plus real Azure Gen2 validation remain tracked in issue #145.
+          EOF
+
+      - name: Upload validated release bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: freebsd15-aarch64-release-${{ steps.bundle.outputs.source_commit }}
+          path: dist/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  publish:
+    name: publish non-overwriting versioned release
+    needs: rebuild
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Download validated release bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: freebsd15-aarch64-release-${{ needs.rebuild.outputs.source_commit }}
+          path: dist
+
+      - name: Publish versioned release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_COMMIT: ${{ needs.rebuild.outputs.source_commit }}
+        run: |
+          (cd dist && sha256sum --check "$ASSET_NAME.sha256")
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release $RELEASE_TAG already exists; refusing to replace a versioned asset"
+            exit 1
+          fi
+          tag_created=false
+          cleanup_tag() {
+            if $tag_created && ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$RELEASE_TAG" || true
+            fi
+          }
+          trap cleanup_tag ERR
+          gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/$RELEASE_TAG" -f "sha=$SOURCE_COMMIT"
+          tag_created=true
+          gh release create "$RELEASE_TAG" \
+            "dist/$ASSET_NAME" \
+            "dist/$ASSET_NAME.sha256" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$RELEASE_TITLE" \
+            --notes-file "dist/release-notes.md" \
+            --latest=false
+          trap - ERR
+
+          asset_sha256=$(awk '{print $1}' "dist/$ASSET_NAME.sha256")
+          {
+            echo "### Versioned FreeBSD release published"
+            echo
+            echo "- Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$RELEASE_TAG"
+            echo "- Asset: https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$ASSET_NAME"
+            echo "- SHA-256: \`$asset_sha256\`"
+          } >> "$GITHUB_STEP_SUMMARY"
