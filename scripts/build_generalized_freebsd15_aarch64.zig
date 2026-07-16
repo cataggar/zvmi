@@ -273,6 +273,10 @@ const customization_user_data_template =
     \\      sysrc 'ifconfig_DEFAULT=SYNCDHCP accept_rtadv'
     \\      sysrc 'ifconfig_hn0=SYNCDHCP'
     \\      sysrc firstboot_pkg_upgrade_enable=NO
+    \\      sysrc -f /boot/loader.conf 'console=comconsole,efi,vidconsole'
+    \\      sysrc -f /boot/loader.conf comconsole_speed=115200
+    \\      sysrc -f /boot/loader.conf boot_multicons=YES
+    \\      sysrc -f /boot/loader.conf boot_serial=YES
     \\
     \\      if [ ! -f /usr/local/etc/waagent.conf ]; then
     \\          cp /usr/local/etc/waagent.conf.sample /usr/local/etc/waagent.conf
@@ -1200,6 +1204,21 @@ test "FreeBSD customization seed pins secure generalization behavior" {
         u8,
         user_data,
         "touch /firstboot",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        user_data,
+        "console=comconsole,efi,vidconsole",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        user_data,
+        "boot_multicons=YES",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        user_data,
+        "boot_serial=YES",
     ) != null);
     const expected_result = customization_result_prefix ++ " " ++ nonce ++ " 0";
     try std.testing.expect(std.mem.indexOf(

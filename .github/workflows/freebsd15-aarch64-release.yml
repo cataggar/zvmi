@@ -11,8 +11,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  RELEASE_TAG: FreeBSD15.1-aarch64-20260716
-  RELEASE_TITLE: FreeBSD 15.1 AArch64 - 20260716
+  RELEASE_TAG: FreeBSD15.1-aarch64-20260716.1
+  RELEASE_TITLE: FreeBSD 15.1 AArch64 - 20260716.1
   ASSET_NAME: FreeBSD-15.1-RELEASE-arm64-aarch64-generalized.qcow2
   SOURCE_NAME: FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz
   SOURCE_URL: https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/aarch64/Latest/FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz
@@ -117,7 +117,7 @@ jobs:
           - Source SHA-256: \`$source_sha256\`
           - Azure agent package: \`azure-agent-2.15.0.1\`
 
-          The acceptance test proves injected-key SSH, agent/network/swap/account configuration, reboot and reconnect, stable per-guest identity, distinct SSH host fingerprints and host UUIDs across two guests, and clean shutdown. Azure Arm64 support remains experimental; this QCOW2 is not directly uploadable to Azure, and the correctly aligned fixed-VHD derivation plus real Azure Gen2 validation remain tracked in issue #145.
+          The acceptance test proves injected-key SSH, agent/network/swap/account configuration, reboot and reconnect, stable per-guest identity, distinct SSH host fingerprints and host UUIDs across two guests, and clean shutdown. The guest also carries FreeBSD's official Azure serial-console loader settings. This QCOW2 is not directly uploadable to Azure; derive the aligned fixed VHD with \`zvmi azure derive\`. Azure Arm64 support remains experimental until this exact release asset completes real Azure Gen2 validation tracked in issue #145.
           EOF
 
       - name: Upload validated release bundle
