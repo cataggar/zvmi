@@ -72,6 +72,7 @@ pub const OpenError = error{
     EncryptionNotSupported,
     UnsupportedIncompatibleFeature,
     ExternalDataFileNotSupported,
+    BackingFileNotSupported,
     UnsupportedCompressionType,
     ExtendedL2NotSupported,
     MissingExternalDataFileName,
@@ -325,6 +326,16 @@ const Layout = struct {
 
 pub fn open(io: Io, file: Io.File) OpenError!Info {
     return openInternal(io, file, null);
+}
+
+/// Parses a top-level qcow2 without opening any referenced host path.
+/// Digest-pinned artifact pipelines use this to reject backing and external
+/// data files before an untrusted image can cause dependency I/O.
+pub fn openStandalone(io: Io, file: Io.File) OpenError!Info {
+    const parsed = try parseLayer(file, io);
+    if (parsed.backing_file_len != 0) return error.BackingFileNotSupported;
+    if (parsed.data_file_len != 0) return error.ExternalDataFileNotSupported;
+    return infoFromParsed(parsed);
 }
 
 pub fn openAtPath(io: Io, file: Io.File, path: []const u8) OpenError!Info {
@@ -2007,6 +2018,26 @@ test "openAtPath resolves recursive backing files" {
     var root_buf: [14]u8 = undefined;
     _ = try pread(file, io, info, &root_buf, 2 * base.cluster_size + 96);
     try std.testing.expectEqualSlices(u8, "ROOT-CLUSTER-2", &root_buf);
+}
+
+test "openStandalone rejects a backing path without opening it" {
+    const io = std.testing.io;
+    const path = "test-qcow2-standalone-reject.qcow2";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    _ = try writeSingleClusterFixture(io, path, .{
+        .backing_file = "/path/that/must/not/be/opened",
+        .guest_cluster_index = 0,
+        .payload = "standalone",
+    });
+    const file = try Io.Dir.cwd().openFile(io, path, .{
+        .mode = .read_only,
+    });
+    defer file.close(io);
+    try std.testing.expectError(
+        error.BackingFileNotSupported,
+        openStandalone(io, file),
+    );
 }
 
 test "pread zero-fills beyond a shorter backing image" {

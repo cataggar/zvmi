@@ -13,6 +13,7 @@ const image_mod = @import("image.zig");
 const Image = image_mod.Image;
 const mbr = @import("mbr.zig");
 const gpt = @import("gpt.zig");
+const artifact_pipeline = @import("artifact_pipeline.zig");
 
 pub const one_mib: u64 = 1024 * 1024;
 
@@ -20,7 +21,10 @@ pub const Generation = enum { gen1, gen2 };
 
 pub const FixupError = error{
     NotAFixedVhd,
-} || Image.ResizeError || Image.PreadError || gpt.ReadError || mbr.Mbr.DecodeError;
+    GptRelocationRequired,
+    SizeOverflow,
+} || Image.ResizeError || Image.PreadError || gpt.VerifyError ||
+    mbr.Mbr.DecodeError;
 
 pub const FixupResult = struct {
     old_size: u64,
@@ -34,20 +38,34 @@ pub fn alignSizeToMib(size: u64) u64 {
     return (size + one_mib - 1) / one_mib * one_mib;
 }
 
+pub fn alignSizeToMibChecked(size: u64) error{SizeOverflow}!u64 {
+    const rounded = std.math.add(u64, size, one_mib - 1) catch
+        return error.SizeOverflow;
+    return rounded / one_mib * one_mib;
+}
+
+pub const DeriveFixedVhdOptions = artifact_pipeline.DeriveFixedVhdOptions;
+pub const DerivedFixedVhd = artifact_pipeline.DerivedFixedVhd;
+pub const deriveFixedVhd = artifact_pipeline.deriveFixedVhd;
+
 /// Pads `img` (which must already be a fixed vhd) up to a 1 MiB-aligned
-/// size. Returns the before/after sizes. Does not touch partition tables --
-/// call `checkPartitionStyle` separately (typically before growing, since
-/// growing a fixed vhd only extends trailing free space, which is exactly
-/// where a partitioned disk's backup GPT would need to move to; this
-/// library does not yet relocate the backup GPT automatically, so for GPT
-/// disks it's best to size the image to a 1 MiB multiple *before* calling
-/// `gpt.writeGpt`).
+/// size. GPT images that need growth are rejected before mutation because
+/// their backup table must be relocated transactionally with `deriveFixedVhd`.
 pub fn alignFixedVhd(img: *Image, io: Io) FixupError!FixupResult {
     if (img.format != .vhd or img.dynamic != null) return error.NotAFixedVhd;
 
     const old_size = img.virtual_size;
-    const new_size = alignSizeToMib(old_size);
+    const new_size = try alignSizeToMibChecked(old_size);
     if (new_size != old_size) {
+        var mbr_buf: [mbr.sector_size]u8 = undefined;
+        _ = try img.pread(io, &mbr_buf, 0);
+        if (mbr.Mbr.decode(&mbr_buf)) |boot_record| {
+            for (boot_record.entries) |entry| {
+                if (entry.partition_type == .gpt_protective) {
+                    return error.GptRelocationRequired;
+                }
+            }
+        } else |_| {}
         try img.resize(io, new_size);
     }
     return .{ .old_size = old_size, .new_size = new_size, .was_resized = new_size != old_size };
@@ -82,7 +100,12 @@ pub fn checkPartitionStyle(img: Image, io: Io, allocator: std.mem.Allocator, gen
             if (!has_protective_entry) {
                 return .{ .generation = generation, .ok = false, .message = "Gen2 requires a GPT protective MBR (0xEE partition), but none was found" };
             }
-            const parsed = gpt.readGpt(img, io, allocator) catch |err| return .{
+            var parsed = gpt.readVerifiedGpt(
+                img,
+                io,
+                allocator,
+                1024 * 1024,
+            ) catch |err| return .{
                 .generation = generation,
                 .ok = false,
                 .message = switch (err) {
@@ -90,10 +113,15 @@ pub fn checkPartitionStyle(img: Image, io: Io, allocator: std.mem.Allocator, gen
                     error.BadHeaderChecksum => "GPT header checksum mismatch",
                     error.BadPartitionArrayChecksum => "GPT partition array checksum mismatch",
                     error.UnsupportedPartitionEntrySize => "GPT partition entry size is not the expected 128 bytes",
+                    error.PartitionArrayMismatch => "primary and backup GPT partition arrays differ",
+                    error.HeaderMismatch => "primary and backup GPT headers differ",
+                    error.InvalidHeaderGeometry => "GPT header locations or usable bounds are invalid",
+                    error.InvalidPartitionBounds => "GPT partition extent is outside the usable range",
+                    error.OverlappingPartitions => "GPT partitions overlap",
                     else => "failed to read GPT",
                 },
             };
-            allocator.free(parsed.partitions);
+            parsed.deinit(allocator);
             return .{ .generation = generation, .ok = true, .message = "valid protective MBR + GPT found" };
         },
         .gen1 => {
@@ -143,6 +171,42 @@ test "alignFixedVhd rejects dynamic vhd and raw" {
         defer img.close(io);
         try std.testing.expectError(error.NotAFixedVhd, alignFixedVhd(&img, io));
     }
+}
+
+test "alignFixedVhd rejects unaligned GPT before mutation" {
+    const io = std.testing.io;
+    const path = "test-azure-align-gpt.vhd";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const size: u64 = 16 * 1024 * 1024 - gpt.sector_size;
+    var img = try Image.create(io, path, .vhd, size, .{
+        .vhd_subformat = .fixed,
+    });
+    defer img.close(io);
+    const guid = @import("guid.zig");
+    const specs = [_]gpt.PartitionSpec{.{
+        .type_guid = guid.esp,
+        .unique_guid = guid.parse("55555555-5555-5555-5555-555555555555"),
+        .size_sectors = 2048,
+    }};
+    var placements: [specs.len]gpt.Placement = undefined;
+    try gpt.writeGpt(
+        &img,
+        io,
+        guid.parse("44444444-4444-4444-4444-444444444444"),
+        &specs,
+        &placements,
+    );
+
+    try std.testing.expectError(
+        error.GptRelocationRequired,
+        alignFixedVhd(&img, io),
+    );
+    try std.testing.expectEqual(size, img.virtual_size);
+    try std.testing.expectEqual(
+        size + @import("vhd.zig").footer_size,
+        (try img.info(io)).file_size,
+    );
 }
 
 test "checkPartitionStyle validates Gen2 GPT layout" {

@@ -405,6 +405,551 @@ pub fn readGpt(img: Image, io: Io, allocator: std.mem.Allocator) ReadError!Parse
     return .{ .header = header, .partitions = try list.toOwnedSlice() };
 }
 
+pub const VerifiedGpt = struct {
+    primary_header: Header,
+    backup_header: Header,
+    primary_header_sector: [sector_size]u8,
+    backup_header_sector: [sector_size]u8,
+    partition_array: []u8,
+    partitions: []PartitionEntry,
+    protective_mbr_sector: [sector_size]u8,
+    protective_entry_index: u8,
+
+    pub fn deinit(self: *VerifiedGpt, allocator: std.mem.Allocator) void {
+        allocator.free(self.partition_array);
+        allocator.free(self.partitions);
+        self.* = undefined;
+    }
+};
+
+pub const VerifyError = error{
+    ImageNotSectorAligned,
+    InvalidProtectiveMbr,
+    UnsupportedRevision,
+    UnsupportedHeaderSize,
+    InvalidHeaderReservedBytes,
+    InvalidHeaderGeometry,
+    HeaderMismatch,
+    PartitionArrayMismatch,
+    PartitionArrayTooLarge,
+    InvalidPartitionBounds,
+    OverlappingPartitions,
+} || ReadError || mbr.Mbr.DecodeError;
+
+/// Strictly validates the protective MBR and both GPT copies. Unlike
+/// `readGpt`, this is intended for image publication and conversion, where a
+/// stale or disagreeing backup table must be rejected rather than repaired
+/// implicitly. Raw partition-array bytes are retained so relocation can copy
+/// every slot exactly, including empty and vendor-extended entry bytes.
+pub fn readVerifiedGpt(
+    img: Image,
+    io: Io,
+    allocator: std.mem.Allocator,
+    max_partition_array_bytes: u64,
+) VerifyError!VerifiedGpt {
+    if (img.virtual_size == 0 or img.virtual_size % sector_size != 0) {
+        return error.ImageNotSectorAligned;
+    }
+    const total_sectors = img.virtual_size / sector_size;
+    if (total_sectors < 3) return error.InvalidHeaderGeometry;
+
+    var protective_mbr_sector: [sector_size]u8 = undefined;
+    try preadExact(img, io, &protective_mbr_sector, 0);
+    const protective_mbr = try mbr.Mbr.decode(&protective_mbr_sector);
+    var protective_entry_index: ?u8 = null;
+    for (protective_mbr.entries, 0..) |entry, i| {
+        if (entry.partition_type == .gpt_protective) {
+            if (protective_entry_index != null or entry.bootable or
+                entry.first_lba != 1 or
+                entry.sector_count != protectiveSectorCount(total_sectors))
+            {
+                return error.InvalidProtectiveMbr;
+            }
+            protective_entry_index = @intCast(i);
+        } else if (entry.partition_type != .empty) {
+            return error.InvalidProtectiveMbr;
+        }
+    }
+    const protective_index = protective_entry_index orelse
+        return error.InvalidProtectiveMbr;
+
+    var primary_sector: [sector_size]u8 = undefined;
+    try preadExact(img, io, &primary_sector, sector_size);
+    const primary = try decodeStrictHeader(&primary_sector);
+    if (primary.current_lba != 1 or primary.backup_lba != total_sectors - 1) {
+        return error.InvalidHeaderGeometry;
+    }
+
+    var backup_sector: [sector_size]u8 = undefined;
+    try preadExact(
+        img,
+        io,
+        &backup_sector,
+        try sectorOffset(primary.backup_lba),
+    );
+    const backup = try decodeStrictHeader(&backup_sector);
+    if (backup.current_lba != primary.backup_lba or
+        backup.backup_lba != primary.current_lba)
+    {
+        return error.InvalidHeaderGeometry;
+    }
+    if (primary.revision != backup.revision or
+        primary.header_size != backup.header_size or
+        primary.first_usable_lba != backup.first_usable_lba or
+        primary.last_usable_lba != backup.last_usable_lba or
+        !std.mem.eql(u8, &primary.disk_guid, &backup.disk_guid) or
+        primary.num_partition_entries != backup.num_partition_entries or
+        primary.partition_entry_size != backup.partition_entry_size or
+        primary.partition_array_crc32 != backup.partition_array_crc32)
+    {
+        return error.HeaderMismatch;
+    }
+
+    const array_bytes = try partitionArrayBytes(primary);
+    if (array_bytes == 0 or array_bytes > max_partition_array_bytes) {
+        return error.PartitionArrayTooLarge;
+    }
+    const array_sectors = std.math.divCeil(u64, array_bytes, sector_size) catch
+        return error.InvalidPartitionArrayBounds;
+    const primary_array_end = std.math.add(
+        u64,
+        primary.partition_entry_lba,
+        array_sectors,
+    ) catch return error.InvalidPartitionArrayBounds;
+    const backup_array_end = std.math.add(
+        u64,
+        backup.partition_entry_lba,
+        array_sectors,
+    ) catch return error.InvalidPartitionArrayBounds;
+    if (primary.partition_entry_lba <= primary.current_lba or
+        primary_array_end > primary.first_usable_lba or
+        primary.first_usable_lba > primary.last_usable_lba or
+        backup.partition_entry_lba <= primary.last_usable_lba or
+        backup_array_end > backup.current_lba)
+    {
+        return error.InvalidHeaderGeometry;
+    }
+
+    const array_len = std.math.cast(usize, array_bytes) orelse
+        return error.PartitionArrayTooLarge;
+    const primary_array = try allocator.alloc(u8, array_len);
+    errdefer allocator.free(primary_array);
+    try preadExact(
+        img,
+        io,
+        primary_array,
+        try sectorOffset(primary.partition_entry_lba),
+    );
+    if (std.hash.crc.Crc32.hash(primary_array) !=
+        primary.partition_array_crc32)
+    {
+        return error.BadPartitionArrayChecksum;
+    }
+
+    const backup_array = try allocator.alloc(u8, array_len);
+    defer allocator.free(backup_array);
+    try preadExact(
+        img,
+        io,
+        backup_array,
+        try sectorOffset(backup.partition_entry_lba),
+    );
+    if (std.hash.crc.Crc32.hash(backup_array) !=
+        backup.partition_array_crc32)
+    {
+        return error.BadPartitionArrayChecksum;
+    }
+    if (!std.mem.eql(u8, primary_array, backup_array)) {
+        return error.PartitionArrayMismatch;
+    }
+
+    var list = std.array_list.Managed(PartitionEntry).init(allocator);
+    errdefer list.deinit();
+    const entry_size: usize = @intCast(primary.partition_entry_size);
+    var i: u32 = 0;
+    while (i < primary.num_partition_entries) : (i += 1) {
+        const entry_offset = @as(usize, i) * entry_size;
+        var entry = PartitionEntry.decode(
+            primary_array[entry_offset..][0..partition_entry_size],
+        );
+        entry.table_index = i;
+        if (entry.isEmpty()) continue;
+        if (entry.first_lba < primary.first_usable_lba or
+            entry.last_lba < entry.first_lba or
+            entry.last_lba > primary.last_usable_lba)
+        {
+            return error.InvalidPartitionBounds;
+        }
+        for (list.items) |existing| {
+            if (entry.first_lba <= existing.last_lba and
+                existing.first_lba <= entry.last_lba)
+            {
+                return error.OverlappingPartitions;
+            }
+        }
+        try list.append(entry);
+    }
+
+    return .{
+        .primary_header = primary,
+        .backup_header = backup,
+        .primary_header_sector = primary_sector,
+        .backup_header_sector = backup_sector,
+        .partition_array = primary_array,
+        .partitions = try list.toOwnedSlice(),
+        .protective_mbr_sector = protective_mbr_sector,
+        .protective_entry_index = protective_index,
+    };
+}
+
+pub const RelocationResult = struct {
+    was_relocated: bool,
+    old_backup_lba: u64,
+    new_backup_lba: u64,
+    old_last_usable_lba: u64,
+    new_last_usable_lba: u64,
+};
+
+pub const RelocateError = error{
+    ImageNotSectorAligned,
+    ImageDidNotGrow,
+    SourceMetadataChanged,
+    PartitionArrayTooLarge,
+    InvalidPartitionArrayBounds,
+    InvalidPartitionBounds,
+} || Image.PreadError || Image.PwriteError || std.mem.Allocator.Error ||
+    error{UnexpectedEndOfFile};
+
+/// Relocates a verified backup GPT to the current end of `img` without
+/// changing any partition entry or partition extent. The partition array is
+/// copied as opaque bytes, and the protective MBR update preserves bootstrap
+/// code, disk signature, and unrelated bytes.
+pub fn relocateBackup(
+    img: *Image,
+    io: Io,
+    allocator: std.mem.Allocator,
+    verified: VerifiedGpt,
+) RelocateError!RelocationResult {
+    if (img.virtual_size == 0 or img.virtual_size % sector_size != 0) {
+        return error.ImageNotSectorAligned;
+    }
+    const new_backup_lba = img.virtual_size / sector_size - 1;
+    const old_backup_lba = verified.primary_header.backup_lba;
+    if (new_backup_lba < old_backup_lba) return error.ImageDidNotGrow;
+    if (new_backup_lba == old_backup_lba) {
+        return .{
+            .was_relocated = false,
+            .old_backup_lba = old_backup_lba,
+            .new_backup_lba = new_backup_lba,
+            .old_last_usable_lba = verified.primary_header.last_usable_lba,
+            .new_last_usable_lba = verified.primary_header.last_usable_lba,
+        };
+    }
+
+    var current_primary: [sector_size]u8 = undefined;
+    try preadExact(img.*, io, &current_primary, sector_size);
+    if (!std.mem.eql(
+        u8,
+        &current_primary,
+        &verified.primary_header_sector,
+    )) return error.SourceMetadataChanged;
+    const current_array = try allocator.alloc(
+        u8,
+        verified.partition_array.len,
+    );
+    defer allocator.free(current_array);
+    try preadExact(
+        img.*,
+        io,
+        current_array,
+        try sectorOffset(verified.primary_header.partition_entry_lba),
+    );
+    if (!std.mem.eql(u8, current_array, verified.partition_array)) {
+        return error.SourceMetadataChanged;
+    }
+    var current_mbr: [sector_size]u8 = undefined;
+    try preadExact(img.*, io, &current_mbr, 0);
+    if (!std.mem.eql(u8, &current_mbr, &verified.protective_mbr_sector)) {
+        return error.SourceMetadataChanged;
+    }
+
+    const array_bytes: u64 = @intCast(verified.partition_array.len);
+    const array_sectors = std.math.divCeil(u64, array_bytes, sector_size) catch
+        return error.InvalidPartitionArrayBounds;
+    if (new_backup_lba <= array_sectors) {
+        return error.InvalidPartitionArrayBounds;
+    }
+    const new_backup_array_lba = new_backup_lba - array_sectors;
+    if (new_backup_array_lba == 0) return error.InvalidPartitionArrayBounds;
+    const new_last_usable_lba = new_backup_array_lba - 1;
+    if (new_last_usable_lba < verified.primary_header.last_usable_lba) {
+        return error.ImageDidNotGrow;
+    }
+    for (verified.partitions) |partition| {
+        if (partition.last_lba > new_last_usable_lba) {
+            return error.InvalidPartitionBounds;
+        }
+    }
+
+    var primary_sector = verified.primary_header_sector;
+    std.mem.writeInt(u64, primary_sector[32..40], new_backup_lba, .little);
+    std.mem.writeInt(
+        u64,
+        primary_sector[48..56],
+        new_last_usable_lba,
+        .little,
+    );
+    updateHeaderChecksum(&primary_sector);
+
+    var backup_sector = verified.backup_header_sector;
+    std.mem.writeInt(u64, backup_sector[24..32], new_backup_lba, .little);
+    std.mem.writeInt(
+        u64,
+        backup_sector[32..40],
+        verified.primary_header.current_lba,
+        .little,
+    );
+    std.mem.writeInt(
+        u64,
+        backup_sector[48..56],
+        new_last_usable_lba,
+        .little,
+    );
+    std.mem.writeInt(
+        u64,
+        backup_sector[72..80],
+        new_backup_array_lba,
+        .little,
+    );
+    updateHeaderChecksum(&backup_sector);
+
+    var protective_mbr = verified.protective_mbr_sector;
+    const entry_offset = mbr.partition_table_offset +
+        @as(usize, verified.protective_entry_index) * mbr.entry_size;
+    const sector_count = protectiveSectorCount(new_backup_lba + 1);
+    const end_chs = mbr.chsForLba(sector_count);
+    @memcpy(protective_mbr[entry_offset + 5 .. entry_offset + 8], &end_chs);
+    std.mem.writeInt(
+        u32,
+        protective_mbr[entry_offset + 12 ..][0..4],
+        sector_count,
+        .little,
+    );
+
+    try img.pwrite(
+        io,
+        verified.partition_array,
+        try sectorOffset(new_backup_array_lba),
+    );
+    try img.pwrite(
+        io,
+        &backup_sector,
+        try sectorOffset(new_backup_lba),
+    );
+    try img.pwrite(io, &protective_mbr, 0);
+    try img.pwrite(io, &primary_sector, sector_size);
+
+    return .{
+        .was_relocated = true,
+        .old_backup_lba = old_backup_lba,
+        .new_backup_lba = new_backup_lba,
+        .old_last_usable_lba = verified.primary_header.last_usable_lba,
+        .new_last_usable_lba = new_last_usable_lba,
+    };
+}
+
+fn decodeStrictHeader(buf: *const [sector_size]u8) VerifyError!Header {
+    const header = try Header.decode(buf);
+    if (header.revision != 0x0001_0000) return error.UnsupportedRevision;
+    if (header.header_size != header_size) return error.UnsupportedHeaderSize;
+    if (!std.mem.allEqual(u8, buf[20..24], 0) or
+        !std.mem.allEqual(u8, buf[header_size..], 0))
+    {
+        return error.InvalidHeaderReservedBytes;
+    }
+    if (header.partition_entry_size < partition_entry_size or
+        header.partition_entry_size % 8 != 0 or
+        header.num_partition_entries == 0)
+    {
+        return error.UnsupportedPartitionEntrySize;
+    }
+    return header;
+}
+
+fn partitionArrayBytes(header: Header) error{InvalidPartitionArrayBounds}!u64 {
+    return std.math.mul(
+        u64,
+        header.num_partition_entries,
+        header.partition_entry_size,
+    ) catch error.InvalidPartitionArrayBounds;
+}
+
+fn sectorOffset(lba: u64) error{InvalidPartitionArrayBounds}!u64 {
+    return std.math.mul(u64, lba, sector_size) catch
+        error.InvalidPartitionArrayBounds;
+}
+
+fn preadExact(
+    img: Image,
+    io: Io,
+    buffer: []u8,
+    offset: u64,
+) (Image.PreadError || error{UnexpectedEndOfFile})!void {
+    if (try img.pread(io, buffer, offset) != buffer.len) {
+        return error.UnexpectedEndOfFile;
+    }
+}
+
+fn protectiveSectorCount(total_sectors: u64) u32 {
+    return @intCast(@min(total_sectors - 1, std.math.maxInt(u32)));
+}
+
+fn updateHeaderChecksum(buf: *[sector_size]u8) void {
+    const encoded_header_size = std.mem.readInt(u32, buf[12..16], .little);
+    std.debug.assert(encoded_header_size >= header_size);
+    std.debug.assert(encoded_header_size <= sector_size);
+    buf[16..20].* = .{ 0, 0, 0, 0 };
+    const checksum = std.hash.crc.Crc32.hash(buf[0..encoded_header_size]);
+    std.mem.writeInt(u32, buf[16..20], checksum, .little);
+}
+
+test "readVerifiedGpt and relocateBackup preserve partition bytes and extents" {
+    const io = std.testing.io;
+    const path = "test-gpt-verified-relocate.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const source_size: u64 = 64 * 1024 * 1024 - sector_size;
+    var img = try Image.create(io, path, .raw, source_size, .{});
+    defer img.close(io);
+
+    const disk_guid = guid.parse("11111111-2222-3333-4444-555555555555");
+    const entries = [_]PartitionEntry{
+        .{
+            .partition_type_guid = guid.esp,
+            .unique_partition_guid = guid.parse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+            .first_lba = 2048,
+            .last_lba = 4095,
+            .attributes = 0x1000_0000_0000_0001,
+            .name_utf16le = asciiName("efi"),
+        },
+        .{
+            .partition_type_guid = guid.linux_filesystem_data,
+            .unique_partition_guid = guid.parse("01234567-89ab-cdef-0123-456789abcdef"),
+            .first_lba = 8192,
+            .last_lba = 32767,
+            .attributes = 0x8000_0000_0000_0000,
+            .name_utf16le = asciiName("root"),
+        },
+    };
+    try writePartitionTables(&img, io, disk_guid, &entries);
+
+    var mbr_sector: [sector_size]u8 = undefined;
+    try preadExact(img, io, &mbr_sector, 0);
+    mbr_sector[17] = 0xa5;
+    try img.pwrite(io, &mbr_sector, 0);
+
+    var verified = try readVerifiedGpt(
+        img,
+        io,
+        std.testing.allocator,
+        1024 * 1024,
+    );
+    defer verified.deinit(std.testing.allocator);
+    const original_array = try std.testing.allocator.dupe(
+        u8,
+        verified.partition_array,
+    );
+    defer std.testing.allocator.free(original_array);
+    const original_partitions = try std.testing.allocator.dupe(
+        PartitionEntry,
+        verified.partitions,
+    );
+    defer std.testing.allocator.free(original_partitions);
+
+    const target_size: u64 = 64 * 1024 * 1024;
+    try img.resize(io, target_size);
+    const relocation = try relocateBackup(
+        &img,
+        io,
+        std.testing.allocator,
+        verified,
+    );
+    try std.testing.expect(relocation.was_relocated);
+    try std.testing.expectEqual(
+        target_size / sector_size - 1,
+        relocation.new_backup_lba,
+    );
+
+    var relocated = try readVerifiedGpt(
+        img,
+        io,
+        std.testing.allocator,
+        1024 * 1024,
+    );
+    defer relocated.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(
+        u8,
+        original_array,
+        relocated.partition_array,
+    );
+    try std.testing.expectEqual(original_partitions.len, relocated.partitions.len);
+    for (original_partitions, relocated.partitions) |before, after| {
+        try std.testing.expectEqual(before.table_index, after.table_index);
+        try std.testing.expectEqual(before.first_lba, after.first_lba);
+        try std.testing.expectEqual(before.last_lba, after.last_lba);
+        try std.testing.expectEqual(before.attributes, after.attributes);
+        try std.testing.expectEqualSlices(
+            u8,
+            std.mem.asBytes(&before.name_utf16le),
+            std.mem.asBytes(&after.name_utf16le),
+        );
+    }
+    try std.testing.expectEqual(@as(u8, 0xa5), relocated.protective_mbr_sector[17]);
+}
+
+test "readVerifiedGpt rejects backup corruption and overlapping partitions" {
+    const io = std.testing.io;
+    const path = "test-gpt-verified-corruption.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const size: u64 = 32 * 1024 * 1024;
+    var img = try Image.create(io, path, .raw, size, .{});
+    defer img.close(io);
+    const disk_guid = guid.parse("22222222-3333-4444-5555-666666666666");
+    const entries = [_]PartitionEntry{
+        .{
+            .partition_type_guid = guid.esp,
+            .unique_partition_guid = guid.parse("aaaaaaaa-0000-0000-0000-000000000001"),
+            .first_lba = 2048,
+            .last_lba = 4095,
+        },
+        .{
+            .partition_type_guid = guid.linux_filesystem_data,
+            .unique_partition_guid = guid.parse("aaaaaaaa-0000-0000-0000-000000000002"),
+            .first_lba = 4095,
+            .last_lba = 8191,
+        },
+    };
+    try writePartitionTables(&img, io, disk_guid, &entries);
+    try std.testing.expectError(
+        error.OverlappingPartitions,
+        readVerifiedGpt(img, io, std.testing.allocator, 1024 * 1024),
+    );
+
+    const valid_entries = [_]PartitionEntry{entries[0]};
+    try writePartitionTables(&img, io, disk_guid, &valid_entries);
+    const backup_array_lba =
+        size / sector_size - 1 - partition_array_sectors;
+    var byte: [1]u8 = undefined;
+    try preadExact(img, io, &byte, try sectorOffset(backup_array_lba));
+    byte[0] ^= 0xff;
+    try img.pwrite(io, &byte, try sectorOffset(backup_array_lba));
+    try std.testing.expectError(
+        error.BadPartitionArrayChecksum,
+        readVerifiedGpt(img, io, std.testing.allocator, 1024 * 1024),
+    );
+}
+
 test "growLastPartition extends the last partition and relocates the backup header/array" {
     const io = std.testing.io;
     const path = "test-gpt-grow.img";

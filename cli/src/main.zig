@@ -26,6 +26,7 @@ const usage =
     \\  resize <file> [+]<size>
     \\  check <file>
     \\  map [--output=human|json] <file>
+    \\  azure derive --input-sha256 <hex> [--expected-virtual-size <size>] <input.qcow2> <output.vhd>
     \\  azure fixup --generation 1|2 <file>
     \\  azure deprovision [--user <username>] <file>
     \\  cosi <disk-image> -o <output.cosi>

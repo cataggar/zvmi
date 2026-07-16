@@ -11,6 +11,9 @@ const Dir = Io.Dir;
 const File = Io.File;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const image = @import("image.zig");
+const gpt = @import("gpt.zig");
+const guid = @import("guid.zig");
+const vhd = @import("vhd.zig");
 
 pub const Digest = [Sha256.digest_length]u8;
 
@@ -180,6 +183,27 @@ pub const FinalizedQcow2 = struct {
     virtual_size: u64,
     compression: Qcow2Compression,
     cluster_size: u32,
+};
+
+pub const DeriveFixedVhdOptions = struct {
+    input_path: []const u8,
+    expected_input_sha256: Digest,
+    max_input_size: u64,
+    expected_virtual_size: ?u64 = null,
+    max_virtual_size: u64,
+    output_path: []const u8,
+    max_output_size: u64,
+    max_partition_array_bytes: u64 = 1024 * 1024,
+    unique_id: ?[16]u8 = null,
+    timestamp_unix: ?i64 = null,
+};
+
+pub const DerivedFixedVhd = struct {
+    artifact: Metadata,
+    source_virtual_size: u64,
+    virtual_size: u64,
+    partition_count: usize,
+    relocation: gpt.RelocationResult,
 };
 
 pub fn sha256Bytes(bytes: []const u8) Digest {
@@ -457,18 +481,17 @@ pub fn finalizeQcow2(
     const virtual_size = switch (options.source_format) {
         .raw => source_stat.size,
         .qcow2 => size: {
-            source_image = image.Image.openFile(io, source_file) catch |err| {
-                return err;
+            source_image = image.Image.openStandaloneQcow2File(
+                io,
+                source_file,
+            ) catch |err| switch (err) {
+                error.BackingFileNotSupported,
+                error.ExternalDataFileNotSupported,
+                => return error.SourceNotStandalone,
+                else => return err,
             };
             source_file_open = false;
             const opened = &source_image.?;
-            if (opened.format != .qcow2) return error.SourceFormatMismatch;
-            const qcow2_info = opened.qcow2.?;
-            if (qcow2_info.backing_file_len != 0 or
-                qcow2_info.data_file_len != 0)
-            {
-                return error.SourceNotStandalone;
-            }
             break :size opened.virtual_size;
         },
     };
@@ -629,6 +652,207 @@ pub fn finalizeQcow2(
     };
 }
 
+/// Transactionally converts a standalone GPT qcow2 into an Azure-ready fixed
+/// VHD. The data region is rounded up to 1 MiB, while the verified backup GPT
+/// is relocated without changing partition-array bytes or partition extents.
+/// The source is descriptor-pinned and revalidated before atomic publication.
+pub fn deriveFixedVhd(
+    allocator: Allocator,
+    io: Io,
+    options: DeriveFixedVhdOptions,
+) !DerivedFixedVhd {
+    if (builtin.os.tag != .linux) return error.UnsupportedHost;
+    if (options.max_input_size == 0) return error.InvalidInputSizeLimit;
+    if (options.max_virtual_size == 0) return error.InvalidVirtualSizeLimit;
+    if (options.max_output_size == 0) return error.InvalidOutputSizeLimit;
+    if (options.max_partition_array_bytes == 0) {
+        return error.InvalidPartitionArraySizeLimit;
+    }
+
+    const source_file = try Dir.cwd().openFile(io, options.input_path, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+    });
+    var source_file_open = true;
+    defer if (source_file_open) source_file.close(io);
+    const source_stat = try source_file.stat(io);
+    if (source_stat.kind != .file) return error.NotRegularFile;
+    if (source_stat.size > options.max_input_size) return error.InputTooLarge;
+    const source = try hashOpenFileLength(
+        io,
+        source_file,
+        options.input_path,
+        source_stat.size,
+    );
+    if (!sameFileSnapshot(source_stat, try source_file.stat(io))) {
+        return error.InputChanged;
+    }
+    if (!std.mem.eql(u8, &source.sha256, &options.expected_input_sha256)) {
+        return error.InputChecksumMismatch;
+    }
+
+    var source_image = image.Image.openStandaloneQcow2File(
+        io,
+        source_file,
+    ) catch |err| switch (err) {
+        error.BackingFileNotSupported,
+        error.ExternalDataFileNotSupported,
+        => return error.SourceNotStandalone,
+        error.BadFileSignature => return error.SourceFormatMismatch,
+        else => return err,
+    };
+    source_file_open = false;
+    defer source_image.close(io);
+    const source_virtual_size = source_image.virtual_size;
+    if (source_virtual_size == 0 or
+        source_virtual_size > options.max_virtual_size)
+    {
+        return error.VirtualSizeTooLarge;
+    }
+    if (options.expected_virtual_size) |expected| {
+        if (source_virtual_size != expected) return error.UnexpectedVirtualSize;
+    }
+    const source_check = try source_image.check(io);
+    if (!source_check.ok) return error.SourceImageInvalid;
+
+    var source_gpt = try gpt.readVerifiedGpt(
+        source_image,
+        io,
+        allocator,
+        options.max_partition_array_bytes,
+    );
+    defer source_gpt.deinit(allocator);
+
+    const rounded = std.math.add(
+        u64,
+        source_virtual_size,
+        (1024 * 1024) - 1,
+    ) catch return error.VirtualSizeTooLarge;
+    const target_virtual_size = rounded / (1024 * 1024) * (1024 * 1024);
+    if (target_virtual_size > options.max_virtual_size) {
+        return error.VirtualSizeTooLarge;
+    }
+    const target_file_size = std.math.add(
+        u64,
+        target_virtual_size,
+        vhd.footer_size,
+    ) catch return error.OutputTooLarge;
+    if (target_file_size > options.max_output_size) {
+        return error.OutputTooLarge;
+    }
+
+    var output = try OutputLocation.open(io, options.output_path);
+    defer output.close(io);
+    if (try aliasesExistingOutput(io, output, source_image.file)) {
+        return error.InputOutputAliased;
+    }
+    var stage = try output.dir.createFileAtomic(io, output.basename, .{
+        .replace = true,
+    });
+    defer stage.deinit(io);
+    try validateStageBounded(io, stage.file, options.max_output_size);
+
+    const stage_image_file = try openProcFdReadWrite(io, stage.file);
+    var finalized = try image.Image.createFile(
+        io,
+        stage_image_file,
+        .vhd,
+        target_virtual_size,
+        .{
+            .vhd_subformat = .fixed,
+            .unique_id = options.unique_id,
+            .timestamp_unix = options.timestamp_unix,
+        },
+    );
+    var finalized_open = true;
+    defer if (finalized_open) finalized.close(io);
+    try validateStageBounded(io, stage.file, options.max_output_size);
+
+    try image.copyAll(io, source_image, &finalized, allocator);
+    const relocation = try gpt.relocateBackup(
+        &finalized,
+        io,
+        allocator,
+        source_gpt,
+    );
+
+    var final_gpt = try gpt.readVerifiedGpt(
+        finalized,
+        io,
+        allocator,
+        options.max_partition_array_bytes,
+    );
+    defer final_gpt.deinit(allocator);
+    if (!std.mem.eql(
+        u8,
+        source_gpt.partition_array,
+        final_gpt.partition_array,
+    )) return error.PartitionArrayChanged;
+    if (source_gpt.partitions.len != final_gpt.partitions.len) {
+        return error.PartitionArrayChanged;
+    }
+    if (final_gpt.primary_header.backup_lba !=
+        target_virtual_size / gpt.sector_size - 1)
+    {
+        return error.BackupGptNotAtEnd;
+    }
+
+    if (finalized.format != .vhd or finalized.dynamic != null) {
+        return error.FinalImageNotFixedVhd;
+    }
+    if (finalized.virtual_size != target_virtual_size) {
+        return error.VirtualSizeMismatch;
+    }
+    const final_check = try finalized.check(io);
+    if (!final_check.ok) return error.FinalImageInvalid;
+    const final_stat = try finalized.file.stat(io);
+    if (final_stat.kind != .file or final_stat.size != target_file_size) {
+        return error.FinalImageSizeMismatch;
+    }
+    try validateStageBounded(io, stage.file, options.max_output_size);
+
+    if (!sameFileSnapshot(source_stat, try source_image.file.stat(io))) {
+        return error.InputChanged;
+    }
+    const source_after = try hashOpenFileLength(
+        io,
+        source_image.file,
+        options.input_path,
+        source_stat.size,
+    );
+    if (!sameFileSnapshot(source_stat, try source_image.file.stat(io)) or
+        !std.mem.eql(
+            u8,
+            &source_after.sha256,
+            &options.expected_input_sha256,
+        ))
+    {
+        return error.InputChanged;
+    }
+
+    try finalized.file.sync(io);
+    const artifact = try hashOpenFile(
+        io,
+        finalized.file,
+        options.output_path,
+    );
+    finalized.close(io);
+    finalized_open = false;
+    try validateStageBounded(io, stage.file, options.max_output_size);
+    if (artifact.size != target_file_size) {
+        return error.FinalImageSizeMismatch;
+    }
+    try stage.replace(io);
+    return .{
+        .artifact = artifact,
+        .source_virtual_size = source_virtual_size,
+        .virtual_size = target_virtual_size,
+        .partition_count = source_gpt.partitions.len,
+        .relocation = relocation,
+    };
+}
+
 const QemuImgRunOptions = struct {
     argv: []const []const u8,
     stdin: std.process.SpawnOptions.StdIo,
@@ -662,6 +886,20 @@ fn openProcFdReadOnly(io: Io, file: File) !File {
     );
     return Dir.cwd().openFile(io, path, .{
         .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = true,
+    });
+}
+
+fn openProcFdReadWrite(io: Io, file: File) !File {
+    var path_buffer: [64]u8 = undefined;
+    const path = try std.fmt.bufPrint(
+        &path_buffer,
+        "/proc/self/fd/{d}",
+        .{file.handle},
+    );
+    return Dir.cwd().openFile(io, path, .{
+        .mode = .read_write,
         .allow_directory = false,
         .follow_symlinks = true,
     });
@@ -1601,6 +1839,232 @@ test "QCOW2 finalization rejects hard-linked input and output" {
             },
         ),
     );
+}
+
+test "fixed VHD derivation relocates mirrored GPT transactionally" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    const input_path = "test-derive-vhd-input.qcow2";
+    const output_path = "test-derive-vhd-output.vhd";
+    defer Dir.cwd().deleteFile(io, output_path) catch {};
+    defer Dir.cwd().deleteFile(io, input_path) catch {};
+
+    const source_size: u64 = 16 * 1024 * 1024 - gpt.sector_size;
+    var source = try image.Image.create(
+        io,
+        input_path,
+        .qcow2,
+        source_size,
+        .{},
+    );
+    const specs = [_]gpt.PartitionSpec{
+        .{
+            .type_guid = guid.esp,
+            .unique_guid = guid.parse("11111111-2222-3333-4444-555555555555"),
+            .size_sectors = 2048,
+            .name_utf16le = gpt.asciiName("efi"),
+        },
+        .{
+            .type_guid = guid.linux_filesystem_data,
+            .unique_guid = guid.parse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+            .size_sectors = 4096,
+            .name_utf16le = gpt.asciiName("root"),
+        },
+    };
+    var placements: [specs.len]gpt.Placement = undefined;
+    try gpt.writeGpt(
+        &source,
+        io,
+        guid.parse("01234567-89ab-cdef-0123-456789abcdef"),
+        &specs,
+        &placements,
+    );
+    source.close(io);
+    const source_before = try hashFile(io, input_path);
+
+    const result = try deriveFixedVhd(
+        std.testing.allocator,
+        io,
+        .{
+            .input_path = input_path,
+            .expected_input_sha256 = source_before.sha256,
+            .max_input_size = 32 * 1024 * 1024,
+            .expected_virtual_size = source_size,
+            .max_virtual_size = 32 * 1024 * 1024,
+            .output_path = output_path,
+            .max_output_size = 32 * 1024 * 1024,
+            .unique_id = [_]u8{0x42} ** 16,
+            .timestamp_unix = 0,
+        },
+    );
+    try std.testing.expectEqual(source_size, result.source_virtual_size);
+    try std.testing.expectEqual(
+        @as(u64, 16 * 1024 * 1024),
+        result.virtual_size,
+    );
+    try std.testing.expectEqual(@as(usize, specs.len), result.partition_count);
+    try std.testing.expect(result.relocation.was_relocated);
+
+    const source_after = try hashFile(io, input_path);
+    try std.testing.expectEqualSlices(
+        u8,
+        &source_before.sha256,
+        &source_after.sha256,
+    );
+    var source_reopened = try image.Image.openPathReadOnly(io, input_path);
+    defer source_reopened.close(io);
+    var source_gpt = try gpt.readVerifiedGpt(
+        source_reopened,
+        io,
+        std.testing.allocator,
+        1024 * 1024,
+    );
+    defer source_gpt.deinit(std.testing.allocator);
+
+    var output = try image.Image.openPathReadOnly(io, output_path);
+    defer output.close(io);
+    try std.testing.expectEqual(image.Format.vhd, output.format);
+    try std.testing.expect(output.dynamic == null);
+    try std.testing.expectEqual(result.virtual_size, output.virtual_size);
+    try std.testing.expectEqual(
+        result.virtual_size + vhd.footer_size,
+        (try output.info(io)).file_size,
+    );
+    var output_gpt = try gpt.readVerifiedGpt(
+        output,
+        io,
+        std.testing.allocator,
+        1024 * 1024,
+    );
+    defer output_gpt.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(
+        u8,
+        source_gpt.partition_array,
+        output_gpt.partition_array,
+    );
+    for (source_gpt.partitions, output_gpt.partitions) |before, after| {
+        try std.testing.expectEqual(before.first_lba, after.first_lba);
+        try std.testing.expectEqual(before.last_lba, after.last_lba);
+    }
+}
+
+test "fixed VHD derivation preserves output on digest failure and rejects aliases" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    const input_path = "test-derive-vhd-safety.qcow2";
+    const output_path = "test-derive-vhd-safety.vhd";
+    defer Dir.cwd().deleteFile(io, output_path) catch {};
+    defer Dir.cwd().deleteFile(io, input_path) catch {};
+
+    var source = try image.Image.create(
+        io,
+        input_path,
+        .qcow2,
+        8 * 1024 * 1024,
+        .{},
+    );
+    const specs = [_]gpt.PartitionSpec{.{
+        .type_guid = guid.esp,
+        .unique_guid = guid.parse("99999999-8888-7777-6666-555555555555"),
+        .size_sectors = 2048,
+    }};
+    var placements: [specs.len]gpt.Placement = undefined;
+    try gpt.writeGpt(
+        &source,
+        io,
+        guid.parse("12345678-1234-5678-9abc-def012345678"),
+        &specs,
+        &placements,
+    );
+    source.close(io);
+    const metadata = try hashFile(io, input_path);
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = output_path,
+        .data = "existing\n",
+    });
+    var options = DeriveFixedVhdOptions{
+        .input_path = input_path,
+        .expected_input_sha256 = sha256Bytes("wrong"),
+        .max_input_size = 16 * 1024 * 1024,
+        .max_virtual_size = 16 * 1024 * 1024,
+        .output_path = output_path,
+        .max_output_size = 16 * 1024 * 1024,
+    };
+    try std.testing.expectError(
+        error.InputChecksumMismatch,
+        deriveFixedVhd(std.testing.allocator, io, options),
+    );
+    try expectFileContent(io, output_path, "existing\n");
+
+    try Dir.cwd().deleteFile(io, output_path);
+    const input_file = try Dir.cwd().openFile(io, input_path, .{
+        .mode = .read_only,
+    });
+    defer input_file.close(io);
+    try input_file.hardLink(io, Dir.cwd(), output_path, .{});
+    options.expected_input_sha256 = metadata.sha256;
+    try std.testing.expectError(
+        error.InputOutputAliased,
+        deriveFixedVhd(std.testing.allocator, io, options),
+    );
+}
+
+test "fixed VHD derivation rejects backing paths before opening them" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    const input_path = "test-derive-vhd-backed.qcow2";
+    const output_path = "test-derive-vhd-backed.vhd";
+    defer Dir.cwd().deleteFile(io, output_path) catch {};
+    defer Dir.cwd().deleteFile(io, input_path) catch {};
+
+    var source = try image.Image.create(
+        io,
+        input_path,
+        .qcow2,
+        8 * 1024 * 1024,
+        .{},
+    );
+    source.close(io);
+    const backing_path = "/path/that/must/not/be-opened";
+    const backing_offset: u64 = 128;
+    const file = try Dir.cwd().openFile(io, input_path, .{
+        .mode = .read_write,
+    });
+    try file.writePositionalAll(io, backing_path, backing_offset);
+    var backing_offset_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &backing_offset_bytes, backing_offset, .big);
+    try file.writePositionalAll(io, &backing_offset_bytes, 8);
+    var backing_length_bytes: [4]u8 = undefined;
+    std.mem.writeInt(
+        u32,
+        &backing_length_bytes,
+        backing_path.len,
+        .big,
+    );
+    try file.writePositionalAll(io, &backing_length_bytes, 16);
+    file.close(io);
+
+    const metadata = try hashFile(io, input_path);
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = output_path,
+        .data = "existing\n",
+    });
+    try std.testing.expectError(
+        error.SourceNotStandalone,
+        deriveFixedVhd(
+            std.testing.allocator,
+            io,
+            .{
+                .input_path = input_path,
+                .expected_input_sha256 = metadata.sha256,
+                .max_input_size = 16 * 1024 * 1024,
+                .max_virtual_size = 16 * 1024 * 1024,
+                .output_path = output_path,
+                .max_output_size = 16 * 1024 * 1024,
+            },
+        ),
+    );
+    try expectFileContent(io, output_path, "existing\n");
 }
 
 test "QCOW2 finalization enforces virtual and output size limits" {

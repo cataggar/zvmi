@@ -112,6 +112,19 @@ pub const Image = struct {
         return openFileWithPath(io, file, null);
     }
 
+    /// Takes ownership of a standalone qcow2 file without resolving or
+    /// opening any path named by its header.
+    pub fn openStandaloneQcow2File(io: Io, file: Io.File) OpenError!Image {
+        const qcow2_info = try qcow2.openStandalone(io, file);
+        return .{
+            .file = file,
+            .format = .qcow2,
+            .data_offset = 0,
+            .virtual_size = qcow2_info.virtual_size,
+            .qcow2 = qcow2_info,
+        };
+    }
+
     /// Lists path-resolved host files, excluding the top-level image, that
     /// contribute guest-visible data. Only qcow2 currently has dependencies.
     pub fn sourceDependencyPaths(
@@ -249,7 +262,26 @@ pub const Image = struct {
         });
         errdefer if (exclusive) Io.Dir.cwd().deleteFile(io, path) catch {};
         errdefer file.close(io);
+        return initializeFile(io, file, format, size, options);
+    }
 
+    /// Initializes an already-open file as a new image and takes ownership of
+    /// its handle. Callers can use this with descriptor-pinned atomic staging
+    /// files without reopening a pathname.
+    pub fn createFile(io: Io, file: Io.File, format: Format, size: u64, options: CreateOptions) CreateError!Image {
+        errdefer file.close(io);
+        try validateCreate(format, size, options);
+        try file.setLength(io, 0);
+        return initializeFile(io, file, format, size, options);
+    }
+
+    fn initializeFile(
+        io: Io,
+        file: Io.File,
+        format: Format,
+        size: u64,
+        options: CreateOptions,
+    ) CreateError!Image {
         switch (format) {
             .raw => {
                 try file.setLength(io, size);
@@ -729,7 +761,7 @@ fn randomUuid(io: Io) [16]u8 {
 }
 
 pub const CopyError = Image.PreadError || Image.PwriteError ||
-    std.mem.Allocator.Error || error{UnexpectedEndOfFile};
+    std.mem.Allocator.Error || error{ UnexpectedEndOfFile, DestinationTooSmall };
 
 /// Copies all `src` virtual-disk bytes into `*dst` (which must already have
 /// been created with at least `src`'s virtual size). Used by `zvmi convert`.
@@ -743,6 +775,7 @@ pub const CopyError = Image.PreadError || Image.PwriteError ||
 /// format's allocation unit so a mostly-zero chunk cannot force adjacent
 /// blocks or clusters to be allocated just because one contains live data.
 pub fn copyAll(io: Io, src: Image, dst: *Image, allocator: std.mem.Allocator) CopyError!void {
+    if (dst.virtual_size < src.virtual_size) return error.DestinationTooSmall;
     const chunk_size: usize = if (dst.dynamic) |d|
         d.block_size
     else if (dst.vhdx) |v|
