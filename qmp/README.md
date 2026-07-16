@@ -85,6 +85,7 @@ defer client.close();
 var spawned = try qmp.spawnAndConnect(allocator, io, .{
     .binary = "qemu-system-x86_64",
     .extra_args = &.{ "-M", "isapc", "-display", "none" },
+    .connect_timeout = .fromSeconds(10),
 });
 defer spawned.deinit();
 
@@ -98,7 +99,19 @@ if (reply.err) |e| return error.CommandFailed;
 var status = try qmp.qapi.queryStatus(spawned.client, allocator);
 defer status.deinit();
 std.debug.print("running={}\n", .{status.value.running});
+
+// Deadline-bounded command, status, and child supervision:
+const deadline = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(30));
+const running = try spawned.client.queryRunningUntil(deadline);
+if (running) {
+    var quit_reply = try spawned.client.executeUntil("quit", null, deadline);
+    defer quit_reply.deinit();
+    if (quit_reply.err != null) return error.CommandFailed;
+}
+_ = try spawned.waitUntil(deadline);
 ```
+
+`spawnAndConnect` enforces `connect_timeout` across socket creation, the server greeting, and capability negotiation. `executeUntil`, `queryRunningUntil`, and `waitUntil` use an absolute awake-clock deadline and cancel their in-flight operation on expiry.
 
 ## Typed QAPI bindings (`qmp.qapi`)
 
@@ -140,4 +153,3 @@ rather than failing generation):
   care primarily about the process exiting should tolerate an error from
   the `quit` call itself and check `Spawned.wait()` / process exit
   instead.
-

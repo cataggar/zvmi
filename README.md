@@ -157,11 +157,14 @@ zvmi/
                               #   gracefully when qemu-system-x86_64, OVMF, or
                               #   the ZVMI_BOOT_TEST_* fixture env vars aren't
                               #   available
+    freebsd15_aarch64_boot.zig
+                              #   opt-in generalized FreeBSD acceptance under
+                              #   AArch64 UEFI QEMU, including SSH and reboot
   scripts/
     build_generalized_azurelinux4.zig  # generalized Azure Linux 4 Gen2 QCOW2
                               #   builder (run via `zig build generalized-azurelinux4`)
     build_generalized_freebsd15_aarch64.zig
-                              #   verified FreeBSD 15.1 AArch64 base QCOW2
+                              #   generalized FreeBSD 15.1 AArch64 QCOW2
                               #   builder (run via `zig build generalized-freebsd15-aarch64`)
     zstd_max_preload.zig       # LD_PRELOAD shared library that forces maximum
                               #   zstd compression level in qemu-img
@@ -189,14 +192,17 @@ zig build            # build the library + the zvmi CLI
 zig build test       # run all tests (boot-smoke tests skip gracefully
                       #   without qemu-system-x86_64/OVMF/fixtures)
 zig build test-boot-smoke  # run just the real-QEMU boot-smoke tests
+zig build test-freebsd15-aarch64-boot
+                      # run opt-in FreeBSD AArch64 QEMU/SSH/reboot acceptance
 zig build run -- <args>   # run the CLI, e.g. `zig build run -- info foo.vhd`
 zig build run -- qemu     # download (if needed) and boot the Azure Linux image
 zig build generalized-azurelinux4 -- [--iso <path>] [--output <path>] [--size <size>] [--work-dir <dir>]
                       # build a generalized Azure Linux 4 Gen2 QCOW2 image
                       #   (Linux-only; requires root, curl, dnf, qemu-img, sudo)
-zig build generalized-freebsd15-aarch64 -- [--source <path>] [--output <path>] [--work-dir <dir>]
-                      # prepare a verified FreeBSD 15.1 AArch64 base QCOW2
-                      #   (Linux-only; requires curl, XZ Utils, qemu-img)
+zig build generalized-freebsd15-aarch64 -- [--source <path>] [--output <path>] [--work-dir <dir>] [--base-only]
+                      # build a generalized FreeBSD 15.1 AArch64 QCOW2
+                      #   (Linux-only; requires curl, XZ Utils, qemu-img,
+                      #   qemu-system-aarch64, AAVMF, xorriso, and networking)
 ```
 
 ## Use from another `build.zig`
@@ -494,9 +500,9 @@ The builder requires Zig 0.16, `curl`, `dnf`, GNU tar, `qemu-img`, and passwordl
 
 The manually dispatched **Rebuild Azure Linux 4 release image** GitHub Actions workflow builds this image from current `main`, validates it, and replaces `AzureLinux-4.0-x86_64.qcow2` in the `AzureLinux4.0-20260714` release while refreshing the published checksum and provenance.
 
-### FreeBSD 15.1 AArch64 base QCOW2
+### Generalized FreeBSD 15.1 AArch64 QCOW2
 
-The first FreeBSD builder stage downloads the official `FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz`, verifies its pinned compressed SHA-256, decompresses it with explicit memory and output limits, and transactionally converts it to a standalone zstd-compressed QCOW2:
+The FreeBSD builder downloads the official `FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz`, verifies its pinned compressed SHA-256, and decompresses it with explicit memory and output limits. It boots a private mutable QCOW2 under AArch64 UEFI QEMU with a nonce-bound NoCloud seed, installs the pinned `azure-agent-2.15.0.1` package, enables SSH and generic `vtnet*` plus Azure `hn0` DHCP, removes the OS-disk swap entry, locks root, removes the default `freebsd` user, deprovisions waagent, and clears guest identity during a normal shutdown. Only an exact authenticated success marker followed by a clean QEMU exit permits transactional publication as a standalone zstd-compressed QCOW2.
 
 ```
 zig build generalized-freebsd15-aarch64 -- \
@@ -504,7 +510,21 @@ zig build generalized-freebsd15-aarch64 -- \
   --output /path/to/FreeBSD-15.1-RELEASE-arm64-aarch64-generalized.qcow2
 ```
 
-The builder is Linux-only and requires Zig 0.16, `curl`, XZ Utils, and `qemu-img`. Use `--source` to supply the official compressed image without downloading it; the pinned checksum is still required unless explicitly overridden with `--source-sha256`. This command currently prepares and validates the compact upstream BASIC-CLOUDINIT UFS base without changing its guest contents. Azure provisioning-agent installation, QEMU-based guest customization and generalization, AArch64 UEFI boot acceptance, and Azure Arm64 validation remain follow-up work for issue #145.
+The builder is Linux-only and requires Zig 0.16, `curl`, XZ Utils, `qemu-img`, `qemu-system-aarch64`, `xorriso`, AArch64 EDK2/AAVMF firmware, and outbound guest networking for the signed FreeBSD package installation. Use `--source` to supply the official compressed image without downloading it; the pinned checksum is still required unless explicitly overridden with `--source-sha256`. Firmware is discovered at the common `/usr/share/AAVMF` and `/usr/share/edk2/aarch64` locations or may be supplied with `--uefi-code` and `--uefi-vars`. `--accel auto` uses KVM on an AArch64 Linux host when `/dev/kvm` is accessible and TCG otherwise. `--base-only` retains the earlier verified-base behavior and does not require QEMU, firmware, xorriso, or guest networking.
+
+The known-good local boot shape is `qemu-system-aarch64 -machine virt,accel=tcg -cpu max -smp 2 -m 2048` with a read-only AAVMF code pflash, a private writable copy of the AAVMF vars pflash, the QCOW2 as a virtio disk, a `cidata` ISO as a read-only virtio disk, a `virtio-net-pci` user-network device, `virtio-rng-pci`, and a serial console. The builder assembles this invocation automatically and supports explicit tool and firmware paths.
+
+Run the opt-in acceptance test against a completed image:
+
+```text
+ZVMI_FREEBSD15_AARCH64_IMAGE=/path/to/FreeBSD-15.1-RELEASE-arm64-aarch64-generalized.qcow2 \
+ZVMI_FREEBSD15_AARCH64_QEMU=/usr/bin/qemu-system-aarch64 \
+zig build test-freebsd15-aarch64-boot
+```
+
+The test clearly skips when `ZVMI_FREEBSD15_AARCH64_IMAGE` is absent. When enabled, it boots two independent disposable overlays with fresh NoCloud seeds, proves each injected SSH key works, verifies the generalized agent/network/swap/account/identity state, reboots and reconnects to each guest, and powers off cleanly. Each guest's SSH host fingerprint and host UUID must remain stable across its reboot, while both values must differ between the two guests.
+
+Azure Arm64 support remains experimental and is not implied by local QEMU acceptance. The upstream virtual size is 6,477,643,776 bytes and is not 1 MiB-aligned, so do not blindly extend and convert it to a fixed VHD: the backup GPT must be relocated correctly first. Real Azure Arm64 Gen2 validation and the release workflow remain tracked by issue #145.
 
 ### Booting the release image with QEMU
 

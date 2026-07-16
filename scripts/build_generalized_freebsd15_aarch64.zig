@@ -1,12 +1,15 @@
-//! Prepare the verified FreeBSD 15.1 AArch64 cloud-image base used by the
-//! generalized QEMU/Azure builder. This initial stage acquires, decompresses,
-//! validates, and transactionally recompresses the official standalone QCOW2.
+//! Build a generalized FreeBSD 15.1 AArch64 QCOW2 from the official
+//! BASIC-CLOUDINIT image. The source is verified and decompressed before a
+//! nonce-authenticated NoCloud customization runs under AArch64 UEFI QEMU.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const zvmi = @import("zvmi");
+const qmp = @import("qmp");
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
+const File = std.Io.File;
 const Io = std.Io;
 const artifact_pipeline = zvmi.artifact_pipeline;
 
@@ -18,15 +21,41 @@ const image_max_size: u64 = 6 * 1024 * 1024 * 1024;
 const official_virtual_size: u64 = 6_477_643_776;
 const finalized_image_max_size: u64 = 7 * 1024 * 1024 * 1024;
 const xz_memory_limit: u64 = 1024 * 1024 * 1024;
+const seed_iso_max_size: u64 = 4 * 1024 * 1024;
+const firmware_max_size: u64 = 128 * 1024 * 1024;
+const default_customization_timeout_seconds: u32 = 30 * 60;
+const qmp_connect_timeout_seconds: u32 = 10;
+const customization_result_prefix = "ZVMI_FREEBSD_CUSTOMIZATION_RESULT";
+const serial_tail_size: usize = 256 * 1024;
+
+const Accel = enum {
+    auto,
+    kvm,
+    tcg,
+
+    fn parse(text: []const u8) ?Accel {
+        if (std.mem.eql(u8, text, "auto")) return .auto;
+        if (std.mem.eql(u8, text, "kvm")) return .kvm;
+        if (std.mem.eql(u8, text, "tcg")) return .tcg;
+        return null;
+    }
+};
 
 const Args = struct {
     source: ?[]const u8 = null,
     source_sha256: []const u8 = official_source_sha256,
-    output: []const u8 = "zvmi-freebsd15.1-aarch64-base.qcow2",
+    output: []const u8 = "zvmi-freebsd15.1-aarch64-generalized.qcow2",
     work_dir: []const u8 = ".scratch/generalized-freebsd15-aarch64",
     curl_path: []const u8 = "curl",
     xz_path: []const u8 = "xz",
     qemu_img_path: []const u8 = "qemu-img",
+    qemu_path: []const u8 = "qemu-system-aarch64",
+    xorriso_path: []const u8 = "xorriso",
+    uefi_code_path: ?[]const u8 = null,
+    uefi_vars_path: ?[]const u8 = null,
+    accel: Accel = .auto,
+    customization_timeout_seconds: u32 = default_customization_timeout_seconds,
+    base_only: bool = false,
 };
 
 const help_text =
@@ -39,6 +68,13 @@ const help_text =
     \\  --curl <path>            curl executable (default: curl)
     \\  --xz <path>              XZ Utils executable (default: xz)
     \\  --qemu-img <path>        qemu-img executable (default: qemu-img)
+    \\  --qemu <path>            qemu-system-aarch64 executable
+    \\  --xorriso <path>         xorriso executable used for the NoCloud ISO
+    \\  --uefi-code <path>       AArch64 UEFI pflash code image
+    \\  --uefi-vars <path>       AArch64 UEFI pflash variables template
+    \\  --accel <auto|kvm|tcg>   QEMU accelerator (default: auto)
+    \\  --timeout <seconds>      Guest customization timeout (default: 1800)
+    \\  --base-only              Prepare the verified upstream base without customization
     \\
     \\Preferred invocation: zig build generalized-freebsd15-aarch64 -- [options]
     \\
@@ -63,6 +99,28 @@ fn parseArgs(argv: []const []const u8) !Args {
             args.xz_path = try nextValue(argv, &i);
         } else if (std.mem.eql(u8, arg, "--qemu-img")) {
             args.qemu_img_path = try nextValue(argv, &i);
+        } else if (std.mem.eql(u8, arg, "--qemu")) {
+            args.qemu_path = try nextValue(argv, &i);
+        } else if (std.mem.eql(u8, arg, "--xorriso")) {
+            args.xorriso_path = try nextValue(argv, &i);
+        } else if (std.mem.eql(u8, arg, "--uefi-code")) {
+            args.uefi_code_path = try nextValue(argv, &i);
+        } else if (std.mem.eql(u8, arg, "--uefi-vars")) {
+            args.uefi_vars_path = try nextValue(argv, &i);
+        } else if (std.mem.eql(u8, arg, "--accel")) {
+            args.accel = Accel.parse(try nextValue(argv, &i)) orelse
+                return error.InvalidAccelerator;
+        } else if (std.mem.eql(u8, arg, "--timeout")) {
+            args.customization_timeout_seconds = std.fmt.parseUnsigned(
+                u32,
+                try nextValue(argv, &i),
+                10,
+            ) catch return error.InvalidTimeout;
+            if (args.customization_timeout_seconds == 0) {
+                return error.InvalidTimeout;
+            }
+        } else if (std.mem.eql(u8, arg, "--base-only")) {
+            args.base_only = true;
         } else if (std.mem.eql(u8, arg, "--help") or
             std.mem.eql(u8, arg, "-h"))
         {
@@ -72,6 +130,9 @@ fn parseArgs(argv: []const []const u8) !Args {
             return error.UnexpectedArgument;
         }
     }
+    if ((args.uefi_code_path == null) != (args.uefi_vars_path == null)) {
+        return error.IncompleteFirmwareOverride;
+    }
     return args;
 }
 
@@ -79,6 +140,692 @@ fn nextValue(argv: []const []const u8, index: *usize) ![]const u8 {
     index.* += 1;
     if (index.* >= argv.len) return error.MissingValue;
     return argv[index.*];
+}
+
+fn canonicalPathAlloc(
+    allocator: Allocator,
+    io: Io,
+    path: []const u8,
+) ![]u8 {
+    const canonical = Dir.cwd().realPathFileAlloc(
+        io,
+        path,
+        allocator,
+    ) catch |err| switch (err) {
+        error.FileNotFound => {
+            const parent = std.fs.path.dirname(path) orelse ".";
+            const canonical_parent = try Dir.cwd().realPathFileAlloc(
+                io,
+                parent,
+                allocator,
+            );
+            defer allocator.free(canonical_parent);
+            return std.fs.path.join(
+                allocator,
+                &.{ canonical_parent, std.fs.path.basename(path) },
+            );
+        },
+        else => return err,
+    };
+    defer allocator.free(canonical);
+    return allocator.dupe(u8, canonical);
+}
+
+fn rejectOutputAlias(
+    allocator: Allocator,
+    io: Io,
+    output_path: []const u8,
+    work_file_path: []const u8,
+) !void {
+    const output_stat = Dir.cwd().statFile(io, output_path, .{
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    if (output_stat) |stat| {
+        if (stat.kind == .sym_link) return error.OutputPathIsSymlink;
+    }
+
+    const canonical_output = try canonicalPathAlloc(
+        allocator,
+        io,
+        output_path,
+    );
+    defer allocator.free(canonical_output);
+    const canonical_work_file = try canonicalPathAlloc(
+        allocator,
+        io,
+        work_file_path,
+    );
+    defer allocator.free(canonical_work_file);
+    if (std.mem.eql(u8, canonical_output, canonical_work_file)) {
+        return error.OutputAliasesWorkFile;
+    }
+
+    if (output_stat == null or output_stat.?.kind != .file) return;
+    const work_stat = Dir.cwd().statFile(io, work_file_path, .{
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    if (work_stat.kind != .file or
+        work_stat.inode != output_stat.?.inode)
+    {
+        return;
+    }
+
+    const output_file = try Dir.cwd().openFile(io, output_path, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+    });
+    defer output_file.close(io);
+    const work_file = try Dir.cwd().openFile(io, work_file_path, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+    });
+    defer work_file.close(io);
+    if (try artifact_pipeline.sameFileIdentity(io, output_file, work_file)) {
+        return error.OutputAliasesWorkFile;
+    }
+}
+
+const customization_user_data_template =
+    \\#cloud-config
+    \\hostname: zvmi-freebsd-customizer
+    \\users: []
+    \\ssh_pwauth: false
+    \\packages:
+    \\  - azure-agent-2.15.0.1
+    \\write_files:
+    \\  - path: /etc/rc.conf.d/firstboot_pkg_upgrade
+    \\    permissions: "0644"
+    \\    content: |
+    \\      firstboot_pkg_upgrade_enable="NO"
+    \\  - path: /root/zvmi-generalize.sh
+    \\    permissions: "0700"
+    \\    content: |
+    \\      #!/bin/sh
+    \\      set -eu
+    \\      report_failure()
+    \\      {
+    \\          status=$?
+    \\          trap - EXIT
+    \\          if [ "${status}" -eq 0 ]; then
+    \\              status=1
+    \\          fi
+    \\          printf 'ZVMI_FREEBSD_CUSTOMIZATION_RESULT @NONCE@ %d\n' "${status}" >/dev/console
+    \\          exit "${status}"
+    \\      }
+    \\      trap report_failure EXIT
+    \\      trap 'exit 1' HUP INT TERM
+    \\
+    \\      pkg info -e azure-agent
+    \\      sysrc waagent_enable=YES
+    \\      sysrc sshd_enable=YES
+    \\      sysrc nuageinit_enable=YES
+    \\      sysrc growfs_enable=YES
+    \\      sysrc growfs_swap_size=0
+    \\      sysrc dumpdev=NO
+    \\      sysrc 'ifconfig_DEFAULT=SYNCDHCP accept_rtadv'
+    \\      sysrc 'ifconfig_hn0=SYNCDHCP'
+    \\      sysrc firstboot_pkg_upgrade_enable=NO
+    \\
+    \\      if [ ! -f /usr/local/etc/waagent.conf ]; then
+    \\          cp /usr/local/etc/waagent.conf.sample /usr/local/etc/waagent.conf
+    \\      fi
+    \\      set_agent_config()
+    \\      {
+    \\          key=$1
+    \\          value=$2
+    \\          awk -v key="${key}" -v value="${value}" '
+    \\              BEGIN { found = 0 }
+    \\              index($0, key "=") == 1 {
+    \\                  print key "=" value
+    \\                  found = 1
+    \\                  next
+    \\              }
+    \\              { print }
+    \\              END {
+    \\                  if (!found)
+    \\                      print key "=" value
+    \\              }
+    \\          ' /usr/local/etc/waagent.conf > /usr/local/etc/waagent.conf.zvmi
+    \\          mv /usr/local/etc/waagent.conf.zvmi /usr/local/etc/waagent.conf
+    \\      }
+    \\      set_agent_config Provisioning.Agent auto
+    \\      set_agent_config Provisioning.SshHostKeyPairType ed25519
+    \\      set_agent_config ResourceDisk.SwapSizeMB 2048
+    \\      set_agent_config Logs.Console n
+    \\
+    \\      swapoff -a
+    \\      awk '$3 != "swap" { print }' /etc/fstab > /etc/fstab.zvmi
+    \\      chmod 0644 /etc/fstab.zvmi
+    \\      mv /etc/fstab.zvmi /etc/fstab
+    \\      if pw usershow freebsd >/dev/null 2>&1; then
+    \\          pw userdel freebsd -r
+    \\      fi
+    \\      pw lock root
+    \\      /usr/local/sbin/waagent -deprovision -force
+    \\      pkg clean -ay
+    \\      rm -rf /var/cache/pkg/*
+    \\      rm -f /var/db/pkg/repo-*.sqlite
+    \\
+    \\      cat > /etc/rc.d/zvmi_generalize <<'ZVMI_SHUTDOWN'
+    \\      #!/bin/sh
+    \\      #
+    \\      # PROVIDE: zvmi_generalize
+    \\      # BEFORE: random
+    \\      # KEYWORD: shutdown
+    \\      . /etc/rc.subr
+    \\      name="zvmi_generalize"
+    \\      start_cmd=":"
+    \\      stop_cmd="zvmi_generalize_stop"
+    \\      zvmi_generalize_stop()
+    \\      {
+    \\          set -eu
+    \\          rm -rf /var/lib/waagent /var/log/azure /var/cache/nuageinit
+    \\          rm -rf /var/db/entropy/*
+    \\          rm -f /var/log/waagent.log /var/log/nuageinit.log
+    \\          rm -f /var/run/waagent.pid
+    \\          rm -f /etc/rc.conf.d/hostname
+    \\          rm -f /etc/rc.conf.d/network
+    \\          rm -f /etc/rc.conf.d/routing
+    \\          rm -f /etc/ssh/ssh_host_*
+    \\          rm -f /etc/hostid /etc/machine-id
+    \\          rm -f /var/db/dhclient.leases.*
+    \\          rm -f /root/.*history /root/zvmi-generalize.sh
+    \\          touch /firstboot
+    \\          rm -f /etc/rc.d/zvmi_generalize
+    \\          sync
+    \\          printf 'ZVMI_FREEBSD_CUSTOMIZATION_RESULT @NONCE@ 0\n' >/dev/console
+    \\      }
+    \\      load_rc_config "${name}"
+    \\      run_rc_command "$1"
+    \\      ZVMI_SHUTDOWN
+    \\      chmod 0555 /etc/rc.d/zvmi_generalize
+    \\      /usr/sbin/daemon -cf /bin/sh -c \
+    \\          '/bin/sleep 30; /sbin/shutdown -p now "zvmi customization complete"'
+    \\      trap - EXIT HUP INT TERM
+    \\runcmd:
+    \\  - /bin/sh /root/zvmi-generalize.sh
+    \\
+;
+
+const customization_metadata_template =
+    \\instance-id: zvmi-build-@NONCE@
+    \\local-hostname: zvmi-freebsd-customizer
+    \\
+;
+
+fn replaceNonceAlloc(
+    allocator: Allocator,
+    template: []const u8,
+    nonce: []const u8,
+) ![]u8 {
+    const token = "@NONCE@";
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var offset: usize = 0;
+    while (std.mem.indexOfPos(u8, template, offset, token)) |index| {
+        try output.writer.writeAll(template[offset..index]);
+        try output.writer.writeAll(nonce);
+        offset = index + token.len;
+    }
+    try output.writer.writeAll(template[offset..]);
+    return output.toOwnedSlice();
+}
+
+const FirmwarePaths = struct {
+    code: []const u8,
+    vars: []const u8,
+};
+
+fn pathReadable(io: Io, path: []const u8) !bool {
+    Dir.cwd().access(io, path, .{ .read = true }) catch |err| switch (err) {
+        error.FileNotFound, error.AccessDenied, error.PermissionDenied => return false,
+        else => return err,
+    };
+    return true;
+}
+
+fn resolveFirmware(io: Io, args: Args) !FirmwarePaths {
+    if (args.uefi_code_path) |code| {
+        const vars = args.uefi_vars_path.?;
+        if (!try pathReadable(io, code) or !try pathReadable(io, vars)) {
+            return error.FirmwareNotReadable;
+        }
+        return .{ .code = code, .vars = vars };
+    }
+    const candidates = [_]FirmwarePaths{
+        .{
+            .code = "/usr/share/AAVMF/AAVMF_CODE.fd",
+            .vars = "/usr/share/AAVMF/AAVMF_VARS.fd",
+        },
+        .{
+            .code = "/usr/share/edk2/aarch64/QEMU_EFI-pflash.raw",
+            .vars = "/usr/share/edk2/aarch64/vars-template-pflash.raw",
+        },
+    };
+    for (candidates) |candidate| {
+        if (try pathReadable(io, candidate.code) and
+            try pathReadable(io, candidate.vars))
+        {
+            return candidate;
+        }
+    }
+    return error.FirmwareNotFound;
+}
+
+const TemporaryDirectory = struct {
+    allocator: Allocator,
+    path: []u8,
+
+    fn create(allocator: Allocator, io: Io, parent: []const u8) !TemporaryDirectory {
+        var random: [16]u8 = undefined;
+        for (0..16) |_| {
+            Io.random(io, &random);
+            const hex = std.fmt.bytesToHex(random, .lower);
+            const path = try std.fmt.allocPrint(
+                allocator,
+                "{s}/.zvmi-freebsd-{s}",
+                .{ parent, &hex },
+            );
+            Dir.cwd().createDir(
+                io,
+                path,
+                .fromMode(0o700),
+            ) catch |err| switch (err) {
+                error.PathAlreadyExists => {
+                    allocator.free(path);
+                    continue;
+                },
+                else => {
+                    allocator.free(path);
+                    return err;
+                },
+            };
+            return .{ .allocator = allocator, .path = path };
+        }
+        return error.TemporaryDirectoryCollision;
+    }
+
+    fn deinit(self: *TemporaryDirectory, io: Io) void {
+        Dir.cwd().deleteTree(io, self.path) catch |err| {
+            std.debug.print(
+                "warning: could not remove temporary directory {s}: {s}\n",
+                .{ self.path, @errorName(err) },
+            );
+        };
+        self.allocator.free(self.path);
+        self.* = undefined;
+    }
+};
+
+fn runCommand(io: Io, argv: []const []const u8, failure: anyerror) !void {
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    defer child.kill(io);
+    const term = try child.wait(io);
+    switch (term) {
+        .exited => |code| if (code != 0) return failure,
+        else => return failure,
+    }
+}
+
+fn copyFirmwareBounded(
+    io: Io,
+    source_path: []const u8,
+    destination_path: []const u8,
+    max_size: u64,
+) !void {
+    const source = try Dir.cwd().openFile(io, source_path, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = true,
+    });
+    defer source.close(io);
+    const stat = try source.stat(io);
+    if (stat.kind != .file) return error.NotRegularFile;
+    if (stat.size > max_size) return error.FirmwareTooLarge;
+
+    const destination = try Dir.cwd().createFile(io, destination_path, .{
+        .read = true,
+        .exclusive = true,
+    });
+    defer destination.close(io);
+    var buffer: [64 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < stat.size) {
+        const length: usize = @intCast(@min(stat.size - offset, buffer.len));
+        const read = try source.readPositionalAll(io, buffer[0..length], offset);
+        if (read != length) return error.ShortRead;
+        try destination.writePositionalAll(io, buffer[0..length], offset);
+        offset += length;
+    }
+    const final_stat = try source.stat(io);
+    if (final_stat.kind != .file or
+        final_stat.inode != stat.inode or
+        final_stat.size != stat.size or
+        final_stat.mtime.nanoseconds != stat.mtime.nanoseconds or
+        final_stat.ctime.nanoseconds != stat.ctime.nanoseconds)
+    {
+        return error.FirmwareChanged;
+    }
+}
+
+fn createSeedIso(
+    allocator: Allocator,
+    io: Io,
+    temporary_path: []const u8,
+    xorriso_path: []const u8,
+    nonce: []const u8,
+) ![]u8 {
+    const seed_dir = try std.fs.path.join(allocator, &.{ temporary_path, "seed" });
+    defer allocator.free(seed_dir);
+    try Dir.cwd().createDir(io, seed_dir, .default_dir);
+    const metadata_path = try std.fs.path.join(allocator, &.{ seed_dir, "meta-data" });
+    defer allocator.free(metadata_path);
+    const user_data_path = try std.fs.path.join(allocator, &.{ seed_dir, "user-data" });
+    defer allocator.free(user_data_path);
+    const seed_iso_path = try std.fs.path.join(allocator, &.{ temporary_path, "seed.iso" });
+    errdefer allocator.free(seed_iso_path);
+
+    const metadata = try replaceNonceAlloc(
+        allocator,
+        customization_metadata_template,
+        nonce,
+    );
+    defer allocator.free(metadata);
+    const user_data = try replaceNonceAlloc(
+        allocator,
+        customization_user_data_template,
+        nonce,
+    );
+    defer allocator.free(user_data);
+    try Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = metadata });
+    try Dir.cwd().writeFile(io, .{ .sub_path = user_data_path, .data = user_data });
+    try runCommand(io, &.{
+        xorriso_path,
+        "-as",
+        "mkisofs",
+        "-quiet",
+        "-V",
+        "cidata",
+        "-J",
+        "-r",
+        "-o",
+        seed_iso_path,
+        seed_dir,
+    }, error.SeedIsoCreationFailed);
+    const seed_stat = try Dir.cwd().statFile(io, seed_iso_path, .{
+        .follow_symlinks = false,
+    });
+    if (seed_stat.kind != .file) return error.NotRegularFile;
+    if (seed_stat.size > seed_iso_max_size) return error.SeedIsoTooLarge;
+    const seed = try artifact_pipeline.hashFile(io, seed_iso_path);
+    if (seed.size != seed_stat.size) return error.SeedIsoChanged;
+    return seed_iso_path;
+}
+
+fn resolveAccel(io: Io, requested: Accel) !Accel {
+    if (requested != .auto) return requested;
+    if (builtin.cpu.arch == .aarch64) {
+        Dir.cwd().access(
+            io,
+            "/dev/kvm",
+            .{ .read = true, .write = true },
+        ) catch return .tcg;
+        return .kvm;
+    }
+    return .tcg;
+}
+
+const SerialResult = enum { none, success, failure };
+
+fn readSerialResult(
+    io: Io,
+    path: []const u8,
+    success_marker: []const u8,
+    result_marker: []const u8,
+) !SerialResult {
+    const file = Dir.cwd().openFile(io, path, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return .none,
+        else => return err,
+    };
+    defer file.close(io);
+    const stat = try file.stat(io);
+    const length: usize = @intCast(@min(stat.size, serial_tail_size));
+    var buffer: [serial_tail_size]u8 = undefined;
+    const offset = stat.size - length;
+    const read = try file.readPositionalAll(io, buffer[0..length], offset);
+    const bytes = buffer[0..read];
+    if (std.mem.indexOf(u8, bytes, success_marker) != null) return .success;
+    if (std.mem.indexOf(u8, bytes, result_marker) != null) return .failure;
+    return .none;
+}
+
+fn printSerialTail(io: Io, path: []const u8) void {
+    const file = Dir.cwd().openFile(io, path, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+    }) catch return;
+    defer file.close(io);
+    const stat = file.stat(io) catch return;
+    const length: usize = @intCast(@min(stat.size, serial_tail_size));
+    var buffer: [serial_tail_size]u8 = undefined;
+    const read = file.readPositionalAll(
+        io,
+        buffer[0..length],
+        stat.size - length,
+    ) catch return;
+    std.debug.print("FreeBSD serial output tail:\n{s}\n", .{buffer[0..read]});
+}
+
+fn escapeQemuDriveValue(
+    allocator: Allocator,
+    value: []const u8,
+) ![]u8 {
+    var escaped: std.Io.Writer.Allocating = .init(allocator);
+    defer escaped.deinit();
+    for (value) |byte| {
+        try escaped.writer.writeByte(byte);
+        if (byte == ',') try escaped.writer.writeByte(',');
+    }
+    return escaped.toOwnedSlice();
+}
+
+fn runGuestCustomization(
+    allocator: Allocator,
+    io: Io,
+    args: Args,
+    uefi_code_path: []const u8,
+    image_path: []const u8,
+    seed_iso_path: []const u8,
+    vars_path: []const u8,
+    serial_path: []const u8,
+    nonce: []const u8,
+) !void {
+    const accel = try resolveAccel(io, args.accel);
+    const machine = switch (accel) {
+        .kvm => "virt,accel=kvm",
+        .tcg => "virt,accel=tcg",
+        .auto => unreachable,
+    };
+    const cpu = if (accel == .kvm) "host" else "max";
+    const escaped_code = try escapeQemuDriveValue(allocator, uefi_code_path);
+    defer allocator.free(escaped_code);
+    const escaped_vars = try escapeQemuDriveValue(allocator, vars_path);
+    defer allocator.free(escaped_vars);
+    const code_drive = try std.fmt.allocPrint(
+        allocator,
+        "if=pflash,format=raw,readonly=on,file={s}",
+        .{escaped_code},
+    );
+    defer allocator.free(code_drive);
+    const vars_drive = try std.fmt.allocPrint(
+        allocator,
+        "if=pflash,format=raw,file={s}",
+        .{escaped_vars},
+    );
+    defer allocator.free(vars_drive);
+    const serial = try std.fmt.allocPrint(allocator, "file:{s}", .{serial_path});
+    defer allocator.free(serial);
+
+    const image = try Dir.cwd().openFile(io, image_path, .{
+        .mode = .read_write,
+        .allow_directory = false,
+        .follow_symlinks = false,
+    });
+    defer image.close(io);
+    const seed = try Dir.cwd().openFile(io, seed_iso_path, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+    });
+    defer seed.close(io);
+
+    const deadline = Io.Clock.awake.now(io).addDuration(
+        .fromSeconds(args.customization_timeout_seconds),
+    );
+    var spawned = try qmp.spawnAndConnect(allocator, io, .{
+        .binary = args.qemu_path,
+        .extra_args = &.{
+            "-machine",
+            machine,
+            "-cpu",
+            cpu,
+            "-smp",
+            "2",
+            "-m",
+            "2048",
+            "-display",
+            "none",
+            "-no-reboot",
+            "-no-shutdown",
+            "-monitor",
+            "none",
+            "-serial",
+            serial,
+            "-drive",
+            code_drive,
+            "-drive",
+            vars_drive,
+            "-drive",
+            "file=/proc/self/fd/0,format=qcow2,if=virtio",
+            "-drive",
+            "file=/proc/self/fd/1,format=raw,if=virtio,readonly=on",
+            "-netdev",
+            "user,id=net0",
+            "-device",
+            "virtio-net-pci,netdev=net0",
+            "-device",
+            "virtio-rng-pci",
+        },
+        .stdin = .{ .file = image },
+        .stdout = .{ .file = seed },
+        .stderr = .inherit,
+        .connect_timeout = .fromSeconds(
+            @min(
+                args.customization_timeout_seconds,
+                qmp_connect_timeout_seconds,
+            ),
+        ),
+    });
+    var child_waited = false;
+    defer {
+        if (!child_waited) spawned.kill();
+        spawned.deinit();
+    }
+
+    const success_marker = try std.fmt.allocPrint(
+        allocator,
+        "{s} {s} 0",
+        .{ customization_result_prefix, nonce },
+    );
+    defer allocator.free(success_marker);
+    const result_marker = try std.fmt.allocPrint(
+        allocator,
+        "{s} {s} ",
+        .{ customization_result_prefix, nonce },
+    );
+    defer allocator.free(result_marker);
+    var success_seen = false;
+    var success_deadline: ?Io.Timestamp = null;
+
+    while (Io.Clock.awake.now(io).nanoseconds < deadline.nanoseconds) {
+        switch (try readSerialResult(
+            io,
+            serial_path,
+            success_marker,
+            result_marker,
+        )) {
+            .none => {},
+            .failure => return error.GuestCustomizationFailed,
+            .success => {
+                if (!success_seen) {
+                    success_seen = true;
+                    success_deadline = Io.Clock.awake.now(io).addDuration(
+                        .fromSeconds(120),
+                    );
+                }
+            },
+        }
+
+        const running = spawned.client.queryRunningUntil(deadline) catch |err| {
+            spawned.kill();
+            child_waited = true;
+            return err;
+        };
+        if (!running) {
+            switch (try readSerialResult(
+                io,
+                serial_path,
+                success_marker,
+                result_marker,
+            )) {
+                .none => {},
+                .failure => return error.GuestCustomizationFailed,
+                .success => success_seen = true,
+            }
+            if (!success_seen) return error.GuestCustomizationFailed;
+            var reply = try spawned.client.executeUntil(
+                "quit",
+                null,
+                deadline,
+            );
+            defer reply.deinit();
+            if (reply.err != null) return error.QemuCustomizationFailed;
+            const term = try spawned.waitUntil(deadline);
+            child_waited = true;
+            switch (term) {
+                .exited => |code| if (code != 0) {
+                    return error.QemuCustomizationFailed;
+                },
+                else => return error.QemuCustomizationFailed,
+            }
+            return;
+        }
+        if (success_deadline) |grace| {
+            if (Io.Clock.awake.now(io).nanoseconds >= grace.nanoseconds) {
+                return error.GuestShutdownTimedOut;
+            }
+        }
+        try Io.sleep(io, .fromMilliseconds(500), .awake);
+    }
+    return error.GuestCustomizationTimedOut;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -106,6 +853,12 @@ pub fn main(init: std.process.Init) !void {
         &.{ args.work_dir, source_name },
     );
     defer allocator.free(cached_source);
+    try rejectOutputAlias(
+        allocator,
+        io,
+        args.output,
+        cached_source,
+    );
     const compressed_source = if (args.source) |path| path else blk: {
         var curl = artifact_pipeline.CurlDownloader{
             .executable_path = args.curl_path,
@@ -131,12 +884,15 @@ pub fn main(init: std.process.Init) !void {
         break :blk cached_source;
     };
 
+    var temporary = try TemporaryDirectory.create(
+        allocator,
+        io,
+        args.work_dir,
+    );
+    defer temporary.deinit(io);
     const decompressed_path = try std.fs.path.join(
         allocator,
-        &.{
-            args.work_dir,
-            "FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2",
-        },
+        &.{ temporary.path, "source.qcow2" },
     );
     defer allocator.free(decompressed_path);
     std.debug.print("Decompressing and validating FreeBSD source...\n", .{});
@@ -153,23 +909,131 @@ pub fn main(init: std.process.Init) !void {
         },
     );
 
-    std.debug.print("Finalizing standalone zstd QCOW2...\n", .{});
-    const finalized = try artifact_pipeline.finalizeQcow2(
-        allocator,
-        io,
-        .{
-            .input_path = decompressed.path,
-            .expected_input_sha256 = decompressed.sha256,
-            .max_input_size = image_max_size,
-            .source_format = .qcow2,
-            .expected_virtual_size = official_virtual_size,
-            .max_virtual_size = official_virtual_size,
-            .output_path = args.output,
-            .max_output_size = finalized_image_max_size,
-            .qemu_img_path = args.qemu_img_path,
-            .compression = .zstd,
-        },
-    );
+    const finalized = if (args.base_only) blk: {
+        std.debug.print("Finalizing verified upstream base QCOW2...\n", .{});
+        break :blk try artifact_pipeline.finalizeQcow2(
+            allocator,
+            io,
+            .{
+                .input_path = decompressed.path,
+                .expected_input_sha256 = decompressed.sha256,
+                .max_input_size = image_max_size,
+                .source_format = .qcow2,
+                .expected_virtual_size = official_virtual_size,
+                .max_virtual_size = official_virtual_size,
+                .output_path = args.output,
+                .max_output_size = finalized_image_max_size,
+                .qemu_img_path = args.qemu_img_path,
+                .compression = .zstd,
+            },
+        );
+    } else blk: {
+        const firmware = try resolveFirmware(io, args);
+        const mutable_path = try std.fs.path.join(
+            allocator,
+            &.{ temporary.path, "customized.qcow2" },
+        );
+        defer allocator.free(mutable_path);
+        const vars_path = try std.fs.path.join(
+            allocator,
+            &.{ temporary.path, "uefi-vars.fd" },
+        );
+        defer allocator.free(vars_path);
+        const code_path = try std.fs.path.join(
+            allocator,
+            &.{ temporary.path, "uefi-code.fd" },
+        );
+        defer allocator.free(code_path);
+        const serial_path = try std.fs.path.join(
+            allocator,
+            &.{ temporary.path, "serial.log" },
+        );
+        defer allocator.free(serial_path);
+
+        std.debug.print("Preparing mutable FreeBSD QCOW2...\n", .{});
+        _ = try artifact_pipeline.finalizeQcow2(
+            allocator,
+            io,
+            .{
+                .input_path = decompressed.path,
+                .expected_input_sha256 = decompressed.sha256,
+                .max_input_size = image_max_size,
+                .source_format = .qcow2,
+                .expected_virtual_size = official_virtual_size,
+                .max_virtual_size = official_virtual_size,
+                .output_path = mutable_path,
+                .max_output_size = finalized_image_max_size,
+                .qemu_img_path = args.qemu_img_path,
+                .compression = .zstd,
+            },
+        );
+        try copyFirmwareBounded(
+            io,
+            firmware.code,
+            code_path,
+            firmware_max_size,
+        );
+        try copyFirmwareBounded(
+            io,
+            firmware.vars,
+            vars_path,
+            firmware_max_size,
+        );
+
+        var nonce_bytes: [16]u8 = undefined;
+        Io.random(io, &nonce_bytes);
+        const nonce_hex = std.fmt.bytesToHex(nonce_bytes, .lower);
+        const seed_iso_path = try createSeedIso(
+            allocator,
+            io,
+            temporary.path,
+            args.xorriso_path,
+            &nonce_hex,
+        );
+        defer allocator.free(seed_iso_path);
+
+        std.debug.print(
+            "Customizing under AArch64 UEFI QEMU ({s})...\n",
+            .{@tagName(try resolveAccel(io, args.accel))},
+        );
+        runGuestCustomization(
+            allocator,
+            io,
+            args,
+            code_path,
+            mutable_path,
+            seed_iso_path,
+            vars_path,
+            serial_path,
+            &nonce_hex,
+        ) catch |err| {
+            std.debug.print(
+                "error: FreeBSD guest customization failed: {s}\n",
+                .{@errorName(err)},
+            );
+            printSerialTail(io, serial_path);
+            return err;
+        };
+
+        const customized = try artifact_pipeline.hashFile(io, mutable_path);
+        std.debug.print("Finalizing generalized standalone zstd QCOW2...\n", .{});
+        break :blk try artifact_pipeline.finalizeQcow2(
+            allocator,
+            io,
+            .{
+                .input_path = mutable_path,
+                .expected_input_sha256 = customized.sha256,
+                .max_input_size = finalized_image_max_size,
+                .source_format = .qcow2,
+                .expected_virtual_size = official_virtual_size,
+                .max_virtual_size = official_virtual_size,
+                .output_path = args.output,
+                .max_output_size = finalized_image_max_size,
+                .qemu_img_path = args.qemu_img_path,
+                .compression = .zstd,
+            },
+        );
+    };
     const finalized_sha256 = artifact_pipeline.formatSha256(
         finalized.artifact.sha256,
     );
@@ -191,6 +1055,14 @@ test "FreeBSD builder defaults pin the official release source" {
     try std.testing.expectEqualStrings("curl", args.curl_path);
     try std.testing.expectEqualStrings("xz", args.xz_path);
     try std.testing.expectEqualStrings("qemu-img", args.qemu_img_path);
+    try std.testing.expectEqualStrings("qemu-system-aarch64", args.qemu_path);
+    try std.testing.expectEqualStrings("xorriso", args.xorriso_path);
+    try std.testing.expectEqual(Accel.auto, args.accel);
+    try std.testing.expectEqual(
+        default_customization_timeout_seconds,
+        args.customization_timeout_seconds,
+    );
+    try std.testing.expect(!args.base_only);
     _ = try artifact_pipeline.parseSha256(args.source_sha256);
 }
 
@@ -210,6 +1082,19 @@ test "FreeBSD builder parses explicit source and tool paths" {
         "/tools/xz",
         "--qemu-img",
         "/tools/qemu-img",
+        "--qemu",
+        "/tools/qemu-system-aarch64",
+        "--xorriso",
+        "/tools/xorriso",
+        "--uefi-code",
+        "/firmware/code.fd",
+        "--uefi-vars",
+        "/firmware/vars.fd",
+        "--accel",
+        "tcg",
+        "--timeout",
+        "900",
+        "--base-only",
     });
     try std.testing.expectEqualStrings("base.qcow2.xz", args.source.?);
     try std.testing.expectEqualStrings("out.qcow2", args.output);
@@ -217,6 +1102,13 @@ test "FreeBSD builder parses explicit source and tool paths" {
     try std.testing.expectEqualStrings("/tools/curl", args.curl_path);
     try std.testing.expectEqualStrings("/tools/xz", args.xz_path);
     try std.testing.expectEqualStrings("/tools/qemu-img", args.qemu_img_path);
+    try std.testing.expectEqualStrings("/tools/qemu-system-aarch64", args.qemu_path);
+    try std.testing.expectEqualStrings("/tools/xorriso", args.xorriso_path);
+    try std.testing.expectEqualStrings("/firmware/code.fd", args.uefi_code_path.?);
+    try std.testing.expectEqualStrings("/firmware/vars.fd", args.uefi_vars_path.?);
+    try std.testing.expectEqual(Accel.tcg, args.accel);
+    try std.testing.expectEqual(@as(u32, 900), args.customization_timeout_seconds);
+    try std.testing.expect(args.base_only);
 }
 
 test "FreeBSD builder rejects malformed arguments" {
@@ -227,5 +1119,135 @@ test "FreeBSD builder rejects malformed arguments" {
     try std.testing.expectError(
         error.UnexpectedArgument,
         parseArgs(&.{"--unknown"}),
+    );
+    try std.testing.expectError(
+        error.InvalidAccelerator,
+        parseArgs(&.{ "--accel", "invalid" }),
+    );
+    try std.testing.expectError(
+        error.InvalidTimeout,
+        parseArgs(&.{ "--timeout", "0" }),
+    );
+    try std.testing.expectError(
+        error.IncompleteFirmwareOverride,
+        parseArgs(&.{ "--uefi-code", "code.fd" }),
+    );
+}
+
+test "FreeBSD builder rejects output aliases before acquisition" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var root_buffer: [Dir.max_path_bytes]u8 = undefined;
+    const root_length = try temporary.dir.realPath(io, &root_buffer);
+    const root = root_buffer[0..root_length];
+    const cached = try std.fs.path.join(allocator, &.{ root, source_name });
+    defer allocator.free(cached);
+    const output = try std.fs.path.join(allocator, &.{ root, "output.qcow2" });
+    defer allocator.free(output);
+
+    try std.testing.expectError(
+        error.OutputAliasesWorkFile,
+        rejectOutputAlias(allocator, io, cached, cached),
+    );
+    try rejectOutputAlias(allocator, io, output, cached);
+
+    try temporary.dir.symLink(
+        io,
+        source_name,
+        "output.qcow2",
+        .{},
+    );
+    try std.testing.expectError(
+        error.OutputPathIsSymlink,
+        rejectOutputAlias(allocator, io, output, cached),
+    );
+}
+
+test "FreeBSD customization seed pins secure generalization behavior" {
+    const allocator = std.testing.allocator;
+    const nonce = "0123456789abcdef";
+    const user_data = try replaceNonceAlloc(
+        allocator,
+        customization_user_data_template,
+        nonce,
+    );
+    defer allocator.free(user_data);
+
+    try std.testing.expect(std.mem.indexOf(u8, user_data, "@NONCE@") == null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        user_data,
+        "azure-agent-2.15.0.1",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        user_data,
+        "users: []",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        user_data,
+        "waagent -deprovision -force",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        user_data,
+        "/usr/sbin/daemon -cf",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        user_data,
+        "touch /firstboot",
+    ) != null);
+    const expected_result = customization_result_prefix ++ " " ++ nonce ++ " 0";
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        user_data,
+        expected_result,
+    ) != null);
+}
+
+test "QEMU drive values escape commas" {
+    const escaped = try escapeQemuDriveValue(
+        std.testing.allocator,
+        "work,dir/vars.fd",
+    );
+    defer std.testing.allocator.free(escaped);
+    try std.testing.expectEqualStrings("work,,dir/vars.fd", escaped);
+}
+
+test "serial result requires the nonce and successful status" {
+    const io = std.testing.io;
+    const path = "test-freebsd-customization-serial.log";
+    defer Dir.cwd().deleteFile(io, path) catch {};
+    const nonce = "abcdef";
+    const success = customization_result_prefix ++ " abcdef 0";
+    const result = customization_result_prefix ++ " abcdef ";
+
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = path,
+        .data = customization_result_prefix ++ " other 0\n",
+    });
+    try std.testing.expectEqual(
+        SerialResult.none,
+        try readSerialResult(io, path, success, result),
+    );
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = path,
+        .data = customization_result_prefix ++ " " ++ nonce ++ " 7\n",
+    });
+    try std.testing.expectEqual(
+        SerialResult.failure,
+        try readSerialResult(io, path, success, result),
+    );
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = path,
+        .data = success ++ "\n",
+    });
+    try std.testing.expectEqual(
+        SerialResult.success,
+        try readSerialResult(io, path, success, result),
     );
 }
