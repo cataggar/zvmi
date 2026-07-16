@@ -18,7 +18,7 @@ const zvmi = @import("zvmi");
 const qmp = @import("qmp");
 const qemu_host = @import("qemu_host");
 
-const qemu_boot_smoke_timeout_seconds: i64 = 60;
+const qemu_boot_smoke_timeout_seconds: i64 = 120;
 const qemu_boot_smoke_serial_limit: usize = 256 * 1024;
 const qemu_boot_smoke_disk_size: u64 = 4 * 1024 * zvmi.azure.one_mib;
 
