@@ -565,6 +565,41 @@ pub fn build(b: *std.Build) void {
         const builder_test_step = b.step("test-generalized-azurelinux4", "Run build_generalized_azurelinux4 unit tests");
         builder_test_step.dependOn(&run_builder_tests.step);
         test_step.dependOn(&run_builder_tests.step);
+
+        const freebsd_builder_mod = b.createModule(.{
+            .root_source_file = b.path("scripts/build_generalized_freebsd15_aarch64.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zvmi", .module = host_zvmi_mod },
+            },
+        });
+        const freebsd_builder_exe = b.addExecutable(.{
+            .name = "build_generalized_freebsd15_aarch64",
+            .root_module = freebsd_builder_mod,
+        });
+        b.installArtifact(freebsd_builder_exe);
+
+        const run_freebsd_builder = b.addRunArtifact(freebsd_builder_exe);
+        if (b.args) |args| run_freebsd_builder.addArgs(args);
+        const generalized_freebsd_step = b.step(
+            "generalized-freebsd15-aarch64",
+            "Prepare the verified FreeBSD 15.1 AArch64 base QCOW2 (Linux, curl, xz, qemu-img)",
+        );
+        generalized_freebsd_step.dependOn(&run_freebsd_builder.step);
+
+        const freebsd_builder_tests = b.addTest(.{
+            .root_module = freebsd_builder_mod,
+        });
+        const run_freebsd_builder_tests = b.addRunArtifact(
+            freebsd_builder_tests,
+        );
+        const freebsd_builder_test_step = b.step(
+            "test-generalized-freebsd15-aarch64",
+            "Run FreeBSD 15.1 AArch64 builder unit tests",
+        );
+        freebsd_builder_test_step.dependOn(&run_freebsd_builder_tests.step);
+        test_step.dependOn(&run_freebsd_builder_tests.step);
     }
 
     test_step.dependOn(&run_zvmi_tests.step);

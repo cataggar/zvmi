@@ -148,6 +148,9 @@ zvmi/
   scripts/
     build_generalized_azurelinux4.zig  # generalized Azure Linux 4 Gen2 QCOW2
                               #   builder (run via `zig build generalized-azurelinux4`)
+    build_generalized_freebsd15_aarch64.zig
+                              #   verified FreeBSD 15.1 AArch64 base QCOW2
+                              #   builder (run via `zig build generalized-freebsd15-aarch64`)
     zstd_max_preload.zig       # LD_PRELOAD shared library that forces maximum
                               #   zstd compression level in qemu-img
     ci/
@@ -179,6 +182,9 @@ zig build run -- qemu     # download (if needed) and boot the Azure Linux image
 zig build generalized-azurelinux4 -- [--iso <path>] [--output <path>] [--size <size>] [--work-dir <dir>]
                       # build a generalized Azure Linux 4 Gen2 QCOW2 image
                       #   (Linux-only; requires root, curl, dnf, qemu-img, sudo)
+zig build generalized-freebsd15-aarch64 -- [--source <path>] [--output <path>] [--work-dir <dir>]
+                      # prepare a verified FreeBSD 15.1 AArch64 base QCOW2
+                      #   (Linux-only; requires curl, XZ Utils, qemu-img)
 ```
 
 ## Use from another `build.zig`
@@ -462,7 +468,7 @@ unknown layouts are left untouched.
 
 ### Minimal generalized Azure Linux 4 QCOW2
 
-Host-side image builders can reuse `zvmi.artifact_pipeline` for bounded SHA-256-verified acquisition and transactional publication. Download callbacks receive only a pipeline-owned writer rather than a staging path, and `decompressXz` requires an explicit XZ Utils executable plus compressed-input digest, memory limit, and output-size limit before atomically replacing an output.
+Host-side image builders can reuse `zvmi.artifact_pipeline` for bounded SHA-256-verified acquisition and transactional publication. Download callbacks receive only a pipeline-owned writer rather than a staging path, `decompressXz` requires an explicit XZ Utils executable plus compressed-input digest, memory limit, and output-size limit, and Linux-only `finalizeQcow2` converts a digest-pinned raw or standalone QCOW2 source to a validated standalone QCOW2. All three operations preserve an existing destination until validation succeeds.
 
 `scripts/build_generalized_azurelinux4.zig` (run via `zig build generalized-azurelinux4`) provides the complete reproducible recipe used for the generalized Azure image: it downloads and verifies the official Azure Linux 4 ISO, pulls `mcr.microsoft.com/azurelinux-beta/base/core:4.0`, installs signed x86_64 `openssh-server` and `sudo` packages, injects static `azinit`/`azagent`, removes host identity, creates a bounded multi-layer OCI layout, builds a 768 MiB Gen2 QCOW2, and compresses it to maximum zstd level via an LD_PRELOAD intercept library (`scripts/zstd_max_preload.zig`).
 
@@ -475,6 +481,18 @@ zig build generalized-azurelinux4 -- \
 The builder requires Zig 0.16, `curl`, `dnf`, GNU tar, `qemu-img`, and passwordless or interactive `sudo`. On a non-x86_64 build host, x86_64 binfmt and `qemu-x86_64-static` are also required so RPM scriptlets can run inside the target rootfs; on Azure Linux install them with `sudo tdnf install -y qemu-user-static-x86`. Use `--iso` to supply an already-downloaded ISO and `--size` to override the 768 MiB virtual disk size. The build system automatically passes the paths of the built native zvmi, guest azinit/azagent binaries, and the preload library; no separate `zig build` invocation is needed.
 
 The manually dispatched **Rebuild Azure Linux 4 release image** GitHub Actions workflow builds this image from current `main`, validates it, and replaces `AzureLinux-4.0-x86_64.qcow2` in the `AzureLinux4.0-20260714` release while refreshing the published checksum and provenance.
+
+### FreeBSD 15.1 AArch64 base QCOW2
+
+The first FreeBSD builder stage downloads the official `FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz`, verifies its pinned compressed SHA-256, decompresses it with explicit memory and output limits, and transactionally converts it to a standalone zstd-compressed QCOW2:
+
+```
+zig build generalized-freebsd15-aarch64 -- \
+  --work-dir /path/to/build-cache \
+  --output /path/to/FreeBSD-15.1-RELEASE-arm64-aarch64-generalized.qcow2
+```
+
+The builder is Linux-only and requires Zig 0.16, `curl`, XZ Utils, and `qemu-img`. Use `--source` to supply the official compressed image without downloading it; the pinned checksum is still required unless explicitly overridden with `--source-sha256`. This command currently prepares and validates the compact upstream BASIC-CLOUDINIT UFS base without changing its guest contents. Azure provisioning-agent installation, QEMU-based guest customization and generalization, AArch64 UEFI boot acceptance, and Azure Arm64 validation remain follow-up work for issue #145.
 
 ### Booting the release image with QEMU
 
