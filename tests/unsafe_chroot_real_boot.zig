@@ -549,23 +549,40 @@ fn validateProvenance(
         "/boot/initramfs-{s}.img",
         .{kernel},
     );
+    const expected_temporary = "/run/zvmi-initramfs.img";
     for (provenance.tools) |tool| {
         if (!std.mem.eql(u8, tool.name, "dracut") or
-            tool.command.len != 6)
+            tool.command.len != 8)
         {
             continue;
         }
         if (std.mem.eql(u8, tool.command[0], "/usr/bin/dracut") and
             std.mem.eql(u8, tool.command[1], "--force") and
             std.mem.eql(u8, tool.command[2], "--no-hostonly") and
-            std.mem.eql(u8, tool.command[3], "--kver") and
-            std.mem.eql(u8, tool.command[4], kernel) and
-            std.mem.eql(u8, tool.command[5], expected_output))
+            std.mem.eql(u8, tool.command[3], "--tmpdir") and
+            std.mem.eql(u8, tool.command[4], "/run") and
+            std.mem.eql(u8, tool.command[5], "--kver") and
+            std.mem.eql(u8, tool.command[6], kernel) and
+            std.mem.eql(u8, tool.command[7], expected_temporary))
         {
             found_dracut = true;
         }
     }
     try ensure(found_dracut);
+    var found_publish = false;
+    for (provenance.tools) |tool| {
+        if (tool.command.len == 4 and
+            std.mem.eql(u8, tool.name, "cp") and
+            tool.version.len != 0 and
+            std.mem.eql(u8, tool.command[0], "/usr/bin/cp") and
+            std.mem.eql(u8, tool.command[1], "--remove-destination") and
+            std.mem.eql(u8, tool.command[2], expected_temporary) and
+            std.mem.eql(u8, tool.command[3], expected_output))
+        {
+            found_publish = true;
+        }
+    }
+    try ensure(found_publish);
 }
 
 const RuntimeContext = struct {

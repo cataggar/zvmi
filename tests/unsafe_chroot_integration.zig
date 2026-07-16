@@ -24,6 +24,9 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, executable_name, "dracut")) {
         return runGuestDracut(init.io, argv[1..]);
     }
+    if (std.mem.eql(u8, executable_name, "cp")) {
+        return runGuestCp(init.io, argv[1..]);
+    }
     if (argv.len == 3 and
         std.mem.eql(u8, argv[1], "--unsafe-chroot-worker"))
     {
@@ -203,7 +206,7 @@ fn runIntegration(
             return error.IntegrationCleanupFailed;
         }
     }
-    try ensure(result.provenance.tools.len == 4);
+    try ensure(result.provenance.tools.len == 5);
     const preserved = result.provenance.execution.preserved orelse
         return error.MissingPreservedProvenance;
     try ensure(preserved.installed_packages.len == 1);
@@ -352,6 +355,7 @@ fn createSourceDisk(
     );
     try tree.putSymlink("usr/bin/tdnf", "rpm", .{ .mode = 0o777 });
     try tree.putSymlink("usr/bin/dracut", "rpm", .{ .mode = 0o777 });
+    try tree.putSymlink("usr/bin/cp", "rpm", .{ .mode = 0o777 });
     _ = try zvmi.ext4.populate(
         io,
         image.file,
@@ -441,7 +445,14 @@ fn runGuestDracut(io: Io, args: []const []const u8) !void {
         std.debug.print("dracut integration-1\n", .{});
         return;
     }
-    if (args.len == 0 or !containsArg(args, "--no-hostonly")) {
+    if (args.len == 0 or
+        !containsArg(args, "--no-hostonly") or
+        !std.mem.eql(
+            u8,
+            argumentImmediatelyAfter(args, "--tmpdir") orelse "",
+            "/run",
+        ))
+    {
         return error.UnexpectedDracutInvocation;
     }
     try writeGuestMarker(
@@ -449,6 +460,33 @@ fn runGuestDracut(io: Io, args: []const []const u8) !void {
         args[args.len - 1],
         "integration initramfs",
     );
+}
+
+fn runGuestCp(io: Io, args: []const []const u8) !void {
+    if (containsArg(args, "--version")) {
+        std.debug.print("cp (GNU coreutils) integration-1\n", .{});
+        return;
+    }
+    if (args.len != 3 or
+        !std.mem.eql(u8, args[0], "--remove-destination"))
+    {
+        return error.UnexpectedCpInvocation;
+    }
+    var buffer: [64]u8 = undefined;
+    const source = try Io.Dir.cwd().openFile(io, args[1], .{
+        .mode = .read_only,
+        .allow_directory = false,
+    });
+    defer source.close(io);
+    const length = try source.readPositionalAll(io, &buffer, 0);
+    Io.Dir.cwd().deleteFile(io, args[2]) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = args[2],
+        .data = buffer[0..length],
+    });
 }
 
 fn writeGuestMarker(io: Io, path: []const u8, value: []const u8) !void {
