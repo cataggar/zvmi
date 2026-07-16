@@ -17,6 +17,7 @@
 //! real socket or a running QEMU.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const net = Io.net;
 
@@ -293,6 +294,84 @@ pub const Client = struct {
         }
     }
 
+    /// Executes one command while enforcing an absolute awake-clock deadline.
+    /// A timeout cancels the in-flight socket operation; the caller should
+    /// close the client rather than issuing another command afterward.
+    pub fn executeUntil(
+        self: *Client,
+        name: []const u8,
+        args: ?std.json.Value,
+        deadline: Io.Timestamp,
+    ) !Reply {
+        const timeout_duration = try remainingDuration(self.io, deadline);
+        const ExecuteResult = @typeInfo(
+            @TypeOf(Client.execute),
+        ).@"fn".return_type.?;
+        const Selection = union(enum) {
+            reply: ExecuteResult,
+            timeout: Io.Cancelable!void,
+        };
+        var buffer: [2]Selection = undefined;
+        var select = Io.Select(Selection).init(self.io, &buffer);
+        select.async(.reply, Client.execute, .{ self, name, args });
+        select.async(
+            .timeout,
+            Io.sleep,
+            .{ self.io, timeout_duration, .awake },
+        );
+        const selected = select.await() catch |err| {
+            while (select.cancel()) |remaining| {
+                switch (remaining) {
+                    .reply => |reply_result| {
+                        if (reply_result) |reply_value| {
+                            var reply = reply_value;
+                            reply.deinit();
+                        } else |_| {}
+                    },
+                    .timeout => |timeout_result| timeout_result catch {},
+                }
+            }
+            return err;
+        };
+        switch (selected) {
+            .reply => |result| {
+                select.cancelDiscard();
+                return result;
+            },
+            .timeout => |result| {
+                try result;
+                while (select.cancel()) |remaining| {
+                    switch (remaining) {
+                        .reply => |reply_result| {
+                            if (reply_result) |reply_value| {
+                                var reply = reply_value;
+                                reply.deinit();
+                            } else |_| {}
+                        },
+                        .timeout => |timeout_result| timeout_result catch {},
+                    }
+                }
+                return error.QmpTimedOut;
+            },
+        }
+    }
+
+    /// Returns QEMU's current `running` status before `deadline`.
+    pub fn queryRunningUntil(
+        self: *Client,
+        deadline: Io.Timestamp,
+    ) !bool {
+        var reply = try self.executeUntil("query-status", null, deadline);
+        defer reply.deinit();
+        if (reply.err != null) return error.CommandFailed;
+        const result = reply.result orelse return error.UnexpectedResponse;
+        if (result != .object) return error.UnexpectedResponse;
+        const running = result.object.get("running") orelse
+            return error.UnexpectedResponse;
+        if (running != .bool) return error.UnexpectedResponse;
+        return running.bool;
+    }
+
     /// Pop the oldest queued event, if any, without blocking on the socket.
     /// Caller owns the result and must call `.deinit()`.
     pub fn pollEvent(self: *Client) ?EventMsg {
@@ -338,6 +417,8 @@ pub const SpawnOptions = struct {
     connect_timeout: Io.Duration = .fromSeconds(10),
     /// How long to wait between connection attempts.
     connect_retry_interval: Io.Duration = .fromMilliseconds(50),
+    /// Child standard input, useful for descriptor-pinned QEMU block devices.
+    stdin: std.process.SpawnOptions.StdIo = .ignore,
     stdout: std.process.SpawnOptions.StdIo = .inherit,
     stderr: std.process.SpawnOptions.StdIo = .inherit,
 };
@@ -369,7 +450,112 @@ pub const Spawned = struct {
     pub fn wait(self: *Spawned) !std.process.Child.Term {
         return self.child.wait(self.io);
     }
+
+    /// Waits for the child while enforcing an absolute awake-clock deadline.
+    pub fn waitUntil(
+        self: *Spawned,
+        deadline: Io.Timestamp,
+    ) !std.process.Child.Term {
+        const timeout_duration = try remainingDuration(self.io, deadline);
+        const WaitResult = @typeInfo(
+            @TypeOf(Spawned.wait),
+        ).@"fn".return_type.?;
+        const Selection = union(enum) {
+            child: WaitResult,
+            timeout: Io.Cancelable!void,
+        };
+        var buffer: [2]Selection = undefined;
+        var select = Io.Select(Selection).init(self.io, &buffer);
+        select.async(.child, Spawned.wait, .{self});
+        select.async(
+            .timeout,
+            Io.sleep,
+            .{ self.io, timeout_duration, .awake },
+        );
+        const selected = select.await() catch |err| {
+            select.cancelDiscard();
+            return err;
+        };
+        switch (selected) {
+            .child => |result| {
+                select.cancelDiscard();
+                return result;
+            },
+            .timeout => |result| {
+                try result;
+                select.cancelDiscard();
+                return error.QmpTimedOut;
+            },
+        }
+    }
 };
+
+fn remainingDuration(io: Io, deadline: Io.Timestamp) !Io.Duration {
+    const now = Io.Clock.awake.now(io);
+    if (now.nanoseconds >= deadline.nanoseconds) return error.QmpTimedOut;
+    return .fromNanoseconds(deadline.nanoseconds - now.nanoseconds);
+}
+
+fn connectUnixUntil(
+    allocator: std.mem.Allocator,
+    io: Io,
+    path: []const u8,
+    deadline: Io.Timestamp,
+) !*Client {
+    const timeout_duration = try remainingDuration(io, deadline);
+    const ConnectResult = @typeInfo(
+        @TypeOf(Client.connectUnix),
+    ).@"fn".return_type.?;
+    const Selection = union(enum) {
+        client: ConnectResult,
+        timeout: Io.Cancelable!void,
+    };
+    var buffer: [2]Selection = undefined;
+    var select = Io.Select(Selection).init(io, &buffer);
+    select.async(
+        .client,
+        Client.connectUnix,
+        .{ allocator, io, path },
+    );
+    select.async(
+        .timeout,
+        Io.sleep,
+        .{ io, timeout_duration, .awake },
+    );
+    const selected = select.await() catch |err| {
+        while (select.cancel()) |remaining| {
+            switch (remaining) {
+                .client => |client_result| {
+                    if (client_result) |client| {
+                        client.close();
+                    } else |_| {}
+                },
+                .timeout => |timeout_result| timeout_result catch {},
+            }
+        }
+        return err;
+    };
+    switch (selected) {
+        .client => |result| {
+            select.cancelDiscard();
+            return result;
+        },
+        .timeout => |result| {
+            try result;
+            while (select.cancel()) |remaining| {
+                switch (remaining) {
+                    .client => |client_result| {
+                        if (client_result) |client| {
+                            client.close();
+                        } else |_| {}
+                    },
+                    .timeout => |timeout_result| timeout_result catch {},
+                }
+            }
+            return error.QmpTimedOut;
+        },
+    }
+}
 
 /// Launches `options.binary` with a generated (or explicit)
 /// `-qmp unix:<path>,server=on,wait=off` argument, waits for the control
@@ -394,7 +580,7 @@ pub fn spawnAndConnect(allocator: std.mem.Allocator, io: Io, options: SpawnOptio
 
     var child = try std.process.spawn(io, .{
         .argv = argv.items,
-        .stdin = .ignore,
+        .stdin = options.stdin,
         .stdout = options.stdout,
         .stderr = options.stderr,
     });
@@ -402,9 +588,27 @@ pub fn spawnAndConnect(allocator: std.mem.Allocator, io: Io, options: SpawnOptio
 
     const deadline = Io.Clock.awake.now(io).addDuration(options.connect_timeout);
     const client = while (true) {
-        break Client.connectUnix(allocator, io, sock_path) catch |err| {
-            if (Io.Clock.awake.now(io).nanoseconds >= deadline.nanoseconds) return err;
-            try Io.sleep(io, options.connect_retry_interval, .awake);
+        break connectUnixUntil(
+            allocator,
+            io,
+            sock_path,
+            deadline,
+        ) catch |err| {
+            const now = Io.Clock.awake.now(io);
+            if (err == error.QmpTimedOut or
+                now.nanoseconds >= deadline.nanoseconds)
+            {
+                return error.QmpTimedOut;
+            }
+            const remaining = deadline.nanoseconds - now.nanoseconds;
+            try Io.sleep(
+                io,
+                .fromNanoseconds(@min(
+                    remaining,
+                    options.connect_retry_interval.nanoseconds,
+                )),
+                .awake,
+            );
             continue;
         };
     };
@@ -534,6 +738,29 @@ test "writeCommand: omits arguments when null" {
     const obj = parsed.value.object;
     try std.testing.expectEqualStrings("query-status", obj.get("execute").?.string);
     try std.testing.expect(obj.get("arguments") == null);
+}
+
+test "spawnAndConnect bounds an exited child without a QMP socket" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    Io.Dir.cwd().access(std.testing.io, "/bin/false", .{
+        .execute = true,
+    }) catch return error.SkipZigTest;
+
+    const started = Io.Clock.awake.now(std.testing.io);
+    try std.testing.expectError(
+        error.QmpTimedOut,
+        spawnAndConnect(std.testing.allocator, std.testing.io, .{
+            .binary = "/bin/false",
+            .connect_timeout = .fromMilliseconds(100),
+            .connect_retry_interval = .fromMilliseconds(10),
+            .stdout = .ignore,
+            .stderr = .ignore,
+        }),
+    );
+    const elapsed = started.durationTo(
+        Io.Clock.awake.now(std.testing.io),
+    );
+    try std.testing.expect(elapsed.nanoseconds < Io.Duration.fromSeconds(5).nanoseconds);
 }
 
 test "qapi: generated module fully type-checks" {

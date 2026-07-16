@@ -304,6 +304,23 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = optimize,
     });
+    const freebsd_boot_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/freebsd15_aarch64_boot.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "qmp", .module = host_qmp_mod },
+                .{ .name = "qemu_host", .module = host_qemu_host_mod },
+            },
+        }),
+    });
+    const run_freebsd_boot_tests = b.addRunArtifact(freebsd_boot_tests);
+    const freebsd_boot_test_step = b.step(
+        "test-freebsd15-aarch64-boot",
+        "Run opt-in generalized FreeBSD 15.1 AArch64 QEMU acceptance",
+    );
+    freebsd_boot_test_step.dependOn(&run_freebsd_boot_tests.step);
     const unsafe_chroot_real_boot_exe = b.addExecutable(.{
         .name = "zvmi-unsafe-chroot-real-boot",
         .root_module = b.createModule(.{
@@ -572,6 +589,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "zvmi", .module = host_zvmi_mod },
+                .{ .name = "qmp", .module = host_qmp_mod },
             },
         });
         const freebsd_builder_exe = b.addExecutable(.{
@@ -584,7 +602,7 @@ pub fn build(b: *std.Build) void {
         if (b.args) |args| run_freebsd_builder.addArgs(args);
         const generalized_freebsd_step = b.step(
             "generalized-freebsd15-aarch64",
-            "Prepare the verified FreeBSD 15.1 AArch64 base QCOW2 (Linux, curl, xz, qemu-img)",
+            "Build a generalized FreeBSD 15.1 AArch64 QCOW2 (Linux, QEMU, UEFI)",
         );
         generalized_freebsd_step.dependOn(&run_freebsd_builder.step);
 
@@ -616,6 +634,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_qmp_codegen_tests.step);
     test_step.dependOn(&run_qmp_schema_tests.step);
     test_step.dependOn(&run_boot_smoke_tests.step);
+    test_step.dependOn(&run_freebsd_boot_tests.step);
     test_step.dependOn(&run_unsafe_chroot_integration.step);
     test_step.dependOn(&run_nbd_mod_tests.step);
     test_step.dependOn(&run_nbd_exe_tests.step);

@@ -826,7 +826,7 @@ fn sameFileSnapshot(expected: File.Stat, actual: File.Stat) bool {
         actual.ctime.nanoseconds == expected.ctime.nanoseconds;
 }
 
-fn sameFileIdentity(io: Io, a: File, b: File) !bool {
+pub fn sameFileIdentity(io: Io, a: File, b: File) !bool {
     const a_stat = try a.stat(io);
     const b_stat = try b.stat(io);
     if (a_stat.inode != b_stat.inode) return false;
