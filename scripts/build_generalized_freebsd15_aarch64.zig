@@ -730,7 +730,7 @@ fn runGuestCustomization(
             "-netdev",
             "user,id=net0",
             "-device",
-            "virtio-net-pci,netdev=net0",
+            "virtio-net-pci,netdev=net0,romfile=",
             "-device",
             "virtio-rng-pci",
         },

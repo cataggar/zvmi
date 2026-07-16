@@ -756,7 +756,7 @@ test "generalized FreeBSD AArch64 boots, provisions SSH, and survives reboot" {
                 "-netdev",
                 hostfwd,
                 "-device",
-                "virtio-net-pci,netdev=net0",
+                "virtio-net-pci,netdev=net0,romfile=",
                 "-device",
                 "virtio-rng-pci",
             },
