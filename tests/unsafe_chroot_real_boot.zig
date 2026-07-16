@@ -407,7 +407,7 @@ fn buildSourceImage(
     });
     defer report.deinit(allocator);
     for (report.planned_partitions) |partition| {
-        if (partition.planned.role == .root) {
+        if (partition.planned.role == .root_x86_64) {
             return partition.planned.offset_bytes;
         }
     }
