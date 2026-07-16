@@ -503,7 +503,7 @@ The manually dispatched **Rebuild Azure Linux 4 release image** GitHub Actions w
 
 ### Generalized FreeBSD 15.1 AArch64 QCOW2
 
-The FreeBSD builder downloads the official `FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz`, verifies its pinned compressed SHA-256, and decompresses it with explicit memory and output limits. It boots a private mutable QCOW2 under AArch64 UEFI QEMU with a nonce-bound NoCloud seed, installs the pinned `azure-agent-2.15.0.1` package, enables SSH and generic `vtnet*` plus Azure `hn0` DHCP, removes the OS-disk swap entry, locks root, removes the default `freebsd` user, deprovisions waagent, and clears guest identity during a normal shutdown. Only an exact authenticated success marker followed by a clean QEMU exit permits transactional publication as a standalone zstd-compressed QCOW2.
+The FreeBSD builder downloads the official `FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz`, verifies its pinned compressed SHA-256, and decompresses it with explicit memory and output limits. It boots a private mutable QCOW2 under AArch64 UEFI QEMU with a nonce-bound NoCloud seed, installs the pinned `azure-agent-2.15.0.1` package, enables SSH and generic `vtnet*` plus Azure `hn0` DHCP, applies FreeBSD's official Azure multi-console/115200-baud serial loader settings, removes the OS-disk swap entry, locks root, removes the default `freebsd` user, deprovisions waagent, and clears guest identity during a normal shutdown. Only an exact authenticated success marker followed by a clean QEMU exit permits transactional publication as a standalone zstd-compressed QCOW2.
 
 ```
 zig build generalized-freebsd15-aarch64 -- \
@@ -525,13 +525,14 @@ zig build test-freebsd15-aarch64-boot
 
 The test clearly skips when `ZVMI_FREEBSD15_AARCH64_IMAGE` is absent. When enabled, it boots two independent disposable overlays with fresh NoCloud seeds, proves each injected SSH key works, verifies the generalized agent/network/swap/account/identity state, reboots and reconnects to each guest, and powers off cleanly. Each guest's SSH host fingerprint and host UUID must remain stable across its reboot, while both values must differ between the two guests.
 
-The manually dispatched **Rebuild FreeBSD 15.1 AArch64 release image** GitHub Actions workflow runs on a native `ubuntu-24.04-arm` hosted runner, caches the digest-pinned upstream source, builds and validates the generalized image, runs the dual-instance acceptance, and creates the versioned `FreeBSD15.1-aarch64-20260716` release with the QCOW2, checksum file, and complete source/build provenance. Build and test jobs have read-only repository access; a separate publication job receives the write token and refuses to use an existing release or tag.
+The manually dispatched **Rebuild FreeBSD 15.1 AArch64 release image** GitHub Actions workflow runs on a native `ubuntu-24.04-arm` hosted runner, caches the digest-pinned upstream source, builds and validates the generalized image, runs the dual-instance acceptance, and creates the versioned `FreeBSD15.1-aarch64-20260716.1` release with the QCOW2, checksum file, and complete source/build provenance. Build and test jobs have read-only repository access; a separate publication job receives the write token and refuses to use an existing release or tag.
 
 The released QCOW2 can be derived into an Azure fixed VHD without changing its partitions:
 
 ```text
+input_sha256=$(awk '{print $1}' FreeBSD-15.1-RELEASE-arm64-aarch64-generalized.qcow2.sha256)
 zvmi azure derive \
-  --input-sha256 c1a5c50d8a274e268da3a876017a8459d84a580a3fbaa01a9852b774108dcc01 \
+  --input-sha256 "$input_sha256" \
   --expected-virtual-size 6477643776 \
   FreeBSD-15.1-RELEASE-arm64-aarch64-generalized.qcow2 \
   FreeBSD-15.1-RELEASE-arm64-aarch64-generalized.vhd
