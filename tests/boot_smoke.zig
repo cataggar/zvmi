@@ -22,7 +22,7 @@ const qemu_boot_smoke_timeout_seconds: i64 = 60;
 const qemu_boot_smoke_serial_limit: usize = 256 * 1024;
 const qemu_boot_smoke_disk_size: u64 = 4 * 1024 * zvmi.azure.one_mib;
 
-const OvmfFirmwarePair = qemu_host.FirmwarePair;
+pub const OvmfFirmwarePair = qemu_host.FirmwarePair;
 
 const QemuBootSmokePrereqs = struct {
     qemu_path: []u8,
@@ -48,12 +48,12 @@ const IsoOciFixtures = struct {
     }
 };
 
-const QemuBootSmokeResult = struct {
+pub const QemuBootSmokeResult = struct {
     timed_out: bool,
     quit_acknowledged: bool,
     serial_output: []u8,
 
-    fn deinit(self: *QemuBootSmokeResult, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *QemuBootSmokeResult, allocator: std.mem.Allocator) void {
         allocator.free(self.serial_output);
         self.* = undefined;
     }
@@ -254,7 +254,7 @@ const qemu_boot_smoke_poll_interval_ms: u64 = 200;
 /// entries at all -- the raw MBR disk's embedded GRUB boots directly); pass
 /// a firmware pair (with `ovmf_vars_copy_path` pointing at a *writable copy*
 /// of its vars file) for a Gen2/UEFI boot.
-fn runQemuBootSmoke(
+pub fn runQemuBootSmoke(
     allocator: std.mem.Allocator,
     io: Io,
     qemu_path: []const u8,

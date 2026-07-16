@@ -292,6 +292,41 @@ pub fn build(b: *std.Build) void {
         &run_unsafe_chroot_integration.step,
     );
 
+    const host_qmp_mod = b.createModule(.{
+        .root_source_file = b.path("qmp/src/qmp.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    const host_qemu_host_mod = b.createModule(.{
+        .root_source_file = b.path("qemu/host.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    const unsafe_chroot_real_boot_exe = b.addExecutable(.{
+        .name = "zvmi-unsafe-chroot-real-boot",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/unsafe_chroot_real_boot.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zvmi", .module = host_zvmi_mod },
+                .{ .name = "qmp", .module = host_qmp_mod },
+                .{ .name = "qemu_host", .module = host_qemu_host_mod },
+            },
+        }),
+        .linkage = .static,
+    });
+    const run_unsafe_chroot_real_boot = b.addRunArtifact(
+        unsafe_chroot_real_boot_exe,
+    );
+    const unsafe_chroot_real_boot_step = b.step(
+        "test-unsafe-chroot-real-boot",
+        "Run real TDNF/dracut customization and QEMU boot integration",
+    );
+    unsafe_chroot_real_boot_step.dependOn(
+        &run_unsafe_chroot_real_boot.step,
+    );
+
     // ---- nbd: native Zig NBD client + reference server ----
     const nbd_mod = b.addModule("nbd", .{
         .root_source_file = b.path("nbd/src/nbd.zig"),
