@@ -62,9 +62,9 @@ pub fn build(b: *std.Build) void {
     // VM setup (issue #112). Statically linked for self-containment
     // (matching azinit's philosophy), but -- unlike azinit, which is
     // pinned to a single real-boot x86_64 QEMU test fixture -- built for
-    // the standard target/optimize so it stays portable across whatever
-    // architecture a given image targets (Azure supports Arm64 VMs too)
-    // and remains natively testable via `zig build test` on any host.
+    // the standard target/optimize so it supports every Linux architecture
+    // a given image targets (Azure supports Arm64 VMs too) and remains
+    // natively testable via `zig build test` on any host.
     // Imports `zvmi` too (issue #113's resource-disk setup reuses
     // `mbr.zig`/`ext4.zig` directly against a real block device). ----
     const azagent_mod = b.createModule(.{
@@ -77,12 +77,14 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const azagent_exe = b.addExecutable(.{
-        .name = "azagent",
-        .root_module = azagent_mod,
-        .linkage = .static,
-    });
-    b.installArtifact(azagent_exe);
+    if (target.result.os.tag == .linux) {
+        const azagent_exe = b.addExecutable(.{
+            .name = "azagent",
+            .root_module = azagent_mod,
+            .linkage = .static,
+        });
+        b.installArtifact(azagent_exe);
+    }
 
     const azagent_tests = b.addTest(.{ .root_module = azagent_mod });
     const run_azagent_tests = b.addRunArtifact(azagent_tests);
