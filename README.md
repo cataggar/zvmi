@@ -538,7 +538,7 @@ zvmi azure derive \
   FreeBSD-15.1-RELEASE-arm64-aarch64-generalized.vhd
 ```
 
-The resulting VHD has a 6,478,102,528-byte aligned data region plus its 512-byte fixed-VHD footer. The source backup header at LBA 12,651,647 moves to LBA 12,652,543, its array moves immediately before it, and partition-array bytes and extents remain unchanged. Azure Arm64 support remains experimental until this derived VHD passes real Azure Arm64 Gen2 provisioning and reboot validation.
+The released QCOW2 has SHA-256 `fa7f673b05702d26a06b614a6c1bd63b21c621f3ae2b4eb4c90ece112ebfd47c`. The resulting VHD has SHA-256 `2d05663027aa0c7df4b11def41749a6b4d802fe98fc86da0e4caa9cd729f438f`, a 6,478,102,528-byte aligned data region, and a 512-byte fixed-VHD footer. The source backup header at LBA 12,651,647 moves to LBA 12,652,543, its array moves immediately before it, and partition-array bytes and extents remain unchanged. The exact VHD was published as an Arm64 Gen2 Azure Compute Gallery version and validated on a fresh `Standard_D2pls_v5` VM: provisioning and `waagent` reached Ready, the injected SSH key and `hn0` DHCP worked, root remained locked with no swap, a guest-initiated reboot preserved host identity and SSH host keys, and managed Boot Diagnostics captured the complete 115200-baud FreeBSD kernel and rc startup without guest-side changes.
 
 ### Booting the release image with QEMU
 
