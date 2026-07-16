@@ -98,7 +98,7 @@ zvmi/
         resize.zig            # `zvmi resize`
         check.zig             # `zvmi check`
         map.zig               # `zvmi map`
-        azure.zig             # `zvmi azure fixup`, `zvmi azure deprovision`
+        azure.zig             # Azure fixed-VHD derivation/readiness helpers
         cosi.zig              # `zvmi cosi`
         build_image.zig       # `zvmi build-image`
         qemu.zig              # `zvmi qemu`
@@ -417,7 +417,8 @@ zvmi resize disk.vhdx +4G
 zvmi resize disk.vhd +4G
 zvmi check disk.vhd
 zvmi map disk.vhd
-zvmi azure fixup --generation 1|2 disk.vhd  # pads to 1 MiB, checks MBR/GPT
+zvmi azure derive --input-sha256 <hex> input.qcow2 output.vhd  # transactional aligned Gen2 VHD + GPT relocation
+zvmi azure fixup --generation 1|2 disk.vhd  # checks MBR/GPT; refuses unsafe GPT growth
 zvmi azure deprovision disk.vhd                    # generalize: reset hostname/SSH host keys/machine-id/DHCP state
 zvmi azure deprovision --user azureuser disk.vhd   # also removes that user account + its home directory
 zvmi cosi disk.img -o disk.cosi              # tar + metadata.json + per-partition raw.zst
@@ -486,7 +487,7 @@ unknown layouts are left untouched.
 
 ### Minimal generalized Azure Linux 4 QCOW2
 
-Host-side image builders can reuse `zvmi.artifact_pipeline` for bounded SHA-256-verified acquisition and transactional publication. Download callbacks receive only a pipeline-owned writer rather than a staging path, `decompressXz` requires an explicit XZ Utils executable plus compressed-input digest, memory limit, and output-size limit, and Linux-only `finalizeQcow2` converts a digest-pinned raw or standalone QCOW2 source to a validated standalone QCOW2. All three operations preserve an existing destination until validation succeeds.
+Host-side image builders can reuse `zvmi.artifact_pipeline` for bounded SHA-256-verified acquisition and transactional publication. Download callbacks receive only a pipeline-owned writer rather than a staging path, `decompressXz` requires an explicit XZ Utils executable plus compressed-input digest, memory limit, and output-size limit, and Linux-only `finalizeQcow2` converts a digest-pinned raw or standalone QCOW2 source to a validated standalone QCOW2. `zvmi.azure.deriveFixedVhd` converts a digest-pinned standalone GPT QCOW2 into a 1 MiB-aligned fixed VHD through a descriptor-pinned atomic stage, strictly cross-validates the primary and backup GPT copies, preserves the raw partition array and every partition extent, relocates the backup GPT, and revalidates the VHD and both GPT copies before publication. All operations preserve an existing destination until validation succeeds.
 
 `scripts/build_generalized_azurelinux4.zig` (run via `zig build generalized-azurelinux4`) provides the complete reproducible recipe used for the generalized Azure image: it downloads and verifies the official Azure Linux 4 ISO, pulls `mcr.microsoft.com/azurelinux-beta/base/core:4.0`, installs signed x86_64 `openssh-server` and `sudo` packages, injects static `azinit`/`azagent`, removes host identity, creates a bounded multi-layer OCI layout, builds a 768 MiB Gen2 QCOW2, and compresses it to maximum zstd level via an LD_PRELOAD intercept library (`scripts/zstd_max_preload.zig`).
 
@@ -526,7 +527,17 @@ The test clearly skips when `ZVMI_FREEBSD15_AARCH64_IMAGE` is absent. When enabl
 
 The manually dispatched **Rebuild FreeBSD 15.1 AArch64 release image** GitHub Actions workflow runs on a native `ubuntu-24.04-arm` hosted runner, caches the digest-pinned upstream source, builds and validates the generalized image, runs the dual-instance acceptance, and creates the versioned `FreeBSD15.1-aarch64-20260716` release with the QCOW2, checksum file, and complete source/build provenance. Build and test jobs have read-only repository access; a separate publication job receives the write token and refuses to use an existing release or tag.
 
-Azure Arm64 support remains experimental and is not implied by local QEMU acceptance. The upstream virtual size is 6,477,643,776 bytes and is not 1 MiB-aligned, so do not blindly extend and convert it to a fixed VHD: the backup GPT must be relocated correctly first. Correctly aligned fixed-VHD derivation and real Azure Arm64 Gen2 validation remain tracked by issue #145.
+The released QCOW2 can be derived into an Azure fixed VHD without changing its partitions:
+
+```text
+zvmi azure derive \
+  --input-sha256 c1a5c50d8a274e268da3a876017a8459d84a580a3fbaa01a9852b774108dcc01 \
+  --expected-virtual-size 6477643776 \
+  FreeBSD-15.1-RELEASE-arm64-aarch64-generalized.qcow2 \
+  FreeBSD-15.1-RELEASE-arm64-aarch64-generalized.vhd
+```
+
+The resulting VHD has a 6,478,102,528-byte aligned data region plus its 512-byte fixed-VHD footer. The source backup header at LBA 12,651,647 moves to LBA 12,652,543, its array moves immediately before it, and partition-array bytes and extents remain unchanged. Azure Arm64 support remains experimental until this derived VHD passes real Azure Arm64 Gen2 provisioning and reboot validation.
 
 ### Booting the release image with QEMU
 
@@ -596,6 +607,9 @@ MBR/GPT partition-table read/write is available as a library API
 (`zvmi.mbr`, `zvmi.gpt`, `zvmi.guid`) with round-trip test coverage, used by
 `zvmi azure fixup` to validate the disk's partition style against the
 requested Hyper-V generation (Gen1 = plain MBR, Gen2 = protective MBR + GPT).
+Gen2 validation cross-checks both GPT headers and byte-identical partition
+arrays. In-place fixup rejects unaligned GPT images before mutation; use
+`zvmi azure derive` for transactional alignment and relocation.
 There is no interactive partitioning CLI command yet -- that lands with
 `zvmi build-image`.
 

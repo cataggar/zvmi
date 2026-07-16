@@ -499,6 +499,14 @@ test "generalized FreeBSD AArch64 boots, provisions SSH, and survives reboot" {
         allocator,
     );
     defer allocator.free(absolute_image);
+    const backing_format: []const u8 = if (std.mem.endsWith(
+        u8,
+        absolute_image,
+        ".vhd",
+    ))
+        "vpc"
+    else
+        "qcow2";
 
     const qemu_path = try requireToolOverrideAlloc(
         allocator,
@@ -576,7 +584,7 @@ test "generalized FreeBSD AArch64 boots, provisions SSH, and survives reboot" {
             "-f",
             "qcow2",
             "-F",
-            "qcow2",
+            backing_format,
             "-b",
             absolute_image,
             overlay_path,
