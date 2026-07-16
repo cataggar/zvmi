@@ -4,6 +4,18 @@ A Zig 0.16 library and CLI for reading and writing VM disk image formats
 (raw, VHD/VPC, VHDX, and qcow2) plus filesystem/image-build
 orchestration, analogous to `qemu-img`.
 
+## Install
+
+Install the pre-built `zvmi` CLI from GitHub Releases with
+[ghr](https://github.com/cataggar/ghr):
+
+```console
+ghr install cataggar/zvmi@v0.1.0
+```
+
+Release archives contain only the `zvmi` CLI. Build from source to use the
+library or the repository's other tools.
+
 ## Goal
 
 Build a fixed, 1 MiB-aligned Azure-compatible VHD from the

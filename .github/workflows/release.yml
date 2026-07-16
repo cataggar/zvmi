@@ -1,0 +1,216 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify release version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Match tag and package versions
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${GITHUB_REF_NAME#v}"
+          if [[ -z "$version" || "$version" == "$GITHUB_REF_NAME" ]]; then
+            echo "::error::Release tag must start with v and include a version"
+            exit 1
+          fi
+          if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Release tag '$GITHUB_REF_NAME' is not a supported SemVer tag"
+            exit 1
+          fi
+
+          manifest_version=$(
+            sed -nE 's/^[[:space:]]*\.version[[:space:]]*=[[:space:]]*"([^"]+)",[[:space:]]*$/\1/p' build.zig.zon
+          )
+          manifest_version_count=$(
+            printf '%s\n' "$manifest_version" | awk 'NF { count++ } END { print count + 0 }'
+          )
+          if [[ "$manifest_version_count" != 1 ]]; then
+            echo "::error::Expected exactly one .version entry in build.zig.zon"
+            exit 1
+          fi
+
+          if [[ "$version" != "$manifest_version" ]]; then
+            echo "::error::Tag version '$version' does not match build.zig.zon version '$manifest_version'"
+            exit 1
+          fi
+
+          prerelease=false
+          version_without_build="${version%%+*}"
+          if [[ "$version_without_build" == *-* ]]; then
+            prerelease=true
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Verified release version"
+            echo
+            echo "- Tag: \`$GITHUB_REF_NAME\`"
+            echo "- Package: \`$manifest_version\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-linux-musl
+            name: linux-musl-x64
+            executable: zvmi
+          - os: ubuntu-22.04-arm
+            target: aarch64-linux-musl
+            name: linux-musl-arm64
+            executable: zvmi
+          - os: ubuntu-22.04
+            target: x86_64-macos
+            name: macos-x64
+            executable: zvmi
+          - os: macos-14
+            target: aarch64-macos
+            name: macos-arm64
+            executable: zvmi
+          - os: windows-latest
+            target: x86_64-windows
+            name: windows-x64
+            executable: zvmi.exe
+          - os: ubuntu-22.04
+            target: aarch64-windows
+            name: windows-arm64
+            executable: zvmi.exe
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@3f92e616222f9f5965921619e0ae2804c01ef6c5 # v0.6.6
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          ghr-version: 0.6.6
+          tools: |
+            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Build
+        run: zig build install-zvmi -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          PLATFORM: ${{ matrix.name }}
+          EXECUTABLE: ${{ matrix.executable }}
+        run: |
+          set -euo pipefail
+
+          package="zvmi-${VERSION}-${PLATFORM}"
+          source_executable="zig-out/bin/${EXECUTABLE}"
+          test -f "$source_executable"
+
+          mkdir -p "$package/bin"
+          cp "$source_executable" "$package/bin/"
+          cp LICENSE README.md "$package/"
+
+          executable_count=$(find "$package/bin" -maxdepth 1 -type f | wc -l | tr -d ' ')
+          test "$executable_count" = 1
+          tar czf "$package.tar.gz" "$package"
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          file: zig-out/bin/${{ matrix.executable }}
+          output-file: zvmi-${{ needs.verify.outputs.version }}-${{ matrix.name }}.sbom.spdx.json
+          upload-artifact: false
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            zvmi-*.tar.gz
+            zvmi-*.sbom.spdx.json
+          if-no-files-found: error
+
+  release:
+    name: Create Release
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Download artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          merge-multiple: true
+
+      - name: Verify release assets
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          platforms=(
+            linux-musl-x64
+            linux-musl-arm64
+            macos-x64
+            macos-arm64
+            windows-x64
+            windows-arm64
+          )
+          for platform in "${platforms[@]}"; do
+            test -f "zvmi-${VERSION}-${platform}.tar.gz"
+            test -f "zvmi-${VERSION}-${platform}.sbom.spdx.json"
+          done
+
+          archive_count=$(find . -maxdepth 1 -type f -name 'zvmi-*.tar.gz' | wc -l | tr -d ' ')
+          sbom_count=$(find . -maxdepth 1 -type f -name 'zvmi-*.sbom.spdx.json' | wc -l | tr -d ' ')
+          test "$archive_count" = 6
+          test "$sbom_count" = 6
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2 # v2.2.3
+        with:
+          subject-path: zvmi-*.tar.gz
+
+      - name: Create release
+        uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
+        with:
+          name: zvmi ${{ needs.verify.outputs.version }}
+          tag_name: ${{ github.ref_name }}
+          body: |
+            **Install:**
+
+            ```console
+            ghr install cataggar/zvmi@${{ github.ref_name }}
+            ```
+          files: |
+            zvmi-*.tar.gz
+            zvmi-*.sbom.spdx.json
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ needs.verify.outputs.prerelease }}
