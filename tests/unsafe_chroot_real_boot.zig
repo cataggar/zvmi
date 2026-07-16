@@ -399,7 +399,7 @@ fn buildSourceImage(
         .output_format = .raw,
         .generation = .gen2,
         .size = disk_size,
-        .extra_kernel_options = "console=tty0 console=ttyS0,115200n8",
+        .extra_kernel_options = "console=tty0 console=ttyS0,115200n8 selinux=0",
         .os = .{
             .filesystem = &filesystem,
             .services = &services,

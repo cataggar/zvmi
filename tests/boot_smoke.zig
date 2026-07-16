@@ -447,7 +447,7 @@ test "build-image boot-smokes typed customization and generalization under Gen2 
         .output_format = .raw,
         .generation = .gen2,
         .size = qemu_boot_smoke_disk_size,
-        .extra_kernel_options = "console=tty0 console=ttyS0,115200n8",
+        .extra_kernel_options = "console=tty0 console=ttyS0,115200n8 selinux=0",
         .os = .{
             .filesystem = &filesystem,
             .hostname = "zvmi-customized",
