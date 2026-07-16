@@ -19,12 +19,13 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const oci = @import("oci");
+const zvmi = @import("zvmi");
+const oci = zvmi.oci;
+const artifact_pipeline = zvmi.artifact_pipeline;
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
 const Io = std.Io;
-const Sha256 = std.crypto.hash.sha2.Sha256;
 const linux = std.os.linux;
 
 // ─── constants ───────────────────────────────────────────────────────────────
@@ -40,6 +41,7 @@ const oci_index_type = "application/vnd.oci.image.index.v1+json";
 const docker_manifest_type = "application/vnd.docker.distribution.manifest.v2+json";
 const docker_index_type = "application/vnd.docker.distribution.manifest.list.v2+json";
 const zvmi_max_layer_bytes: u64 = 128 * 1024 * 1024;
+const iso_max_bytes: u64 = 2 * 1024 * 1024 * 1024;
 const accept_header = oci_index_type ++ ", " ++ docker_index_type ++ ", " ++ oci_manifest_type ++ ", " ++ docker_manifest_type;
 
 // ─── subprocess helpers ──────────────────────────────────────────────────────
@@ -126,25 +128,16 @@ fn readPseudoFile(gpa: Allocator, path: [:0]const u8) ![]u8 {
 
 /// SHA-256 of `bytes`, returned as lowercase hex (64 chars).
 pub fn sha256Bytes(bytes: []const u8) [64]u8 {
-    var raw: [32]u8 = undefined;
-    Sha256.hash(bytes, &raw, .{});
-    return std.fmt.bytesToHex(raw, .lower);
+    return artifact_pipeline.formatSha256(
+        artifact_pipeline.sha256Bytes(bytes),
+    );
 }
 
 /// SHA-256 hex of the file at `path`.  Streams in 64 KiB chunks.
 fn sha256File(io: Io, path: []const u8) ![64]u8 {
-    var file = try Dir.cwd().openFile(io, path, .{});
-    defer file.close(io);
-
-    var read_buf: [65536]u8 = undefined;
-    const h = Sha256.init(.{});
-    var file_reader = file.reader(io, &read_buf);
-    var hash_proxy_buf: [256]u8 = undefined;
-    var hashed = file_reader.interface.hashed(h, &hash_proxy_buf);
-    _ = try hashed.reader.discardRemaining();
-    var raw: [32]u8 = undefined;
-    hashed.hasher.final(&raw);
-    return std.fmt.bytesToHex(raw, .lower);
+    return artifact_pipeline.formatSha256(
+        (try artifact_pipeline.hashFile(io, path)).sha256,
+    );
 }
 
 // ─── path safety ─────────────────────────────────────────────────────────────
@@ -170,8 +163,8 @@ pub fn parseDigestHex(digest: []const u8) error{InvalidDigest}![]const u8 {
         digest["sha256:".len..]
     else
         digest;
-    if (hex.len != 64) return error.InvalidDigest;
-    for (hex) |c| if (!std.ascii.isHex(c)) return error.InvalidDigest;
+    _ = artifact_pipeline.parseSha256(digest) catch
+        return error.InvalidDigest;
     return hex;
 }
 
@@ -300,15 +293,6 @@ fn downloadBlob(
 ) !void {
     const expected = try parseDigestHex(digest);
 
-    // Cache hit?
-    if (Dir.cwd().statFile(io, dest_path, .{})) |_| {
-        const actual = try sha256File(io, dest_path);
-        if (std.mem.eql(u8, &actual, expected)) {
-            std.debug.print("  blob {s}...: cached\n", .{expected[0..12]});
-            return;
-        }
-    } else |_| {}
-
     // Create parent directory.
     if (std.fs.path.dirname(dest_path)) |parent| {
         Dir.cwd().createDirPath(io, parent) catch |err| switch (err) {
@@ -317,24 +301,33 @@ fn downloadBlob(
         };
     }
 
-    const partial = try std.fmt.allocPrint(gpa, "{s}.part", .{dest_path});
-    defer gpa.free(partial);
-
     const url = try std.fmt.allocPrint(gpa, "{s}/{s}/blobs/{s}", .{ mcr_base, repository, digest });
     defer gpa.free(url);
 
-    std.debug.print("  blob {s}...: downloading\n", .{expected[0..12]});
-    try run(gpa, io, &.{ "curl", "-fL", "--retry", "3", "-C", "-", "-o", partial, url });
-
-    const actual = try sha256File(io, partial);
-    if (!std.mem.eql(u8, &actual, expected)) {
-        Dir.cwd().deleteFile(io, partial) catch {};
-        std.debug.print("error: blob digest mismatch: expected {s}, got {s}\n", .{ expected, &actual });
-        return error.DigestMismatch;
+    const expected_digest = artifact_pipeline.parseSha256(digest) catch
+        return error.InvalidDigest;
+    const acquired = artifact_pipeline.acquireVerified(
+        gpa,
+        io,
+        .{
+            .url = url,
+            .destination_path = dest_path,
+            .expected_sha256 = expected_digest,
+            .max_size = zvmi_max_layer_bytes,
+        },
+        .{ .downloadFn = curlDownload },
+    ) catch |err| switch (err) {
+        error.ChecksumMismatch => {
+            std.debug.print("error: blob digest mismatch: expected {s}\n", .{expected});
+            return error.DigestMismatch;
+        },
+        else => return err,
+    };
+    if (acquired.reused_cache) {
+        std.debug.print("  blob {s}...: cached\n", .{expected[0..12]});
+    } else {
+        std.debug.print("  blob {s}...: verified\n", .{expected[0..12]});
     }
-
-    try Dir.rename(Dir.cwd(), partial, Dir.cwd(), dest_path, io);
-    std.debug.print("  blob {s}...: verified\n", .{expected[0..12]});
 }
 
 // ─── layer extraction ────────────────────────────────────────────────────────
@@ -989,30 +982,66 @@ fn downloadIso(gpa: Allocator, io: Io, work_dir: []const u8) ![]const u8 {
     defer gpa.free(checksum_bytes);
     var checksum_fields = std.mem.tokenizeAny(u8, checksum_bytes, " \t\r\n");
     const expected = checksum_fields.next() orelse return error.InvalidIsoChecksum;
-    _ = try parseDigestHex(expected);
-
-    if (Dir.cwd().statFile(io, iso_path, .{})) |_| {
-        const actual = try sha256File(io, iso_path);
-        if (std.mem.eql(u8, &actual, expected)) {
-            std.debug.print("ISO cached at {s}\n", .{iso_path});
-            return iso_path;
-        }
-    } else |_| {}
-
-    const partial = try std.fmt.allocPrint(gpa, "{s}.part", .{iso_path});
-    defer gpa.free(partial);
-
-    std.debug.print("Downloading ISO...\n", .{});
-    try run(gpa, io, &.{ "curl", "-fL", "--retry", "3", "-C", "-", "-o", partial, iso_url });
-
-    const actual = try sha256File(io, partial);
-    if (!std.mem.eql(u8, &actual, expected)) {
-        std.debug.print("error: ISO checksum mismatch\n", .{});
-        return error.IsoChecksumMismatch;
+    const expected_digest = artifact_pipeline.parseSha256(expected) catch
+        return error.InvalidIsoChecksum;
+    const acquired = artifact_pipeline.acquireVerified(
+        gpa,
+        io,
+        .{
+            .url = iso_url,
+            .destination_path = iso_path,
+            .expected_sha256 = expected_digest,
+            .max_size = iso_max_bytes,
+        },
+        .{ .downloadFn = curlDownload },
+    ) catch |err| switch (err) {
+        error.ChecksumMismatch => return error.IsoChecksumMismatch,
+        else => return err,
+    };
+    if (acquired.reused_cache) {
+        std.debug.print("ISO cached at {s}\n", .{iso_path});
+    } else {
+        std.debug.print("ISO downloaded: {s}\n", .{iso_path});
     }
-    try Dir.rename(Dir.cwd(), partial, Dir.cwd(), iso_path, io);
-    std.debug.print("ISO downloaded: {s}\n", .{iso_path});
     return iso_path;
+}
+
+fn curlDownload(
+    _: ?*anyopaque,
+    _: Allocator,
+    io: Io,
+    url: []const u8,
+    output: *Io.Writer,
+) !void {
+    std.debug.print("Downloading artifact...\n", .{});
+    var child = try std.process.spawn(io, .{
+        .argv = &.{
+            "curl",
+            "-fLsS",
+            "--retry",
+            "3",
+            url,
+        },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .inherit,
+    });
+    defer child.kill(io);
+
+    var pipe_buffer: [64 * 1024]u8 = undefined;
+    var pipe_reader = child.stdout.?.readerStreaming(io, &pipe_buffer);
+    var buffer: [64 * 1024]u8 = undefined;
+    while (true) {
+        const read = try pipe_reader.interface.readSliceShort(&buffer);
+        if (read == 0) break;
+        try output.writeAll(buffer[0..read]);
+    }
+
+    const term = try child.wait(io);
+    switch (term) {
+        .exited => |code| if (code != 0) return error.CommandFailed,
+        else => return error.CommandFailed,
+    }
 }
 
 // ─── tool check ──────────────────────────────────────────────────────────────

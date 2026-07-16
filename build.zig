@@ -520,17 +520,12 @@ pub fn build(b: *std.Build) void {
         zstd_preload_lib.root_module.linkSystemLibrary("dl", .{});
         b.installArtifact(zstd_preload_lib);
 
-        const builder_oci_mod = b.createModule(.{
-            .root_source_file = b.path("packages/zvmi/src/oci.zig"),
-            .target = b.graph.host,
-            .optimize = optimize,
-        });
         const builder_mod = b.createModule(.{
             .root_source_file = b.path("scripts/build_generalized_azurelinux4.zig"),
             .target = b.graph.host,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "oci", .module = builder_oci_mod },
+                .{ .name = "zvmi", .module = host_zvmi_mod },
             },
         });
         const builder_exe = b.addExecutable(.{

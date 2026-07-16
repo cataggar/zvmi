@@ -462,6 +462,8 @@ unknown layouts are left untouched.
 
 ### Minimal generalized Azure Linux 4 QCOW2
 
+Host-side image builders can reuse `zvmi.artifact_pipeline` for bounded SHA-256-verified acquisition and transactional publication. Download callbacks receive only a pipeline-owned writer rather than a staging path, and `decompressXz` requires an explicit XZ Utils executable plus compressed-input digest, memory limit, and output-size limit before atomically replacing an output.
+
 `scripts/build_generalized_azurelinux4.zig` (run via `zig build generalized-azurelinux4`) provides the complete reproducible recipe used for the generalized Azure image: it downloads and verifies the official Azure Linux 4 ISO, pulls `mcr.microsoft.com/azurelinux-beta/base/core:4.0`, installs signed x86_64 `openssh-server` and `sudo` packages, injects static `azinit`/`azagent`, removes host identity, creates a bounded multi-layer OCI layout, builds a 768 MiB Gen2 QCOW2, and compresses it to maximum zstd level via an LD_PRELOAD intercept library (`scripts/zstd_max_preload.zig`).
 
 ```
