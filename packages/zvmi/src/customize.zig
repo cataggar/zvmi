@@ -21,6 +21,7 @@ const os_customization = @import("os_customization.zig");
 const customization_wire = @import("customization_wire.zig");
 const preserved_image = @import("preserved_image.zig");
 const root_tree = @import("root_tree.zig");
+const transaction_guard = @import("transaction_guard.zig");
 const verity = @import("verity.zig");
 
 pub const legacy_api_version: u32 = 2;
@@ -4100,7 +4101,9 @@ pub fn execute(
         return try failureOutcome(allocator, diagnostics.items);
     };
     var transaction_active = true;
-    errdefer if (transaction_active) cwd.deleteTree(io, plan.data.transaction_path) catch {};
+    errdefer if (transaction_active) {
+        _ = cleanupTransaction(io, plan.data.transaction_path);
+    };
 
     var bridge = BuildEventBridge{
         .event_sink = event_sink,
@@ -4177,8 +4180,26 @@ pub fn execute(
         },
     }
 
+    var commit_barrier = transaction_guard.seal(
+        io,
+        plan.data.transaction_path,
+    ) catch |err| {
+        try appendFailure(
+            &diagnostics,
+            .cleanup_failed,
+            .cleanup,
+            plan.data.transaction_path,
+            "could not seal the backend transaction before final verification",
+            err,
+        );
+        emitDiagnostics(event_sink, diagnostics.items);
+        return try failureOutcome(allocator, diagnostics.items);
+    };
+    defer commit_barrier.release(io);
+
     const source_digests_after = hashPlanSources(allocator, io, plan) catch |err| {
         try appendFailure(&diagnostics, .source_hash_failed, .execution, "/input", "failed to verify a declared source hash", err);
+        commit_barrier.release(io);
         if (cleanupTransaction(io, plan.data.transaction_path)) |diagnostic| try diagnostics.append(diagnostic);
         emitDiagnostics(event_sink, diagnostics.items);
         return try failureOutcome(allocator, diagnostics.items);
@@ -4193,6 +4214,7 @@ pub fn execute(
             .message = "a source changed while the image was being built",
             .remediation = "retry with immutable or cache-snapshotted inputs",
         });
+        commit_barrier.release(io);
         if (cleanupTransaction(io, plan.data.transaction_path)) |diagnostic| try diagnostics.append(diagnostic);
         emitDiagnostics(event_sink, diagnostics.items);
         return try failureOutcome(allocator, diagnostics.items);
@@ -4200,12 +4222,14 @@ pub fn execute(
 
     const output_digest = hashPath(allocator, io, plan.data.staging_output_path) catch |err| {
         try appendFailure(&diagnostics, .source_hash_failed, .execution, "/output/path", "failed to hash the completed output", err);
+        commit_barrier.release(io);
         if (cleanupTransaction(io, plan.data.transaction_path)) |diagnostic| try diagnostics.append(diagnostic);
         emitDiagnostics(event_sink, diagnostics.items);
         return try failureOutcome(allocator, diagnostics.items);
     };
     const output_file_size = (cwd.statFile(io, plan.data.staging_output_path, .{}) catch |err| {
         try appendFailure(&diagnostics, .execution_failed, .execution, "/output/path", "failed to inspect the completed output", err);
+        commit_barrier.release(io);
         if (cleanupTransaction(io, plan.data.transaction_path)) |diagnostic| try diagnostics.append(diagnostic);
         emitDiagnostics(event_sink, diagnostics.items);
         return try failureOutcome(allocator, diagnostics.items);
@@ -4236,6 +4260,7 @@ pub fn execute(
     else
         cwd.renamePreserve(plan.data.staging_output_path, cwd, plan.data.output.path, io);
     commit_result catch |err| {
+        commit_barrier.release(io);
         result.deinit(allocator);
         final_diagnostics.deinit(allocator);
         final_diagnostics_owned_by_function = false;
@@ -4248,6 +4273,7 @@ pub fn execute(
         return try failureOutcome(allocator, diagnostics.items);
     };
 
+    commit_barrier.release(io);
     const cleanup_failure = cleanupTransaction(io, plan.data.transaction_path);
     transaction_active = false;
     const cleanup_slot = &final_diagnostics.items[final_diagnostics.items.len - 1];
@@ -4531,6 +4557,17 @@ fn appendFailure(
 }
 
 fn cleanupTransaction(io: Io, transaction_path: []const u8) ?Diagnostic {
+    var barrier = transaction_guard.seal(io, transaction_path) catch |err| {
+        return .{
+            .severity = .warning,
+            .phase = .cleanup,
+            .code = .cleanup_failed,
+            .configuration_path = transaction_path,
+            .message = "refused to remove a transaction that could not be sealed against backend leases",
+            .cause = .{ .error_name = @errorName(err) },
+        };
+    };
+    barrier.release(io);
     Io.Dir.cwd().deleteTree(io, transaction_path) catch |err| {
         return .{
             .severity = .warning,
@@ -4538,6 +4575,16 @@ fn cleanupTransaction(io: Io, transaction_path: []const u8) ?Diagnostic {
             .code = .cleanup_failed,
             .configuration_path = transaction_path,
             .message = "failed to remove the transaction directory",
+            .cause = .{ .error_name = @errorName(err) },
+        };
+    };
+    transaction_guard.finishCleanup(io, transaction_path) catch |err| {
+        return .{
+            .severity = .warning,
+            .phase = .cleanup,
+            .code = .cleanup_failed,
+            .configuration_path = transaction_path,
+            .message = "removed the transaction but failed to remove its external cleanup seal",
             .cause = .{ .error_name = @errorName(err) },
         };
     };
@@ -5524,6 +5571,26 @@ test "preflight resolves a symlink before missing output ancestors" {
     try std.testing.expectEqual(CapabilityState.missing, state);
 }
 
+test "transaction cleanup refuses an active backend lease" {
+    const io = std.testing.io;
+    const transaction_path = "test-customize-active-backend";
+    defer Io.Dir.cwd().deleteTree(io, transaction_path) catch {};
+    try Io.Dir.cwd().createDirPath(io, transaction_path);
+    var lease = try transaction_guard.acquire(io, transaction_path);
+
+    const blocked = cleanupTransaction(io, transaction_path).?;
+    try std.testing.expectEqual(DiagnosticCode.cleanup_failed, blocked.code);
+    try std.testing.expect(try transaction_guard.hasActiveLease(io, transaction_path));
+    _ = try Io.Dir.cwd().statFile(io, transaction_path, .{});
+
+    try lease.release(io);
+    try std.testing.expect(cleanupTransaction(io, transaction_path) == null);
+    try std.testing.expectError(
+        error.FileNotFound,
+        Io.Dir.cwd().statFile(io, transaction_path, .{}),
+    );
+}
+
 test "failed execution leaves no final output and removes its transaction" {
     const io = std.testing.io;
     const iso_path = "test-customize-invalid.iso";
@@ -5691,6 +5758,108 @@ test "successful execution commits output and emits provenance" {
         outcome.result.?.provenance.sources[2].path,
         customization_path,
     ));
+}
+
+test "execution never publishes while a backend lease remains active" {
+    const io = std.testing.io;
+    const iso_path = "test-customize-lease.iso";
+    const container_path = "test-customize-lease.container";
+    const workspace_path = "test-customize-lease-work";
+    const output_path = workspace_path ++ "/output.raw";
+    defer Io.Dir.cwd().deleteFile(io, iso_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, container_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, workspace_path) catch {};
+    try Io.Dir.cwd().createDirPath(io, workspace_path);
+    for ([_]struct { path: []const u8, content: []const u8 }{
+        .{ .path = iso_path, .content = "source-iso" },
+        .{ .path = container_path, .content = "source-container" },
+    }) |source| {
+        var file = try Io.Dir.cwd().createFile(io, source.path, .{});
+        defer file.close(io);
+        try file.writePositionalAll(io, source.content, 0);
+    }
+
+    var request = validRequest();
+    request.input = .{ .iso_oci = .{
+        .iso_path = iso_path,
+        .container_path = container_path,
+        .rootfs_path_in_iso = "rootfs.squashfs",
+    } };
+    request.output = .{ .path = output_path, .format = .raw, .size = 128 * mib };
+    request.execution.workspace_path = workspace_path;
+
+    const LeaseRunner = struct {
+        fn run(
+            _: ?*anyopaque,
+            _: Allocator,
+            run_io: Io,
+            plan: *const ResolvedPlan,
+            _: ?EventSink,
+            stage_sink: build_image.StageSink,
+        ) !void {
+            for (plan.data.operations) |operation| {
+                if (!stage_sink.advance(freshStageForAction(operation.action) orelse
+                    return error.InvalidOperationOrder))
+                {
+                    return error.InvalidOperationOrder;
+                }
+            }
+            const file = try Io.Dir.cwd().createFile(
+                run_io,
+                plan.data.staging_output_path,
+                .{},
+            );
+            defer file.close(run_io);
+            try file.writePositionalAll(run_io, "unreleased-image", 0);
+            var lease_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+            const lease_path = try transaction_guard.activeLeasePath(
+                plan.data.transaction_path,
+                &lease_buffer,
+            );
+            const lease = try Io.Dir.cwd().createFile(
+                run_io,
+                lease_path,
+                .{ .exclusive = true },
+            );
+            lease.close(run_io);
+        }
+    };
+
+    var resolved = try resolve(
+        std.testing.allocator,
+        &request,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer resolved.deinit(std.testing.allocator);
+    const transaction_path = resolved.plan.?.data.transaction_path;
+    var platform = Platform.system();
+    platform.runFn = LeaseRunner.run;
+    var outcome = try execute(
+        std.testing.allocator,
+        io,
+        &resolved.plan.?,
+        platform,
+        null,
+    );
+    defer outcome.deinit(std.testing.allocator);
+
+    try std.testing.expect(outcome.result == null);
+    try std.testing.expect(outcome.diagnostics.hasErrors());
+    try std.testing.expectError(
+        error.FileNotFound,
+        Io.Dir.cwd().statFile(io, output_path, .{}),
+    );
+    try std.testing.expect(try transaction_guard.hasActiveLease(
+        io,
+        transaction_path,
+    ));
+    var lease_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+    const lease_path = try transaction_guard.activeLeasePath(
+        transaction_path,
+        &lease_buffer,
+    );
+    try Io.Dir.cwd().deleteFile(io, lease_path);
 }
 
 test "execution rejects a customization source changed during the build" {

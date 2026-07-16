@@ -60,6 +60,58 @@ pub const Report = struct {
     operation_count: usize,
 };
 
+pub const PartitionGeometry = struct {
+    offset: u64,
+    length: u64,
+};
+
+pub const RawMutationTarget = struct {
+    raw_path: []const u8,
+    virtual_size: u64,
+    stage_inode: Io.File.INode,
+    partition: PartitionGeometry,
+};
+
+pub const RawMutationHook = struct {
+    context: ?*anyopaque = null,
+    runFn: *const fn (
+        context: ?*anyopaque,
+        allocator: Allocator,
+        io: Io,
+        target: RawMutationTarget,
+    ) anyerror!void,
+
+    fn run(
+        self: RawMutationHook,
+        allocator: Allocator,
+        io: Io,
+        target: RawMutationTarget,
+    ) !void {
+        try self.runFn(self.context, allocator, io, target);
+    }
+};
+
+pub const RawMutationOptions = struct {
+    source_path: []const u8,
+    output_path: []const u8,
+    output_format: Format,
+    root_partition: PartitionSelector,
+    expected_source_format: ?Format = null,
+    expected_virtual_size: ?u64 = null,
+    require_linux_partition: bool = false,
+    dependency_paths: []const []const u8 = &.{},
+    output_create_options: image_mod.CreateOptions = .{},
+};
+
+pub const RawMutationReport = struct {
+    source_format: Format,
+    output_format: Format,
+    virtual_size: u64,
+    partition_offset: u64,
+    partition_length: u64,
+    flattened_backing_chain: bool,
+};
+
 /// Options for a rootless, full-tree rebuild of the deliberately narrow
 /// `zvmi_ext4_v1` source profile. `source_date_epoch` controls pure OS
 /// customization data; the ext4 inode/superblock timestamp is validated and
@@ -128,103 +180,137 @@ const Partition = struct {
     length: u64,
 };
 
+/// Flattens a preserved source into an exclusive raw stage, closes every
+/// source/stage handle, invokes `hook`, and publishes only after the hook
+/// returns. The hook must release every loop, mount, and child-process
+/// reference to `target.raw_path` before returning.
+pub fn transactRaw(
+    allocator: Allocator,
+    io: Io,
+    options: RawMutationOptions,
+    hook: RawMutationHook,
+) !RawMutationReport {
+    return transactRawInternal(allocator, io, options, hook, "raw-mutation");
+}
+
 pub fn edit(
     allocator: Allocator,
     io: Io,
     options: Options,
 ) !Report {
-    if (options.source_path.len == 0 or options.output_path.len == 0) return error.InvalidPath;
-    const source_path = try std.fs.path.resolve(allocator, &.{options.source_path});
-    defer allocator.free(source_path);
-    const output_path = try std.fs.path.resolve(allocator, &.{options.output_path});
-    defer allocator.free(output_path);
-    if (std.mem.eql(u8, source_path, output_path)) return error.SourceOutputConflict;
     try validateOperations(options.operations);
 
-    var source = try Image.openPathReadOnly(io, source_path);
-    var source_open = true;
-    defer if (source_open) source.close(io);
-    if (options.expected_virtual_size) |expected| {
-        if (expected != source.virtual_size) return error.VirtualSizeMismatch;
-    }
-    const virtual_size = source.virtual_size;
-    const source_format = source.format;
-    const flattened = if (source.qcow2) |info| info.backing_depth != 0 else false;
-    const partition = try selectPartition(allocator, io, source, options.root_partition);
-    const partition_end = std.math.add(u64, partition.offset, partition.length) catch
-        return error.InvalidPartitionBounds;
-    if (partition.length == 0 or partition_end > virtual_size) return error.InvalidPartitionBounds;
-
-    const raw_path = try std.fmt.allocPrint(allocator, "{s}.native-edit.raw", .{output_path});
-    defer allocator.free(raw_path);
-    const output_stage_path = try std.fmt.allocPrint(allocator, "{s}.native-edit.output", .{output_path});
-    defer allocator.free(output_stage_path);
-    if (std.mem.eql(u8, raw_path, source_path) or
-        std.mem.eql(u8, output_stage_path, source_path))
-    {
-        return error.SourceOutputConflict;
-    }
-    var raw_exists = false;
-    defer if (raw_exists) Io.Dir.cwd().deleteFile(io, raw_path) catch {};
-    var output_stage_exists = false;
-    defer if (output_stage_exists) Io.Dir.cwd().deleteFile(io, output_stage_path) catch {};
-
-    var raw = try Image.createExclusive(io, raw_path, .raw, virtual_size, .{});
-    raw_exists = true;
-    var raw_open = true;
-    defer if (raw_open) raw.close(io);
-    try image_mod.copyAll(io, source, &raw, allocator);
-    source.close(io);
-    source_open = false;
-
-    var editor = try ext4.Editor.open(io, raw.file, allocator, .{ .offset = partition.offset });
-    var editor_open = true;
-    defer if (editor_open) editor.deinit();
-    const filesystem_bytes = std.math.mul(u64, editor.reader.total_blocks, editor.reader.block_size) catch
-        return error.InvalidFilesystemBounds;
-    const filesystem_end = std.math.add(u64, partition.offset, filesystem_bytes) catch
-        return error.InvalidFilesystemBounds;
-    if (filesystem_end > partition_end) return error.InvalidFilesystemBounds;
-
-    try preflightOperations(allocator, io, &editor, options.operations, options.max_source_file_bytes);
-    for (options.operations) |operation| {
-        switch (operation) {
-            .overwrite_file => |overwrite| {
-                const content = try loadSource(allocator, io, overwrite.source, options.max_source_file_bytes);
-                defer allocator.free(content);
-                try editor.writeFile(io, overwrite.path, content);
-            },
-            .remove_file => |path| try editor.deleteFile(io, path),
-            .remove_tree => |path| try editor.deleteTree(io, path),
-        }
-    }
-    try editor.close(io);
-    editor_open = false;
-    raw.close(io);
-    raw_open = false;
-
-    try publishRawStaging(
+    var dependency_paths = try std.array_list.Managed([]const u8).initCapacity(
+        allocator,
+        options.operations.len,
+    );
+    defer dependency_paths.deinit();
+    for (options.operations) |operation| switch (operation) {
+        .overwrite_file => |overwrite| switch (overwrite.source) {
+            .host_path => |path| try dependency_paths.append(path),
+            .bytes => {},
+        },
+        .remove_file, .remove_tree => {},
+    };
+    var context = EditMutationContext{
+        .operations = options.operations,
+        .max_source_file_bytes = options.max_source_file_bytes,
+    };
+    const mutation = try transactRawInternal(
         allocator,
         io,
-        raw_path,
-        output_stage_path,
-        output_path,
-        options.output_format,
-        virtual_size,
-        options.output_create_options,
-        &raw_exists,
-        &output_stage_exists,
+        .{
+            .source_path = options.source_path,
+            .output_path = options.output_path,
+            .output_format = options.output_format,
+            .root_partition = options.root_partition,
+            .expected_virtual_size = options.expected_virtual_size,
+            .dependency_paths = dependency_paths.items,
+            .output_create_options = options.output_create_options,
+        },
+        .{ .context = &context, .runFn = runEditMutation },
+        "native-edit",
     );
 
     return .{
-        .source_format = source_format,
-        .output_format = options.output_format,
-        .virtual_size = virtual_size,
-        .partition_offset = partition.offset,
-        .partition_length = partition.length,
-        .flattened_backing_chain = flattened,
+        .source_format = mutation.source_format,
+        .output_format = mutation.output_format,
+        .virtual_size = mutation.virtual_size,
+        .partition_offset = mutation.partition_offset,
+        .partition_length = mutation.partition_length,
+        .flattened_backing_chain = mutation.flattened_backing_chain,
         .operation_count = options.operations.len,
     };
+}
+
+const EditMutationContext = struct {
+    operations: []const Operation,
+    max_source_file_bytes: u64,
+};
+
+fn runEditMutation(
+    context_ptr: ?*anyopaque,
+    allocator: Allocator,
+    io: Io,
+    target: RawMutationTarget,
+) !void {
+    const context: *EditMutationContext = @ptrCast(@alignCast(context_ptr.?));
+    var raw = try openRawStage(
+        io,
+        target.raw_path,
+        target.virtual_size,
+        target.stage_inode,
+        true,
+    );
+    defer raw.close(io);
+    var editor = try ext4.Editor.open(
+        io,
+        raw.file,
+        allocator,
+        .{ .offset = target.partition.offset },
+    );
+    var editor_open = true;
+    defer if (editor_open) editor.deinit();
+    const filesystem_bytes = std.math.mul(
+        u64,
+        editor.reader.total_blocks,
+        editor.reader.block_size,
+    ) catch return error.InvalidFilesystemBounds;
+    const filesystem_end = std.math.add(
+        u64,
+        target.partition.offset,
+        filesystem_bytes,
+    ) catch return error.InvalidFilesystemBounds;
+    const partition_end = std.math.add(
+        u64,
+        target.partition.offset,
+        target.partition.length,
+    ) catch return error.InvalidFilesystemBounds;
+    if (filesystem_end > partition_end) return error.InvalidFilesystemBounds;
+
+    try preflightOperations(
+        allocator,
+        io,
+        &editor,
+        context.operations,
+        context.max_source_file_bytes,
+    );
+    for (context.operations) |operation| switch (operation) {
+        .overwrite_file => |overwrite| {
+            const content = try loadSource(
+                allocator,
+                io,
+                overwrite.source,
+                context.max_source_file_bytes,
+            );
+            defer allocator.free(content);
+            try editor.writeFile(io, overwrite.path, content);
+        },
+        .remove_file => |path| try editor.deleteFile(io, path),
+        .remove_tree => |path| try editor.deleteTree(io, path),
+    };
+    try editor.close(io);
+    editor_open = false;
 }
 
 /// Performs the complete rebuild source preflight using read-only handles.
@@ -466,7 +552,7 @@ pub fn rebuild(
     const final_view = try tree.ext4View();
 
     var raw_exists = false;
-    defer if (raw_exists) Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+    defer if (raw_exists) removeStagingPath(io, raw_path);
     var output_stage_exists = false;
     defer if (output_stage_exists) Io.Dir.cwd().deleteFile(io, output_stage_path) catch {};
 
@@ -487,10 +573,11 @@ pub fn rebuild(
         .uuid = scanned.identity.uuid,
         .timestamp = scanned.identity.global_timestamp,
     });
+    const raw_inode = (try raw.file.stat(io)).inode;
     raw.close(io);
     raw_open = false;
 
-    try publishRawStaging(
+    publishRawStaging(
         allocator,
         io,
         raw_path,
@@ -499,9 +586,14 @@ pub fn rebuild(
         options.output_format,
         virtual_size,
         options.output_create_options,
+        raw_inode,
         &raw_exists,
         &output_stage_exists,
-    );
+    ) catch |err| {
+        try removeStagingPathChecked(io, raw_path);
+        raw_exists = false;
+        return err;
+    };
 
     return .{
         .source_format = source_format,
@@ -523,6 +615,126 @@ pub fn rebuild(
         .existing_operation_count = options.existing_operations.len,
         .os_customization_count = customizationCount(options.customization),
         .generalization_count = generalizationCount(options.generalization),
+    };
+}
+
+fn transactRawInternal(
+    allocator: Allocator,
+    io: Io,
+    options: RawMutationOptions,
+    hook: RawMutationHook,
+    staging_label: []const u8,
+) !RawMutationReport {
+    if (options.source_path.len == 0 or options.output_path.len == 0) {
+        return error.InvalidPath;
+    }
+    const source_path = try std.fs.path.resolve(allocator, &.{options.source_path});
+    defer allocator.free(source_path);
+    const output_path = try std.fs.path.resolve(allocator, &.{options.output_path});
+    defer allocator.free(output_path);
+    if (std.mem.eql(u8, source_path, output_path)) return error.SourceOutputConflict;
+
+    var source = try Image.openPathReadOnly(io, source_path);
+    var source_open = true;
+    defer if (source_open) source.close(io);
+    if (options.expected_source_format) |expected| {
+        if (source.format != expected) return error.SourceFormatMismatch;
+    }
+    if (options.expected_virtual_size) |expected| {
+        if (source.virtual_size != expected) return error.VirtualSizeMismatch;
+    }
+    const virtual_size = source.virtual_size;
+    const source_format = source.format;
+    const flattened = if (source.qcow2) |info| info.backing_depth != 0 else false;
+    const partition = if (options.require_linux_partition)
+        try selectRebuildPartition(allocator, io, source, options.root_partition)
+    else
+        try selectPartition(allocator, io, source, options.root_partition);
+    const partition_end = std.math.add(
+        u64,
+        partition.offset,
+        partition.length,
+    ) catch return error.InvalidPartitionBounds;
+    if (partition.length == 0 or partition_end > virtual_size) {
+        return error.InvalidPartitionBounds;
+    }
+
+    const raw_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}.{s}.raw",
+        .{ output_path, staging_label },
+    );
+    defer allocator.free(raw_path);
+    const output_stage_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}.{s}.output",
+        .{ output_path, staging_label },
+    );
+    defer allocator.free(output_stage_path);
+    try validateRawArtifactPaths(
+        allocator,
+        source,
+        source_path,
+        output_path,
+        raw_path,
+        output_stage_path,
+        options.dependency_paths,
+    );
+
+    var raw_exists = false;
+    defer if (raw_exists) Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+    var output_stage_exists = false;
+    defer if (output_stage_exists) Io.Dir.cwd().deleteFile(io, output_stage_path) catch {};
+
+    var raw = try Image.createExclusive(io, raw_path, .raw, virtual_size, .{});
+    raw_exists = true;
+    var raw_open = true;
+    defer if (raw_open) raw.close(io);
+    try image_mod.copyAll(io, source, &raw, allocator);
+    source.close(io);
+    source_open = false;
+    const raw_inode = (try raw.file.stat(io)).inode;
+    raw.close(io);
+    raw_open = false;
+
+    hook.run(allocator, io, .{
+        .raw_path = raw_path,
+        .virtual_size = virtual_size,
+        .stage_inode = raw_inode,
+        .partition = .{
+            .offset = partition.offset,
+            .length = partition.length,
+        },
+    }) catch |err| {
+        try removeStagingPathChecked(io, raw_path);
+        raw_exists = false;
+        return err;
+    };
+    publishRawStaging(
+        allocator,
+        io,
+        raw_path,
+        output_stage_path,
+        output_path,
+        options.output_format,
+        virtual_size,
+        options.output_create_options,
+        raw_inode,
+        &raw_exists,
+        &output_stage_exists,
+    ) catch |err| {
+        try removeStagingPathChecked(io, raw_path);
+        raw_exists = false;
+        return err;
+    };
+
+    return .{
+        .source_format = source_format,
+        .output_format = options.output_format,
+        .virtual_size = virtual_size,
+        .partition_offset = partition.offset,
+        .partition_length = partition.length,
+        .flattened_backing_chain = flattened,
     };
 }
 
@@ -559,17 +771,23 @@ fn publishRawStaging(
     output_format: Format,
     virtual_size: u64,
     output_create_options: image_mod.CreateOptions,
+    expected_raw_inode: Io.File.INode,
     raw_exists: *bool,
     output_stage_exists: *bool,
 ) !void {
+    var raw_source = try openRawStage(
+        io,
+        raw_path,
+        virtual_size,
+        expected_raw_inode,
+        false,
+    );
+    defer raw_source.close(io);
     if (output_format == .raw) {
         try Io.Dir.cwd().renamePreserve(raw_path, Io.Dir.cwd(), output_path, io);
         raw_exists.* = false;
         return;
     }
-
-    var raw_source = try Image.openPathReadOnly(io, raw_path);
-    defer raw_source.close(io);
     var output = try Image.createExclusive(
         io,
         output_stage_path,
@@ -581,10 +799,84 @@ fn publishRawStaging(
     var output_open = true;
     defer if (output_open) output.close(io);
     try image_mod.copyAll(io, raw_source, &output, allocator);
+    const output_inode = (try output.file.stat(io)).inode;
     output.close(io);
     output_open = false;
+    const pinned_output = try openPinnedStage(io, output_stage_path, output_inode);
+    defer pinned_output.close(io);
     try Io.Dir.cwd().renamePreserve(output_stage_path, Io.Dir.cwd(), output_path, io);
     output_stage_exists.* = false;
+}
+
+fn openRawStage(
+    io: Io,
+    path: []const u8,
+    expected_size: ?u64,
+    expected_inode: ?Io.File.INode,
+    writable: bool,
+) !Image {
+    const file = try Io.Dir.cwd().openFile(io, path, .{
+        .mode = if (writable) .read_write else .read_only,
+        .follow_symlinks = false,
+    });
+    errdefer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.kind != .file) return error.RawStageNotRegularFile;
+    if (stat.nlink != 1) return error.RawStageAliased;
+    if (expected_size) |size| {
+        if (stat.size != size) return error.VirtualSizeMismatch;
+    }
+    if (expected_inode) |inode| {
+        if (stat.inode != inode) return error.RawStageReplaced;
+    }
+    return .{
+        .file = file,
+        .format = .raw,
+        .data_offset = 0,
+        .virtual_size = stat.size,
+    };
+}
+
+fn removeStagingPath(io: Io, path: []const u8) void {
+    removeStagingPathChecked(io, path) catch {};
+}
+
+fn removeStagingPathChecked(io: Io, path: []const u8) !void {
+    const cwd = Io.Dir.cwd();
+    const stat = cwd.statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    if (stat.kind == .directory) {
+        if (std.fs.path.isAbsolute(path)) {
+            try Io.Dir.deleteDirAbsolute(io, path);
+        } else {
+            try cwd.deleteDir(io, path);
+        }
+    } else {
+        if (std.fs.path.isAbsolute(path)) {
+            try Io.Dir.deleteFileAbsolute(io, path);
+        } else {
+            try cwd.deleteFile(io, path);
+        }
+    }
+}
+
+fn openPinnedStage(
+    io: Io,
+    path: []const u8,
+    expected_inode: Io.File.INode,
+) !Io.File {
+    const file = try Io.Dir.cwd().openFile(io, path, .{
+        .mode = .read_only,
+        .follow_symlinks = false,
+    });
+    errdefer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.kind != .file) return error.OutputStageNotRegularFile;
+    if (stat.nlink != 1) return error.OutputStageAliased;
+    if (stat.inode != expected_inode) return error.OutputStageReplaced;
+    return file;
 }
 
 fn zeroFileRange(io: Io, file: Io.File, offset: u64, length: u64) !void {
@@ -630,6 +922,35 @@ fn preflightHostFile(io: Io, path: []const u8, max_bytes: u64) !void {
     const stat = try file.stat(io);
     if (stat.kind != .file) return error.SourceNotRegularFile;
     if (stat.size > max_bytes) return error.SourceFileTooLarge;
+}
+
+fn validateRawArtifactPaths(
+    allocator: Allocator,
+    source: Image,
+    source_path: []const u8,
+    output_path: []const u8,
+    raw_path: []const u8,
+    output_stage_path: []const u8,
+    hook_dependencies: []const []const u8,
+) !void {
+    const artifacts = [_][]const u8{ output_path, raw_path, output_stage_path };
+    for (artifacts, 0..) |path, index| {
+        if (std.mem.eql(u8, path, source_path)) return error.SourceOutputConflict;
+        for (artifacts[index + 1 ..]) |other| {
+            if (std.mem.eql(u8, path, other)) return error.SourceOutputConflict;
+        }
+    }
+    const source_dependencies = try source.sourceDependencyPaths(allocator);
+    defer {
+        for (source_dependencies) |path| allocator.free(path);
+        allocator.free(source_dependencies);
+    }
+    for (source_dependencies) |dependency| {
+        try validateDependencyArtifactIsolation(allocator, dependency, &artifacts);
+    }
+    for (hook_dependencies) |dependency| {
+        try validateDependencyArtifactIsolation(allocator, dependency, &artifacts);
+    }
 }
 
 fn validateRebuildArtifactPaths(
@@ -1859,6 +2180,215 @@ test "failed rebuild customization and publication clean every staging artifact"
     var bytes: ["preserve-me".len]u8 = undefined;
     _ = try existing.readPositionalAll(io, &bytes, 0);
     try std.testing.expectEqualStrings("preserve-me", &bytes);
+}
+
+test "raw mutation hook receives a closed standalone stage and controls publication" {
+    const io = std.testing.io;
+    const source_path = "test-raw-mutation-source.raw";
+    const output_path = "test-raw-mutation-output.qcow2";
+    const corrupt_path = "test-raw-mutation-corrupt.raw";
+    const alias_path = "test-raw-mutation-alias.raw";
+    const directory_path = "test-raw-mutation-directory.raw";
+    const failed_path = "test-raw-mutation-failed.raw";
+    const paths = [_][]const u8{
+        source_path,
+        output_path,
+        output_path ++ ".raw-mutation.raw",
+        output_path ++ ".raw-mutation.output",
+        corrupt_path,
+        corrupt_path ++ ".raw-mutation.raw",
+        corrupt_path ++ ".raw-mutation.output",
+        alias_path,
+        alias_path ++ ".raw-mutation.raw",
+        alias_path ++ ".raw-mutation.output",
+        directory_path,
+        directory_path ++ ".raw-mutation.raw",
+        directory_path ++ ".raw-mutation.output",
+        failed_path,
+        failed_path ++ ".raw-mutation.raw",
+        failed_path ++ ".raw-mutation.output",
+    };
+    for (paths) |path| removeStagingPath(io, path);
+    defer for (paths) |path| removeStagingPath(io, path);
+    try createTestDisk(io, source_path);
+    const source_before = try hashTestPath(io, source_path);
+
+    const SuccessHook = struct {
+        fn run(
+            context_ptr: ?*anyopaque,
+            _: Allocator,
+            hook_io: Io,
+            target: RawMutationTarget,
+        ) !void {
+            const called: *bool = @ptrCast(@alignCast(context_ptr.?));
+            called.* = true;
+            var stage = try Image.openPath(hook_io, target.raw_path);
+            defer stage.close(hook_io);
+            try stage.pwrite(hook_io, "zvmi", target.partition.offset + 4096);
+        }
+    };
+    var called = false;
+    const report = try transactRaw(std.testing.allocator, io, .{
+        .source_path = source_path,
+        .output_path = output_path,
+        .output_format = .qcow2,
+        .root_partition = .{ .mbr_index = 1 },
+        .expected_virtual_size = test_disk_size,
+        .require_linux_partition = true,
+    }, .{ .context = &called, .runFn = SuccessHook.run });
+    try std.testing.expect(called);
+    try std.testing.expectEqual(test_disk_size, report.virtual_size);
+    try std.testing.expectEqual(
+        @as(u64, test_partition_first_lba) * mbr.sector_size,
+        report.partition_offset,
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        &source_before,
+        &(try hashTestPath(io, source_path)),
+    );
+    var output = try Image.openPathReadOnly(io, output_path);
+    defer output.close(io);
+    var changed: [4]u8 = undefined;
+    _ = try output.pread(io, &changed, report.partition_offset + 4096);
+    try std.testing.expectEqualStrings("zvmi", &changed);
+
+    const TruncateHook = struct {
+        fn run(
+            _: ?*anyopaque,
+            _: Allocator,
+            hook_io: Io,
+            target: RawMutationTarget,
+        ) !void {
+            const stage = try Io.Dir.cwd().openFile(
+                hook_io,
+                target.raw_path,
+                .{ .mode = .read_write },
+            );
+            defer stage.close(hook_io);
+            try stage.setLength(hook_io, target.virtual_size - 1);
+        }
+    };
+    try std.testing.expectError(error.VirtualSizeMismatch, transactRaw(
+        std.testing.allocator,
+        io,
+        .{
+            .source_path = source_path,
+            .output_path = corrupt_path,
+            .output_format = .raw,
+            .root_partition = .{ .mbr_index = 1 },
+        },
+        .{ .runFn = TruncateHook.run },
+    ));
+    inline for (.{ "", ".raw-mutation.raw", ".raw-mutation.output" }) |suffix| {
+        const artifact = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{s}{s}",
+            .{ corrupt_path, suffix },
+        );
+        defer std.testing.allocator.free(artifact);
+        try std.testing.expectError(
+            error.FileNotFound,
+            Io.Dir.cwd().statFile(io, artifact, .{}),
+        );
+    }
+
+    const AliasHook = struct {
+        fn run(
+            context_ptr: ?*anyopaque,
+            _: Allocator,
+            hook_io: Io,
+            target: RawMutationTarget,
+        ) !void {
+            const original_path: *const []const u8 = @ptrCast(@alignCast(context_ptr.?));
+            try Io.Dir.cwd().deleteFile(hook_io, target.raw_path);
+            try Io.Dir.cwd().hardLink(
+                original_path.*,
+                Io.Dir.cwd(),
+                target.raw_path,
+                hook_io,
+                .{},
+            );
+        }
+    };
+    var original_path: []const u8 = source_path;
+    try std.testing.expectError(error.RawStageAliased, transactRaw(
+        std.testing.allocator,
+        io,
+        .{
+            .source_path = source_path,
+            .output_path = alias_path,
+            .output_format = .raw,
+            .root_partition = .{ .mbr_index = 1 },
+        },
+        .{ .context = @ptrCast(&original_path), .runFn = AliasHook.run },
+    ));
+    try std.testing.expectEqualSlices(
+        u8,
+        &source_before,
+        &(try hashTestPath(io, source_path)),
+    );
+
+    const DirectoryHook = struct {
+        fn run(
+            _: ?*anyopaque,
+            _: Allocator,
+            hook_io: Io,
+            target: RawMutationTarget,
+        ) !void {
+            try Io.Dir.cwd().deleteFile(hook_io, target.raw_path);
+            try Io.Dir.cwd().createDir(hook_io, target.raw_path, .default_dir);
+        }
+    };
+    try std.testing.expectError(error.RawStageNotRegularFile, transactRaw(
+        std.testing.allocator,
+        io,
+        .{
+            .source_path = source_path,
+            .output_path = directory_path,
+            .output_format = .raw,
+            .root_partition = .{ .mbr_index = 1 },
+        },
+        .{ .runFn = DirectoryHook.run },
+    ));
+    try std.testing.expectError(
+        error.FileNotFound,
+        Io.Dir.cwd().statFile(io, directory_path ++ ".raw-mutation.raw", .{}),
+    );
+
+    const FailureHook = struct {
+        fn run(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: Io,
+            _: RawMutationTarget,
+        ) !void {
+            return error.InjectedMutationFailure;
+        }
+    };
+    try std.testing.expectError(error.InjectedMutationFailure, transactRaw(
+        std.testing.allocator,
+        io,
+        .{
+            .source_path = source_path,
+            .output_path = failed_path,
+            .output_format = .raw,
+            .root_partition = .{ .mbr_index = 1 },
+        },
+        .{ .runFn = FailureHook.run },
+    ));
+    inline for (.{ "", ".raw-mutation.raw", ".raw-mutation.output" }) |suffix| {
+        const artifact = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{s}{s}",
+            .{ failed_path, suffix },
+        );
+        defer std.testing.allocator.free(artifact);
+        try std.testing.expectError(
+            error.FileNotFound,
+            Io.Dir.cwd().statFile(io, artifact, .{}),
+        );
+    }
 }
 
 test "preserved editor mutates a raw copy without changing source or unrelated bytes" {
