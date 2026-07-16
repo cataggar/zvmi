@@ -102,7 +102,11 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    b.installArtifact(cli_exe);
+    const install_cli = b.addInstallArtifact(cli_exe, .{});
+    b.getInstallStep().dependOn(&install_cli.step);
+
+    const install_cli_step = b.step("install-zvmi", "Install only the zvmi CLI");
+    install_cli_step.dependOn(&install_cli.step);
 
     const run_cmd = b.addRunArtifact(cli_exe);
     run_cmd.step.dependOn(b.getInstallStep());
