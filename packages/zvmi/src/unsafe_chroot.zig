@@ -288,6 +288,7 @@ const Session = struct {
     rpm_version: []const u8 = "",
     tdnf_version: []const u8 = "",
     dracut_version: []const u8 = "",
+    cp_version: []const u8 = "",
 
     fn openAndRun(self: *Session) ?void {
         self.open() catch return null;
@@ -943,12 +944,25 @@ const Session = struct {
                 .{kernel},
             );
             defer self.allocator.free(output);
+            const temporary_output = "/run/zvmi-initramfs.img";
             try self.runChroot(&.{
                 "/usr/bin/dracut",
                 "--force",
                 "--no-hostonly",
+                "--tmpdir",
+                "/run",
                 "--kver",
                 kernel,
+                temporary_output,
+            });
+            self.cp_version = try self.runChrootCapture(&.{
+                "/usr/bin/cp",
+                "--version",
+            });
+            try self.runChroot(&.{
+                "/usr/bin/cp",
+                "--remove-destination",
+                temporary_output,
                 output,
             });
         }
@@ -1013,6 +1027,7 @@ const Session = struct {
         if (std.mem.endsWith(u8, guest_path, "/rpm")) return self.rpm_version;
         if (std.mem.endsWith(u8, guest_path, "/tdnf")) return self.tdnf_version;
         if (std.mem.endsWith(u8, guest_path, "/dracut")) return self.dracut_version;
+        if (std.mem.endsWith(u8, guest_path, "/cp")) return self.cp_version;
         return "";
     }
 };
@@ -1650,7 +1665,7 @@ test "worker executes policy with strict reverse cleanup" {
     const result = try executeManifest(allocator, io, manifest, executor);
     try std.testing.expect(result.operation_succeeded);
     try std.testing.expect(result.cleanup_complete);
-    try std.testing.expectEqual(@as(usize, 4), result.report.tools.len);
+    try std.testing.expectEqual(@as(usize, 5), result.report.tools.len);
     try std.testing.expectEqualStrings(
         "RPM version 4.18.0",
         result.report.tools[0].version,
@@ -1662,6 +1677,10 @@ test "worker executes policy with strict reverse cleanup" {
     try std.testing.expectEqualStrings(
         "dracut 102",
         result.report.tools[3].version,
+    );
+    try std.testing.expectEqualStrings(
+        "cp (GNU coreutils) 9.4",
+        result.report.tools[4].version,
     );
     try std.testing.expectEqual(
         @as(usize, 2),
@@ -1949,6 +1968,9 @@ const FakeExecutorContext = struct {
         }
         if (containsArg(argv, "/usr/bin/dracut") and containsArg(argv, "--version")) {
             return fakeResult(allocator, "dracut 102\n", 0);
+        }
+        if (containsArg(argv, "/usr/bin/cp") and containsArg(argv, "--version")) {
+            return fakeResult(allocator, "cp (GNU coreutils) 9.4\n", 0);
         }
         if (containsArg(argv, "/usr/bin/rpm") and containsArg(argv, "-qa")) {
             return fakeResult(

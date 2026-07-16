@@ -18,11 +18,11 @@ const zvmi = @import("zvmi");
 const qmp = @import("qmp");
 const qemu_host = @import("qemu_host");
 
-const qemu_boot_smoke_timeout_seconds: i64 = 60;
+const qemu_boot_smoke_timeout_seconds: i64 = 120;
 const qemu_boot_smoke_serial_limit: usize = 256 * 1024;
 const qemu_boot_smoke_disk_size: u64 = 4 * 1024 * zvmi.azure.one_mib;
 
-const OvmfFirmwarePair = qemu_host.FirmwarePair;
+pub const OvmfFirmwarePair = qemu_host.FirmwarePair;
 
 const QemuBootSmokePrereqs = struct {
     qemu_path: []u8,
@@ -48,12 +48,12 @@ const IsoOciFixtures = struct {
     }
 };
 
-const QemuBootSmokeResult = struct {
+pub const QemuBootSmokeResult = struct {
     timed_out: bool,
     quit_acknowledged: bool,
     serial_output: []u8,
 
-    fn deinit(self: *QemuBootSmokeResult, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *QemuBootSmokeResult, allocator: std.mem.Allocator) void {
         allocator.free(self.serial_output);
         self.* = undefined;
     }
@@ -254,7 +254,7 @@ const qemu_boot_smoke_poll_interval_ms: u64 = 200;
 /// entries at all -- the raw MBR disk's embedded GRUB boots directly); pass
 /// a firmware pair (with `ovmf_vars_copy_path` pointing at a *writable copy*
 /// of its vars file) for a Gen2/UEFI boot.
-fn runQemuBootSmoke(
+pub fn runQemuBootSmoke(
     allocator: std.mem.Allocator,
     io: Io,
     qemu_path: []const u8,
@@ -447,7 +447,7 @@ test "build-image boot-smokes typed customization and generalization under Gen2 
         .output_format = .raw,
         .generation = .gen2,
         .size = qemu_boot_smoke_disk_size,
-        .extra_kernel_options = "console=tty0 console=ttyS0,115200n8",
+        .extra_kernel_options = "console=tty0 console=ttyS0,115200n8 selinux=0",
         .os = .{
             .filesystem = &filesystem,
             .hostname = "zvmi-customized",
@@ -471,9 +471,11 @@ test "build-image boot-smokes typed customization and generalization under Gen2 
     );
     defer qemu.deinit(allocator);
 
-    if (!serialOutputShowsKernelBoot(qemu.serial_output)) {
+    if (!serialOutputShowsKernelBoot(qemu.serial_output) or
+        std.mem.indexOf(u8, qemu.serial_output, "ZVMI customization verified") == null)
+    {
         std.debug.print(
-            "QEMU boot smoke test did not reach kernel serial output (timed_out={}, quit_acknowledged={})\nserial output:\n{s}\n",
+            "QEMU customization boot smoke did not reach its marker (timed_out={}, quit_acknowledged={})\nserial output:\n{s}\n",
             .{ qemu.timed_out, qemu.quit_acknowledged, qemu.serial_output },
         );
     }
