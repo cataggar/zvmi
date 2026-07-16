@@ -269,6 +269,29 @@ pub fn build(b: *std.Build) void {
     const boot_smoke_step = b.step("test-boot-smoke", "Run opportunistic real-QEMU boot-smoke tests");
     boot_smoke_step.dependOn(&run_boot_smoke_tests.step);
 
+    const unsafe_chroot_integration_exe = b.addExecutable(.{
+        .name = "zvmi-unsafe-chroot-integration",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/unsafe_chroot_integration.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zvmi", .module = host_zvmi_mod },
+            },
+        }),
+        .linkage = .static,
+    });
+    const run_unsafe_chroot_integration = b.addRunArtifact(
+        unsafe_chroot_integration_exe,
+    );
+    const unsafe_chroot_integration_step = b.step(
+        "test-unsafe-chroot-integration",
+        "Run the privileged unsafe-chroot lifecycle integration",
+    );
+    unsafe_chroot_integration_step.dependOn(
+        &run_unsafe_chroot_integration.step,
+    );
+
     // ---- nbd: native Zig NBD client + reference server ----
     const nbd_mod = b.addModule("nbd", .{
         .root_source_file = b.path("nbd/src/nbd.zig"),
@@ -526,6 +549,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_qmp_codegen_tests.step);
     test_step.dependOn(&run_qmp_schema_tests.step);
     test_step.dependOn(&run_boot_smoke_tests.step);
+    test_step.dependOn(&run_unsafe_chroot_integration.step);
     test_step.dependOn(&run_nbd_mod_tests.step);
     test_step.dependOn(&run_nbd_exe_tests.step);
     test_step.dependOn(&run_nbd_server_tests.step);

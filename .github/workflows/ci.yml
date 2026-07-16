@@ -32,3 +32,8 @@ jobs:
 
       - name: zig build test
         run: zig build test --summary all
+
+      - name: privileged unsafe-chroot integration
+        env:
+          ZVMI_RUN_PRIVILEGED_TEST: "1"
+        run: zig build test-unsafe-chroot-integration --summary all
