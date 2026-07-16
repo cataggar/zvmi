@@ -306,6 +306,9 @@ fn downloadBlob(
 
     const expected_digest = artifact_pipeline.parseSha256(digest) catch
         return error.InvalidDigest;
+    var curl = artifact_pipeline.CurlDownloader{
+        .executable_path = "curl",
+    };
     const acquired = artifact_pipeline.acquireVerified(
         gpa,
         io,
@@ -315,7 +318,7 @@ fn downloadBlob(
             .expected_sha256 = expected_digest,
             .max_size = zvmi_max_layer_bytes,
         },
-        .{ .downloadFn = curlDownload },
+        curl.downloader(),
     ) catch |err| switch (err) {
         error.ChecksumMismatch => {
             std.debug.print("error: blob digest mismatch: expected {s}\n", .{expected});
@@ -984,6 +987,9 @@ fn downloadIso(gpa: Allocator, io: Io, work_dir: []const u8) ![]const u8 {
     const expected = checksum_fields.next() orelse return error.InvalidIsoChecksum;
     const expected_digest = artifact_pipeline.parseSha256(expected) catch
         return error.InvalidIsoChecksum;
+    var curl = artifact_pipeline.CurlDownloader{
+        .executable_path = "curl",
+    };
     const acquired = artifact_pipeline.acquireVerified(
         gpa,
         io,
@@ -993,7 +999,7 @@ fn downloadIso(gpa: Allocator, io: Io, work_dir: []const u8) ![]const u8 {
             .expected_sha256 = expected_digest,
             .max_size = iso_max_bytes,
         },
-        .{ .downloadFn = curlDownload },
+        curl.downloader(),
     ) catch |err| switch (err) {
         error.ChecksumMismatch => return error.IsoChecksumMismatch,
         else => return err,
@@ -1004,44 +1010,6 @@ fn downloadIso(gpa: Allocator, io: Io, work_dir: []const u8) ![]const u8 {
         std.debug.print("ISO downloaded: {s}\n", .{iso_path});
     }
     return iso_path;
-}
-
-fn curlDownload(
-    _: ?*anyopaque,
-    _: Allocator,
-    io: Io,
-    url: []const u8,
-    output: *Io.Writer,
-) !void {
-    std.debug.print("Downloading artifact...\n", .{});
-    var child = try std.process.spawn(io, .{
-        .argv = &.{
-            "curl",
-            "-fLsS",
-            "--retry",
-            "3",
-            url,
-        },
-        .stdin = .ignore,
-        .stdout = .pipe,
-        .stderr = .inherit,
-    });
-    defer child.kill(io);
-
-    var pipe_buffer: [64 * 1024]u8 = undefined;
-    var pipe_reader = child.stdout.?.readerStreaming(io, &pipe_buffer);
-    var buffer: [64 * 1024]u8 = undefined;
-    while (true) {
-        const read = try pipe_reader.interface.readSliceShort(&buffer);
-        if (read == 0) break;
-        try output.writeAll(buffer[0..read]);
-    }
-
-    const term = try child.wait(io);
-    switch (term) {
-        .exited => |code| if (code != 0) return error.CommandFailed,
-        else => return error.CommandFailed,
-    }
 }
 
 // ─── tool check ──────────────────────────────────────────────────────────────
@@ -1141,6 +1109,18 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("error: {s}\n{s}", .{ @errorName(err), help_text });
         std.process.exit(1);
     };
+    const requested_size = zvmi.parseSize(args.size) catch |err| {
+        std.debug.print("error: invalid --size ({s})\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    const max_qcow2_file_size = std.math.add(
+        u64,
+        requested_size,
+        requested_size / 64 + 64 * 1024 * 1024,
+    ) catch {
+        std.debug.print("error: --size is too large\n", .{});
+        std.process.exit(1);
+    };
 
     const zvmi_path = args.zvmi_path orelse {
         std.debug.print("error: --zvmi is required (provided by zig build)\n", .{});
@@ -1201,10 +1181,7 @@ pub fn main(init: std.process.Init) !void {
     // Build the raw QCOW2 first (no compression).
     const raw_qcow2 = try std.fmt.allocPrint(gpa, "{s}.raw.qcow2", .{args.output});
     defer gpa.free(raw_qcow2);
-    const compressed_qcow2 = try std.fmt.allocPrint(gpa, "{s}.tmp", .{args.output});
-    defer gpa.free(compressed_qcow2);
     Dir.cwd().deleteFile(io, raw_qcow2) catch {};
-    Dir.cwd().deleteFile(io, compressed_qcow2) catch {};
 
     std.debug.print("Building disk image...\n", .{});
     try run(gpa, io, &.{
@@ -1234,44 +1211,40 @@ pub fn main(init: std.process.Init) !void {
     defer env_map.deinit();
     try env_map.put("LD_PRELOAD", preload_path);
 
-    var compress_child = try std.process.spawn(io, .{
-        .argv = &.{
-            "qemu-img",                                 "convert",
-            "-c",                                       "-f",
-            "qcow2",                                    "-O",
-            "qcow2",                                    "-o",
-            "compression_type=zstd,cluster_size=65536", raw_qcow2,
-            compressed_qcow2,
+    const raw_metadata = try artifact_pipeline.hashFile(io, raw_qcow2);
+    const finalized = artifact_pipeline.finalizeQcow2(
+        gpa,
+        io,
+        .{
+            .input_path = raw_qcow2,
+            .expected_input_sha256 = raw_metadata.sha256,
+            .max_input_size = max_qcow2_file_size,
+            .source_format = .qcow2,
+            .expected_virtual_size = requested_size,
+            .max_virtual_size = requested_size,
+            .output_path = args.output,
+            .max_output_size = max_qcow2_file_size,
+            .qemu_img_path = "qemu-img",
+            .compression = .zstd,
+            .convert_environ_map = &env_map,
         },
-        .stdin = .ignore,
-        .stdout = .inherit,
-        .stderr = .inherit,
-        .environ_map = &env_map,
-    });
-    const compress_term = try compress_child.wait(io);
-    switch (compress_term) {
-        .exited => |code| if (code != 0) {
-            Dir.cwd().deleteFile(io, compressed_qcow2) catch {};
-            std.debug.print("error: qemu-img compress failed (code {d}); keeping {s}\n", .{ code, raw_qcow2 });
-            return error.CompressionFailed;
-        },
-        else => {
-            Dir.cwd().deleteFile(io, compressed_qcow2) catch {};
-            std.debug.print("error: qemu-img terminated abnormally; keeping {s}\n", .{raw_qcow2});
-            return error.CompressionFailed;
-        },
-    }
-
-    try run(gpa, io, &.{ "qemu-img", "check", compressed_qcow2 });
-    try Dir.rename(Dir.cwd(), compressed_qcow2, Dir.cwd(), args.output, io);
+    ) catch |err| {
+        std.debug.print(
+            "error: QCOW2 finalization failed ({s}); keeping {s}\n",
+            .{ @errorName(err), raw_qcow2 },
+        );
+        return err;
+    };
 
     // Remove the intermediate uncompressed QCOW2 on success.
     Dir.cwd().deleteFile(io, raw_qcow2) catch |err| {
         std.debug.print("warning: could not remove {s}: {s}\n", .{ raw_qcow2, @errorName(err) });
     };
 
-    const stat = try Dir.cwd().statFile(io, args.output, .{});
-    std.debug.print("Built {s} ({d} bytes)\n", .{ args.output, stat.size });
+    std.debug.print(
+        "Built {s} ({d} bytes, virtual size {d})\n",
+        .{ args.output, finalized.artifact.size, finalized.virtual_size },
+    );
 }
 
 // ─── unit tests ──────────────────────────────────────────────────────────────
