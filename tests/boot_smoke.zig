@@ -471,9 +471,11 @@ test "build-image boot-smokes typed customization and generalization under Gen2 
     );
     defer qemu.deinit(allocator);
 
-    if (!serialOutputShowsKernelBoot(qemu.serial_output)) {
+    if (!serialOutputShowsKernelBoot(qemu.serial_output) or
+        std.mem.indexOf(u8, qemu.serial_output, "ZVMI customization verified") == null)
+    {
         std.debug.print(
-            "QEMU boot smoke test did not reach kernel serial output (timed_out={}, quit_acknowledged={})\nserial output:\n{s}\n",
+            "QEMU customization boot smoke did not reach its marker (timed_out={}, quit_acknowledged={})\nserial output:\n{s}\n",
             .{ qemu.timed_out, qemu.quit_acknowledged, qemu.serial_output },
         );
     }

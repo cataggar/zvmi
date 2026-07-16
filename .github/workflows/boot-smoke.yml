@@ -80,15 +80,15 @@ jobs:
             echo "::warning::build-verity-initramfs-fixture.sh failed; ZVMI_BOOT_TEST_VERITY_OCI won't be set, so the --verity boot-smoke test will skip"
           fi
 
-      - name: zig build test-boot-smoke
-        env:
-          ZVMI_BOOT_TEST_ISO: ${{ github.workspace }}/fixtures/azurelinux-4.0-x86_64.iso
-          ZVMI_BOOT_TEST_OCI: ${{ github.workspace }}/fixtures/oci-minimal
-        run: zig build test-boot-smoke --summary all
-
       - name: Real TDNF/dracut customization and QEMU boot
         env:
           ZVMI_RUN_REAL_PACKAGE_BOOT: "1"
           ZVMI_BOOT_TEST_ISO: ${{ github.workspace }}/fixtures/azurelinux-4.0-x86_64.iso
           ZVMI_BOOT_TEST_OCI: ${{ github.workspace }}/fixtures/oci-minimal
         run: zig build test-unsafe-chroot-real-boot --summary all
+
+      - name: zig build test-boot-smoke
+        env:
+          ZVMI_BOOT_TEST_ISO: ${{ github.workspace }}/fixtures/azurelinux-4.0-x86_64.iso
+          ZVMI_BOOT_TEST_OCI: ${{ github.workspace }}/fixtures/oci-minimal
+        run: zig build test-boot-smoke --summary all
