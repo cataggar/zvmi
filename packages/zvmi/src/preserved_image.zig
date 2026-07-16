@@ -706,6 +706,10 @@ fn transactRawInternal(
             .length = partition.length,
         },
     }) catch |err| {
+        if (err == error.MutationResourcesActive) {
+            raw_exists = false;
+            return err;
+        }
         try removeStagingPathChecked(io, raw_path);
         raw_exists = false;
         return err;
