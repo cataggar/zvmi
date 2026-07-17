@@ -48,6 +48,9 @@ const ArchitectureDescriptor = struct {
     iso_name: []const u8,
     iso_sha256: []const u8,
     base_manifest_digest: []const u8,
+    repository_base_url: []const u8,
+    repomd_url: []const u8,
+    repomd_sha256: []const u8,
     signing_key_path: []const u8,
     systemd_boot_rpm_name: []const u8,
     systemd_boot_rpm_url: []const u8,
@@ -78,6 +81,9 @@ const x86_64 = ArchitectureDescriptor{
     // 2026-07-17. Pinning it prevents a moving endpoint changing the recipe.
     .iso_sha256 = "d98f7d1ffaa916de7c9f66ffdadb150c174da691509e760835709ffa7829ca48",
     .base_manifest_digest = "sha256:9070b05147f01e5a4bac47723c95f2555e11b9d3324c1df1910ff3545b7ce319",
+    .repository_base_url = "https://packages.microsoft.com/azurelinux/4.0/beta/base/x86_64",
+    .repomd_url = "https://packages.microsoft.com/azurelinux/4.0/beta/base/x86_64/repodata/repomd.xml",
+    .repomd_sha256 = "a494ab6c6175f129350bb81f01d331bb02cc012c9489306c372dff98381a30fc",
     .signing_key_path = "etc/pki/rpm-gpg/RPM-GPG-KEY-azurelinux-4.0-x86_64",
     .systemd_boot_rpm_name = "systemd-boot-unsigned-258.4-4.azl4.x86_64.rpm",
     .systemd_boot_rpm_url = "https://packages.microsoft.com/azurelinux/4.0/beta/base/x86_64/Packages/s/systemd-boot-unsigned-258.4-4.azl4.x86_64.rpm",
@@ -108,6 +114,9 @@ const aarch64 = ArchitectureDescriptor{
     // 2026-07-17. Pinning it prevents a moving endpoint changing the recipe.
     .iso_sha256 = "762039fde64a59806750ee86ca98132fad4f9df02e7684490017cdfda0c55157",
     .base_manifest_digest = "sha256:e541db83a8511c25fa1dd989161263874b7395ddd588f5caaa25453ea4e23263",
+    .repository_base_url = "https://packages.microsoft.com/azurelinux/4.0/beta/base/aarch64",
+    .repomd_url = "https://packages.microsoft.com/azurelinux/4.0/beta/base/aarch64/repodata/repomd.xml",
+    .repomd_sha256 = "bd463282c4d8daaebbb6e600d6a21848e91aff7d2021255377b3547a4531106d",
     .signing_key_path = "etc/pki/rpm-gpg/RPM-GPG-KEY-azurelinux-4.0-aarch64",
     .systemd_boot_rpm_name = "systemd-boot-unsigned-258.4-4.azl4.aarch64.rpm",
     .systemd_boot_rpm_url = "https://packages.microsoft.com/azurelinux/4.0/beta/base/aarch64/Packages/s/systemd-boot-unsigned-258.4-4.azl4.aarch64.rpm",
@@ -147,6 +156,7 @@ const docker_manifest_type = "application/vnd.docker.distribution.manifest.v2+js
 const docker_index_type = "application/vnd.docker.distribution.manifest.list.v2+json";
 const zvmi_max_layer_bytes: u64 = 128 * 1024 * 1024;
 const iso_max_bytes: u64 = 2 * 1024 * 1024 * 1024;
+const repomd_max_bytes: usize = 1024 * 1024;
 const accept_header = oci_index_type ++ ", " ++ docker_index_type ++ ", " ++ oci_manifest_type ++ ", " ++ docker_manifest_type;
 const generalized_esp_size_bytes: u64 = 512 * 1024 * 1024;
 const generalized_esp_size_arg = "512M";
@@ -629,6 +639,228 @@ fn writeRootFile(
     Dir.cwd().deleteFile(io, tmp_path) catch {};
 }
 
+fn repositoryMetadataMatches(
+    metadata: []const u8,
+    architecture: *const ArchitectureDescriptor,
+) bool {
+    const actual = sha256Bytes(metadata);
+    return metadata.len <= repomd_max_bytes and
+        std.mem.eql(u8, &actual, architecture.repomd_sha256);
+}
+
+/// Fetch the moving repository endpoint into a bounded temporary cache entry.
+/// Deleting the entry first intentionally bypasses reusable download caching,
+/// so both checks observe the repository's current repomd.xml rather than a
+/// previously verified local copy.
+fn verifyRemoteRepositoryMetadata(
+    gpa: Allocator,
+    io: Io,
+    work_dir: []const u8,
+    architecture: *const ArchitectureDescriptor,
+) !void {
+    const metadata_path = try std.fmt.allocPrint(
+        gpa,
+        "{s}/downloads/repomd-{s}.xml",
+        .{ work_dir, architecture.dnf_architecture },
+    );
+    defer gpa.free(metadata_path);
+    const parent = std.fs.path.dirname(metadata_path) orelse return error.InvalidCachePath;
+    try Dir.cwd().createDirPath(io, parent);
+    Dir.cwd().deleteFile(io, metadata_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+
+    const expected_digest = artifact_pipeline.parseSha256(architecture.repomd_sha256) catch
+        return error.InvalidRepositoryMetadataChecksum;
+    var curl = artifact_pipeline.CurlDownloader{
+        .executable_path = "curl",
+    };
+    _ = artifact_pipeline.acquireVerified(
+        gpa,
+        io,
+        .{
+            .url = architecture.repomd_url,
+            .destination_path = metadata_path,
+            .expected_sha256 = expected_digest,
+            .max_size = repomd_max_bytes,
+        },
+        curl.downloader(),
+    ) catch |err| switch (err) {
+        error.ChecksumMismatch => {
+            std.debug.print(
+                "error: repository metadata mismatch for {s}: expected {s}\n",
+                .{ architecture.repomd_url, architecture.repomd_sha256 },
+            );
+            return error.RepositoryMetadataMismatch;
+        },
+        else => return err,
+    };
+}
+
+fn verifyRepositoryMetadataFile(
+    io: Io,
+    path: []const u8,
+    architecture: *const ArchitectureDescriptor,
+) !void {
+    const actual = try sha256File(io, path);
+    if (!std.mem.eql(u8, &actual, architecture.repomd_sha256)) {
+        std.debug.print(
+            "error: repository metadata mismatch for {s}: expected {s}, got {s}\n",
+            .{ path, architecture.repomd_sha256, &actual },
+        );
+        return error.RepositoryMetadataMismatch;
+    }
+}
+
+/// DNF hashes cache-directory names. Find its sole repomd.xml in an isolated
+/// cache and ensure it is the same pin checked from the remote endpoint.
+fn verifyCachedRepositoryMetadata(
+    gpa: Allocator,
+    io: Io,
+    cache_dir: []const u8,
+    architecture: *const ArchitectureDescriptor,
+) !void {
+    const matches = try capture(gpa, io, &.{
+        "find", cache_dir, "-type", "f", "-path", "*/repodata/repomd.xml", "-print",
+    });
+    defer gpa.free(matches);
+
+    var found: ?[]const u8 = null;
+    var lines = std.mem.splitScalar(u8, matches, '\n');
+    while (lines.next()) |line| {
+        const path = std.mem.trim(u8, line, "\r\t ");
+        if (path.len == 0) continue;
+        if (found != null) return error.AmbiguousCachedRepositoryMetadata;
+        found = path;
+    }
+    try verifyRepositoryMetadataFile(
+        io,
+        found orelse return error.MissingCachedRepositoryMetadata,
+        architecture,
+    );
+}
+
+const DnfCachePaths = struct {
+    cache_dir: []u8,
+    persist_dir: []u8,
+    cache_opt: []u8,
+    persist_opt: []u8,
+
+    fn deinit(self: *DnfCachePaths, gpa: Allocator) void {
+        gpa.free(self.cache_dir);
+        gpa.free(self.persist_dir);
+        gpa.free(self.cache_opt);
+        gpa.free(self.persist_opt);
+        self.* = undefined;
+    }
+};
+
+fn prepareDnfCache(
+    gpa: Allocator,
+    io: Io,
+    work_dir: []const u8,
+    architecture: *const ArchitectureDescriptor,
+) !DnfCachePaths {
+    const cache_dir = try std.fmt.allocPrint(gpa, "{s}/dnf-cache-{s}", .{ work_dir, architecture.dnf_architecture });
+    errdefer gpa.free(cache_dir);
+    const persist_dir = try std.fmt.allocPrint(gpa, "{s}/dnf-persist-{s}", .{ work_dir, architecture.dnf_architecture });
+    errdefer gpa.free(persist_dir);
+    const cache_opt = try std.fmt.allocPrint(gpa, "--setopt=cachedir={s}", .{cache_dir});
+    errdefer gpa.free(cache_opt);
+    const persist_opt = try std.fmt.allocPrint(gpa, "--setopt=persistdir={s}", .{persist_dir});
+    errdefer gpa.free(persist_opt);
+
+    // DNF runs under sudo, so remove stale root-owned directories explicitly
+    // before making a fresh, builder-scoped cache and persist store.
+    try sudo(gpa, io, &.{ "rm", "-rf", "--", cache_dir, persist_dir });
+    try Dir.cwd().createDirPath(io, cache_dir);
+    try Dir.cwd().createDirPath(io, persist_dir);
+    return .{
+        .cache_dir = cache_dir,
+        .persist_dir = persist_dir,
+        .cache_opt = cache_opt,
+        .persist_opt = persist_opt,
+    };
+}
+
+fn captureInstalledNevras(gpa: Allocator, io: Io, rootfs_path: []const u8) ![]u8 {
+    return capture(gpa, io, &.{
+        "sudo",
+        "chroot",
+        rootfs_path,
+        "/usr/bin/rpm",
+        "-qa",
+        "--qf",
+        "%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n",
+    });
+}
+
+/// Emit packages newly installed by the package transactions in stable
+/// lexical NEVRA order, independent of RPM database iteration order.
+fn formatInstalledNevraClosure(
+    gpa: Allocator,
+    before: []const u8,
+    after: []const u8,
+) ![]u8 {
+    var prior = std.StringHashMap(void).init(gpa);
+    defer prior.deinit();
+    var before_lines = std.mem.splitScalar(u8, before, '\n');
+    while (before_lines.next()) |raw| {
+        const nevra = std.mem.trim(u8, raw, "\r\t ");
+        if (nevra.len != 0) try prior.put(nevra, {});
+    }
+
+    var emitted = std.StringHashMap(void).init(gpa);
+    defer emitted.deinit();
+    var closure = std.array_list.Managed([]u8).init(gpa);
+    defer {
+        for (closure.items) |nevra| gpa.free(nevra);
+        closure.deinit();
+    }
+    var after_lines = std.mem.splitScalar(u8, after, '\n');
+    while (after_lines.next()) |raw| {
+        const nevra = std.mem.trim(u8, raw, "\r\t ");
+        if (nevra.len == 0 or prior.contains(nevra) or emitted.contains(nevra)) continue;
+        try emitted.put(nevra, {});
+        try closure.append(try gpa.dupe(u8, nevra));
+    }
+    std.mem.sortUnstable([]u8, closure.items, {}, struct {
+        fn lessThan(_: void, lhs: []u8, rhs: []u8) bool {
+            return std.mem.lessThan(u8, lhs, rhs);
+        }
+    }.lessThan);
+
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    errdefer output.deinit();
+    for (closure.items) |nevra| try output.writer.print("{s}\n", .{nevra});
+    return output.toOwnedSlice();
+}
+
+fn writeNevraProvenance(
+    gpa: Allocator,
+    io: Io,
+    work_dir: []const u8,
+    architecture: *const ArchitectureDescriptor,
+    closure: []const u8,
+) !void {
+    const provenance_dir = try std.fmt.allocPrint(gpa, "{s}/provenance", .{work_dir});
+    defer gpa.free(provenance_dir);
+    try Dir.cwd().createDirPath(io, provenance_dir);
+    const provenance_path = try std.fmt.allocPrint(
+        gpa,
+        "{s}/installed-nevra-{s}.txt",
+        .{ provenance_dir, architecture.dnf_architecture },
+    );
+    defer gpa.free(provenance_path);
+    try Dir.cwd().writeFile(io, .{ .sub_path = provenance_path, .data = closure });
+    std.debug.print("Installed NEVRA closure ({s}) written to {s}:\n{s}", .{
+        architecture.dnf_architecture,
+        provenance_path,
+        closure,
+    });
+}
+
 /// Install packages, binaries, and configuration into the rootfs.
 fn installGuestContent(
     gpa: Allocator,
@@ -697,23 +929,77 @@ fn installGuestContent(
     defer gpa.free(gpgkey_opt);
     const forcearch_opt = try std.fmt.allocPrint(gpa, "--forcearch={s}", .{architecture.dnf_architecture});
     defer gpa.free(forcearch_opt);
+
+    // Resolve only against a new, private cache. First pin the live endpoint,
+    // then populate and verify DNF's copy before switching DNF to cache-only
+    // mode for the package transaction. RPM payload checksums from that pinned
+    // primary metadata and the configured RPM signing key remain enforced.
+    try verifyRemoteRepositoryMetadata(gpa, io, work_dir, architecture);
+    var dnf_cache = try prepareDnfCache(gpa, io, work_dir, architecture);
+    defer dnf_cache.deinit(gpa);
+    const baseurl_opt = try std.fmt.allocPrint(
+        gpa,
+        "--setopt=azurelinux-base.baseurl={s}",
+        .{architecture.repository_base_url},
+    );
+    defer gpa.free(baseurl_opt);
+    const metadata_expire_opt = "--setopt=azurelinux-base.metadata_expire=never";
+    const metalink_opt = "--setopt=azurelinux-base.metalink=";
+    const mirrorlist_opt = "--setopt=azurelinux-base.mirrorlist=";
+    const keepcache_opt = "--setopt=keepcache=True";
+    const gpgcheck_opt = "--setopt=azurelinux-base.gpgcheck=True";
     try sudo(gpa, io, &.{
         "dnf",                              "-y",
         "--installroot",                    rootfs_path,
         "--releasever=4.0",                 forcearch_opt,
         "--repo=azurelinux-base",           gpgkey_opt,
-        "--setopt=install_weak_deps=False", "install",
-        "openssh-server",                   "sudo",
+        baseurl_opt,                        metalink_opt,
+        mirrorlist_opt,                     metadata_expire_opt,
+        keepcache_opt,                      gpgcheck_opt,
+        dnf_cache.cache_opt,                dnf_cache.persist_opt,
+        "--setopt=install_weak_deps=False", "makecache",
+    });
+    try verifyCachedRepositoryMetadata(gpa, io, dnf_cache.cache_dir, architecture);
+
+    const installed_before = try captureInstalledNevras(gpa, io, rootfs_path);
+    defer gpa.free(installed_before);
+    try sudo(gpa, io, &.{
+        "dnf",                 "-C",
+        "-y",                  "--installroot",
+        rootfs_path,           "--releasever=4.0",
+        forcearch_opt,         "--repo=azurelinux-base",
+        gpgkey_opt,            baseurl_opt,
+        metalink_opt,          mirrorlist_opt,
+        metadata_expire_opt,   keepcache_opt,
+        gpgcheck_opt,          dnf_cache.cache_opt,
+        dnf_cache.persist_opt, "--setopt=install_weak_deps=False",
+        "install",             "openssh-server",
+        "sudo",
     });
 
     // Install the pinned local RPM in a separate, repository-free transaction.
     try sudo(gpa, io, &.{
-        "dnf",              "-y",
-        "--installroot",    rootfs_path,
-        "--releasever=4.0", forcearch_opt,
-        "--disablerepo=*",  "--setopt=install_weak_deps=False",
-        "install",          systemd_boot_rpm_path,
+        "dnf",                              "-C",
+        "-y",                               "--installroot",
+        rootfs_path,                        "--releasever=4.0",
+        forcearch_opt,                      dnf_cache.cache_opt,
+        dnf_cache.persist_opt,              "--disablerepo=*",
+        "--setopt=install_weak_deps=False", "install",
+        systemd_boot_rpm_path,
     });
+    const installed_after = try captureInstalledNevras(gpa, io, rootfs_path);
+    defer gpa.free(installed_after);
+    const installed_closure = try formatInstalledNevraClosure(gpa, installed_before, installed_after);
+    defer gpa.free(installed_closure);
+    try writeNevraProvenance(gpa, io, work_dir, architecture, installed_closure);
+
+    // Re-fetch the moving endpoint before proceeding to OCI publication. A
+    // changed repomd.xml means the package transaction is no longer provably
+    // reproducible, even though cache-only DNF prevented it from changing this
+    // transaction's resolved package set.
+    try verifyRemoteRepositoryMetadata(gpa, io, work_dir, architecture);
+    try sudo(gpa, io, &.{ "rm", "-rf", "--", dnf_cache.cache_dir, dnf_cache.persist_dir });
+
     const stub_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ rootfs_path, architecture.systemd_boot_stub_path });
     defer gpa.free(stub_path);
     const stub_stat = try Dir.cwd().statFile(io, stub_path, .{ .follow_symlinks = false });
@@ -785,16 +1071,13 @@ fn installGuestContent(
         try sudo(gpa, io, &.{ "rm", "-f", guest_interp });
     }
 
-    // Clean dnf caches.
-    try sudo(gpa, io, &.{
-        "dnf",         "--installroot",          rootfs_path, "--releasever=4.0",
-        forcearch_opt, "--repo=azurelinux-base", "clean",     "all",
-    });
-    const dnf_cache = try std.fmt.allocPrint(gpa, "{s}/var/cache/dnf", .{rootfs_path});
-    defer gpa.free(dnf_cache);
+    // Clean any cache or log that a DNF version still places in the install
+    // root despite the isolated cache/persist options above.
+    const rootfs_dnf_cache = try std.fmt.allocPrint(gpa, "{s}/var/cache/dnf", .{rootfs_path});
+    defer gpa.free(rootfs_dnf_cache);
     const dnf_log = try std.fmt.allocPrint(gpa, "{s}/var/log/dnf.log", .{rootfs_path});
     defer gpa.free(dnf_log);
-    try sudo(gpa, io, &.{ "rm", "-rf", dnf_cache });
+    try sudo(gpa, io, &.{ "rm", "-rf", rootfs_dnf_cache });
     try sudo(gpa, io, &.{ "rm", "-f", dnf_log });
 
     try run(gpa, io, &.{ "file", sbin_zvminit, azagent_dest });
@@ -1624,7 +1907,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Check required external tools.
     var tools_ok = true;
-    for (&[_][]const u8{ "sudo", "tar", "dnf", "curl", "qemu-img", "file" }) |tool| {
+    for (&[_][]const u8{ "sudo", "tar", "dnf", "curl", "qemu-img", "file", "find" }) |tool| {
         if (!requireTool(gpa, io, tool)) {
             std.debug.print("error: required tool '{s}' not found in PATH\n", .{tool});
             tools_ok = false;
@@ -1886,6 +2169,7 @@ test "architecture descriptors pin core inputs and output namespaces" {
         try std.testing.expectEqualStrings(expected_cache_path, cache_path);
         _ = try artifact_pipeline.parseSha256(architecture.iso_sha256);
         _ = try artifact_pipeline.parseSha256(architecture.base_manifest_digest);
+        _ = try artifact_pipeline.parseSha256(architecture.repomd_sha256);
         _ = try artifact_pipeline.parseSha256(architecture.systemd_boot_rpm_sha256);
         try std.testing.expectEqual(architecture.root_type_guid, architecture.root_role.defaultTypeGuid());
     }
@@ -1910,6 +2194,14 @@ test "architecture descriptors pin core inputs and output namespaces" {
     try std.testing.expectEqualStrings(
         "sha256:e541db83a8511c25fa1dd989161263874b7395ddd588f5caaa25453ea4e23263",
         aarch64.base_manifest_digest,
+    );
+    try std.testing.expectEqualStrings(
+        "a494ab6c6175f129350bb81f01d331bb02cc012c9489306c372dff98381a30fc",
+        x86_64.repomd_sha256,
+    );
+    try std.testing.expectEqualStrings(
+        "bd463282c4d8daaebbb6e600d6a21848e91aff7d2021255377b3547a4531106d",
+        aarch64.repomd_sha256,
     );
     try std.testing.expectEqualStrings("AzureLinux-4.0-x86_64.core.qcow2", x86_64.default_output_path);
     try std.testing.expectEqualStrings("AzureLinux-4.0-aarch64.core.qcow2", aarch64.default_output_path);
@@ -1986,6 +2278,26 @@ test "supplied ISO checksum must match the selected architecture" {
     const wrong_checksum = sha256Bytes("not an Azure Linux ISO");
     try std.testing.expect(!isoChecksumMatches(wrong_checksum, &x86_64));
     try std.testing.expect(!isoChecksumMatches(wrong_checksum, &aarch64));
+}
+
+test "repository metadata mismatch is rejected for both architectures" {
+    const moving_metadata = "<repomd>different transaction</repomd>";
+    try std.testing.expect(!repositoryMetadataMatches(moving_metadata, &x86_64));
+    try std.testing.expect(!repositoryMetadataMatches(moving_metadata, &aarch64));
+}
+
+test "installed NEVRA closure is deterministically sorted" {
+    const gpa = std.testing.allocator;
+    const closure = try formatInstalledNevraClosure(
+        gpa,
+        "bash-0:5.2-1.x86_64\nzlib-0:1.3-1.x86_64\n",
+        "zlib-0:1.3-1.x86_64\nsudo-0:1.9-2.x86_64\nopenssh-0:9.9-1.x86_64\nbash-0:5.2-1.x86_64\n",
+    );
+    defer gpa.free(closure);
+    try std.testing.expectEqualStrings(
+        "openssh-0:9.9-1.x86_64\nsudo-0:1.9-2.x86_64\n",
+        closure,
+    );
 }
 
 test "architecture and argument parsing accepts only supported values" {
