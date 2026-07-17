@@ -7,6 +7,11 @@ const AzureLinuxArchitecture = enum {
     aarch64,
 };
 
+const AzureLinuxFlavor = enum {
+    core,
+    full,
+};
+
 pub const ImageFormat = image_build.Format;
 pub const ImageGeneration = image_build.Generation;
 pub const ImageBootMode = image_build.BootMode;
@@ -33,8 +38,13 @@ pub fn build(b: *std.Build) void {
     const azurelinux_architecture = b.option(
         AzureLinuxArchitecture,
         "azurelinux-arch",
-        "Azure Linux core guest architecture: x86_64 (default) or aarch64",
+        "Azure Linux guest architecture: x86_64 (default) or aarch64",
     ) orelse .x86_64;
+    const azurelinux_flavor = b.option(
+        AzureLinuxFlavor,
+        "azurelinux-flavor",
+        "Azure Linux guest flavor: core (default, zvminit) or full (official vm-base/systemd)",
+    ) orelse .core;
 
     // ---- packages/zvmi: the core disk-image library ----
     const zvmi_mod = b.addModule("zvmi", .{
@@ -580,11 +590,13 @@ pub fn build(b: *std.Build) void {
         // development host to verify the AArch64 cross-build graph.
         const generalized_check_step = b.step(
             "check-generalized-azurelinux4",
-            "Compile the selected Azure Linux core builder and guest artifacts",
+            "Compile the selected Azure Linux flavor builder and required guest artifacts",
         );
         generalized_check_step.dependOn(&builder_exe.step);
-        generalized_check_step.dependOn(&zvminit_exe.step);
-        generalized_check_step.dependOn(&azagent_guest_exe.step);
+        if (azurelinux_flavor == .core) {
+            generalized_check_step.dependOn(&zvminit_exe.step);
+            generalized_check_step.dependOn(&azagent_guest_exe.step);
+        }
         generalized_check_step.dependOn(&zstd_preload_lib.step);
 
         // `zig build generalized-azurelinux4 -- [--iso ...] [--output ...] ...`
@@ -595,18 +607,22 @@ pub fn build(b: *std.Build) void {
         run_builder.step.dependOn(b.getInstallStep());
         run_builder.addArg("--architecture");
         run_builder.addArg(@tagName(azurelinux_architecture));
+        run_builder.addArg("--flavor");
+        run_builder.addArg(@tagName(azurelinux_flavor));
         run_builder.addArg("--zvmi");
         run_builder.addArtifactArg(cli_exe);
-        run_builder.addArg("--zvminit");
-        run_builder.addArtifactArg(zvminit_exe);
-        run_builder.addArg("--azagent");
-        run_builder.addArtifactArg(azagent_guest_exe);
+        if (azurelinux_flavor == .core) {
+            run_builder.addArg("--zvminit");
+            run_builder.addArtifactArg(zvminit_exe);
+            run_builder.addArg("--azagent");
+            run_builder.addArtifactArg(azagent_guest_exe);
+        }
         run_builder.addArg("--preload");
         run_builder.addArtifactArg(zstd_preload_lib);
         if (b.args) |args| run_builder.addArgs(args);
         const generalized_step = b.step(
             "generalized-azurelinux4",
-            "Build a generalized Azure Linux 4 Gen2 QCOW2 image (requires root, Linux, dnf, qemu-img)",
+            "Build a generalized Azure Linux 4 Gen2 core or full QCOW2 image (requires root, Linux, dnf, qemu-img)",
         );
         generalized_step.dependOn(&run_builder.step);
 

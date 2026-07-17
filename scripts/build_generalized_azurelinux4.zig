@@ -1,4 +1,4 @@
-//! Build a minimal generalized Azure Linux 4 Gen2 QCOW2 image.
+//! Build a generalized Azure Linux 4 Gen2 QCOW2 image.
 //!
 //! Equivalent to scripts/build-generalized-azurelinux4.py but implemented as
 //! native Zig 0.16 code. Invoked via `zig build generalized-azurelinux4 -- [args]`
@@ -7,10 +7,11 @@
 //!
 //! CLI arguments accepted:
 //!   --architecture <arch> Azure Linux guest architecture (injected by build.zig)
+//!   --flavor <core|full>  Image flavor (core is the compatible default)
 //!   --iso <path>        Architecture-matched Azure Linux 4 ISO (downloaded if omitted)
-//!   --output <path>     Output QCOW2 path (architecture-specific default)
-//!   --size <size>       Disk size (default: 1184M)
-//!   --work-dir <dir>    Working directory (architecture-specific default)
+//!   --output <path>     Output QCOW2 path (architecture/flavor-specific default)
+//!   --size <size>       Disk size (flavor-specific default)
+//!   --work-dir <dir>    Working directory (architecture/flavor-specific default)
 //!
 //! Arguments injected automatically by build.zig:
 //!   --zvmi <path>       Built native zvmi executable
@@ -35,6 +36,205 @@ const base_image = "azurelinux-beta/base/core";
 const base_tag = "4.0";
 const mcr_base = "https://mcr.microsoft.com/v2";
 const AzureLinuxArchitecture = zvmi.bootconfig.Architecture;
+
+/// The full image package manifest is vendored from this exact upstream KIWI
+/// profile.  KIWI itself is deliberately not part of the build: DNF consumes
+/// this encoded package closure against the pinned Azure Linux repomd.xml.
+const vm_base_upstream_repository = "https://github.com/microsoft/azurelinux";
+const vm_base_upstream_commit = "5b41bff6ebaf7e8fc78637b564efee23b66e7d67";
+const vm_base_profile_blob = "8c870852e711273275c83f0b94ecd914ff709af8";
+const vm_base_profile_path = "base/images/vm-base/vm-base.kiwi";
+const vm_base_profile_name = "vm-base";
+
+const Flavor = enum {
+    core,
+    full,
+};
+
+const Pid1 = enum {
+    zvminit,
+    systemd,
+};
+
+const Provisioner = enum {
+    zvminit_azagent,
+    cloud_init_waagent,
+};
+
+/// Azure Linux 4 vm-base's architecture-neutral `<packages type="image">`
+/// group plus its selected `vm-base` runtime repositories package.  The
+/// x86_64/AArch64 EFI packages from the upstream bootstrap group are supplied
+/// separately by `ArchitectureDescriptor.full_efi_packages`.
+const vm_base_packages = [_][]const u8{
+    "azurelinux-release-cloud",
+    "bash",
+    "ca-certificates",
+    "coreutils",
+    "acl",
+    "attr",
+    "audit",
+    "bash-completion",
+    "bind-utils",
+    "brotli",
+    "bzip2",
+    "chkconfig",
+    "chrony",
+    "cloud-init",
+    "cloud-utils-growpart",
+    "cracklib-dicts",
+    "cronie",
+    "cryptsetup",
+    "cyrus-sasl",
+    "device-mapper-event",
+    "dnf5",
+    "dnf5-plugins",
+    "efibootmgr",
+    "file",
+    "firewalld",
+    "glibc",
+    "glibc-langpack-en",
+    "grub2",
+    "grubby",
+    "gzip",
+    "hostname",
+    "iproute",
+    "iputils",
+    "irqbalance",
+    "kernel",
+    "lvm2",
+    "lz4",
+    "man-db",
+    "nano",
+    "ncurses",
+    "ncurses-term",
+    "net-tools",
+    "nftables",
+    "nvme-cli",
+    "openssh-clients",
+    "openssh-server",
+    "rootfiles",
+    "rsync",
+    "selinux-policy-targeted",
+    "setup",
+    "shadow-utils",
+    "sudo",
+    "systemd",
+    "systemd-networkd",
+    "systemd-resolved",
+    "tar",
+    "tpm2-tss",
+    "unzip",
+    "util-linux",
+    "vim-minimal",
+    "wget",
+    "which",
+    "zchunk",
+    "zlib",
+    "WALinuxAgent",
+    "azure-vm-utils",
+    "hyperv-daemons",
+    "kernel-modules",
+    "azurelinux-repos",
+};
+
+const core_packages = [_][]const u8{
+    "openssh-server",
+    "sudo",
+};
+
+const core_required_rootfs_paths = [_][]const u8{
+    "usr/bin/bash",
+    "usr/bin/azagent",
+    "usr/bin/zvminit",
+    "usr/bin/sshd",
+};
+
+const full_required_rootfs_paths = [_][]const u8{
+    "usr/bin/bash",
+    "usr/bin/cloud-init",
+    "usr/bin/sshd",
+    "usr/lib/systemd/systemd",
+    "usr/sbin/sshd",
+    "usr/sbin/waagent",
+    "etc/waagent.conf",
+};
+
+const core_forbidden_rootfs_paths = [_][]const u8{};
+const full_forbidden_rootfs_paths = [_][]const u8{
+    "sbin/zvminit",
+    "usr/bin/zvminit",
+    "usr/sbin/azagent",
+    "usr/bin/azagent",
+    "etc/ssh/sshd_config.d/10-zvminit.conf",
+    "var/lib/azagent/provisioned",
+};
+
+const FlavorDescriptor = struct {
+    flavor: Flavor,
+    default_size: []const u8,
+    esp_size_bytes: u64,
+    esp_size_arg: []const u8,
+    minimum_root_free_bytes: u64,
+    required_rootfs_paths: []const []const u8,
+    forbidden_rootfs_paths: []const []const u8,
+    required_packages: []const []const u8,
+    forbidden_packages: []const []const u8,
+    pid1: Pid1,
+    provisioner: Provisioner,
+    oci_entrypoint: []const u8,
+    oci_provenance_kind: []const u8,
+    max_oci_layer_bytes: u64,
+};
+
+const core = FlavorDescriptor{
+    .flavor = .core,
+    .default_size = "1184M",
+    .esp_size_bytes = 512 * 1024 * 1024,
+    .esp_size_arg = "512M",
+    .minimum_root_free_bytes = 128 * 1024 * 1024,
+    .required_rootfs_paths = &core_required_rootfs_paths,
+    .forbidden_rootfs_paths = &core_forbidden_rootfs_paths,
+    .required_packages = &core_packages,
+    .forbidden_packages = &.{},
+    .pid1 = .zvminit,
+    .provisioner = .zvminit_azagent,
+    .oci_entrypoint = "/sbin/zvminit",
+    .oci_provenance_kind = "pinned-core-oci",
+    .max_oci_layer_bytes = 128 * 1024 * 1024,
+};
+
+const full = FlavorDescriptor{
+    .flavor = .full,
+    // vm-base.kiwi explicitly sets a 5 GiB fixed-size image.  This builder
+    // retains that size despite emitting QCOW2 and uses a larger ESP for UKIs.
+    .default_size = "5G",
+    .esp_size_bytes = 512 * 1024 * 1024,
+    .esp_size_arg = "512M",
+    .minimum_root_free_bytes = 1024 * 1024 * 1024,
+    .required_rootfs_paths = &full_required_rootfs_paths,
+    .forbidden_rootfs_paths = &full_forbidden_rootfs_paths,
+    .required_packages = &vm_base_packages,
+    .forbidden_packages = &.{ "zvminit", "azagent" },
+    .pid1 = .systemd,
+    .provisioner = .cloud_init_waagent,
+    .oci_entrypoint = "/usr/lib/systemd/systemd",
+    .oci_provenance_kind = "pinned-vm-base-profile-repomd-nevra",
+    .max_oci_layer_bytes = 512 * 1024 * 1024,
+};
+
+fn flavorDescriptor(flavor: Flavor) *const FlavorDescriptor {
+    return switch (flavor) {
+        .core => &core,
+        .full => &full,
+    };
+}
+
+fn ociLayerPlanCount(flavor: *const FlavorDescriptor) usize {
+    return switch (flavor.flavor) {
+        .core => 3,
+        .full => 7,
+    };
+}
 
 /// All target-dependent Azure Linux core-image inputs and output conventions.
 /// Keeping them together prevents a guest architecture from being selected in
@@ -66,8 +266,7 @@ const ArchitectureDescriptor = struct {
     binfmt_registration_path: [:0]const u8,
     binfmt_static_name: []const u8,
     elf_file_marker: []const u8,
-    default_output_path: []const u8,
-    default_work_dir: []const u8,
+    full_efi_packages: []const []const u8,
 };
 
 const x86_64 = ArchitectureDescriptor{
@@ -99,8 +298,7 @@ const x86_64 = ArchitectureDescriptor{
     .binfmt_registration_path = "/proc/sys/fs/binfmt_misc/qemu-x86_64",
     .binfmt_static_name = "qemu-x86_64-static",
     .elf_file_marker = "x86-64",
-    .default_output_path = "AzureLinux-4.0-x86_64.core.qcow2",
-    .default_work_dir = ".scratch/azurelinux4-core-x86_64",
+    .full_efi_packages = &.{ "grub2-efi-x64-modules", "grub2-efi-x64", "shim" },
 };
 
 const aarch64 = ArchitectureDescriptor{
@@ -132,8 +330,7 @@ const aarch64 = ArchitectureDescriptor{
     .binfmt_registration_path = "/proc/sys/fs/binfmt_misc/qemu-aarch64",
     .binfmt_static_name = "qemu-aarch64-static",
     .elf_file_marker = "aarch64",
-    .default_output_path = "AzureLinux-4.0-aarch64.core.qcow2",
-    .default_work_dir = ".scratch/azurelinux4-core-aarch64",
+    .full_efi_packages = &.{ "grub2-efi-aa64-modules", "grub2-efi-aa64", "shim" },
 };
 
 fn architectureDescriptor(architecture: AzureLinuxArchitecture) *const ArchitectureDescriptor {
@@ -149,23 +346,40 @@ fn requireArchitecture(
     return architectureDescriptor(architecture orelse return error.MissingArchitecture);
 }
 
+fn defaultOutputPath(architecture: AzureLinuxArchitecture, flavor: Flavor) []const u8 {
+    return switch (flavor) {
+        .core => switch (architecture) {
+            .x86_64 => "AzureLinux-4.0-x86_64.core.qcow2",
+            .aarch64 => "AzureLinux-4.0-aarch64.core.qcow2",
+        },
+        .full => switch (architecture) {
+            .x86_64 => "AzureLinux-4.0-x86_64.qcow2",
+            .aarch64 => "AzureLinux-4.0-aarch64.qcow2",
+        },
+    };
+}
+
+fn defaultWorkDir(architecture: AzureLinuxArchitecture, flavor: Flavor) []const u8 {
+    return switch (flavor) {
+        .core => switch (architecture) {
+            .x86_64 => ".scratch/azurelinux4-core-x86_64",
+            .aarch64 => ".scratch/azurelinux4-core-aarch64",
+        },
+        .full => switch (architecture) {
+            .x86_64 => ".scratch/azurelinux4-full-x86_64",
+            .aarch64 => ".scratch/azurelinux4-full-aarch64",
+        },
+    };
+}
+
 const systemd_boot_unsigned_rpm_max_bytes: u64 = 16 * 1024 * 1024;
 const oci_manifest_type = "application/vnd.oci.image.manifest.v1+json";
 const oci_index_type = "application/vnd.oci.image.index.v1+json";
 const docker_manifest_type = "application/vnd.docker.distribution.manifest.v2+json";
 const docker_index_type = "application/vnd.docker.distribution.manifest.list.v2+json";
-const zvmi_max_layer_bytes: u64 = 128 * 1024 * 1024;
 const iso_max_bytes: u64 = 2 * 1024 * 1024 * 1024;
 const repomd_max_bytes: usize = 1024 * 1024;
 const accept_header = oci_index_type ++ ", " ++ docker_index_type ++ ", " ++ oci_manifest_type ++ ", " ++ docker_manifest_type;
-const generalized_esp_size_bytes: u64 = 512 * 1024 * 1024;
-const generalized_esp_size_arg = "512M";
-const required_rootfs_files = [_][]const u8{
-    "usr/bin/bash",
-    "usr/bin/azagent",
-    "usr/bin/zvminit",
-    "usr/bin/sshd",
-};
 const zvminit_symlink_paths = [_][]const u8{
     "usr/bin/init",
     "usr/bin/poweroff",
@@ -209,11 +423,11 @@ fn run(gpa: Allocator, io: Io, argv: []const []const u8) !void {
 
 /// Like `run` but prepends "sudo".
 fn sudo(gpa: Allocator, io: Io, argv: []const []const u8) !void {
-    const full = try gpa.alloc([]const u8, argv.len + 1);
-    defer gpa.free(full);
-    full[0] = "sudo";
-    @memcpy(full[1..], argv);
-    try run(gpa, io, full);
+    const command = try gpa.alloc([]const u8, argv.len + 1);
+    defer gpa.free(command);
+    command[0] = "sudo";
+    @memcpy(command[1..], argv);
+    try run(gpa, io, command);
 }
 
 /// Run command, capture stdout. Returns owned bytes (caller frees).
@@ -460,7 +674,7 @@ fn downloadBlob(
             .url = url,
             .destination_path = dest_path,
             .expected_sha256 = expected_digest,
-            .max_size = zvmi_max_layer_bytes,
+            .max_size = core.max_oci_layer_bytes,
         },
         curl.downloader(),
     ) catch |err| switch (err) {
@@ -761,10 +975,19 @@ fn prepareDnfCache(
     io: Io,
     work_dir: []const u8,
     architecture: *const ArchitectureDescriptor,
+    flavor: *const FlavorDescriptor,
 ) !DnfCachePaths {
-    const cache_dir = try std.fmt.allocPrint(gpa, "{s}/dnf-cache-{s}", .{ work_dir, architecture.dnf_architecture });
+    const cache_dir = try std.fmt.allocPrint(
+        gpa,
+        "{s}/dnf-cache-{s}-{s}",
+        .{ work_dir, @tagName(flavor.flavor), architecture.dnf_architecture },
+    );
     errdefer gpa.free(cache_dir);
-    const persist_dir = try std.fmt.allocPrint(gpa, "{s}/dnf-persist-{s}", .{ work_dir, architecture.dnf_architecture });
+    const persist_dir = try std.fmt.allocPrint(
+        gpa,
+        "{s}/dnf-persist-{s}-{s}",
+        .{ work_dir, @tagName(flavor.flavor), architecture.dnf_architecture },
+    );
     errdefer gpa.free(persist_dir);
     const cache_opt = try std.fmt.allocPrint(gpa, "--setopt=cachedir={s}", .{cache_dir});
     errdefer gpa.free(cache_opt);
@@ -842,6 +1065,7 @@ fn writeNevraProvenance(
     io: Io,
     work_dir: []const u8,
     architecture: *const ArchitectureDescriptor,
+    flavor: *const FlavorDescriptor,
     closure: []const u8,
 ) !void {
     const provenance_dir = try std.fmt.allocPrint(gpa, "{s}/provenance", .{work_dir});
@@ -849,12 +1073,13 @@ fn writeNevraProvenance(
     try Dir.cwd().createDirPath(io, provenance_dir);
     const provenance_path = try std.fmt.allocPrint(
         gpa,
-        "{s}/installed-nevra-{s}.txt",
-        .{ provenance_dir, architecture.dnf_architecture },
+        "{s}/installed-nevra-{s}-{s}.txt",
+        .{ provenance_dir, @tagName(flavor.flavor), architecture.dnf_architecture },
     );
     defer gpa.free(provenance_path);
     try Dir.cwd().writeFile(io, .{ .sub_path = provenance_path, .data = closure });
-    std.debug.print("Installed NEVRA closure ({s}) written to {s}:\n{s}", .{
+    std.debug.print("Installed NEVRA closure ({s}/{s}) written to {s}:\n{s}", .{
+        @tagName(flavor.flavor),
         architecture.dnf_architecture,
         provenance_path,
         closure,
@@ -865,6 +1090,7 @@ fn writeNevraProvenance(
 /// prevents a refresh while deliberately omitting `-C`: package payloads that
 /// are referenced by the cached primary metadata may still be downloaded.
 fn dnfInstallArgs(
+    gpa: Allocator,
     rootfs_path: []const u8,
     forcearch_opt: []const u8,
     gpgkey_opt: []const u8,
@@ -877,8 +1103,11 @@ fn dnfInstallArgs(
     gpgcheck_opt: []const u8,
     cache_opt: []const u8,
     persist_opt: []const u8,
-) [21][]const u8 {
-    return .{
+    packages: []const []const u8,
+) ![]const []const u8 {
+    var args = std.array_list.Managed([]const u8).init(gpa);
+    errdefer args.deinit();
+    try args.appendSlice(&.{
         "dnf",
         "-y",
         "--installroot",
@@ -898,9 +1127,9 @@ fn dnfInstallArgs(
         persist_opt,
         "--setopt=install_weak_deps=False",
         "install",
-        "openssh-server",
-        "sudo",
-    };
+    });
+    try args.appendSlice(packages);
+    return args.toOwnedSlice();
 }
 
 fn argvContains(argv: []const []const u8, needle: []const u8) bool {
@@ -910,17 +1139,400 @@ fn argvContains(argv: []const []const u8, needle: []const u8) bool {
     return false;
 }
 
-/// Install packages, binaries, and configuration into the rootfs.
-fn installGuestContent(
+fn packagesForFlavor(
+    gpa: Allocator,
+    flavor: *const FlavorDescriptor,
+    architecture: *const ArchitectureDescriptor,
+) ![]const []const u8 {
+    const efi_len: usize = if (flavor.flavor == .full) architecture.full_efi_packages.len else 0;
+    const packages = try gpa.alloc([]const u8, flavor.required_packages.len + efi_len);
+    @memcpy(packages[0..flavor.required_packages.len], flavor.required_packages);
+    if (efi_len != 0) {
+        @memcpy(packages[flavor.required_packages.len..], architecture.full_efi_packages);
+    }
+    return packages;
+}
+
+fn validateRequiredPackages(
+    gpa: Allocator,
+    io: Io,
+    rootfs_path: []const u8,
+    packages: []const []const u8,
+) !void {
+    var argv = std.array_list.Managed([]const u8).init(gpa);
+    defer argv.deinit();
+    try argv.appendSlice(&.{ "sudo", "chroot", rootfs_path, "/usr/bin/rpm", "-q" });
+    try argv.appendSlice(packages);
+    try run(gpa, io, argv.items);
+}
+
+fn validateForbiddenPackages(
+    gpa: Allocator,
+    io: Io,
+    rootfs_path: []const u8,
+    packages: []const []const u8,
+) !void {
+    for (packages) |package| {
+        const result = std.process.run(gpa, io, .{
+            .argv = &.{ "sudo", "chroot", rootfs_path, "/usr/bin/rpm", "-q", package },
+        }) catch return error.CommandFailed;
+        defer {
+            gpa.free(result.stdout);
+            gpa.free(result.stderr);
+        }
+        switch (result.term) {
+            .exited => |code| if (code == 0) return error.ForbiddenPackageInstalled,
+            else => return error.ForbiddenPackageInstalled,
+        }
+    }
+}
+
+fn rootfsPath(rootfs_path: []const u8, gpa: Allocator, relative_path: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "{s}/{s}", .{ rootfs_path, relative_path });
+}
+
+fn validateFlavorPaths(
+    gpa: Allocator,
+    io: Io,
+    rootfs_path: []const u8,
+    flavor: *const FlavorDescriptor,
+) !void {
+    for (flavor.required_rootfs_paths) |relative_path| {
+        const path = try rootfsPath(rootfs_path, gpa, relative_path);
+        defer gpa.free(path);
+        const stat = Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch {
+            std.debug.print("error: {s} rootfs is missing /{s}\n", .{ @tagName(flavor.flavor), relative_path });
+            return error.IncompleteFlavorRootfs;
+        };
+        if (stat.kind != .file) return error.IncompleteFlavorRootfs;
+    }
+    for (flavor.forbidden_rootfs_paths) |relative_path| {
+        const path = try rootfsPath(rootfs_path, gpa, relative_path);
+        defer gpa.free(path);
+        if (Dir.cwd().statFile(io, path, .{ .follow_symlinks = false })) |_| {
+            std.debug.print("error: {s} rootfs contains forbidden /{s}\n", .{ @tagName(flavor.flavor), relative_path });
+            return error.ForbiddenFlavorRootfsPath;
+        } else |_| {}
+    }
+}
+
+const azurelinux_signing_key_sha256 = "1092f37ec429e58bf9c7f898df17c3c32eb2ce3c4c037afb8ffe2d2b42e16e89";
+const azurelinux_signing_key_fingerprint = "2BC94FFF7015A5F28F1537AD0CD9FED33135CE90";
+
+fn trustedSigningKeyPath(
+    gpa: Allocator,
+    work_dir: []const u8,
+    architecture: *const ArchitectureDescriptor,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        gpa,
+        "{s}/trusted-rpm-gpg-{s}.asc",
+        .{ work_dir, architecture.dnf_architecture },
+    );
+}
+
+fn validateTrustedSigningKey(
+    gpa: Allocator,
+    io: Io,
+    key_path: []const u8,
+) !void {
+    const actual = try sha256File(io, key_path);
+    if (!std.mem.eql(u8, &actual, azurelinux_signing_key_sha256)) {
+        std.debug.print("error: Azure Linux RPM signing key checksum mismatch\n", .{});
+        return error.InvalidAzureLinuxSigningKey;
+    }
+    const key_listing = try capture(gpa, io, &.{ "gpg", "--show-keys", "--with-colons", key_path });
+    defer gpa.free(key_listing);
+    if (std.mem.indexOf(u8, key_listing, "fpr:::::::::" ++ azurelinux_signing_key_fingerprint ++ ":") == null) {
+        std.debug.print("error: Azure Linux RPM signing key fingerprint mismatch\n", .{});
+        return error.InvalidAzureLinuxSigningKey;
+    }
+}
+
+/// Extract only the verified signing key from the pinned core OCI rootfs.
+/// Full images discard this rootfs immediately after extraction and never
+/// publish a core filesystem layer.
+fn extractTrustedSigningKey(
+    gpa: Allocator,
+    io: Io,
+    rootfs_path: []const u8,
+    work_dir: []const u8,
+    architecture: *const ArchitectureDescriptor,
+) ![]u8 {
+    const signing_key_guest = try std.fmt.allocPrint(
+        gpa,
+        "{s}/{s}",
+        .{ rootfs_path, architecture.signing_key_path },
+    );
+    defer gpa.free(signing_key_guest);
+    const host_key = try trustedSigningKeyPath(gpa, work_dir, architecture);
+    errdefer gpa.free(host_key);
+    try sudo(gpa, io, &.{ "install", "-m", "0644", signing_key_guest, host_key });
+    try validateTrustedSigningKey(gpa, io, host_key);
+    return host_key;
+}
+
+fn bootstrapFullRootfs(
+    gpa: Allocator,
+    io: Io,
+    work_dir: []const u8,
+    rootfs_path: []const u8,
+    architecture: *const ArchitectureDescriptor,
+) ![]u8 {
+    const key_source_path = try std.fmt.allocPrint(gpa, "{s}/core-key-source", .{work_dir});
+    defer gpa.free(key_source_path);
+    const core_digest = try pullRootfs(gpa, io, work_dir, key_source_path, architecture);
+    errdefer gpa.free(core_digest);
+    const key_path = try extractTrustedSigningKey(gpa, io, key_source_path, work_dir, architecture);
+    gpa.free(key_path);
+    try sudo(gpa, io, &.{ "rm", "-rf", "--", key_source_path });
+    if (Dir.cwd().statFile(io, rootfs_path, .{})) |_| {
+        try sudo(gpa, io, &.{ "rm", "-rf", "--", rootfs_path });
+    } else |_| {}
+    try Dir.cwd().createDirPath(io, rootfs_path);
+    return core_digest;
+}
+
+fn configValueEquals(content: []const u8, key: []const u8, expected: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.startsWith(u8, trimmed, "#")) continue;
+        const equal = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
+        if (std.mem.eql(u8, std.mem.trim(u8, trimmed[0..equal], " \t"), key)) {
+            return std.mem.eql(u8, std.mem.trim(u8, trimmed[equal + 1 ..], " \t"), expected);
+        }
+    }
+    return false;
+}
+
+fn setRootConfigValue(
+    gpa: Allocator,
+    io: Io,
+    rootfs_path: []const u8,
+    work_dir: []const u8,
+    relative_path: []const u8,
+    key: []const u8,
+    value: []const u8,
+) !void {
+    const path = try rootfsPath(rootfs_path, gpa, relative_path);
+    defer gpa.free(path);
+    const existing = capture(gpa, io, &.{ "sudo", "cat", path }) catch |err| switch (err) {
+        error.CommandFailed => try gpa.dupe(u8, ""),
+        else => return err,
+    };
+    defer gpa.free(existing);
+
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var found = false;
+    var lines = std.mem.splitScalar(u8, existing, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        const equal = std.mem.indexOfScalar(u8, trimmed, '=');
+        if (equal) |index| {
+            if (std.mem.eql(u8, std.mem.trim(u8, trimmed[0..index], " \t"), key)) {
+                if (!found) try output.writer.print("{s}={s}\n", .{ key, value });
+                found = true;
+                continue;
+            }
+        }
+        if (line.len != 0) try output.writer.print("{s}\n", .{line});
+    }
+    if (!found) try output.writer.print("{s}={s}\n", .{ key, value });
+    const content = try output.toOwnedSlice();
+    defer gpa.free(content);
+    try writeRootFile(gpa, io, rootfs_path, work_dir, relative_path, content, "0644");
+}
+
+fn validateFullServiceFiles(
+    gpa: Allocator,
+    io: Io,
+    rootfs_path: []const u8,
+) !void {
+    const units = [_][]const u8{
+        "cloud-init-local.service",
+        "cloud-init.service",
+        "cloud-config.service",
+        "cloud-final.service",
+        "waagent.service",
+        "sshd.service",
+        "systemd-networkd.service",
+    };
+    for (units) |unit| {
+        const path = try std.fmt.allocPrint(gpa, "{s}/usr/lib/systemd/system/{s}", .{ rootfs_path, unit });
+        defer gpa.free(path);
+        const stat = Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch {
+            std.debug.print("error: full rootfs is missing systemd unit {s}\n", .{unit});
+            return error.MissingFullServiceUnit;
+        };
+        if (stat.kind != .file and stat.kind != .sym_link) return error.MissingFullServiceUnit;
+    }
+}
+
+fn configureFullGuest(
+    gpa: Allocator,
+    io: Io,
+    rootfs_path: []const u8,
+    work_dir: []const u8,
+) !void {
+    // The vm-base profile delegates account/key provisioning to cloud-init.
+    // WALinuxAgent remains responsible for Ready status and extensions.
+    try setRootConfigValue(gpa, io, rootfs_path, work_dir, "etc/waagent.conf", "Provisioning.Agent", "auto");
+    try setRootConfigValue(gpa, io, rootfs_path, work_dir, "etc/waagent.conf", "ResourceDisk.Format", "n");
+    try setRootConfigValue(gpa, io, rootfs_path, work_dir, "etc/waagent.conf", "ResourceDisk.EnableSwap", "n");
+    try writeRootFile(gpa, io, rootfs_path, work_dir, "etc/ssh/sshd_config.d/20-zvmi-full.conf", "PasswordAuthentication no\n" ++
+        "PermitEmptyPasswords no\n" ++
+        "PubkeyAuthentication yes\n" ++
+        "KbdInteractiveAuthentication no\n", "0600");
+    const waagent_version = try capture(gpa, io, &.{
+        "sudo", "chroot", rootfs_path, "/usr/bin/rpm", "-q", "--qf", "%{VERSION}", "WALinuxAgent",
+    });
+    defer gpa.free(waagent_version);
+    if (!std.mem.startsWith(u8, std.mem.trim(u8, waagent_version, " \t\r\n"), "2.15.")) {
+        return error.UnsupportedWALinuxAgentVersion;
+    }
+    try validateFullServiceFiles(gpa, io, rootfs_path);
+    try sudo(gpa, io, &.{ "systemctl", "--root", rootfs_path, "preset-all" });
+    try sudo(gpa, io, &.{ "systemctl", "--root", rootfs_path, "enable", "waagent.service", "sshd.service", "systemd-networkd.service" });
+    for (&[_][]const u8{ "waagent.service", "sshd.service", "systemd-networkd.service" }) |unit| {
+        const enabled = try capture(gpa, io, &.{ "systemctl", "--root", rootfs_path, "is-enabled", unit });
+        defer gpa.free(enabled);
+        if (!std.mem.eql(u8, std.mem.trim(u8, enabled, " \t\r\n"), "enabled")) {
+            return error.FullServiceNotEnabled;
+        }
+    }
+    try sudo(gpa, io, &.{ "chroot", rootfs_path, "/usr/sbin/sshd", "-t" });
+}
+
+fn configureCoreGuest(
     gpa: Allocator,
     io: Io,
     rootfs_path: []const u8,
     work_dir: []const u8,
     zvminit_path: []const u8,
     azagent_path: []const u8,
+) !void {
+    const sbin_zvminit = try std.fmt.allocPrint(gpa, "{s}/sbin/zvminit", .{rootfs_path});
+    defer gpa.free(sbin_zvminit);
+    try sudo(gpa, io, &.{ "install", "-m", "0755", zvminit_path, sbin_zvminit });
+    for (&[_][]const u8{ "init", "poweroff", "reboot", "shutdown" }) |cmd| {
+        const link = try std.fmt.allocPrint(gpa, "{s}/sbin/{s}", .{ rootfs_path, cmd });
+        defer gpa.free(link);
+        try sudo(gpa, io, &.{ "rm", "-f", link });
+        try sudo(gpa, io, &.{ "ln", "-s", "zvminit", link });
+    }
+    const azagent_dest = try std.fmt.allocPrint(gpa, "{s}/usr/sbin/azagent", .{rootfs_path});
+    defer gpa.free(azagent_dest);
+    try sudo(gpa, io, &.{ "install", "-m", "0755", azagent_path, azagent_dest });
+    try writeRootFile(gpa, io, rootfs_path, work_dir, "etc/ssh/sshd_config.d/10-zvminit.conf", "PasswordAuthentication no\n" ++
+        "PermitEmptyPasswords no\n" ++
+        "PubkeyAuthentication yes\n", "0600");
+    try writeRootFile(gpa, io, rootfs_path, work_dir, "etc/waagent.conf", "ResourceDisk.Format=y\n" ++
+        "ResourceDisk.Filesystem=ext4\n" ++
+        "ResourceDisk.MountPoint=/d\n" ++
+        "ResourceDisk.EnableSwap=n\n" ++
+        "DataDisk.Mount=y\n", "0644");
+    try sudo(gpa, io, &.{ "chroot", rootfs_path, "/usr/bin/ssh-keygen", "-A" });
+    try sudo(gpa, io, &.{ "chroot", rootfs_path, "/usr/sbin/sshd", "-t" });
+    try run(gpa, io, &.{ "file", sbin_zvminit, azagent_dest });
+}
+
+fn generalizeRootfs(
+    gpa: Allocator,
+    io: Io,
+    rootfs_path: []const u8,
+    flavor: *const FlavorDescriptor,
+) !void {
+    const etc_ssh = try std.fmt.allocPrint(gpa, "{s}/etc/ssh", .{rootfs_path});
+    defer gpa.free(etc_ssh);
+    const machine_id = try std.fmt.allocPrint(gpa, "{s}/etc/machine-id", .{rootfs_path});
+    defer gpa.free(machine_id);
+    const hostname = try std.fmt.allocPrint(gpa, "{s}/etc/hostname", .{rootfs_path});
+    defer gpa.free(hostname);
+    const dbus_machine_id = try std.fmt.allocPrint(gpa, "{s}/var/lib/dbus/machine-id", .{rootfs_path});
+    defer gpa.free(dbus_machine_id);
+    const cloud_state = try std.fmt.allocPrint(gpa, "{s}/var/lib/cloud", .{rootfs_path});
+    defer gpa.free(cloud_state);
+    const waagent_state = try std.fmt.allocPrint(gpa, "{s}/var/lib/waagent", .{rootfs_path});
+    defer gpa.free(waagent_state);
+    const azagent_state = try std.fmt.allocPrint(gpa, "{s}/var/lib/azagent", .{rootfs_path});
+    defer gpa.free(azagent_state);
+    const random_seed = try std.fmt.allocPrint(gpa, "{s}/var/lib/systemd/random-seed", .{rootfs_path});
+    defer gpa.free(random_seed);
+    const leases = try std.fmt.allocPrint(gpa, "{s}/var/lib/NetworkManager", .{rootfs_path});
+    defer gpa.free(leases);
+    try sudo(gpa, io, &.{ "find", etc_ssh, "-maxdepth", "1", "-name", "ssh_host_*", "-delete" });
+    try sudo(gpa, io, &.{ "find", rootfs_path, "-type", "f", "-name", "authorized_keys", "-delete" });
+    try sudo(gpa, io, &.{ "rm", "-f", hostname, dbus_machine_id, random_seed });
+    try sudo(gpa, io, &.{ "rm", "-rf", cloud_state, waagent_state, azagent_state, leases });
+    if (flavor.flavor == .full) {
+        try sudo(gpa, io, &.{ "install", "-d", "-m", "0755", cloud_state, waagent_state });
+    }
+    try sudo(gpa, io, &.{ "truncate", "-s", "0", machine_id });
+}
+
+fn validateGeneralizedRootfs(
+    gpa: Allocator,
+    io: Io,
+    rootfs_path: []const u8,
+    flavor: *const FlavorDescriptor,
+) !void {
+    try validateFlavorPaths(gpa, io, rootfs_path, flavor);
+    const machine_id = try rootfsPath(rootfs_path, gpa, "etc/machine-id");
+    defer gpa.free(machine_id);
+    const machine_id_stat = try Dir.cwd().statFile(io, machine_id, .{});
+    if (machine_id_stat.size != 0) return error.GeneratedMachineId;
+    const generated = try capture(gpa, io, &.{
+        "find",  rootfs_path,       "-type", "f",     "(",
+        "-name", "authorized_keys", "-o",    "-name", "ssh_host_*",
+        ")",     "-print",
+    });
+    defer gpa.free(generated);
+    if (std.mem.trim(u8, generated, " \t\r\n").len != 0) return error.BakedIdentityState;
+    const state_paths = [_][]const u8{
+        "var/lib/cloud/instance",
+        "var/lib/waagent",
+        "var/lib/azagent/provisioned",
+    };
+    for (state_paths) |relative_path| {
+        const path = try rootfsPath(rootfs_path, gpa, relative_path);
+        defer gpa.free(path);
+        if (Dir.cwd().statFile(io, path, .{ .follow_symlinks = false })) |stat| {
+            if (stat.kind == .directory) {
+                const entries = try capture(gpa, io, &.{ "find", path, "-mindepth", "1", "-print", "-quit" });
+                defer gpa.free(entries);
+                if (std.mem.trim(u8, entries, " \t\r\n").len == 0) continue;
+            }
+            return error.BakedProvisioningState;
+        } else |_| {}
+    }
+    if (flavor.flavor == .full) {
+        const waagent_conf = try rootfsPath(rootfs_path, gpa, "etc/waagent.conf");
+        defer gpa.free(waagent_conf);
+        const content = try capture(gpa, io, &.{ "sudo", "cat", waagent_conf });
+        defer gpa.free(content);
+        if (!configValueEquals(content, "Provisioning.Agent", "auto") or
+            !configValueEquals(content, "ResourceDisk.Format", "n"))
+        {
+            return error.InvalidFullProvisioningConfiguration;
+        }
+    }
+}
+/// Install the flavor's pinned package closure and configuration into rootfs.
+/// The returned NEVRA closure is retained by OCI provenance construction.
+fn installGuestContent(
+    gpa: Allocator,
+    io: Io,
+    rootfs_path: []const u8,
+    work_dir: []const u8,
+    trusted_key_path: []const u8,
+    zvminit_path: ?[]const u8,
+    azagent_path: ?[]const u8,
     systemd_boot_rpm_path: []const u8,
     architecture: *const ArchitectureDescriptor,
-) !void {
+    flavor: *const FlavorDescriptor,
+) ![]u8 {
     // On a non-native builder, put the registered static interpreter in the
     // target root just for RPM scriptlets, then remove it before layering.
     const target_is_native = builtin.target.cpu.arch == architecture.target_cpu;
@@ -963,18 +1575,8 @@ fn installGuestContent(
         try sudo(gpa, io, &.{ "install", "-D", "-m", "0755", qemu_static, guest_interp });
     }
 
-    // Copy RPM signing key to host so dnf can verify it from outside the chroot.
-    const signing_key_guest = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ rootfs_path, architecture.signing_key_path });
-    defer gpa.free(signing_key_guest);
-    const host_key = try std.fmt.allocPrint(
-        gpa,
-        "{s}/{s}",
-        .{ work_dir, std.fs.path.basename(architecture.signing_key_path) },
-    );
-    defer gpa.free(host_key);
-    try sudo(gpa, io, &.{ "install", "-m", "0644", signing_key_guest, host_key });
-
-    const gpgkey_opt = try std.fmt.allocPrint(gpa, "--setopt=azurelinux-base.gpgkey=file://{s}", .{host_key});
+    try validateTrustedSigningKey(gpa, io, trusted_key_path);
+    const gpgkey_opt = try std.fmt.allocPrint(gpa, "--setopt=azurelinux-base.gpgkey=file://{s}", .{trusted_key_path});
     defer gpa.free(gpgkey_opt);
     const forcearch_opt = try std.fmt.allocPrint(gpa, "--forcearch={s}", .{architecture.dnf_architecture});
     defer gpa.free(forcearch_opt);
@@ -984,7 +1586,7 @@ fn installGuestContent(
     // non-expiring while allowing payload downloads checked by the pinned
     // primary metadata and configured RPM signing key.
     try verifyRemoteRepositoryMetadata(gpa, io, work_dir, architecture);
-    var dnf_cache = try prepareDnfCache(gpa, io, work_dir, architecture);
+    var dnf_cache = try prepareDnfCache(gpa, io, work_dir, architecture, flavor);
     defer dnf_cache.deinit(gpa);
     const baseurl_opt = try std.fmt.allocPrint(
         gpa,
@@ -1014,7 +1616,10 @@ fn installGuestContent(
 
     const installed_before = try captureInstalledNevras(gpa, io, rootfs_path);
     defer gpa.free(installed_before);
-    const package_install_argv = dnfInstallArgs(
+    const flavor_packages = try packagesForFlavor(gpa, flavor, architecture);
+    defer gpa.free(flavor_packages);
+    const package_install_argv = try dnfInstallArgs(
+        gpa,
         rootfs_path,
         forcearch_opt,
         gpgkey_opt,
@@ -1027,8 +1632,10 @@ fn installGuestContent(
         gpgcheck_opt,
         dnf_cache.cache_opt,
         dnf_cache.persist_opt,
+        flavor_packages,
     );
-    try sudo(gpa, io, &package_install_argv);
+    defer gpa.free(package_install_argv);
+    try sudo(gpa, io, package_install_argv);
 
     // Install the pinned local RPM in a separate, repository-free transaction.
     try sudo(gpa, io, &.{
@@ -1043,8 +1650,8 @@ fn installGuestContent(
     const installed_after = try captureInstalledNevras(gpa, io, rootfs_path);
     defer gpa.free(installed_after);
     const installed_closure = try formatInstalledNevraClosure(gpa, installed_before, installed_after);
-    defer gpa.free(installed_closure);
-    try writeNevraProvenance(gpa, io, work_dir, architecture, installed_closure);
+    errdefer gpa.free(installed_closure);
+    try writeNevraProvenance(gpa, io, work_dir, architecture, flavor, installed_closure);
 
     // Re-fetch the moving endpoint before proceeding to OCI publication. A
     // changed repomd.xml means the package transaction is no longer provably
@@ -1060,61 +1667,21 @@ fn installGuestContent(
         std.debug.print("error: installed systemd boot stub is not a nonempty regular file: {s}\n", .{stub_path});
         return error.InvalidSystemdBootStub;
     }
+    try validateRequiredPackages(gpa, io, rootfs_path, flavor_packages);
+    try validateForbiddenPackages(gpa, io, rootfs_path, flavor.forbidden_packages);
 
-    // Install zvminit and relative command symlinks.
-    const sbin_zvminit = try std.fmt.allocPrint(gpa, "{s}/sbin/zvminit", .{rootfs_path});
-    defer gpa.free(sbin_zvminit);
-    try sudo(gpa, io, &.{ "install", "-m", "0755", zvminit_path, sbin_zvminit });
-    for (&[_][]const u8{ "init", "poweroff", "reboot", "shutdown" }) |cmd| {
-        const link = try std.fmt.allocPrint(gpa, "{s}/sbin/{s}", .{ rootfs_path, cmd });
-        defer gpa.free(link);
-        try sudo(gpa, io, &.{ "rm", "-f", link });
-        try sudo(gpa, io, &.{ "ln", "-s", "zvminit", link });
+    switch (flavor.pid1) {
+        .zvminit => try configureCoreGuest(
+            gpa,
+            io,
+            rootfs_path,
+            work_dir,
+            zvminit_path orelse return error.MissingZvminitArtifact,
+            azagent_path orelse return error.MissingAzagentArtifact,
+        ),
+        .systemd => try configureFullGuest(gpa, io, rootfs_path, work_dir),
     }
-
-    // Install azagent.
-    const azagent_dest = try std.fmt.allocPrint(gpa, "{s}/usr/sbin/azagent", .{rootfs_path});
-    defer gpa.free(azagent_dest);
-    try sudo(gpa, io, &.{ "install", "-m", "0755", azagent_path, azagent_dest });
-
-    // Write sshd config drop-in.
-    try writeRootFile(gpa, io, rootfs_path, work_dir, "etc/ssh/sshd_config.d/10-zvminit.conf", "PasswordAuthentication no\n" ++
-        "PermitEmptyPasswords no\n" ++
-        "PubkeyAuthentication yes\n", "0600");
-
-    // Write waagent.conf.
-    try writeRootFile(gpa, io, rootfs_path, work_dir, "etc/waagent.conf", "ResourceDisk.Format=y\n" ++
-        "ResourceDisk.Filesystem=ext4\n" ++
-        "ResourceDisk.MountPoint=/d\n" ++
-        "ResourceDisk.EnableSwap=n\n" ++
-        "DataDisk.Mount=y\n", "0644");
-
-    // Verify sshd config and packages.
-    try sudo(gpa, io, &.{ "chroot", rootfs_path, "/usr/bin/rpm", "-q", "openssh-server", "sudo" });
-    try sudo(gpa, io, &.{ "chroot", rootfs_path, "/usr/bin/ssh-keygen", "-A" });
-    try sudo(gpa, io, &.{ "chroot", rootfs_path, "/usr/sbin/sshd", "-t" });
-
-    // Generalize: remove SSH host keys and machine identity.
-    const etc_ssh = try std.fmt.allocPrint(gpa, "{s}/etc/ssh", .{rootfs_path});
-    defer gpa.free(etc_ssh);
-    try sudo(gpa, io, &.{ "find", etc_ssh, "-maxdepth", "1", "-name", "ssh_host_*", "-delete" });
-
-    const hostname_f = try std.fmt.allocPrint(gpa, "{s}/etc/hostname", .{rootfs_path});
-    defer gpa.free(hostname_f);
-    const dbus_mid = try std.fmt.allocPrint(gpa, "{s}/var/lib/dbus/machine-id", .{rootfs_path});
-    defer gpa.free(dbus_mid);
-    const azagent_state = try std.fmt.allocPrint(gpa, "{s}/var/lib/azagent", .{rootfs_path});
-    defer gpa.free(azagent_state);
-    const machine_id = try std.fmt.allocPrint(gpa, "{s}/etc/machine-id", .{rootfs_path});
-    defer gpa.free(machine_id);
-    try sudo(gpa, io, &.{ "rm", "-f", hostname_f, dbus_mid });
-    try sudo(gpa, io, &.{ "rm", "-rf", azagent_state });
-    const home_dir = try std.fmt.allocPrint(gpa, "{s}/home", .{rootfs_path});
-    defer gpa.free(home_dir);
-    const var_lib = try std.fmt.allocPrint(gpa, "{s}/var/lib", .{rootfs_path});
-    defer gpa.free(var_lib);
-    try sudo(gpa, io, &.{ "install", "-d", "-m", "0755", home_dir, var_lib });
-    try sudo(gpa, io, &.{ "truncate", "-s", "0", machine_id });
+    try generalizeRootfs(gpa, io, rootfs_path, flavor);
 
     // Remove binfmt interpreter from guest.
     if (binfmt_interpreter) |interp| {
@@ -1133,7 +1700,8 @@ fn installGuestContent(
     try sudo(gpa, io, &.{ "rm", "-rf", rootfs_dnf_cache });
     try sudo(gpa, io, &.{ "rm", "-f", dnf_log });
 
-    try run(gpa, io, &.{ "file", sbin_zvminit, azagent_dest });
+    try validateGeneralizedRootfs(gpa, io, rootfs_path, flavor);
+    return installed_closure;
 }
 
 // ─── OCI layout creation ─────────────────────────────────────────────────────
@@ -1145,6 +1713,35 @@ fn writeBlobBytesAlloc(gpa: Allocator, io: Io, blobs_dir: []const u8, bytes: []c
     defer gpa.free(blob_path);
     try Dir.cwd().writeFile(io, .{ .sub_path = blob_path, .data = bytes });
     return std.fmt.allocPrint(gpa, "sha256:{s}", .{&hex});
+}
+
+fn formatOciHistoryComment(
+    gpa: Allocator,
+    source_digest: []const u8,
+    architecture: *const ArchitectureDescriptor,
+    flavor: *const FlavorDescriptor,
+    installed_closure: []const u8,
+) ![]u8 {
+    const closure_sha256 = sha256Bytes(installed_closure);
+    return switch (flavor.flavor) {
+        .core => std.fmt.allocPrint(gpa, "Based on mcr.microsoft.com/{s}:{s} ({s})", .{
+            base_image, base_tag, source_digest,
+        }),
+        .full => std.fmt.allocPrint(
+            gpa,
+            "Based on {s}@{s} {s} ({s}, blob {s}); repomd/{s}={s}; installed-nevra-sha256={s}",
+            .{
+                vm_base_upstream_repository,
+                vm_base_upstream_commit,
+                vm_base_profile_path,
+                vm_base_profile_name,
+                vm_base_profile_blob,
+                architecture.dnf_architecture,
+                architecture.repomd_sha256,
+                &closure_sha256,
+            },
+        ),
+    };
 }
 
 /// Create a gzip-compressed, deterministic tar layer from a rootfs subset.
@@ -1190,6 +1787,7 @@ fn createOciLayer(
     index: usize,
     includes: []const []const u8,
     excludes: []const []const u8,
+    max_layer_bytes: u64,
 ) !LayerResult {
     var tar_path_buf: [512]u8 = undefined;
     var gz_path_buf: [512]u8 = undefined;
@@ -1227,11 +1825,11 @@ fn createOciLayer(
         try sudo(gpa, io, &.{ "chown", own, layer_tar });
     }
 
-    // Enforce zvmi's per-layer size cap.
+    // Keep per-layer input bounded even for the official full profile.
     const tar_stat = try Dir.cwd().statFile(io, layer_tar, .{});
-    if (tar_stat.size > zvmi_max_layer_bytes) {
+    if (tar_stat.size > max_layer_bytes) {
         std.debug.print("error: layer {d} ({d} B) exceeds zvmi's {d}-B limit\n", .{
-            index, tar_stat.size, zvmi_max_layer_bytes,
+            index, tar_stat.size, max_layer_bytes,
         });
         return error.LayerTooLarge;
     }
@@ -1269,8 +1867,10 @@ fn createOciLayout(
     io: Io,
     work_dir: []const u8,
     rootfs_path: []const u8,
-    base_digest: []const u8,
+    source_digest: []const u8,
     architecture: *const ArchitectureDescriptor,
+    flavor: *const FlavorDescriptor,
+    installed_closure: []const u8,
 ) ![]u8 {
     const layout_dir = try std.fmt.allocPrint(gpa, "{s}/oci-generalized", .{work_dir});
 
@@ -1302,16 +1902,28 @@ fn createOciLayout(
         }
     }.lt);
 
-    // Three-layer split: all-except-large-subtrees / usr/share / usr/lib64.
+    // Split the full package profile more finely while retaining an explicit,
+    // bounded cap for every uncompressed tar stream.
     const LayerSpec = struct {
         includes: []const []const u8,
         excludes: []const []const u8,
     };
-    const layer_specs: []const LayerSpec = &.{
+    const core_layer_specs: []const LayerSpec = &.{
         .{ .includes = entry_names.items, .excludes = &.{ "usr/share", "usr/lib64" } },
         .{ .includes = &.{"usr/share"}, .excludes = &.{} },
         .{ .includes = &.{"usr/lib64"}, .excludes = &.{} },
     };
+    const full_layer_specs: []const LayerSpec = &.{
+        .{ .includes = entry_names.items, .excludes = &.{ "usr/bin", "usr/sbin", "usr/lib", "usr/lib64", "usr/share", "var" } },
+        .{ .includes = &.{"usr/bin"}, .excludes = &.{} },
+        .{ .includes = &.{"usr/sbin"}, .excludes = &.{} },
+        .{ .includes = &.{"usr/lib"}, .excludes = &.{} },
+        .{ .includes = &.{"usr/lib64"}, .excludes = &.{} },
+        .{ .includes = &.{"usr/share"}, .excludes = &.{} },
+        .{ .includes = &.{"var"}, .excludes = &.{} },
+    };
+    const layer_specs = if (flavor.flavor == .core) core_layer_specs else full_layer_specs;
+    std.debug.assert(layer_specs.len == ociLayerPlanCount(flavor));
 
     var layer_descriptors = std.array_list.Managed(struct {
         digest: []u8,
@@ -1329,7 +1941,17 @@ fn createOciLayout(
 
     for (layer_specs, 0..) |spec, i| {
         std.debug.print("Creating OCI layer {d}...\n", .{i});
-        const lr = try createOciLayer(gpa, io, work_dir, rootfs_path, blobs_dir, i, spec.includes, spec.excludes);
+        const lr = try createOciLayer(
+            gpa,
+            io,
+            work_dir,
+            rootfs_path,
+            blobs_dir,
+            i,
+            spec.includes,
+            spec.excludes,
+            flavor.max_oci_layer_bytes,
+        );
         try layer_descriptors.append(.{ .digest = lr.compressed_digest, .size = lr.compressed_size });
         try diff_ids.append(lr.diff_id);
     }
@@ -1348,9 +1970,14 @@ fn createOciLayout(
     });
     defer gpa.free(created_ts);
 
-    const history_comment = try std.fmt.allocPrint(gpa, "Based on mcr.microsoft.com/{s}:{s} ({s})", .{
-        base_image, base_tag, base_digest,
-    });
+    const closure_sha256 = sha256Bytes(installed_closure);
+    const history_comment = try formatOciHistoryComment(
+        gpa,
+        source_digest,
+        architecture,
+        flavor,
+        installed_closure,
+    );
     defer gpa.free(history_comment);
 
     // Collect diff_id strings for the config.
@@ -1362,8 +1989,17 @@ fn createOciLayout(
     const config = .{
         .architecture = architecture.oci_architecture,
         .config = .{
-            .Entrypoint = &[_][]const u8{"/sbin/zvminit"},
+            .Entrypoint = &[_][]const u8{flavor.oci_entrypoint},
             .Env = &[_][]const u8{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
+            .Labels = .{
+                .@"io.github.zvmi.flavor" = @tagName(flavor.flavor),
+                .@"io.github.zvmi.provenance" = flavor.oci_provenance_kind,
+                .@"io.github.zvmi.source.digest" = source_digest,
+                .@"io.github.zvmi.vm-base.commit" = vm_base_upstream_commit,
+                .@"io.github.zvmi.vm-base.profile-blob" = vm_base_profile_blob,
+                .@"io.github.zvmi.repomd.sha256" = architecture.repomd_sha256,
+                .@"io.github.zvmi.installed-nevra.sha256" = &closure_sha256,
+            },
         },
         .created = created_ts,
         .history = &[_]struct {
@@ -1507,8 +2143,13 @@ fn validateGeneralizedOciLayout(
     io: Io,
     layout_dir: []const u8,
     architecture: *const ArchitectureDescriptor,
+    flavor: *const FlavorDescriptor,
 ) !void {
-    var image = try oci.loadLayout(io, gpa, layout_dir, .{});
+    var image = try oci.loadLayout(io, gpa, layout_dir, .{
+        .max_blob_size = @intCast(flavor.max_oci_layer_bytes),
+        .max_layer_size = @intCast(flavor.max_oci_layer_bytes),
+        .max_archive_size = @intCast(flavor.max_oci_layer_bytes * 8),
+    });
     defer image.deinit();
 
     const config_architecture = image.config.architecture orelse return error.MissingOciArchitecture;
@@ -1521,8 +2162,8 @@ fn validateGeneralizedOciLayout(
     }
     try validateOsRelease(image);
 
-    // Azure Linux uses merged-/usr symlinks, so OCI records these physical paths.
-    for (required_rootfs_files) |path| {
+    // Azure Linux uses merged-/usr symlinks, so OCI records physical paths.
+    for (flavor.required_rootfs_paths) |path| {
         const entry = image.get(path) orelse {
             std.debug.print("error: generated OCI layout is missing required rootfs path: /{s}\n", .{path});
             return error.IncompleteOciRootfs;
@@ -1540,14 +2181,22 @@ fn validateGeneralizedOciLayout(
         return error.IncompleteOciRootfs;
     };
     if (stub.kind != .file) return error.IncompleteOciRootfs;
-    for (zvminit_symlink_paths) |path| {
-        const entry = image.get(path) orelse {
-            std.debug.print("error: generated OCI layout is missing required zvminit symlink: /{s}\n", .{path});
-            return error.IncompleteOciRootfs;
-        };
-        if (entry.kind != .symlink or !std.mem.eql(u8, entry.link_name orelse "", "zvminit")) {
-            std.debug.print("error: generated OCI rootfs path is not a relative symlink to zvminit: /{s}\n", .{path});
-            return error.IncompleteOciRootfs;
+    for (flavor.forbidden_rootfs_paths) |path| {
+        if (image.get(path) != null) {
+            std.debug.print("error: generated OCI layout contains forbidden rootfs path: /{s}\n", .{path});
+            return error.ForbiddenFlavorRootfsPath;
+        }
+    }
+    if (flavor.pid1 == .zvminit) {
+        for (zvminit_symlink_paths) |path| {
+            const entry = image.get(path) orelse {
+                std.debug.print("error: generated OCI layout is missing required zvminit symlink: /{s}\n", .{path});
+                return error.IncompleteOciRootfs;
+            };
+            if (entry.kind != .symlink or !std.mem.eql(u8, entry.link_name orelse "", "zvminit")) {
+                std.debug.print("error: generated OCI rootfs path is not a relative symlink to zvminit: /{s}\n", .{path});
+                return error.IncompleteOciRootfs;
+            }
         }
     }
 }
@@ -1563,9 +2212,10 @@ fn planGeneralizedGen2Layout(
     gpa: Allocator,
     virtual_size: u64,
     architecture: *const ArchitectureDescriptor,
+    flavor: *const FlavorDescriptor,
 ) ![]zvmi.layout.PlannedPartition {
     const requests = [_]zvmi.layout.PartitionRequest{
-        .{ .name = "ESP", .role = .esp, .size = .{ .fixed = generalized_esp_size_bytes } },
+        .{ .name = "ESP", .role = .esp, .size = .{ .fixed = flavor.esp_size_bytes } },
         .{
             .name = "root",
             .role = architecture.root_role,
@@ -1594,6 +2244,39 @@ fn validatePartitionLayout(
         if (offset_bytes != planned.offset_bytes or length_bytes != planned.length_bytes) {
             return error.UnexpectedPartitionLayout;
         }
+    }
+}
+
+fn rootFreeSpaceIsSufficient(root_size: u64, rootfs_bytes: u64, minimum_free_bytes: u64) bool {
+    const needed = std.math.add(u64, rootfs_bytes, minimum_free_bytes) catch return false;
+    return root_size >= needed;
+}
+
+fn rootfsApparentBytes(gpa: Allocator, io: Io, rootfs_path: []const u8) !u64 {
+    const output = try capture(gpa, io, &.{ "sudo", "du", "--apparent-size", "-s", "-B1", rootfs_path });
+    defer gpa.free(output);
+    const bytes_text = std.mem.trim(u8, std.mem.sliceTo(output, '\t'), " \r\n");
+    return std.fmt.parseInt(u64, bytes_text, 10) catch error.InvalidRootfsSize;
+}
+
+fn enforceMinimumRootFreeSpace(
+    gpa: Allocator,
+    io: Io,
+    rootfs_path: []const u8,
+    virtual_size: u64,
+    architecture: *const ArchitectureDescriptor,
+    flavor: *const FlavorDescriptor,
+) !void {
+    const layout = try planGeneralizedGen2Layout(gpa, virtual_size, architecture, flavor);
+    defer gpa.free(layout);
+    const rootfs_bytes = try rootfsApparentBytes(gpa, io, rootfs_path);
+    const root_size = layout[1].length_bytes;
+    if (!rootFreeSpaceIsSufficient(root_size, rootfs_bytes, flavor.minimum_root_free_bytes)) {
+        std.debug.print(
+            "error: {s} rootfs uses {d} bytes; root partition {d} bytes cannot retain required {d} bytes free\n",
+            .{ @tagName(flavor.flavor), rootfs_bytes, root_size, flavor.minimum_root_free_bytes },
+        );
+        return error.InsufficientRootFreeSpace;
     }
 }
 
@@ -1636,13 +2319,31 @@ fn expectedUkiCmdline(
     gpa: Allocator,
     root_guid: zvmi.guid.Guid,
     architecture: *const ArchitectureDescriptor,
+    flavor: *const FlavorDescriptor,
 ) ![]u8 {
     var root_guid_text: [36]u8 = undefined;
-    return std.fmt.allocPrint(
-        gpa,
-        "root=PARTUUID={s} {s}",
-        .{ zvmi.guid.formatLower(&root_guid_text, root_guid), architecture.extra_kernel_options },
-    );
+    return switch (flavor.pid1) {
+        .zvminit => std.fmt.allocPrint(
+            gpa,
+            "root=PARTUUID={s} {s}",
+            .{ zvmi.guid.formatLower(&root_guid_text, root_guid), architecture.extra_kernel_options },
+        ),
+        .systemd => std.fmt.allocPrint(
+            gpa,
+            "root=PARTUUID={s} {s}",
+            .{ zvmi.guid.formatLower(&root_guid_text, root_guid), architecture.serial_console },
+        ),
+    };
+}
+
+fn ukiExtraKernelOptions(
+    architecture: *const ArchitectureDescriptor,
+    flavor: *const FlavorDescriptor,
+) []const u8 {
+    return switch (flavor.pid1) {
+        .zvminit => architecture.extra_kernel_options,
+        .systemd => architecture.serial_console,
+    };
 }
 
 fn requireNonemptyUkiSection(inspection: *const zvmi.uki.Inspection, name: []const u8) ![]const u8 {
@@ -1651,18 +2352,98 @@ fn requireNonemptyUkiSection(inspection: *const zvmi.uki.Inspection, name: []con
     return section.contents;
 }
 
+fn imageRootfsReadAt(
+    context: *const anyopaque,
+    io: Io,
+    buffer: []u8,
+    offset: u64,
+) anyerror!usize {
+    const image: *const zvmi.Image = @ptrCast(@alignCast(context));
+    return image.pread(io, buffer, offset);
+}
+
+fn requireImageRootfsPathAbsent(
+    rootfs: *const zvmi.ext4.Reader,
+    io: Io,
+    path: []const u8,
+) !void {
+    _ = rootfs.statPath(io, path) catch |err| switch (err) {
+        error.NotFound => return,
+        else => return err,
+    };
+    return error.BakedIdentityState;
+}
+
+fn validateFinalizedImageRootfs(
+    gpa: Allocator,
+    io: Io,
+    image: *const zvmi.Image,
+    image_path: []const u8,
+    root_partition: zvmi.gpt.PartitionEntry,
+    flavor: *const FlavorDescriptor,
+) !void {
+    var backing_file = try Dir.cwd().openFile(io, image_path, .{});
+    defer backing_file.close(io);
+    const root_offset = root_partition.first_lba * zvmi.gpt.sector_size;
+    var rootfs = try zvmi.ext4.openReadOnlySource(io, backing_file, .{
+        .ctx = image,
+        .read_at_fn = imageRootfsReadAt,
+    }, gpa, .{ .offset = root_offset });
+    defer rootfs.deinit();
+
+    for (flavor.required_rootfs_paths) |path| _ = try rootfs.statPath(io, path);
+    for (flavor.forbidden_rootfs_paths) |path| try requireImageRootfsPathAbsent(&rootfs, io, path);
+    for (&[_][]const u8{
+        "etc/hostname",
+        "var/lib/dbus/machine-id",
+        "var/lib/cloud/instance",
+        "var/lib/azagent/provisioned",
+        "etc/ssh/ssh_host_rsa_key",
+        "etc/ssh/ssh_host_rsa_key.pub",
+        "etc/ssh/ssh_host_ecdsa_key",
+        "etc/ssh/ssh_host_ecdsa_key.pub",
+        "etc/ssh/ssh_host_ed25519_key",
+        "etc/ssh/ssh_host_ed25519_key.pub",
+        "etc/ssh/ssh_host_dsa_key",
+        "etc/ssh/ssh_host_dsa_key.pub",
+        "root/.ssh/authorized_keys",
+    }) |path| try requireImageRootfsPathAbsent(&rootfs, io, path);
+    const homes: ?[]zvmi.ext4.DirEntry = rootfs.listDir(io, gpa, "home") catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    defer if (homes) |entries| zvmi.ext4.freeDirEntries(gpa, entries);
+    for (homes orelse &.{}) |home| {
+        if (home.kind != .directory) continue;
+        const authorized_keys = try std.fmt.allocPrint(gpa, "home/{s}/.ssh/authorized_keys", .{home.name});
+        defer gpa.free(authorized_keys);
+        try requireImageRootfsPathAbsent(&rootfs, io, authorized_keys);
+    }
+    const machine_id = try rootfs.statPath(io, "etc/machine-id");
+    if (machine_id.size != 0) return error.GeneratedMachineId;
+    if (flavor.flavor == .full) {
+        const waagent_state = rootfs.listDir(io, gpa, "var/lib/waagent") catch |err| switch (err) {
+            error.NotFound => return error.BakedProvisioningState,
+            else => return err,
+        };
+        defer zvmi.ext4.freeDirEntries(gpa, waagent_state);
+        if (waagent_state.len != 0) return error.BakedProvisioningState;
+    }
+}
+
 fn validateGeneralizedImage(
     gpa: Allocator,
     io: Io,
     image_path: []const u8,
     expected_virtual_size: u64,
     architecture: *const ArchitectureDescriptor,
+    flavor: *const FlavorDescriptor,
 ) !GeneralizedImageValidationReport {
     var image = try zvmi.Image.openPathReadOnly(io, image_path);
     defer image.close(io);
     if (image.virtual_size != expected_virtual_size) return error.UnexpectedVirtualSize;
 
-    const expected_layout = try planGeneralizedGen2Layout(gpa, image.virtual_size, architecture);
+    const expected_layout = try planGeneralizedGen2Layout(gpa, image.virtual_size, architecture, flavor);
     defer gpa.free(expected_layout);
     const parsed = try zvmi.gpt.readGpt(image, io, gpa);
     defer gpa.free(parsed.partitions);
@@ -1673,6 +2454,7 @@ fn validateGeneralizedImage(
     if (std.mem.eql(u8, &root_partition.unique_partition_guid, &zvmi.guid.nil)) {
         return error.InvalidRootPartitionGuid;
     }
+    try validateFinalizedImageRootfs(gpa, io, &image, image_path, root_partition, flavor);
     var esp = try zvmi.fat32.open(&image, io, .{
         .offset = esp_partition.first_lba * zvmi.gpt.sector_size,
         .length = (esp_partition.last_lba - esp_partition.first_lba + 1) * zvmi.gpt.sector_size,
@@ -1711,7 +2493,7 @@ fn validateGeneralizedImage(
     _ = try requireNonemptyUkiSection(&inspection, ".osrel");
     _ = try requireNonemptyUkiSection(&inspection, ".uname");
 
-    const expected_cmdline = try expectedUkiCmdline(gpa, root_partition.unique_partition_guid, architecture);
+    const expected_cmdline = try expectedUkiCmdline(gpa, root_partition.unique_partition_guid, architecture, flavor);
     defer gpa.free(expected_cmdline);
     if (!std.mem.eql(u8, cmdline, expected_cmdline)) return error.UnexpectedUkiCmdline;
 
@@ -1749,6 +2531,60 @@ fn validateIso(io: Io, iso_path: []const u8, architecture: *const ArchitectureDe
             .{ iso_path, architecture.iso_sha256, &actual },
         );
         return error.IsoChecksumMismatch;
+    }
+}
+
+fn isoKernelAssetsMatchInstalledModules(
+    iso_kernel_names: []const u8,
+    iso_initramfs_names: []const u8,
+    installed_kernel_nevras: []const u8,
+) bool {
+    var kernels = std.mem.splitScalar(u8, iso_kernel_names, '\n');
+    while (kernels.next()) |kernel_name| {
+        const release = std.mem.trim(u8, kernel_name, " \r\t");
+        if (!std.mem.startsWith(u8, release, "vmlinuz-")) continue;
+        const kernel_release = release["vmlinuz-".len..];
+        if (std.mem.indexOf(u8, iso_initramfs_names, kernel_release) == null) continue;
+        if (std.mem.indexOf(u8, installed_kernel_nevras, kernel_release) != null) return true;
+    }
+    return false;
+}
+
+/// The ISO contributes only boot assets to both flavors.  A full rootfs is
+/// independently DNF-materialized, so refuse a kernel/initramfs whose release
+/// cannot be matched to the installed kernel-core/kernel-modules closure.
+fn validateFullIsoKernelCompatibility(
+    gpa: Allocator,
+    io: Io,
+    iso_path: []const u8,
+    rootfs_path: []const u8,
+    work_dir: []const u8,
+) !void {
+    const mount_path = try std.fmt.allocPrint(gpa, "{s}/iso-boot-assets", .{work_dir});
+    defer gpa.free(mount_path);
+    try Dir.cwd().createDirPath(io, mount_path);
+    try sudo(gpa, io, &.{ "mount", "-o", "loop,ro", iso_path, mount_path });
+    defer sudo(gpa, io, &.{ "umount", mount_path }) catch {};
+
+    const iso_kernels = try capture(gpa, io, &.{
+        "find", mount_path, "-type", "f", "-name", "vmlinuz-*", "-printf", "%f\n",
+    });
+    defer gpa.free(iso_kernels);
+    const iso_initrds = try capture(gpa, io, &.{
+        "find", mount_path, "-type", "f", "(", "-name", "initramfs-*", "-o", "-name", "initrd-*", ")", "-printf", "%f\n",
+    });
+    defer gpa.free(iso_initrds);
+    const installed = try capture(gpa, io, &.{
+        "sudo",                            "chroot",      rootfs_path,      "/usr/bin/rpm", "-q", "--qf",
+        "%{VERSION}-%{RELEASE}.%{ARCH}\n", "kernel-core", "kernel-modules",
+    });
+    defer gpa.free(installed);
+    if (!isoKernelAssetsMatchInstalledModules(iso_kernels, iso_initrds, installed)) {
+        std.debug.print(
+            "error: ISO kernel/initramfs does not match installed kernel-core/kernel-modules; refusing incoherent full image\n",
+            .{},
+        );
+        return error.IncompatibleIsoKernelModules;
     }
 }
 
@@ -1825,9 +2661,10 @@ fn validateGuestArtifact(
 
 const Args = struct {
     architecture: ?AzureLinuxArchitecture = null,
+    flavor: Flavor = .core,
     iso: ?[]const u8 = null,
     output: ?[]const u8 = null,
-    size: []const u8 = "1184M",
+    size: ?[]const u8 = null,
     work_dir: ?[]const u8 = null,
     zvmi_path: ?[]const u8 = null,
     zvminit_path: ?[]const u8 = null,
@@ -1839,10 +2676,11 @@ const help_text =
     \\Usage: build_generalized_azurelinux4 [options]
     \\
     \\  --architecture <arch> x86_64 or aarch64 (injected by build.zig)
+    \\  --flavor <core|full> Image flavor (default: core)
     \\  --iso <path>        Architecture-matched Azure Linux 4 ISO (downloaded if omitted)
-    \\  --output <path>     Output QCOW2 (architecture-specific default)
-    \\  --size <size>       Disk size (default: 1184M)
-    \\  --work-dir <dir>    Working directory (architecture-specific default)
+    \\  --output <path>     Output QCOW2 (architecture/flavor-specific default)
+    \\  --size <size>       Disk size (flavor-specific default)
+    \\  --work-dir <dir>    Working directory (architecture/flavor-specific default)
     \\  --zvmi <path>       zvmi executable (injected by build.zig)
     \\  --zvminit <path>    guest zvminit binary (injected by build.zig)
     \\  --azagent <path>    guest azagent binary (injected by build.zig)
@@ -1858,6 +2696,12 @@ pub fn parseArchitecture(value: []const u8) error{UnsupportedArchitecture}!Azure
     return error.UnsupportedArchitecture;
 }
 
+pub fn parseFlavor(value: []const u8) error{UnsupportedFlavor}!Flavor {
+    if (std.mem.eql(u8, value, "core")) return .core;
+    if (std.mem.eql(u8, value, "full")) return .full;
+    return error.UnsupportedFlavor;
+}
+
 fn parseArgs(argv: []const []const u8) !Args {
     var a = Args{};
     var i: usize = 0;
@@ -1867,6 +2711,10 @@ fn parseArgs(argv: []const []const u8) !Args {
             i += 1;
             if (i >= argv.len) return error.MissingValue;
             a.architecture = try parseArchitecture(argv[i]);
+        } else if (std.mem.eql(u8, arg, "--flavor")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            a.flavor = try parseFlavor(argv[i]);
         } else if (std.mem.eql(u8, arg, "--iso")) {
             i += 1;
             if (i >= argv.len) return error.MissingValue;
@@ -1926,9 +2774,11 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("error: --architecture is required (provided by zig build)\n", .{});
         std.process.exit(1);
     };
-    const output_path = args.output orelse architecture.default_output_path;
-    const work_dir = args.work_dir orelse architecture.default_work_dir;
-    const requested_size = zvmi.parseSize(args.size) catch |err| {
+    const flavor = flavorDescriptor(args.flavor);
+    const output_path = args.output orelse defaultOutputPath(architecture.architecture, flavor.flavor);
+    const work_dir = args.work_dir orelse defaultWorkDir(architecture.architecture, flavor.flavor);
+    const size_arg = args.size orelse flavor.default_size;
+    const requested_size = zvmi.parseSize(size_arg) catch |err| {
         std.debug.print("error: invalid --size ({s})\n", .{@errorName(err)});
         std.process.exit(1);
     };
@@ -1945,14 +2795,8 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("error: --zvmi is required (provided by zig build)\n", .{});
         std.process.exit(1);
     };
-    const zvminit_path = args.zvminit_path orelse {
-        std.debug.print("error: --zvminit is required (provided by zig build)\n", .{});
-        std.process.exit(1);
-    };
-    const azagent_path = args.azagent_path orelse {
-        std.debug.print("error: --azagent is required (provided by zig build)\n", .{});
-        std.process.exit(1);
-    };
+    const zvminit_path = args.zvminit_path;
+    const azagent_path = args.azagent_path;
     const preload_path = args.preload_path orelse {
         std.debug.print("error: --preload is required (provided by zig build)\n", .{});
         std.process.exit(1);
@@ -1960,15 +2804,17 @@ pub fn main(init: std.process.Init) !void {
 
     // Check required external tools.
     var tools_ok = true;
-    for (&[_][]const u8{ "sudo", "tar", "dnf", "curl", "qemu-img", "file", "find" }) |tool| {
+    for (&[_][]const u8{ "sudo", "tar", "dnf", "curl", "qemu-img", "file", "find", "gpg", "systemctl", "du", "mount", "umount" }) |tool| {
         if (!requireTool(gpa, io, tool)) {
             std.debug.print("error: required tool '{s}' not found in PATH\n", .{tool});
             tools_ok = false;
         }
     }
     if (!tools_ok) std.process.exit(1);
-    try validateGuestArtifact(gpa, io, zvminit_path, architecture);
-    try validateGuestArtifact(gpa, io, azagent_path, architecture);
+    if (flavor.pid1 == .zvminit) {
+        try validateGuestArtifact(gpa, io, zvminit_path orelse return error.MissingZvminitArtifact, architecture);
+        try validateGuestArtifact(gpa, io, azagent_path orelse return error.MissingAzagentArtifact, architecture);
+    }
 
     try Dir.cwd().createDirPath(io, work_dir);
 
@@ -1984,25 +2830,53 @@ pub fn main(init: std.process.Init) !void {
     const rootfs_path = try std.fmt.allocPrint(gpa, "{s}/rootfs", .{work_dir});
     defer gpa.free(rootfs_path);
 
-    const base_digest = try pullRootfs(gpa, io, work_dir, rootfs_path, architecture);
-    defer gpa.free(base_digest);
+    const core_digest = switch (flavor.flavor) {
+        .core => try pullRootfs(gpa, io, work_dir, rootfs_path, architecture),
+        .full => try bootstrapFullRootfs(gpa, io, work_dir, rootfs_path, architecture),
+    };
+    defer gpa.free(core_digest);
+    const trusted_key_path = switch (flavor.flavor) {
+        .core => try extractTrustedSigningKey(gpa, io, rootfs_path, work_dir, architecture),
+        .full => try trustedSigningKeyPath(gpa, work_dir, architecture),
+    };
+    defer gpa.free(trusted_key_path);
 
     const systemd_boot_rpm_path = try acquireSystemdBootRpm(gpa, io, work_dir, architecture);
     defer gpa.free(systemd_boot_rpm_path);
-    try installGuestContent(
+    const installed_closure = try installGuestContent(
         gpa,
         io,
         rootfs_path,
         work_dir,
+        trusted_key_path,
         zvminit_path,
         azagent_path,
         systemd_boot_rpm_path,
         architecture,
+        flavor,
     );
+    defer gpa.free(installed_closure);
+    if (flavor.flavor == .full) {
+        try validateFullIsoKernelCompatibility(gpa, io, iso_path, rootfs_path, work_dir);
+    }
+    try enforceMinimumRootFreeSpace(gpa, io, rootfs_path, requested_size, architecture, flavor);
 
-    const layout_dir = try createOciLayout(gpa, io, work_dir, rootfs_path, base_digest, architecture);
+    const source_identity = switch (flavor.flavor) {
+        .core => core_digest,
+        .full => vm_base_profile_blob,
+    };
+    const layout_dir = try createOciLayout(
+        gpa,
+        io,
+        work_dir,
+        rootfs_path,
+        source_identity,
+        architecture,
+        flavor,
+        installed_closure,
+    );
     defer gpa.free(layout_dir);
-    try validateGeneralizedOciLayout(gpa, io, layout_dir, architecture);
+    try validateGeneralizedOciLayout(gpa, io, layout_dir, architecture, flavor);
 
     // Ensure output parent directory exists.
     if (std.fs.path.dirname(output_path)) |parent| {
@@ -2028,16 +2902,16 @@ pub fn main(init: std.process.Init) !void {
         "--generation",
         "2",
         "--size",
-        args.size,
+        size_arg,
         "--skip-iso-rootfs",
         "--boot-mode",
         "uki",
         "--stub-source-path",
         architecture.systemd_boot_stub_path,
         "--esp-size",
-        generalized_esp_size_arg,
+        flavor.esp_size_arg,
         "--extra-kernel-options",
-        architecture.extra_kernel_options,
+        ukiExtraKernelOptions(architecture, flavor),
         "-o",
         raw_qcow2,
         "-O",
@@ -2078,7 +2952,7 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
 
-    const validation = validateGeneralizedImage(gpa, io, staged_qcow2, requested_size, architecture) catch |err| {
+    const validation = validateGeneralizedImage(gpa, io, staged_qcow2, requested_size, architecture, flavor) catch |err| {
         std.debug.print(
             "error: generalized image structural validation failed ({s}); keeping {s} and {s}\n",
             .{ @errorName(err), raw_qcow2, staged_qcow2 },
@@ -2207,7 +3081,7 @@ test "sha256Bytes produces known digest" {
     try std.testing.expectEqualStrings("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824", &hex);
 }
 
-test "architecture descriptors pin core inputs and output namespaces" {
+test "architecture and flavor descriptors pin inputs and output namespaces" {
     const gpa = std.testing.allocator;
     const cases = [_]*const ArchitectureDescriptor{ &x86_64, &aarch64 };
     for (cases) |architecture| {
@@ -2256,10 +3130,16 @@ test "architecture descriptors pin core inputs and output namespaces" {
         "bd463282c4d8daaebbb6e600d6a21848e91aff7d2021255377b3547a4531106d",
         aarch64.repomd_sha256,
     );
-    try std.testing.expectEqualStrings("AzureLinux-4.0-x86_64.core.qcow2", x86_64.default_output_path);
-    try std.testing.expectEqualStrings("AzureLinux-4.0-aarch64.core.qcow2", aarch64.default_output_path);
-    try std.testing.expectEqualStrings(".scratch/azurelinux4-core-x86_64", x86_64.default_work_dir);
-    try std.testing.expectEqualStrings(".scratch/azurelinux4-core-aarch64", aarch64.default_work_dir);
+    try std.testing.expectEqualStrings("AzureLinux-4.0-x86_64.core.qcow2", defaultOutputPath(.x86_64, .core));
+    try std.testing.expectEqualStrings("AzureLinux-4.0-aarch64.core.qcow2", defaultOutputPath(.aarch64, .core));
+    try std.testing.expectEqualStrings("AzureLinux-4.0-x86_64.qcow2", defaultOutputPath(.x86_64, .full));
+    try std.testing.expectEqualStrings("AzureLinux-4.0-aarch64.qcow2", defaultOutputPath(.aarch64, .full));
+    try std.testing.expectEqualStrings(".scratch/azurelinux4-core-x86_64", defaultWorkDir(.x86_64, .core));
+    try std.testing.expectEqualStrings(".scratch/azurelinux4-core-aarch64", defaultWorkDir(.aarch64, .core));
+    try std.testing.expectEqualStrings(".scratch/azurelinux4-full-x86_64", defaultWorkDir(.x86_64, .full));
+    try std.testing.expectEqualStrings(".scratch/azurelinux4-full-aarch64", defaultWorkDir(.aarch64, .full));
+    try std.testing.expectEqualStrings("5G", full.default_size);
+    try std.testing.expectEqual(@as(u64, 1024 * 1024 * 1024), full.minimum_root_free_bytes);
 }
 
 test "architecture descriptors select RPMs, stubs, EFI paths, and binfmt" {
@@ -2313,6 +3193,72 @@ test "architecture descriptors select RPMs, stubs, EFI paths, and binfmt" {
     try std.testing.expectEqualStrings("/proc/sys/fs/binfmt_misc/qemu-aarch64", aarch64.binfmt_registration_path);
 }
 
+test "full flavor encodes the pinned official vm-base package profile" {
+    try std.testing.expectEqualStrings("https://github.com/microsoft/azurelinux", vm_base_upstream_repository);
+    try std.testing.expectEqualStrings("5b41bff6ebaf7e8fc78637b564efee23b66e7d67", vm_base_upstream_commit);
+    try std.testing.expectEqualStrings("8c870852e711273275c83f0b94ecd914ff709af8", vm_base_profile_blob);
+    try std.testing.expectEqualStrings("base/images/vm-base/vm-base.kiwi", vm_base_profile_path);
+    try std.testing.expectEqualStrings("vm-base", vm_base_profile_name);
+    for (&[_][]const u8{
+        "systemd",
+        "cloud-init",
+        "WALinuxAgent",
+        "openssh-server",
+        "openssh-clients",
+        "azure-vm-utils",
+        "hyperv-daemons",
+        "kernel",
+        "kernel-modules",
+        "systemd-networkd",
+        "sudo",
+        "azurelinux-repos",
+    }) |package| {
+        try std.testing.expect(argvContains(&vm_base_packages, package));
+    }
+    try std.testing.expect(argvContains(x86_64.full_efi_packages, "grub2-efi-x64"));
+    try std.testing.expect(argvContains(aarch64.full_efi_packages, "grub2-efi-aa64"));
+    try std.testing.expect(argvContains(x86_64.full_efi_packages, "shim"));
+    try std.testing.expect(argvContains(aarch64.full_efi_packages, "shim"));
+}
+
+test "flavor contracts keep full systemd-only and core zvminit-only" {
+    try std.testing.expectEqual(Pid1.zvminit, core.pid1);
+    try std.testing.expectEqual(Pid1.systemd, full.pid1);
+    try std.testing.expectEqual(Provisioner.zvminit_azagent, core.provisioner);
+    try std.testing.expectEqual(Provisioner.cloud_init_waagent, full.provisioner);
+    try std.testing.expectEqualStrings("/sbin/zvminit", core.oci_entrypoint);
+    try std.testing.expectEqualStrings("/usr/lib/systemd/systemd", full.oci_entrypoint);
+    for (&[_][]const u8{ "sbin/zvminit", "usr/sbin/azagent", "etc/ssh/sshd_config.d/10-zvminit.conf" }) |path| {
+        try std.testing.expect(argvContains(full.forbidden_rootfs_paths, path));
+    }
+    try std.testing.expect(argvContains(full.required_rootfs_paths, "usr/lib/systemd/systemd"));
+    try std.testing.expect(argvContains(full.required_rootfs_paths, "usr/sbin/waagent"));
+    try std.testing.expect(full.max_oci_layer_bytes > core.max_oci_layer_bytes);
+    try std.testing.expectEqual(@as(usize, 3), ociLayerPlanCount(&core));
+    try std.testing.expectEqual(@as(usize, 7), ociLayerPlanCount(&full));
+}
+
+test "full OCI provenance records profile repomd and NEVRA closure" {
+    const gpa = std.testing.allocator;
+    const history = try formatOciHistoryComment(
+        gpa,
+        vm_base_profile_blob,
+        &aarch64,
+        &full,
+        "WALinuxAgent-0:2.15.0.1-2.azl4.noarch\nsystemd-0:258.4-4.azl4.aarch64\n",
+    );
+    defer gpa.free(history);
+    for (&[_][]const u8{
+        vm_base_upstream_commit,
+        vm_base_profile_blob,
+        vm_base_profile_path,
+        aarch64.repomd_sha256,
+        "installed-nevra-sha256=",
+    }) |needle| {
+        try std.testing.expect(std.mem.indexOf(u8, history, needle) != null);
+    }
+}
+
 test "OCI config architecture is required to match the descriptor" {
     try std.testing.expect(ociConfigArchitectureMatches("amd64", &x86_64));
     try std.testing.expect(ociConfigArchitectureMatches("arm64", &aarch64));
@@ -2339,8 +3285,15 @@ test "repository metadata mismatch is rejected for both architectures" {
     try std.testing.expect(!repositoryMetadataMatches(moving_metadata, &aarch64));
 }
 
+test "trusted signing key is pinned by checksum and fingerprint" {
+    _ = try artifact_pipeline.parseSha256(azurelinux_signing_key_sha256);
+    try std.testing.expectEqualStrings("2BC94FFF7015A5F28F1537AD0CD9FED33135CE90", azurelinux_signing_key_fingerprint);
+}
+
 test "DNF install permits payload downloads without refreshing verified metadata" {
-    const argv = dnfInstallArgs(
+    const gpa = std.testing.allocator;
+    const argv = try dnfInstallArgs(
+        gpa,
         "/target-root",
         "--forcearch=x86_64",
         "--setopt=azurelinux-base.gpgkey=file:///key",
@@ -2353,14 +3306,16 @@ test "DNF install permits payload downloads without refreshing verified metadata
         "--setopt=azurelinux-base.gpgcheck=True",
         "--setopt=cachedir=/private/cache",
         "--setopt=persistdir=/private/persist",
+        &.{ "openssh-server", "sudo" },
     );
-    try std.testing.expect(!argvContains(&argv, "-C"));
-    try std.testing.expect(!argvContains(&argv, "--cacheonly"));
-    try std.testing.expect(argvContains(&argv, "--setopt=metadata_expire=never"));
-    try std.testing.expect(argvContains(&argv, "--setopt=azurelinux-base.metadata_expire=never"));
-    try std.testing.expect(argvContains(&argv, "--setopt=cachedir=/private/cache"));
-    try std.testing.expect(argvContains(&argv, "--setopt=persistdir=/private/persist"));
-    try std.testing.expect(argvContains(&argv, "--setopt=azurelinux-base.gpgcheck=True"));
+    defer gpa.free(argv);
+    try std.testing.expect(!argvContains(argv, "-C"));
+    try std.testing.expect(!argvContains(argv, "--cacheonly"));
+    try std.testing.expect(argvContains(argv, "--setopt=metadata_expire=never"));
+    try std.testing.expect(argvContains(argv, "--setopt=azurelinux-base.metadata_expire=never"));
+    try std.testing.expect(argvContains(argv, "--setopt=cachedir=/private/cache"));
+    try std.testing.expect(argvContains(argv, "--setopt=persistdir=/private/persist"));
+    try std.testing.expect(argvContains(argv, "--setopt=azurelinux-base.gpgcheck=True"));
     try std.testing.expectEqualStrings("install", argv[18]);
     try std.testing.expectEqualStrings("openssh-server", argv[19]);
     try std.testing.expectEqualStrings("sudo", argv[20]);
@@ -2386,8 +3341,11 @@ test "architecture and argument parsing accepts only supported values" {
     try std.testing.expectError(error.UnsupportedArchitecture, parseArchitecture("amd64"));
     try std.testing.expectError(error.UnsupportedArchitecture, parseArchitecture("arm64"));
     try std.testing.expectError(error.MissingArchitecture, requireArchitecture(null));
-    try std.testing.expectEqualStrings("1184M", (try parseArgs(&.{})).size);
-    try std.testing.expectEqualStrings("2G", (try parseArgs(&.{ "--size", "2G" })).size);
+    try std.testing.expectEqual(Flavor.core, (try parseArgs(&.{})).flavor);
+    try std.testing.expect((try parseArgs(&.{})).size == null);
+    try std.testing.expectEqualStrings("2G", (try parseArgs(&.{ "--size", "2G" })).size.?);
+    try std.testing.expectEqual(Flavor.full, (try parseArgs(&.{ "--flavor", "full" })).flavor);
+    try std.testing.expectError(error.UnsupportedFlavor, parseFlavor("minimal"));
     try std.testing.expectEqual(
         AzureLinuxArchitecture.aarch64,
         (try parseArgs(&.{ "--architecture", "aarch64" })).architecture.?,
@@ -2426,11 +3384,11 @@ test "generalized Gen2 layout uses the descriptor root role and GUID" {
     const disk_size = try zvmi.parseSize("1184M");
     const cases = [_]*const ArchitectureDescriptor{ &x86_64, &aarch64 };
     for (cases) |architecture| {
-        const planned = try planGeneralizedGen2Layout(gpa, disk_size, architecture);
+        const planned = try planGeneralizedGen2Layout(gpa, disk_size, architecture, &core);
         defer gpa.free(planned);
 
         try std.testing.expectEqual(@as(usize, 2), planned.len);
-        try std.testing.expectEqual(generalized_esp_size_bytes, planned[0].length_bytes);
+        try std.testing.expectEqual(core.esp_size_bytes, planned[0].length_bytes);
         try std.testing.expectEqual(@as(u64, 670 * 1024 * 1024), planned[1].length_bytes);
         try std.testing.expectEqual(architecture.root_role, planned[1].role);
         try std.testing.expectEqual(architecture.root_type_guid, planned[1].type_guid);
@@ -2452,14 +3410,31 @@ test "generalized Gen2 layout uses the descriptor root role and GUID" {
         try std.testing.expectError(error.UnexpectedPartitionLayout, validatePartitionLayout(&actual, planned));
     }
     try std.testing.expectEqual(disk_size, @as(u64, 1184 * 1024 * 1024));
+
+    const full_size = try zvmi.parseSize(full.default_size);
+    for (cases) |architecture| {
+        const planned = try planGeneralizedGen2Layout(gpa, full_size, architecture, &full);
+        defer gpa.free(planned);
+        try std.testing.expectEqual(full.esp_size_bytes, planned[0].length_bytes);
+        try std.testing.expect(rootFreeSpaceIsSufficient(
+            planned[1].length_bytes,
+            planned[1].length_bytes - full.minimum_root_free_bytes,
+            full.minimum_root_free_bytes,
+        ));
+        try std.testing.expect(!rootFreeSpaceIsSufficient(
+            planned[1].length_bytes,
+            planned[1].length_bytes,
+            full.minimum_root_free_bytes,
+        ));
+    }
 }
 
-test "generalized UKI command line uses architecture-specific serial consoles" {
+test "generalized UKI command lines preserve core and constrain full" {
     const gpa = std.testing.allocator;
     const root_guid = zvmi.guid.parse("11111111-2222-3333-4444-555555555555");
-    const x86_cmdline = try expectedUkiCmdline(gpa, root_guid, &x86_64);
+    const x86_cmdline = try expectedUkiCmdline(gpa, root_guid, &x86_64, &core);
     defer gpa.free(x86_cmdline);
-    const arm_cmdline = try expectedUkiCmdline(gpa, root_guid, &aarch64);
+    const arm_cmdline = try expectedUkiCmdline(gpa, root_guid, &aarch64, &core);
     defer gpa.free(arm_cmdline);
     try std.testing.expectEqualStrings(
         "root=PARTUUID=11111111-2222-3333-4444-555555555555 init=/sbin/zvminit zvminit.mode=persistent zvminit.azure=auto console=tty0 console=ttyS0,115200n8",
@@ -2473,7 +3448,41 @@ test "generalized UKI command line uses architecture-specific serial consoles" {
     try std.testing.expectEqualStrings("console=ttyAMA0,115200n8", aarch64.serial_console);
     try std.testing.expect(std.mem.indexOf(u8, x86_cmdline, "zvminit.shell=on") == null);
     try std.testing.expect(std.mem.indexOf(u8, arm_cmdline, "zvminit.shell=on") == null);
-    try std.testing.expectEqualStrings("512M", generalized_esp_size_arg);
+    try std.testing.expectEqualStrings("512M", core.esp_size_arg);
+
+    const full_x86_cmdline = try expectedUkiCmdline(gpa, root_guid, &x86_64, &full);
+    defer gpa.free(full_x86_cmdline);
+    const full_arm_cmdline = try expectedUkiCmdline(gpa, root_guid, &aarch64, &full);
+    defer gpa.free(full_arm_cmdline);
+    try std.testing.expectEqualStrings(
+        "root=PARTUUID=11111111-2222-3333-4444-555555555555 console=ttyS0,115200n8",
+        full_x86_cmdline,
+    );
+    try std.testing.expectEqualStrings(
+        "root=PARTUUID=11111111-2222-3333-4444-555555555555 console=ttyAMA0,115200n8",
+        full_arm_cmdline,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, full_x86_cmdline, "init=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, full_x86_cmdline, "zvminit.") == null);
+    try std.testing.expect(std.mem.indexOf(u8, full_arm_cmdline, "zvminit.") == null);
+}
+
+test "kernel asset compatibility requires matching ISO and installed releases" {
+    try std.testing.expect(isoKernelAssetsMatchInstalledModules(
+        "vmlinuz-6.6.87.1-1.azl4.x86_64\n",
+        "initramfs-6.6.87.1-1.azl4.x86_64.img\n",
+        "6.6.87.1-1.azl4.x86_64\n",
+    ));
+    try std.testing.expect(!isoKernelAssetsMatchInstalledModules(
+        "vmlinuz-6.6.87.1-1.azl4.x86_64\n",
+        "initramfs-6.6.87.1-1.azl4.x86_64.img\n",
+        "6.6.88.1-1.azl4.x86_64\n",
+    ));
+    try std.testing.expect(!isoKernelAssetsMatchInstalledModules(
+        "vmlinuz-6.6.87.1-1.azl4.x86_64\n",
+        "initramfs-6.6.88.1-1.azl4.x86_64.img\n",
+        "6.6.87.1-1.azl4.x86_64\n",
+    ));
 }
 
 test "gzipFile streams the complete source" {
