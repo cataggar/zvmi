@@ -39,7 +39,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            dnf expect file jq ovmf qemu-system-x86 qemu-utils
+            dnf file jq openssh-client ovmf qemu-system-x86 qemu-utils xorriso
           # Ubuntu defaults to ~/.rpmdb; use the database shipped in the Azure Linux rootfs.
           echo '%_dbpath /usr/lib/sysimage/rpm' | sudo tee /root/.rpmmacros
           test "$(sudo rpm --eval '%{_dbpath}')" = /usr/lib/sysimage/rpm
@@ -82,12 +82,17 @@ jobs:
           sha256sum "dist/$ASSET_NAME"
 
       - name: Boot finalized UKI QCOW2
-        timeout-minutes: 6
+        timeout-minutes: 8
         env:
           IMAGE: ${{ github.workspace }}/dist/${{ env.ASSET_NAME }}
           OVMF_CODE: /usr/share/OVMF/OVMF_CODE_4M.fd
           OVMF_TEMPLATE: /usr/share/OVMF/OVMF_VARS_4M.fd
           OVMF_VARS: ${{ runner.temp }}/azurelinux4-OVMF_VARS.fd
+          OVF_DIR: ${{ runner.temp }}/zvmi-local-ovf
+          OVF_ISO: ${{ runner.temp }}/zvmi-local-ovf.iso
+          SSH_KEY: ${{ runner.temp }}/zvmi-test-ed25519
+          SERIAL_LOG: ${{ runner.temp }}/zvmi-serial.log
+          SSH_PORT: "2222"
         run: |
           set -euo pipefail
           test -x /usr/bin/qemu-system-x86_64
@@ -95,57 +100,156 @@ jobs:
           test -r "$OVMF_TEMPLATE"
           test -r "$IMAGE"
 
+          source_sha256=$(sha256sum "$IMAGE" | awk '{print $1}')
           cp "$OVMF_TEMPLATE" "$OVMF_VARS"
-          trap 'rm -f "$OVMF_VARS"' EXIT
+          mkdir -p "$OVF_DIR"
+          ssh-keygen -q -t ed25519 -N '' -C zvmi-ci -f "$SSH_KEY"
+          public_key=$(cat "$SSH_KEY.pub")
+          cat > "$OVF_DIR/ovf-env.xml" <<EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <Environment xmlns="http://schemas.dmtf.org/ovf/environment/1" xmlns:wa="http://schemas.microsoft.com/windowsazure">
+            <wa:ProvisioningSection>
+              <LinuxProvisioningConfigurationSet xmlns="http://schemas.microsoft.com/windowsazure">
+                <HostName>zvmi-ci</HostName>
+                <UserName>zvmitest</UserName>
+                <DisableSshPasswordAuthentication>true</DisableSshPasswordAuthentication>
+                <SSH><PublicKeys><PublicKey>
+                  <Path>/home/zvmitest/.ssh/authorized_keys</Path>
+                  <Value>$public_key</Value>
+                </PublicKey></PublicKeys></SSH>
+              </LinuxProvisioningConfigurationSet>
+            </wa:ProvisioningSection>
+          </Environment>
+          EOF
+          : > "$OVF_DIR/zvmi-local-provisioning"
+          xorriso -as mkisofs -quiet -iso-level 3 -R -J \
+            -V OVFENV -o "$OVF_ISO" "$OVF_DIR"
+          chmod 0444 "$OVF_ISO"
 
-          timeout --signal=TERM --kill-after=10s 300s expect <<'EXPECT'
-          set timeout 240
-
-          proc fail {pid message} {
-              puts stderr "FAIL: $message"
-              catch {exec kill -TERM $pid}
-              after 2000
-              catch {exec kill -KILL $pid}
-              catch {wait}
-              exit 1
+          qemu_pid=
+          cleanup() {
+            status=$?
+            set +e
+            if [[ -n "$qemu_pid" ]] && kill -0 "$qemu_pid" 2>/dev/null; then
+              kill -TERM "$qemu_pid"
+              sleep 2
+              if kill -0 "$qemu_pid" 2>/dev/null; then
+                kill -KILL "$qemu_pid"
+              fi
+              wait "$qemu_pid"
+            fi
+            if [[ $status -ne 0 && -r "$SERIAL_LOG" ]]; then
+              cat "$SERIAL_LOG"
+            fi
+            rm -rf "$OVF_DIR"
+            rm -f "$OVF_ISO" "$OVMF_VARS" "$SSH_KEY" "$SSH_KEY.pub" "$SERIAL_LOG"
+            exit "$status"
           }
+          trap cleanup EXIT
 
-          spawn -noecho qemu-system-x86_64 \
-              -machine q35,accel=tcg,smm=off \
-              -m 2048 \
-              -display none -monitor none \
-              -serial stdio -no-reboot -snapshot \
-              -drive if=pflash,unit=0,format=raw,readonly=on,file=$env(OVMF_CODE) \
-              -drive if=pflash,unit=1,format=raw,file=$env(OVMF_VARS) \
-              -drive file=$env(IMAGE),format=qcow2,if=virtio \
-              -nic user,model=virtio-net-pci
+          qemu-system-x86_64 \
+            -machine q35,accel=tcg,smm=off \
+            -m 2048 \
+            -display none -monitor none \
+            -serial "file:$SERIAL_LOG" -no-reboot -snapshot \
+            -drive "if=pflash,unit=0,format=raw,readonly=on,file=$OVMF_CODE" \
+            -drive "if=pflash,unit=1,format=raw,file=$OVMF_VARS" \
+            -drive "file=$IMAGE,format=qcow2,if=virtio" \
+            -drive "if=none,id=ovf,format=raw,media=cdrom,readonly=on,file=$OVF_ISO" \
+            -device ide-cd,drive=ovf,bus=ide.1 \
+            -nic "user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22" &
+          qemu_pid=$!
 
-          set pid [exp_pid]
-          expect {
-              -exact {[zvminit] spawning shell on ttyS0} {}
-              timeout { fail $pid "zvminit shell marker timeout" }
-              eof     { fail $pid "QEMU exited before zvminit shell" }
+          ssh_options=(
+            -i "$SSH_KEY"
+            -p "$SSH_PORT"
+            -o BatchMode=yes
+            -o ConnectTimeout=3
+            -o IdentitiesOnly=yes
+            -o KbdInteractiveAuthentication=no
+            -o PasswordAuthentication=no
+            -o PreferredAuthentications=publickey
+            -o StrictHostKeyChecking=no
+            -o UserKnownHostsFile=/dev/null
+          )
+          ssh_ready=false
+          for _ in $(seq 1 120); do
+            if ssh "${ssh_options[@]}" zvmitest@127.0.0.1 true >/dev/null 2>&1; then
+              ssh_ready=true
+              break
+            fi
+            kill -0 "$qemu_pid"
+            sleep 2
+          done
+          test "$ssh_ready" = true
+          grep -Fq '[zvminit] ZVMINIT_PID1_READY supervisor loop active' "$SERIAL_LOG"
+          grep -Fq '[zvminit] azagent completed successfully' "$SERIAL_LOG"
+
+          inspect_guest=$(cat <<'GUEST'
+          set -eu
+          resolved_pid1=$(readlink -f /proc/1/exe)
+          printf 'PID1_EXE=%s\n' "$resolved_pid1" >&2
+          test /proc/1/exe -ef /sbin/zvminit
+          test -b /dev/sr0
+          test -f /var/lib/azagent/provisioned
+          find_sshd_master() {
+            for proc in /proc/[0-9]*; do
+              test -r "$proc/status" || continue
+              name=
+              ppid=
+              while read -r key value _; do
+                case "$key" in
+                  Name:) name=$value ;;
+                  PPid:) ppid=$value ;;
+                esac
+              done < "$proc/status"
+              test "$name" = sshd && test "$ppid" = 1 || continue
+              cmdline=$(tr '\0' ' ' < "$proc/cmdline")
+              case "$cmdline" in
+                *"/usr/sbin/sshd -D -e"*) printf '%s\n' "${proc##*/}"; return 0 ;;
+              esac
+            done
+            return 1
           }
+          find_sshd_master
+          GUEST
+          )
 
-          send -- "exe=\$(readlink /proc/1/exe); cmd=\$(tr '\\0' ' ' </proc/1/cmdline); status=BAD; test /proc/1/exe -ef /sbin/zvminit && test \"\$cmd\" = '/sbin/zvminit ' && status=OK; printf 'ZVMI_PID1_EXE=%s\\n' \"\$exe\"; printf 'ZVMI_PID1_CMDLINE=%s\\n' \"\$cmd\"; printf 'ZVMI_PID1_%s\\n' \"\$status\"; poweroff\r"
+          initial_master=$(ssh "${ssh_options[@]}" zvmitest@127.0.0.1 "$inspect_guest")
+          [[ "$initial_master" =~ ^[0-9]+$ ]]
+          ssh "${ssh_options[@]}" zvmitest@127.0.0.1 \
+            "sudo /usr/bin/bash -c 'kill -KILL $initial_master'" >/dev/null 2>&1 || true
 
-          expect {
-              -exact {ZVMI_PID1_OK} {}
-              -exact {ZVMI_PID1_BAD} { fail $pid "PID 1 verification failed" }
-              timeout { fail $pid "PID 1 response timeout" }
-              eof     { fail $pid "QEMU exited before PID 1 verification" }
-          }
+          restarted_master=
+          for _ in $(seq 1 60); do
+            candidate=$(ssh "${ssh_options[@]}" zvmitest@127.0.0.1 "$inspect_guest" 2>/dev/null || true)
+            if [[ "$candidate" =~ ^[0-9]+$ && "$candidate" != "$initial_master" ]]; then
+              restarted_master=$candidate
+              break
+            fi
+            kill -0 "$qemu_pid"
+            sleep 2
+          done
+          test -n "$restarted_master"
 
-          expect {
-              eof {}
-              timeout { fail $pid "guest did not power off" }
-          }
-
-          set result [wait]
-          if {[lindex $result 2] != 0 || [lindex $result 3] != 0} {
-              exit 1
-          }
-          EXPECT
+          ssh "${ssh_options[@]}" zvmitest@127.0.0.1 \
+            'sudo /sbin/poweroff' >/dev/null 2>&1 || true
+          qemu_exited=false
+          for _ in $(seq 1 60); do
+            if ! kill -0 "$qemu_pid" 2>/dev/null; then
+              qemu_exited=true
+              break
+            fi
+            sleep 1
+          done
+          test "$qemu_exited" = true
+          set +e
+          wait "$qemu_pid"
+          qemu_status=$?
+          set -e
+          qemu_pid=
+          test "$qemu_status" -eq 0
+          test "$(sha256sum "$IMAGE" | awk '{print $1}')" = "$source_sha256"
 
       - name: Replace release asset
         env:
@@ -184,7 +288,7 @@ jobs:
           - UKI stub package: \`systemd-boot-unsigned-258.4-4.azl4.x86_64.rpm\`
           - UKI stub package SHA-256: \`85dd3ac0c532bceb09fc0a85c6568c51fc4ee84e0c478d1302b7a2d84e1bea5c\`
 
-          The builder validates the finalized QCOW2's GPT, ESP, UKI sections, and embedded command line. The release workflow then boots that exact compressed artifact with QEMU/OVMF and verifies \`zvminit\` is PID 1. The base image identifies itself as Azure Linux 4.0 Container Image Beta with \`RELEASE_TYPE=development\`.
+          The builder validates the finalized QCOW2's GPT, ESP, UKI sections, and embedded command line. The release workflow then boots that exact compressed artifact with QEMU/OVMF and ephemeral marked OVF media, proves key-only SSH, verifies \`zvminit\` is PID 1 and directly owns foreground sshd, kills sshd and reconnects after supervisor restart, powers off through PID 1, and re-hashes the unchanged source QCOW2. The base image identifies itself as Azure Linux 4.0 Container Image Beta with \`RELEASE_TYPE=development\`.
           EOF
 
           gh release upload "$RELEASE_TAG" "dist/$ASSET_NAME" --clobber --repo "$GITHUB_REPOSITORY"

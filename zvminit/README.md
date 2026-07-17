@@ -18,13 +18,17 @@ A minimal (~160 KB), statically-linked PID 1 replacement for real-boot testing o
   packet socket taps the device's receive path before that check applies --
   the same technique real DHCP clients (dhclient/udhcpc/systemd-networkd)
   use.
-- Installs `SIGTERM`/`SIGINT` handlers that cleanly power off/reboot, and
+- Installs `SIGTERM`/`SIGINT` handlers that stop managed children before
+  cleanly powering off/rebooting, and
   doubles as `/sbin/poweroff`, `/sbin/reboot`, `/sbin/shutdown` (dispatched
   by `argv[0]`) so the kernel's `orderly_poweroff()` usermode-helper path
   (driven by Hyper-V's shutdown integration service) has something to exec.
-- Loops forever spawning an interactive shell on `/dev/ttyS0`, respawning it
-  if it ever exits (PID 1 exiting panics the kernel), and reaping all other
-  zombie children along the way.
+- Runs a PID-1 supervisor loop that never returns and reaps every child.
+  It discovers serial consoles from `console=` entries and
+  `/sys/class/tty/console/active`, with architecture fallbacks of `ttyS0`
+  (x86_64) and `ttyAMA0` (AArch64). Normal logs prefer `/dev/console`.
+  `zvminit.shell=on` explicitly enables a respawning diagnostic root shell on
+  the discovered serial device; the default is `off`.
 - Detects Azure before launching `azagent`. Automatic detection accepts either
   a readable `ovf-env.xml` provisioning disc or DHCP option 245, and classifies
   a completed DHCP lease with neither signal as non-Azure. Persistent mode
@@ -32,8 +36,27 @@ A minimal (~160 KB), statically-linked PID 1 replacement for real-boot testing o
   current DMI product UUID so moving the disk to a different VM forces
   redetection. Failed DHCP or not-yet-readable media remains unknown and is
   retried without repeatedly launching `azagent`.
-- If `/usr/sbin/azagent` (the guest provisioning agent, see `azagent/`, issue #112) is present, fork+execs it after networking is up so a `--skip-iso-rootfs` image can reach a provisioned login instead of only a bare shell. Immutable mode retains a single best-effort run when detection is inconclusive. Persistent mode retries every five seconds only after Azure is detected or forced, while keeping the serial shell available.
-- If `/usr/sbin/sshd` is present, fork+execs it after provisioning succeeds. In persistent mode, an existing provisioning sentinel also permits SSH to start when `azagent` is skipped, while a fresh non-Azure image remains serial-only. This remains one hardcoded fork+exec rather than a general service supervisor and uses the configuration shipped by the container image.
+- Distinguishes synthetic local OVF media only by the explicit
+  `zvmi-local-provisioning` marker file. Marked media runs
+  `azagent --skip-ready` under the default automatic policy; an unmarked
+  `ovf-env.xml` remains Azure media and keeps fail-closed, retriable WireServer
+  Ready acknowledgement.
+- If `/usr/sbin/azagent` (the guest provisioning agent, see `azagent/`, issue
+  #112) is present, runs it as a direct child after Azure is detected and
+  retries failures every five seconds. A completed local-provisioning sentinel
+  gates SSH independently from retriable WireServer Ready acknowledgement.
+- If `/usr/sbin/sshd` is present and the provisioning sentinel exists, runs
+  `/usr/sbin/sshd -D -e` as a direct child. Unexpected exits are reaped and
+  restarted with exponential backoff capped at 30 seconds. A fresh non-Azure
+  persistent image never exposes SSH. The loop manages only these fixed
+  processes and the optional shell; it is not a general service manager.
+- Emits `[zvminit] ZVMINIT_PID1_READY supervisor loop active` once PID 1 has
+  verified its actual PID is 1, completed base initialization, and entered its
+  supervisor loop. This marker does not claim that provisioning, WireServer
+  Ready, or SSH acceptance has completed.
+- On shutdown, prevents new service starts, broadcasts `SIGTERM` to all
+  permitted guest processes, drains all direct and adopted children, then
+  escalates remaining processes to `SIGKILL` before rebooting or powering off.
 
 ## Building
 
@@ -44,7 +67,10 @@ zig build
 zig build test-zvminit
 ```
 
-The installed executable always cross-compiles to static `x86_64-linux` regardless of host, since that's what these real Azure Gen2 VM fixtures run; there's no `-Doptimize=` toggle because the binary hardcodes `ReleaseSmall`. The tests build for the selected native test target.
+The installed executable cross-compiles statically for the architecture
+selected by `-Dazurelinux-arch=x86_64|aarch64`; there is no `-Doptimize=`
+toggle because the binary hardcodes `ReleaseSmall`. Tests build for the
+selected native test target.
 
 ## Using it
 
@@ -72,6 +98,14 @@ zvmi build-image --iso <azurelinux.iso> --container <oci-layout-with-zvminit-age
 `init=/sbin/zvminit` is required when the packaged OpenSSH dependency set includes systemd; otherwise the systemd-based initramfs selects `/usr/lib/systemd/systemd` directly instead of zvminit. Persistent mode is intentionally incompatible with a read-only dm-verity root. If the root remount fails, zvminit leaves provisioning and SSH disabled and retains serial-console access for diagnosis.
 
 `zvminit.azure=auto` is the default. Use `zvminit.azure=on` to force provisioning retries when Azure's early-boot signals are unavailable, or `zvminit.azure=off` to suppress `azagent` explicitly. Overrides apply only to the current boot and do not replace the cached automatic decision. `zvmi azure deprovision` removes `/var/lib/azagent`, including both the provisioning sentinel and cached environment decision.
+
+`zvminit.shell=off` is also the default. Add `zvminit.shell=on` only to a
+temporary diagnostic boot command line when unauthenticated serial root access
+is acceptable. Released builder command lines intentionally omit it.
+
+The `/sbin/poweroff`, `/sbin/reboot`, and `/sbin/shutdown` helper links signal
+PID 1 so the same complete child-drain path is used rather than rebooting
+around the supervisor.
 
 Generalized Azure deployments must still provide `adminUsername`; use `g` for
 the project image convention. With the builder's `waagent.conf`, azagent mounts

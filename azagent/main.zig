@@ -23,6 +23,7 @@ pub const waagent_conf = @import("waagent_conf.zig");
 pub const resource_disk = @import("resource_disk.zig");
 pub const drive_mounts = @import("drive_mounts.zig");
 pub const root_resize = @import("root_resize.zig");
+pub const validation = @import("validation.zig");
 
 /// Everything `provision` needs, injected rather than hardcoded, so it's
 /// fully testable against a scoped temp directory instead of the real
@@ -39,10 +40,6 @@ pub const Deps = struct {
     /// I/O and therefore testable).
     ovf_env_xml: []const u8,
     now_unix_seconds: i64,
-    /// `null` skips WireServer goal-state/health reporting entirely (used
-    /// by tests, and tolerated in production too -- see the doc comment
-    /// on `reportHealthBestEffort`).
-    wireserver_client: ?*wireserver.Client = null,
     delete_root_password: bool = true,
     /// `null` skips host key regeneration (used by tests, since it needs a
     /// real `/etc/ssh` and the `ssh-keygen` binary on `PATH`).
@@ -56,11 +53,10 @@ pub const Deps = struct {
     waagent_conf: waagent_conf.WaagentConf = .{},
 };
 
-/// Runs the full first-boot provisioning sequence (see issue #112's
-/// phased plan), skipping entirely if the sentinel from a previous run is
-/// already present. Idempotent by construction: every step it calls is
-/// itself idempotent (see each module's doc comments), so re-running
-/// `provision` (e.g. if the sentinel were ever lost) is safe.
+/// Runs local first-boot provisioning and records its sentinel, independently
+/// of Azure WireServer health acknowledgement. Existing sentinels skip only
+/// these local account/key/identity mutations; normal invocations still
+/// report Ready after this function returns.
 pub fn provision(deps: Deps) !void {
     if (try isProvisioned(deps.allocator, deps.var_dir, deps.io)) return;
 
@@ -94,10 +90,6 @@ pub fn provision(deps: Deps) !void {
         try ssh_keys.regenerateHostKeys(deps.allocator, deps.io, ssh_dir);
     }
 
-    if (deps.wireserver_client) |client| {
-        reportHealthBestEffort(deps.allocator, client);
-    }
-
     try sentinel.writeSentinel(deps.var_dir, deps.io, env.hostname);
 }
 
@@ -109,17 +101,38 @@ fn isProvisioned(allocator: std.mem.Allocator, var_dir: std.Io.Dir, io: std.Io) 
     return false;
 }
 
-/// Fetches the goal state and reports "Ready" health back to the
-/// WireServer. Deliberately best-effort (logs and continues on failure,
-/// rather than failing provisioning): unlike the local account-setup
-/// steps, which are self-contained and either succeed or don't, WireServer
-/// reachability depends on external network state this agent doesn't
-/// control, and skipping it doesn't leave the VM any less usable (it's
-/// telemetry back to the platform, not something the VM itself depends
-/// on).
-fn reportHealthBestEffort(allocator: std.mem.Allocator, client: *wireserver.Client) void {
-    reportHealth(allocator, client) catch |err| {
-        std.debug.print("azagent: warning: failed to report health to the WireServer: {t}\n", .{err});
+const ReadyMode = enum {
+    azure,
+    skip,
+};
+
+const Options = struct {
+    ready_mode: ReadyMode = .azure,
+};
+
+fn parseOption(options: *Options, arg: []const u8) error{InvalidArgument}!void {
+    if (std.mem.eql(u8, arg, "--skip-ready")) {
+        options.ready_mode = .skip;
+    } else {
+        return error.InvalidArgument;
+    }
+}
+
+fn parseOptions(args: []const []const u8) error{InvalidArgument}!Options {
+    var options: Options = .{};
+    for (args[1..]) |arg| try parseOption(&options, arg);
+    return options;
+}
+
+const InvocationPlan = struct {
+    provision_locally: bool,
+    acknowledge_ready: bool,
+};
+
+fn invocationPlan(already_provisioned: bool, ready_mode: ReadyMode) InvocationPlan {
+    return .{
+        .provision_locally = !already_provisioned,
+        .acknowledge_ready = ready_mode == .azure,
     };
 }
 
@@ -135,9 +148,21 @@ fn reportHealth(allocator: std.mem.Allocator, client: *wireserver.Client) !void 
     });
 }
 
+fn acknowledgeReady(ready_mode: ReadyMode, reporter: anytype) !void {
+    if (ready_mode == .azure) try reporter.report();
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
+    var options: Options = .{};
+    for (init.minimal.args.vector[1..]) |arg| {
+        const parsed = std.mem.span(arg);
+        parseOption(&options, parsed) catch {
+            std.debug.print("azagent: unknown argument: {s}\nusage: azagent [--skip-ready]\n", .{parsed});
+            std.process.exit(2);
+        };
+    }
 
     if (std.os.linux.geteuid() != 0) {
         std.debug.print("azagent: must run as root\n", .{});
@@ -156,7 +181,8 @@ pub fn main(init: std.process.Init) !void {
     const now = std.Io.Clock.real.now(io);
     const now_unix_seconds: i64 = @intCast(@divTrunc(now.nanoseconds, 1_000_000_000));
 
-    if (!try isProvisioned(gpa, var_dir, io)) {
+    const plan = invocationPlan(try isProvisioned(gpa, var_dir, io), options.ready_mode);
+    if (plan.provision_locally) {
         const ovf_env_xml = cdrom.readOvfEnv(gpa, io) catch |err| {
             std.debug.print("azagent: failed to read ovf-env.xml from the provisioning media: {t}\n", .{err});
             std.process.exit(1);
@@ -167,9 +193,6 @@ pub fn main(init: std.process.Init) !void {
         defer home_parent_dir.close(io);
         var ssh_dir = try etc_dir.openDir(io, "ssh", .{ .iterate = true });
         defer ssh_dir.close(io);
-        var client: wireserver.Client = .init(gpa, io);
-        defer client.deinit();
-
         try provision(.{
             .allocator = gpa,
             .io = io,
@@ -178,7 +201,6 @@ pub fn main(init: std.process.Init) !void {
             .var_dir = var_dir,
             .ovf_env_xml = ovf_env_xml,
             .now_unix_seconds = now_unix_seconds,
-            .wireserver_client = &client,
             .ssh_dir = ssh_dir,
             .waagent_conf = parsed_waagent_conf,
         });
@@ -195,6 +217,20 @@ pub fn main(init: std.process.Init) !void {
     // event, not a first-boot-only one. Not gated by any `waagent.conf`
     // toggle either -- real waagent has no growpart-equivalent conf key.
     rootResizeSetupBestEffort(gpa, io);
+
+    if (plan.acknowledge_ready) {
+        var client: wireserver.Client = .init(gpa, io);
+        defer client.deinit();
+        const Reporter = struct {
+            allocator: std.mem.Allocator,
+            client: *wireserver.Client,
+
+            fn report(self: @This()) !void {
+                try reportHealth(self.allocator, self.client);
+            }
+        };
+        try acknowledgeReady(options.ready_mode, Reporter{ .allocator = gpa, .client = &client });
+    }
 }
 
 /// Best-effort wrapper around `root_resize.setup` -- see its call site in
@@ -279,6 +315,7 @@ test {
     _ = resource_disk;
     _ = drive_mounts;
     _ = root_resize;
+    _ = validation;
 }
 
 test "provision runs the full sequence end to end against scoped temp directories" {
@@ -360,4 +397,63 @@ test "provision runs the full sequence end to end against scoped temp directorie
         .ovf_env_xml = ovf_env_xml,
         .now_unix_seconds = 19700 * 86_400,
     });
+}
+
+test "options require explicit skip-ready and reject unknown arguments" {
+    try std.testing.expectEqual(ReadyMode.azure, (try parseOptions(&.{"azagent"})).ready_mode);
+    try std.testing.expectEqual(ReadyMode.skip, (try parseOptions(&.{ "azagent", "--skip-ready" })).ready_mode);
+    try std.testing.expectError(error.InvalidArgument, parseOptions(&.{ "azagent", "--offline" }));
+}
+
+test "invocation plan separates local provisioning from Ready acknowledgement" {
+    try std.testing.expectEqual(InvocationPlan{
+        .provision_locally = true,
+        .acknowledge_ready = true,
+    }, invocationPlan(false, .azure));
+    try std.testing.expectEqual(InvocationPlan{
+        .provision_locally = false,
+        .acknowledge_ready = true,
+    }, invocationPlan(true, .azure));
+    try std.testing.expectEqual(InvocationPlan{
+        .provision_locally = false,
+        .acknowledge_ready = false,
+    }, invocationPlan(true, .skip));
+}
+
+test "Ready acknowledgement is skipped only explicitly and failures remain retriable" {
+    const Reporter = struct {
+        calls: *usize,
+        fail: bool,
+
+        fn report(self: @This()) !void {
+            self.calls.* += 1;
+            if (self.fail) return error.TransientReadyFailure;
+        }
+    };
+
+    var calls: usize = 0;
+    try acknowledgeReady(.skip, Reporter{ .calls = &calls, .fail = true });
+    try std.testing.expectEqual(@as(usize, 0), calls);
+    try std.testing.expectError(
+        error.TransientReadyFailure,
+        acknowledgeReady(.azure, Reporter{ .calls = &calls, .fail = true }),
+    );
+    try acknowledgeReady(.azure, Reporter{ .calls = &calls, .fail = false });
+    try std.testing.expectEqual(@as(usize, 2), calls);
+}
+
+test "a local provisioning sentinel makes repeated invocation retry-safe" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "var", .default_dir);
+    var var_dir = try tmp.dir.openDir(io, "var", .{});
+    defer var_dir.close(io);
+
+    try sentinel.writeSentinel(var_dir, io, "host");
+    try std.testing.expect(try isProvisioned(allocator, var_dir, io));
+    const retry = invocationPlan(true, .azure);
+    try std.testing.expect(!retry.provision_locally);
+    try std.testing.expect(retry.acknowledge_ready);
 }

@@ -1,11 +1,12 @@
-//! Locates, mounts, and reads `ovf-env.xml` off the provisioning
-//! CD-ROM/DVD Azure attaches to a new Linux VM.
+//! Locates, mounts, and reads `ovf-env.xml` off a provisioning CD-ROM/DVD.
+//! Azure media is the default. Synthetic local media must also contain the
+//! explicit `zvmi-local-provisioning` marker used by zvminit to select
+//! `azagent --skip-ready`; an OVF document alone never selects local mode.
 //!
 //! Deliberately narrower than upstream's `get_dvd_device` (which regex-
 //! matches a long list of device names across many hypervisors/distros):
-//! this project only targets Azure Linux on Azure's Hyper-V, where the
-//! provisioning media is documented to always show up as a SCSI CD-ROM,
-//! so a short fixed candidate list suffices.
+//! Azure's Hyper-V media and the controlled QEMU acceptance topology both
+//! expose `/dev/sr0` (with `/dev/cdrom` retained as a conventional alias).
 //!
 //! Uses direct `mount(2)`/`umount(2)` syscalls (matching `zvminit`'s
 //! style) rather than shelling out to `mount`/`umount`. Not covered by an
@@ -22,19 +23,26 @@ const fstypes = [_][*:0]const u8{ "udf", "iso9660" };
 
 pub const ProbeResult = enum {
     absent,
-    present,
+    azure,
+    local,
     indeterminate,
 };
+
+pub const local_provisioning_marker = "zvmi-local-provisioning";
 
 pub const ReadError = error{
     NoProvisioningMediaFound,
     MountFailed,
 } || std.mem.Allocator.Error || std.Io.Dir.CreateDirPathError || std.Io.Dir.OpenError || std.Io.Dir.ReadFileAllocError;
 
-/// Checks for readable Azure provisioning media without consuming the
-/// document. `probe_mount_point` and `ovf_env_path` must be dedicated to the
-/// caller so a failed probe cannot interfere with `readOvfEnv`.
-pub fn probe(probe_mount_point: [*:0]const u8, ovf_env_path: [*:0]const u8) ProbeResult {
+/// Checks for readable provisioning media without consuming the document.
+/// All paths must be dedicated to the caller so a failed probe cannot
+/// interfere with `readOvfEnv`.
+pub fn probe(
+    probe_mount_point: [*:0]const u8,
+    ovf_env_path: [*:0]const u8,
+    local_marker_path: [*:0]const u8,
+) ProbeResult {
     var mounted = false;
     var device_found = false;
     for (device_candidates) |device| {
@@ -54,9 +62,17 @@ pub fn probe(probe_mount_point: [*:0]const u8, ovf_env_path: [*:0]const u8) Prob
     const fd_rc = linux.open(ovf_env_path, .{ .ACCMODE = .RDONLY }, 0);
     const readable = linux.errno(fd_rc) == .SUCCESS;
     if (readable) _ = linux.close(@intCast(fd_rc));
+    const marker_fd_rc = linux.open(local_marker_path, .{ .ACCMODE = .RDONLY }, 0);
+    const local_marker_readable = linux.errno(marker_fd_rc) == .SUCCESS;
+    if (local_marker_readable) _ = linux.close(@intCast(marker_fd_rc));
 
     _ = unmount(probe_mount_point);
-    return if (readable) .present else .indeterminate;
+    return classifyMountedMedia(readable, local_marker_readable);
+}
+
+fn classifyMountedMedia(ovf_readable: bool, local_marker_readable: bool) ProbeResult {
+    if (!ovf_readable) return .indeterminate;
+    return if (local_marker_readable) .local else .azure;
 }
 
 /// Mounts the first working `(device, fstype)` combination from
@@ -99,5 +115,13 @@ fn unmount(path: [*:0]const u8) bool {
         if (e == .SUCCESS) return true;
         if (e != .INTR) break;
     }
+
     return linux.errno(linux.umount2(path, linux.MNT.DETACH)) == .SUCCESS;
+}
+
+test "mounted media classification requires an explicit local marker" {
+    try std.testing.expectEqual(ProbeResult.azure, classifyMountedMedia(true, false));
+    try std.testing.expectEqual(ProbeResult.local, classifyMountedMedia(true, true));
+    try std.testing.expectEqual(ProbeResult.indeterminate, classifyMountedMedia(false, false));
+    try std.testing.expectEqual(ProbeResult.indeterminate, classifyMountedMedia(false, true));
 }

@@ -6,6 +6,7 @@
 //! `<KeyPair>` private-key deployment path is out of scope).
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const validation = @import("validation.zig");
 
 /// True if `line` (an `authorized_keys` entry, no trailing newline) is
 /// already present verbatim in `content`.
@@ -104,6 +105,7 @@ pub fn deployAuthorizedKeys(
     keys: []const []const u8,
 ) !void {
     if (keys.len == 0) return;
+    for (keys) |key_value| try validation.validatePublicKey(key_value);
 
     try home_dir.createDirPath(io, ".ssh");
     var ssh_dir = try home_dir.openDir(io, ".ssh", .{ .iterate = true });

@@ -98,6 +98,8 @@ pub fn build(b: *std.Build) void {
 
     const azagent_tests = b.addTest(.{ .root_module = azagent_mod });
     const run_azagent_tests = b.addRunArtifact(azagent_tests);
+    const azagent_test_step = b.step("test-azagent", "Run azagent tests");
+    azagent_test_step.dependOn(&run_azagent_tests.step);
 
     // ---- cli: the `zvmi` executable ----
     const cli_exe = b.addExecutable(.{
