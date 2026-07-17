@@ -134,6 +134,16 @@ fn installShutdownHandlers() void {
     _ = linux.sigaction(.INT, &sa, null);
 }
 
+fn requestPid1Shutdown(signal: linux.SIG, command: linux.LINUX_REBOOT.CMD) noreturn {
+    if (isPid1(linux.getpid())) doReboot(command);
+    const rc = linux.kill(1, signal);
+    if (linux.errno(rc) != .SUCCESS) {
+        writeErrno("[zvminit] failed to signal PID 1", linux.errno(rc));
+        linux.exit(1);
+    }
+    linux.exit(0);
+}
+
 // --- hostname ---
 fn setKernelHostname(name: []const u8) void {
     const rc = linux.syscall2(.sethostname, @intFromPtr(name.ptr), name.len);
@@ -444,6 +454,7 @@ fn discoverSerialConsolePath(path_buf: *[80:0]u8) [*:0]const u8 {
 const AzureDecision = enum {
     unknown,
     azure,
+    local,
     non_azure,
 };
 
@@ -457,8 +468,10 @@ fn resolveAzureDecision(policy: AzurePolicy, cached: ?AzureDecision, evidence: A
     return switch (policy) {
         .on => .azure,
         .off => .non_azure,
-        .auto => if (evidence.saw_option_245 or evidence.media == .present)
+        .auto => if (evidence.saw_option_245 or evidence.media == .azure)
             .azure
+        else if (evidence.media == .local)
+            .local
         else if (cached) |decision|
             decision
         else if (evidence.dhcp_acknowledged and evidence.media == .absent)
@@ -518,7 +531,7 @@ fn renderEnvironmentState(buf: []u8, identity: [36]u8, decision: AzureDecision) 
     const decision_text = switch (decision) {
         .azure => "azure",
         .non_azure => "non-azure",
-        .unknown => return null,
+        .unknown, .local => return null,
     };
     return std.fmt.bufPrint(buf, "v1 {s} {s}\n", .{ &identity, decision_text }) catch null;
 }
@@ -621,6 +634,7 @@ fn probeProvisioningMedia() provisioning_media.ProbeResult {
     return provisioning_media.probe(
         "/run/zvminit/provision-media",
         "/run/zvminit/provision-media/ovf-env.xml",
+        "/run/zvminit/provision-media/" ++ provisioning_media.local_provisioning_marker,
     );
 }
 
@@ -1286,19 +1300,32 @@ const sshd_path = "/usr/sbin/sshd";
 const provisioning_retry_seconds: u32 = 5;
 const sshd_max_backoff_seconds: u32 = 30;
 
+const AzagentLaunchMode = enum {
+    azure,
+    local,
+};
+
+fn azagentModeArgument(mode: AzagentLaunchMode) ?[*:0]const u8 {
+    return if (mode == .local) "--skip-ready" else null;
+}
+
 fn attachChildLog() void {
     if (console_log_fd < 0) return;
     _ = linux.dup2(console_log_fd, 1);
     _ = linux.dup2(console_log_fd, 2);
 }
 
-fn spawnAzagent() ?linux.pid_t {
+fn spawnAzagent(mode: AzagentLaunchMode) ?linux.pid_t {
     if (linux.errno(linux.access(azagent_path, linux.F_OK)) != .SUCCESS) return null;
     writeStr("[zvminit] running azagent...\r\n");
     const pid = forkProcess("[zvminit] fork() for azagent failed") orelse return null;
     if (pid == 0) {
         attachChildLog();
-        const argv = [_:null]?[*:0]const u8{ azagent_path, null };
+        const argv = [_:null]?[*:0]const u8{
+            azagent_path,
+            azagentModeArgument(mode),
+            null,
+        };
         const envp = [_:null]?[*:0]const u8{
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             null,
@@ -1378,7 +1405,7 @@ fn persistObservedAzureDecision(
     evidence: AzureEvidence,
 ) void {
     if (policy != .auto) return;
-    if (evidence.saw_option_245 or evidence.media == .present) {
+    if (evidence.saw_option_245 or evidence.media == .azure) {
         persistAzureDecision(identity, .azure);
     } else if (cached == null and evidence.dhcp_acknowledged and evidence.media == .absent) {
         persistAzureDecision(identity, .non_azure);
@@ -1392,12 +1419,13 @@ fn logAzureDecision(decision: AzureDecision, policy: AzurePolicy, evidence: Azur
         .auto => switch (decision) {
             .azure => if (evidence.saw_option_245)
                 writeStr("[zvminit] Azure environment detected from DHCP option 245\r\n")
-            else if (evidence.media == .present)
+            else if (evidence.media == .azure)
                 writeStr("[zvminit] Azure environment detected from provisioning media\r\n")
             else if (cached == .azure)
                 writeStr("[zvminit] Azure environment restored from persistent state\r\n")
             else
                 writeStr("[zvminit] Azure environment detected\r\n"),
+            .local => writeStr("[zvminit] explicit local provisioning media detected; WireServer Ready will be skipped\r\n"),
             .non_azure => if (cached == .non_azure)
                 writeStr("[zvminit] non-Azure environment restored from persistent state; skipping azagent\r\n")
             else
@@ -1478,34 +1506,80 @@ fn reapChildren(supervisor: *Supervisor) void {
     }
 }
 
-fn signalManagedChildren(supervisor: *const Supervisor, signal: linux.SIG) void {
-    for ([_]linux.pid_t{ supervisor.azagent_pid, supervisor.sshd_pid, supervisor.shell_pid }) |pid| {
-        if (pid > 0) _ = linux.kill(pid, signal);
+const ChildDrainState = enum {
+    drained,
+    remaining,
+};
+
+const ShutdownPhase = enum {
+    term,
+    kill,
+    reboot,
+};
+
+fn phaseAfterDrain(phase: ShutdownPhase, state: ChildDrainState) ShutdownPhase {
+    return switch (phase) {
+        .term => if (state == .drained) .reboot else .kill,
+        .kill => .reboot,
+        .reboot => .reboot,
+    };
+}
+
+fn drainExitedChildren(supervisor: *Supervisor) ChildDrainState {
+    while (true) {
+        var status: u32 = 0;
+        const wait_rc = linux.waitpid(-1, &status, linux.W.NOHANG);
+        const wait_error = linux.errno(wait_rc);
+        if (wait_error == .INTR) continue;
+        if (wait_error == .CHILD) return .drained;
+        if (wait_rc == 0) return .remaining;
+        if (wait_error != .SUCCESS) {
+            writeErrno("[zvminit] shutdown waitpid() failed", wait_error);
+            return .remaining;
+        }
+        noteChildExit(supervisor, @intCast(wait_rc), status);
     }
 }
 
-fn managedChildrenRunning(supervisor: *const Supervisor) bool {
-    return supervisor.azagent_pid > 0 or supervisor.sshd_pid > 0 or supervisor.shell_pid > 0;
-}
-
-fn shutdownSupervisor(supervisor: *Supervisor) noreturn {
-    writeStr("[zvminit] stopping managed children\r\n");
-    signalManagedChildren(supervisor, .TERM);
-    var attempts: u32 = 0;
-    while (attempts < 50 and managedChildrenRunning(supervisor)) : (attempts += 1) {
-        reapChildren(supervisor);
+fn boundedChildDrain(supervisor: *Supervisor, attempts: u32) ChildDrainState {
+    var attempt: u32 = 0;
+    while (attempt < attempts) : (attempt += 1) {
+        if (drainExitedChildren(supervisor) == .drained) return .drained;
         const req: linux.timespec = .{ .sec = 0, .nsec = 100_000_000 };
         _ = linux.nanosleep(&req, null);
     }
-    if (managedChildrenRunning(supervisor)) {
-        signalManagedChildren(supervisor, .KILL);
-        attempts = 0;
-        while (attempts < 10 and managedChildrenRunning(supervisor)) : (attempts += 1) {
-            reapChildren(supervisor);
-            const req: linux.timespec = .{ .sec = 0, .nsec = 100_000_000 };
-            _ = linux.nanosleep(&req, null);
-        }
+    return drainExitedChildren(supervisor);
+}
+
+fn isPid1(pid: linux.pid_t) bool {
+    return pid == 1;
+}
+
+fn broadcastGuestSignal(signal: linux.SIG) void {
+    if (!isPid1(linux.getpid())) {
+        writeStr("[zvminit] refusing shutdown broadcast outside PID 1\r\n");
+        linux.exit(1);
     }
+    // Linux kill(-1, ...) excludes process 1 itself. As PID 1 this reaches
+    // every permitted guest process, including adopted ssh session children.
+    const rc = linux.kill(-1, signal);
+    const signal_error = linux.errno(rc);
+    if (signal_error != .SUCCESS and signal_error != .SRCH) {
+        writeErrno("[zvminit] broadcast shutdown signal failed", signal_error);
+    }
+}
+
+fn shutdownSupervisor(supervisor: *Supervisor) noreturn {
+    writeStr("[zvminit] terminating all guest processes\r\n");
+    var phase: ShutdownPhase = .term;
+    broadcastGuestSignal(.TERM);
+    phase = phaseAfterDrain(phase, boundedChildDrain(supervisor, 50));
+    if (phase == .kill) {
+        writeStr("[zvminit] forcing remaining guest processes to exit\r\n");
+        broadcastGuestSignal(.KILL);
+        phase = phaseAfterDrain(phase, boundedChildDrain(supervisor, 50));
+    }
+    std.debug.assert(phase == .reboot);
     doReboot(if (shutdown_signal == 2) .RESTART else .POWER_OFF);
 }
 
@@ -1562,8 +1636,16 @@ fn decrementDelay(delay: *u32) void {
     if (delay.* > 0) delay.* -= 1;
 }
 
+fn azagentLaunchMode(decision: AzureDecision) ?AzagentLaunchMode {
+    return switch (decision) {
+        .azure => .azure,
+        .local => .local,
+        .unknown, .non_azure => null,
+    };
+}
+
 fn shouldRunAzagent(supervisor: *const Supervisor) bool {
-    return supervisor.services_allowed and supervisor.decision == .azure and
+    return supervisor.services_allowed and azagentLaunchMode(supervisor.decision) != null and
         !supervisor.azagent_done and supervisor.azagent_pid == 0 and supervisor.azagent_retry == 0;
 }
 
@@ -1572,6 +1654,10 @@ fn shouldStartSshd(services_allowed: bool, provisioned: bool, sshd_pid: linux.pi
 }
 
 fn supervisorLoop(supervisor: *Supervisor) noreturn {
+    if (!isPid1(linux.getpid())) {
+        writeStr("[zvminit] fatal: supervisor must run as PID 1\r\n");
+        linux.exit(1);
+    }
     if (supervisor.shell_enabled) {
         var buf: [128]u8 = undefined;
         const path = std.mem.span(supervisor.console_path);
@@ -1587,12 +1673,12 @@ fn supervisorLoop(supervisor: *Supervisor) noreturn {
         if (shutdown_signal != 0) shutdownSupervisor(supervisor);
 
         if (shouldRunAzagent(supervisor)) {
-            if (spawnAzagent()) |pid| {
+            if (spawnAzagent(azagentLaunchMode(supervisor.decision).?)) |pid| {
                 supervisor.azagent_pid = pid;
                 supervisor.azagent_missing_logged = false;
             } else {
                 if (!supervisor.azagent_missing_logged) {
-                    writeStr("[zvminit] Azure provisioning requires /usr/sbin/azagent; SSH remains gated\r\n");
+                    writeStr("[zvminit] provisioning requires /usr/sbin/azagent; SSH remains gated\r\n");
                     supervisor.azagent_missing_logged = true;
                 }
                 supervisor.azagent_retry = provisioning_retry_seconds;
@@ -1632,10 +1718,10 @@ fn supervisorLoop(supervisor: *Supervisor) noreturn {
 pub fn main(init: std.process.Init.Minimal) noreturn {
     const argv0 = if (init.args.vector.len > 0) std.mem.span(init.args.vector[0]) else "";
     if (std.mem.endsWith(u8, argv0, "poweroff") or std.mem.endsWith(u8, argv0, "shutdown")) {
-        doReboot(.POWER_OFF);
+        requestPid1Shutdown(.TERM, .POWER_OFF);
     }
     if (std.mem.endsWith(u8, argv0, "reboot")) {
-        doReboot(.RESTART);
+        requestPid1Shutdown(.INT, .RESTART);
     }
 
     installShutdownHandlers();
@@ -1753,13 +1839,15 @@ test "sshd restart backoff is exponential and bounded" {
     try std.testing.expectEqual(sshd_max_backoff_seconds, nextSshdBackoff(sshd_max_backoff_seconds));
 }
 
-test "service gates require Azure for azagent and provisioning for sshd" {
+test "service gates require provisionable media for azagent and sentinel for sshd" {
     var supervisor: Supervisor = undefined;
     supervisor.services_allowed = true;
     supervisor.decision = .azure;
     supervisor.azagent_done = false;
     supervisor.azagent_pid = 0;
     supervisor.azagent_retry = 0;
+    try std.testing.expect(shouldRunAzagent(&supervisor));
+    supervisor.decision = .local;
     try std.testing.expect(shouldRunAzagent(&supervisor));
     supervisor.decision = .non_azure;
     try std.testing.expect(!shouldRunAzagent(&supervisor));
@@ -1768,6 +1856,23 @@ test "service gates require Azure for azagent and provisioning for sshd" {
     try std.testing.expect(shouldStartSshd(true, true, 0, 0));
     try std.testing.expect(!shouldStartSshd(true, true, 42, 0));
     try std.testing.expect(!shouldStartSshd(true, true, 0, 1));
+}
+
+test "azagent launch selects skip-ready only for explicit local media" {
+    try std.testing.expectEqual(AzagentLaunchMode.azure, azagentLaunchMode(.azure).?);
+    try std.testing.expectEqual(@as(?[*:0]const u8, null), azagentModeArgument(.azure));
+    try std.testing.expectEqual(AzagentLaunchMode.local, azagentLaunchMode(.local).?);
+    try std.testing.expectEqualStrings("--skip-ready", std.mem.span(azagentModeArgument(.local).?));
+    try std.testing.expectEqual(@as(?AzagentLaunchMode, null), azagentLaunchMode(.unknown));
+    try std.testing.expectEqual(@as(?AzagentLaunchMode, null), azagentLaunchMode(.non_azure));
+}
+
+test "shutdown policy broadcasts only as PID 1 and escalates after bounded drain" {
+    try std.testing.expect(isPid1(1));
+    try std.testing.expect(!isPid1(2));
+    try std.testing.expectEqual(ShutdownPhase.reboot, phaseAfterDrain(.term, .drained));
+    try std.testing.expectEqual(ShutdownPhase.kill, phaseAfterDrain(.term, .remaining));
+    try std.testing.expectEqual(ShutdownPhase.reboot, phaseAfterDrain(.kill, .remaining));
 }
 
 test "parsePersistedHostname trims line endings and rejects invalid content" {
@@ -1796,6 +1901,7 @@ test "formatMachineId emits lowercase hex and a newline" {
 test "resolveAzureDecision honors overrides, positive evidence, cache, and safe negatives" {
     const none: AzureEvidence = .{ .media = .absent };
     try std.testing.expectEqual(AzureDecision.azure, resolveAzureDecision(.on, .non_azure, none));
+    try std.testing.expectEqual(AzureDecision.azure, resolveAzureDecision(.on, null, .{ .media = .local }));
     try std.testing.expectEqual(AzureDecision.non_azure, resolveAzureDecision(.off, .azure, .{ .saw_option_245 = true }));
 
     try std.testing.expectEqual(
@@ -1804,7 +1910,15 @@ test "resolveAzureDecision honors overrides, positive evidence, cache, and safe 
     );
     try std.testing.expectEqual(
         AzureDecision.azure,
-        resolveAzureDecision(.auto, .non_azure, .{ .media = .present }),
+        resolveAzureDecision(.auto, .non_azure, .{ .media = .azure }),
+    );
+    try std.testing.expectEqual(
+        AzureDecision.local,
+        resolveAzureDecision(.auto, .non_azure, .{ .media = .local }),
+    );
+    try std.testing.expectEqual(
+        AzureDecision.azure,
+        resolveAzureDecision(.auto, null, .{ .saw_option_245 = true, .media = .local }),
     );
     try std.testing.expectEqual(AzureDecision.azure, resolveAzureDecision(.auto, .azure, none));
     try std.testing.expectEqual(AzureDecision.non_azure, resolveAzureDecision(.auto, null, .{
