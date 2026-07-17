@@ -478,6 +478,23 @@ bound to the current DMI product UUID; `zvmi azure deprovision` clears them.
 Use `zvminit.azure=on` or `off` as a per-boot diagnostic override. Also add
 `init=/sbin/zvminit` when the container includes systemd as an OpenSSH dependency,
 ensuring the initramfs launches `zvminit` rather than systemd directly.
+The serial root shell is disabled by default and released core-image command
+lines do not enable it. `zvminit.shell=on` is an explicit diagnostic-only boot
+override. PID 1 logs through `/dev/console`, discovers `ttyS*`/`ttyAMA*` and
+other serial console names from the kernel command line or active-console
+sysfs state, and emits `ZVMINIT_PID1_READY supervisor loop active` after
+entering its child-reaping supervisor loop.
+
+`azagent` validates OVF usernames using the conservative policy
+`[a-z][a-z0-9_-]{0,31}` (no trailing `-`, and `root` is reserved) and validates
+every public key as one printable line of at most 16 KiB containing a plausible
+authorized_keys key-type/base64 pair. Local provisioning writes the existing
+`/var/lib/azagent/provisioned` sentinel before Azure Ready acknowledgement.
+Every normal invocation reports Ready even when that sentinel already exists,
+and a WireServer failure is returned so `zvminit` retries without recreating
+the account or keys. `azagent --skip-ready` is the explicit controlled mode
+for future synthetic local OVF media; the default never infers that mode from
+the presence of an OVF document.
 Azure still requires every generalized-VM deployment to supply an
 `adminUsername`; use `g` for this image convention. The generated
 `waagent.conf` mounts the temporary resource disk at `/d` and enables
@@ -651,11 +668,13 @@ zvmi qemu custom.qcow2
 Use `--qemu`, `--ovmf-code`, and `--ovmf-vars` for non-standard installations.
 Arguments after `--` are appended directly to QEMU. The terminal is attached to
 QEMU's `-nographic` serial console; use QEMU's `Ctrl+A`, then `X`, escape to
-exit. A successful local boot reaches the root shell with:
+exit. With the default secure command line, a successful local boot reaches
+the PID 1 readiness marker without exposing a root shell:
 
 ```text
 [zvminit] non-Azure environment detected; skipping azagent
-[root@azurelinux /]#
+[zvminit] diagnostic root shell disabled
+[zvminit] ZVMINIT_PID1_READY supervisor loop active
 ```
 
 This command is intentionally a focused launcher for the published x86_64

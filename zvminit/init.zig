@@ -12,9 +12,8 @@
 //!     by argv[0]) so the kernel's orderly_poweroff() usermode-helper path
 //!     (driven by Hyper-V's shutdown integration service) has something to
 //!     exec.
-//!   - loop forever spawning an interactive shell on /dev/ttyS0, respawning
-//!     it if it ever exits (PID 1 exiting panics the kernel), and reaping
-//!     all other zombie children along the way.
+//!   - supervise provisioning, foreground sshd, and an optional diagnostic
+//!     serial shell as direct children, reaping every exited child
 //! Root stays mounted read-only by default (matches the dm-verity/immutable
 //! image philosophy elsewhere in this project). `zvminit.mode=persistent`
 //! opts into a writable root for generalized VM images whose provisioned
@@ -24,6 +23,12 @@ const provisioning_media = @import("provisioning_media");
 const linux = std.os.linux;
 
 var log_fd: i32 = -1;
+var console_log_fd: i32 = -1;
+
+fn openConsoleLog() void {
+    const rc = linux.open("/dev/console", .{ .ACCMODE = .WRONLY }, 0);
+    if (linux.errno(rc) == .SUCCESS) console_log_fd = @intCast(rc);
+}
 
 fn openDebugLog() void {
     const rc = linux.open("/run/zvminit.log", .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644);
@@ -32,7 +37,7 @@ fn openDebugLog() void {
 }
 
 fn writeStr(s: []const u8) void {
-    _ = linux.write(2, s.ptr, s.len);
+    _ = linux.write(if (console_log_fd >= 0) console_log_fd else 2, s.ptr, s.len);
     if (log_fd >= 0) _ = linux.write(log_fd, s.ptr, s.len);
 }
 
@@ -104,17 +109,19 @@ fn tryMountEsp() void {
 
 // --- signal-driven / argv0-driven shutdown ---
 fn doReboot(cmd: linux.LINUX_REBOOT.CMD) noreturn {
-    _ = linux.syscall0(.sync);
-    _ = linux.reboot(.MAGIC1, .MAGIC2, cmd, null);
-    // reboot() only returns on failure.
-    linux.exit(0);
+    while (true) {
+        _ = linux.syscall0(.sync);
+        const rc = linux.reboot(.MAGIC1, .MAGIC2, cmd, null);
+        writeErrno("[zvminit] reboot syscall failed; retrying", linux.errno(rc));
+        const req: linux.timespec = .{ .sec = 1, .nsec = 0 };
+        _ = linux.nanosleep(&req, null);
+    }
 }
 
-var shutdown_requested: bool = false;
+var shutdown_signal: u8 = 0;
 
 fn onTermSignal(sig: linux.SIG) callconv(.c) void {
-    _ = sig;
-    shutdown_requested = true;
+    shutdown_signal = if (sig == .INT) 2 else 1;
 }
 
 fn installShutdownHandlers() void {
@@ -269,13 +276,16 @@ const AzurePolicy = enum {
 const BootConfig = struct {
     mode: BootMode = .immutable,
     azure_policy: AzurePolicy = .auto,
+    shell_enabled: bool = false,
     invalid_mode: ?[]const u8 = null,
     invalid_azure_policy: ?[]const u8 = null,
+    invalid_shell: ?[]const u8 = null,
 };
 
 fn parseBootConfig(cmdline: []const u8) BootConfig {
     const mode_prefix = "zvminit.mode=";
     const azure_prefix = "zvminit.azure=";
+    const shell_prefix = "zvminit.shell=";
     var config: BootConfig = .{};
     var tokens = std.mem.tokenizeAny(u8, cmdline, " \t\r\n");
     while (tokens.next()) |token| {
@@ -305,6 +315,18 @@ fn parseBootConfig(cmdline: []const u8) BootConfig {
             } else {
                 config.azure_policy = .auto;
                 config.invalid_azure_policy = value;
+            }
+        } else if (std.mem.startsWith(u8, token, shell_prefix)) {
+            const value = token[shell_prefix.len..];
+            if (std.mem.eql(u8, value, "on")) {
+                config.shell_enabled = true;
+                config.invalid_shell = null;
+            } else if (std.mem.eql(u8, value, "off")) {
+                config.shell_enabled = false;
+                config.invalid_shell = null;
+            } else {
+                config.shell_enabled = false;
+                config.invalid_shell = value;
             }
         }
     }
@@ -352,7 +374,71 @@ fn readBootConfig() BootConfig {
         writeStr(msg);
         config.invalid_azure_policy = null;
     }
+    if (config.invalid_shell) |value| {
+        var msg_buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "[zvminit] invalid zvminit.shell={s}; keeping diagnostic shell off\r\n", .{value}) catch "[zvminit] invalid zvminit.shell; keeping diagnostic shell off\r\n";
+        writeStr(msg);
+        config.invalid_shell = null;
+    }
     return config;
+}
+
+fn isSerialConsoleName(name: []const u8) bool {
+    const prefixes = [_][]const u8{
+        "ttyS",
+        "ttyAMA",
+        "ttyUSB",
+        "ttyACM",
+        "ttymxc",
+        "ttySC",
+        "ttyFIQ",
+        "hvc",
+    };
+    for (prefixes) |prefix| {
+        if (std.mem.startsWith(u8, name, prefix) and name.len > prefix.len) return true;
+    }
+    return false;
+}
+
+fn serialConsoleFromCmdline(cmdline: []const u8) ?[]const u8 {
+    var selected: ?[]const u8 = null;
+    var tokens = std.mem.tokenizeAny(u8, cmdline, " \t\r\n");
+    while (tokens.next()) |token| {
+        if (!std.mem.startsWith(u8, token, "console=")) continue;
+        const value = token["console=".len..];
+        const name = value[0 .. std.mem.indexOfScalar(u8, value, ',') orelse value.len];
+        if (isSerialConsoleName(name)) selected = name;
+    }
+    return selected;
+}
+
+fn serialConsoleFromActive(active: []const u8) ?[]const u8 {
+    var selected: ?[]const u8 = null;
+    var names = std.mem.tokenizeAny(u8, active, " \t\r\n");
+    while (names.next()) |name| {
+        if (isSerialConsoleName(name)) selected = name;
+    }
+    return selected;
+}
+
+fn selectSerialConsole(cmdline: []const u8, active: []const u8, arch: std.Target.Cpu.Arch) []const u8 {
+    if (serialConsoleFromCmdline(cmdline)) |name| return name;
+    if (serialConsoleFromActive(active)) |name| return name;
+    return if (arch == .aarch64) "ttyAMA0" else "ttyS0";
+}
+
+fn discoverSerialConsolePath(path_buf: *[80:0]u8) [*:0]const u8 {
+    var cmdline_buf: [4097]u8 = undefined;
+    const cmdline = readBoundedFile("/proc/cmdline", &cmdline_buf) orelse "";
+    var active_buf: [257]u8 = undefined;
+    const active = readBoundedFile("/sys/class/tty/console/active", &active_buf) orelse "";
+    const name = selectSerialConsole(cmdline, active, @import("builtin").cpu.arch);
+    return std.fmt.bufPrintZ(path_buf, "/dev/{s}", .{name}) catch blk: {
+        const fallback = if (@import("builtin").cpu.arch == .aarch64) "/dev/ttyAMA0" else "/dev/ttyS0";
+        @memcpy(path_buf[0..fallback.len], fallback);
+        path_buf[fallback.len] = 0;
+        break :blk path_buf;
+    };
 }
 
 const AzureDecision = enum {
@@ -1194,29 +1280,24 @@ fn setupNetworking() NetworkResult {
     return network_result;
 }
 
-// ============================== azagent invocation ==============================
-// If /usr/sbin/azagent exists (added via an extra container layer -- see
-// zvmi build-image's automatic systemd-unit wiring for the full-image
-// equivalent, and the root README's build-image section), fork+exec it
-// once so this from-scratch init supports first-boot Azure provisioning
-// too, serving as a reference for what any --skip-iso-rootfs init needs
-// to do to actually reach a usable, provisioned login.
+// ============================== managed children ==============================
 const azagent_path = "/usr/sbin/azagent";
+const sshd_path = "/usr/sbin/sshd";
+const provisioning_retry_seconds: u32 = 5;
+const sshd_max_backoff_seconds: u32 = 30;
 
-const AzagentResult = enum {
-    absent,
-    success,
-    failed,
-};
+fn attachChildLog() void {
+    if (console_log_fd < 0) return;
+    _ = linux.dup2(console_log_fd, 1);
+    _ = linux.dup2(console_log_fd, 2);
+}
 
-fn runAzagentIfPresent() AzagentResult {
-    const access_rc = linux.access(azagent_path, linux.F_OK);
-    if (linux.errno(access_rc) != .SUCCESS) return .absent;
-
+fn spawnAzagent() ?linux.pid_t {
+    if (linux.errno(linux.access(azagent_path, linux.F_OK)) != .SUCCESS) return null;
     writeStr("[zvminit] running azagent...\r\n");
-
-    const pid = forkProcess("[zvminit] fork() for azagent failed") orelse return .failed;
+    const pid = forkProcess("[zvminit] fork() for azagent failed") orelse return null;
     if (pid == 0) {
+        attachChildLog();
         const argv = [_:null]?[*:0]const u8{ azagent_path, null };
         const envp = [_:null]?[*:0]const u8{
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -1226,58 +1307,17 @@ fn runAzagentIfPresent() AzagentResult {
         writeStr("[zvminit] execve(azagent) failed\r\n");
         linux.exit(127);
     }
-    var status: u32 = 0;
-    while (true) {
-        const wait_rc = linux.waitpid(pid, &status, 0);
-        const wait_error = linux.errno(wait_rc);
-        if (wait_error == .INTR) continue;
-        if (wait_error != .SUCCESS) {
-            writeErrno("[zvminit] waitpid() for azagent failed", wait_error);
-            return .failed;
-        }
-        break;
-    }
-    if (linux.W.IFEXITED(status) and linux.W.EXITSTATUS(status) == 0) {
-        writeStr("[zvminit] azagent completed successfully\r\n");
-        return .success;
-    } else {
-        writeStr("[zvminit] azagent exited non-zero\r\n");
-        return .failed;
-    }
+    return pid;
 }
 
-// ============================== sshd invocation ==============================
-// If /usr/sbin/sshd exists (added via an extra container layer), fork+exec
-// it once networking and azagent's SSH host keys / authorized_keys
-// deployment are in place, so a --skip-iso-rootfs image can actually be
-// reached over SSH -- otherwise a "successfully provisioned" minimal
-// container has no way to be reached at all (see issue #129). Called after
-// runAzagentIfPresent() so host keys already exist by the time sshd
-// starts. Tolerant of sshd being entirely absent (most zvminit-based test
-// images, including the boot-smoke QEMU tests, won't have it).
-//
-// Unlike azagent (a run-once step we wait for), sshd daemonizes itself and
-// runs forever, so we must not block on it here: fork+exec it and return
-// immediately, continuing on into shellLoop(). shellLoop()'s existing
-// waitpid(-1, ...) reaping loop already tolerates other children coming
-// and going (it only breaks when the *shell's* pid exits or waitpid
-// errors), so it transparently reaps the transient first-generation sshd
-// process once it exits after daemonizing -- no changes needed there.
-const sshd_path = "/usr/sbin/sshd";
-
-fn runSshdIfPresent() void {
-    const access_rc = linux.access(sshd_path, linux.F_OK);
-    if (linux.errno(access_rc) != .SUCCESS) return;
-
-    // sshd's privilege-separation directory; some builds expect it to
-    // already exist rather than creating it themselves.
+fn spawnSshd() ?linux.pid_t {
+    if (linux.errno(linux.access(sshd_path, linux.F_OK)) != .SUCCESS) return null;
     mkdirIgnoreExists("/run/sshd");
-
-    writeStr("[zvminit] running sshd...\r\n");
-
-    const pid = forkProcess("[zvminit] fork() for sshd failed") orelse return;
+    writeStr("[zvminit] starting supervised sshd -D -e\r\n");
+    const pid = forkProcess("[zvminit] fork() for sshd failed") orelse return null;
     if (pid == 0) {
-        const argv = [_:null]?[*:0]const u8{ sshd_path, null };
+        attachChildLog();
+        const argv = [_:null]?[*:0]const u8{ sshd_path, "-D", "-e", null };
         const envp = [_:null]?[*:0]const u8{
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             null,
@@ -1286,11 +1326,42 @@ fn runSshdIfPresent() void {
         writeStr("[zvminit] execve(sshd) failed\r\n");
         linux.exit(127);
     }
-    // Do not waitpid here -- sshd daemonizes and runs forever; shellLoop's
-    // reaping loop handles it (and any of its descendants) from here on.
+    return pid;
 }
 
-const provisioning_retry_seconds = 5;
+fn spawnDiagnosticShell(console_path: [*:0]const u8) ?linux.pid_t {
+    const tty_fd_raw = linux.open(console_path, .{ .ACCMODE = .RDWR }, 0);
+    if (linux.errno(tty_fd_raw) != .SUCCESS) {
+        writeErrno("[zvminit] opening diagnostic serial console failed", linux.errno(tty_fd_raw));
+        return null;
+    }
+    const tty_fd: i32 = @intCast(tty_fd_raw);
+    const pid = forkProcess("[zvminit] fork() for diagnostic shell failed") orelse {
+        _ = linux.close(tty_fd);
+        return null;
+    };
+    if (pid == 0) {
+        _ = linux.setsid();
+        _ = linux.ioctl(tty_fd, linux.T.IOCSCTTY, 0);
+        _ = linux.dup2(tty_fd, 0);
+        _ = linux.dup2(tty_fd, 1);
+        _ = linux.dup2(tty_fd, 2);
+        if (tty_fd > 2) _ = linux.close(tty_fd);
+
+        const argv = [_:null]?[*:0]const u8{ "/usr/bin/bash", "--login", null };
+        const envp = [_:null]?[*:0]const u8{
+            "HOME=/root",
+            "TERM=linux",
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            null,
+        };
+        _ = linux.execve("/usr/bin/bash", &argv, &envp);
+        writeStr("[zvminit] execve(/usr/bin/bash) failed\r\n");
+        linux.exit(127);
+    }
+    _ = linux.close(tty_fd);
+    return pid;
+}
 
 fn azureEvidence(network: NetworkResult, media: provisioning_media.ProbeResult) AzureEvidence {
     return .{
@@ -1336,145 +1407,225 @@ fn logAzureDecision(decision: AzureDecision, policy: AzurePolicy, evidence: Azur
     }
 }
 
-fn runPersistentSupervisor(
+const Supervisor = struct {
     policy: AzurePolicy,
-    initial_decision: AzureDecision,
-    initial_network: NetworkResult,
-    initial_media: provisioning_media.ProbeResult,
+    decision: AzureDecision,
+    network: NetworkResult,
+    media: provisioning_media.ProbeResult,
     identity: ?[36]u8,
     cached: ?AzureDecision,
-) noreturn {
-    var decision = initial_decision;
-    var network = initial_network;
-    var media = initial_media;
-    var sshd_started = false;
+    persist_detection: bool,
+    services_allowed: bool,
+    shell_enabled: bool,
+    console_path: [*:0]const u8,
 
-    while (true) {
-        switch (decision) {
-            .azure => {
-                if (linux.errno(linux.access(azagent_path, linux.F_OK)) != .SUCCESS) {
-                    writeStr("[zvminit] persistent mode requires /usr/sbin/azagent; SSH will not start\r\n");
-                    linux.exit(1);
-                }
-                switch (runAzagentIfPresent()) {
-                    .success => {
-                        if (!network.dhcp_acknowledged) network = setupNetworking();
-                        if (!sshd_started) runSshdIfPresent();
-                        linux.exit(0);
-                    },
-                    .absent => {
-                        writeStr("[zvminit] azagent disappeared; SSH will not start\r\n");
-                        linux.exit(1);
-                    },
-                    .failed => {
-                        writeStr("[zvminit] retrying azagent in 5 seconds\r\n");
-                    },
-                }
-            },
-            .non_azure => {
-                if (isProvisioned() and !sshd_started) runSshdIfPresent();
-                linux.exit(0);
-            },
-            .unknown => {
-                if (isProvisioned() and !sshd_started) {
-                    runSshdIfPresent();
-                    sshd_started = true;
-                }
-            },
+    azagent_pid: linux.pid_t = 0,
+    azagent_done: bool = false,
+    azagent_retry: u32 = 0,
+    azagent_missing_logged: bool = false,
+    sshd_pid: linux.pid_t = 0,
+    sshd_retry: u32 = 0,
+    sshd_backoff: u32 = 1,
+    shell_pid: linux.pid_t = 0,
+    shell_retry: u32 = 0,
+    detection_retry: u32 = provisioning_retry_seconds,
+};
+
+fn nextSshdBackoff(current: u32) u32 {
+    return @min(current * 2, sshd_max_backoff_seconds);
+}
+
+fn childSucceeded(status: u32) bool {
+    return linux.W.IFEXITED(status) and linux.W.EXITSTATUS(status) == 0;
+}
+
+fn noteChildExit(supervisor: *Supervisor, pid: linux.pid_t, status: u32) void {
+    if (pid == supervisor.azagent_pid) {
+        supervisor.azagent_pid = 0;
+        if (childSucceeded(status)) {
+            supervisor.azagent_done = true;
+            writeStr("[zvminit] azagent completed successfully\r\n");
+        } else {
+            supervisor.azagent_retry = provisioning_retry_seconds;
+            writeStr("[zvminit] azagent failed; retrying in 5 seconds\r\n");
         }
+    } else if (pid == supervisor.sshd_pid) {
+        supervisor.sshd_pid = 0;
+        supervisor.sshd_retry = supervisor.sshd_backoff;
+        supervisor.sshd_backoff = nextSshdBackoff(supervisor.sshd_backoff);
+        writeStr("[zvminit] sshd exited unexpectedly; scheduling restart\r\n");
+    } else if (pid == supervisor.shell_pid) {
+        supervisor.shell_pid = 0;
+        supervisor.shell_retry = 1;
+        writeStr("[zvminit] diagnostic shell exited; scheduling restart\r\n");
+    } else {
+        writeStr("[zvminit] reaped adopted child\r\n");
+    }
+}
 
-        const req: linux.timespec = .{ .sec = provisioning_retry_seconds, .nsec = 0 };
+fn reapChildren(supervisor: *Supervisor) void {
+    while (true) {
+        var status: u32 = 0;
+        const wait_rc = linux.waitpid(-1, &status, linux.W.NOHANG);
+        const wait_error = linux.errno(wait_rc);
+        if (wait_error == .INTR) continue;
+        if (wait_error == .CHILD or wait_rc == 0) return;
+        if (wait_error != .SUCCESS) {
+            writeErrno("[zvminit] waitpid() failed", wait_error);
+            return;
+        }
+        noteChildExit(supervisor, @intCast(wait_rc), status);
+    }
+}
+
+fn signalManagedChildren(supervisor: *const Supervisor, signal: linux.SIG) void {
+    for ([_]linux.pid_t{ supervisor.azagent_pid, supervisor.sshd_pid, supervisor.shell_pid }) |pid| {
+        if (pid > 0) _ = linux.kill(pid, signal);
+    }
+}
+
+fn managedChildrenRunning(supervisor: *const Supervisor) bool {
+    return supervisor.azagent_pid > 0 or supervisor.sshd_pid > 0 or supervisor.shell_pid > 0;
+}
+
+fn shutdownSupervisor(supervisor: *Supervisor) noreturn {
+    writeStr("[zvminit] stopping managed children\r\n");
+    signalManagedChildren(supervisor, .TERM);
+    var attempts: u32 = 0;
+    while (attempts < 50 and managedChildrenRunning(supervisor)) : (attempts += 1) {
+        reapChildren(supervisor);
+        const req: linux.timespec = .{ .sec = 0, .nsec = 100_000_000 };
         _ = linux.nanosleep(&req, null);
-
-        if (!network.dhcp_acknowledged) network = setupNetworking();
-        if (decision == .unknown) {
-            media = probeProvisioningMedia();
-            const next_evidence = azureEvidence(network, media);
-            decision = resolveAzureDecision(policy, cached, next_evidence);
-            persistObservedAzureDecision(policy, cached, identity, next_evidence);
-            if (decision != .unknown) logAzureDecision(decision, policy, next_evidence, cached);
+    }
+    if (managedChildrenRunning(supervisor)) {
+        signalManagedChildren(supervisor, .KILL);
+        attempts = 0;
+        while (attempts < 10 and managedChildrenRunning(supervisor)) : (attempts += 1) {
+            reapChildren(supervisor);
+            const req: linux.timespec = .{ .sec = 0, .nsec = 100_000_000 };
+            _ = linux.nanosleep(&req, null);
         }
+    }
+    doReboot(if (shutdown_signal == 2) .RESTART else .POWER_OFF);
+}
+
+fn updateDetection(supervisor: *Supervisor) void {
+    if (!supervisor.network.dhcp_acknowledged) supervisor.network = setupNetworking();
+    if (supervisor.decision != .unknown) return;
+
+    supervisor.media = probeProvisioningMedia();
+    const evidence = azureEvidence(supervisor.network, supervisor.media);
+    const next_decision = resolveAzureDecision(supervisor.policy, supervisor.cached, evidence);
+    if (supervisor.persist_detection) {
+        persistObservedAzureDecision(supervisor.policy, supervisor.cached, supervisor.identity, evidence);
+    }
+    if (next_decision != .unknown) {
+        supervisor.decision = next_decision;
+        logAzureDecision(next_decision, supervisor.policy, evidence, supervisor.cached);
     }
 }
 
-fn startPersistentProvisioning(policy: AzurePolicy, network: NetworkResult, identity: ?[36]u8, cached: ?AzureDecision) void {
-    const media: provisioning_media.ProbeResult = if (policy == .auto) probeProvisioningMedia() else .indeterminate;
+fn initializeSupervisor(
+    boot_config: BootConfig,
+    network: NetworkResult,
+    identity: ?[36]u8,
+    cached: ?AzureDecision,
+    persist_detection: bool,
+    services_allowed: bool,
+    console_path: [*:0]const u8,
+) Supervisor {
+    const media: provisioning_media.ProbeResult = if (boot_config.azure_policy == .auto and services_allowed)
+        probeProvisioningMedia()
+    else
+        .indeterminate;
     const evidence = azureEvidence(network, media);
-    const decision = resolveAzureDecision(policy, cached, evidence);
-    persistObservedAzureDecision(policy, cached, identity, evidence);
-    logAzureDecision(decision, policy, evidence, cached);
-
-    if (decision == .non_azure) {
-        if (isProvisioned()) runSshdIfPresent();
-        return;
+    const decision = resolveAzureDecision(boot_config.azure_policy, cached, evidence);
+    if (persist_detection) {
+        persistObservedAzureDecision(boot_config.azure_policy, cached, identity, evidence);
     }
-
-    const supervisor_pid = forkProcess("[zvminit] fork() for provisioning supervisor failed") orelse {
-        if (isProvisioned()) runSshdIfPresent() else writeStr("[zvminit] SSH will not start\r\n");
-        return;
+    logAzureDecision(decision, boot_config.azure_policy, evidence, cached);
+    return .{
+        .policy = boot_config.azure_policy,
+        .decision = decision,
+        .network = network,
+        .media = media,
+        .identity = identity,
+        .cached = cached,
+        .persist_detection = persist_detection,
+        .services_allowed = services_allowed,
+        .shell_enabled = boot_config.shell_enabled,
+        .console_path = console_path,
     };
-    if (supervisor_pid == 0) {
-        runPersistentSupervisor(policy, decision, network, media, identity, cached);
-    }
 }
 
-// ============================== main loop ==============================
+fn decrementDelay(delay: *u32) void {
+    if (delay.* > 0) delay.* -= 1;
+}
 
-fn shellLoop() noreturn {
+fn shouldRunAzagent(supervisor: *const Supervisor) bool {
+    return supervisor.services_allowed and supervisor.decision == .azure and
+        !supervisor.azagent_done and supervisor.azagent_pid == 0 and supervisor.azagent_retry == 0;
+}
+
+fn shouldStartSshd(services_allowed: bool, provisioned: bool, sshd_pid: linux.pid_t, retry: u32) bool {
+    return services_allowed and provisioned and sshd_pid == 0 and retry == 0;
+}
+
+fn supervisorLoop(supervisor: *Supervisor) noreturn {
+    if (supervisor.shell_enabled) {
+        var buf: [128]u8 = undefined;
+        const path = std.mem.span(supervisor.console_path);
+        const msg = std.fmt.bufPrint(&buf, "[zvminit] diagnostic root shell enabled on {s}\r\n", .{path}) catch "[zvminit] diagnostic root shell enabled\r\n";
+        writeStr(msg);
+    } else {
+        writeStr("[zvminit] diagnostic root shell disabled\r\n");
+    }
+    writeStr("[zvminit] ZVMINIT_PID1_READY supervisor loop active\r\n");
+
     while (true) {
-        if (shutdown_requested) doReboot(.POWER_OFF);
+        reapChildren(supervisor);
+        if (shutdown_signal != 0) shutdownSupervisor(supervisor);
 
-        const tty_fd_raw = linux.open("/dev/ttyS0", .{ .ACCMODE = .RDWR }, 0);
-        if (linux.errno(tty_fd_raw) != .SUCCESS) {
-            writeStr("[zvminit] failed to open /dev/ttyS0, retrying in 1s\r\n");
-            const req: linux.timespec = .{ .sec = 1, .nsec = 0 };
-            _ = linux.nanosleep(&req, null);
-            continue;
-        }
-        const tty_fd: i32 = @intCast(tty_fd_raw);
-
-        _ = linux.setsid();
-        _ = linux.ioctl(tty_fd, linux.T.IOCSCTTY, 0);
-
-        const pid = forkProcess("[zvminit] fork() for shell failed") orelse {
-            _ = linux.close(tty_fd);
-            const req: linux.timespec = .{ .sec = 1, .nsec = 0 };
-            _ = linux.nanosleep(&req, null);
-            continue;
-        };
-        if (pid == 0) {
-            _ = linux.dup2(tty_fd, 0);
-            _ = linux.dup2(tty_fd, 1);
-            _ = linux.dup2(tty_fd, 2);
-            if (tty_fd > 2) _ = linux.close(tty_fd);
-
-            const argv = [_:null]?[*:0]const u8{ "/usr/bin/bash", "--login", null };
-            const envp = [_:null]?[*:0]const u8{
-                "HOME=/root",
-                "TERM=linux",
-                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                null,
-            };
-            _ = linux.execve("/usr/bin/bash", &argv, &envp);
-            writeStr("[zvminit] execve(/usr/bin/bash) failed\r\n");
-            linux.exit(127);
+        if (shouldRunAzagent(supervisor)) {
+            if (spawnAzagent()) |pid| {
+                supervisor.azagent_pid = pid;
+                supervisor.azagent_missing_logged = false;
+            } else {
+                if (!supervisor.azagent_missing_logged) {
+                    writeStr("[zvminit] Azure provisioning requires /usr/sbin/azagent; SSH remains gated\r\n");
+                    supervisor.azagent_missing_logged = true;
+                }
+                supervisor.azagent_retry = provisioning_retry_seconds;
+            }
         }
 
-        _ = linux.close(tty_fd);
-
-        while (true) {
-            if (shutdown_requested) break;
-            var status: u32 = 0;
-            const wait_rc = linux.waitpid(-1, &status, 0);
-            const wait_error = linux.errno(wait_rc);
-            if (wait_error == .INTR) continue;
-            if (wait_error != .SUCCESS) break;
-            const wpid: linux.pid_t = @intCast(wait_rc);
-            if (wpid == pid) break;
+        if (shouldStartSshd(supervisor.services_allowed, isProvisioned(), supervisor.sshd_pid, supervisor.sshd_retry)) {
+            if (spawnSshd()) |pid| {
+                supervisor.sshd_pid = pid;
+            } else {
+                supervisor.sshd_retry = supervisor.sshd_backoff;
+                supervisor.sshd_backoff = nextSshdBackoff(supervisor.sshd_backoff);
+            }
         }
 
-        if (shutdown_requested) doReboot(.POWER_OFF);
-        writeStr("\r\n[zvminit] shell exited, respawning...\r\n");
+        if (supervisor.shell_enabled and supervisor.shell_pid == 0 and supervisor.shell_retry == 0) {
+            if (spawnDiagnosticShell(supervisor.console_path)) |pid| {
+                supervisor.shell_pid = pid;
+            } else {
+                supervisor.shell_retry = 1;
+            }
+        }
+
+        const req: linux.timespec = .{ .sec = 1, .nsec = 0 };
+        _ = linux.nanosleep(&req, null);
+        decrementDelay(&supervisor.azagent_retry);
+        decrementDelay(&supervisor.sshd_retry);
+        decrementDelay(&supervisor.shell_retry);
+        decrementDelay(&supervisor.detection_retry);
+        if (supervisor.services_allowed and supervisor.detection_retry == 0) {
+            updateDetection(supervisor);
+            supervisor.detection_retry = provisioning_retry_seconds;
+        }
     }
 }
 
@@ -1493,8 +1644,11 @@ pub fn main(init: std.process.Init.Minimal) noreturn {
     mountIgnoreBusy("sysfs", "/sys", "sysfs", 0);
     mountIgnoreBusy("devtmpfs", "/dev", "devtmpfs", 0);
     mountIgnoreBusy("tmpfs", "/run", "tmpfs", 0);
+    openConsoleLog();
     openDebugLog();
     const boot_config = readBootConfig();
+    var console_path_buf: [80:0]u8 = undefined;
+    const console_path = discoverSerialConsolePath(&console_path_buf);
     const boot_mode = boot_config.mode;
     const persistent_root_ready = if (boot_mode == .persistent) remountRootWritable() else false;
     loadBootModules(boot_mode);
@@ -1512,65 +1666,108 @@ pub fn main(init: std.process.Init.Minimal) noreturn {
     writeStr("\r\n[zvminit] base mounts ready; configuring network...\r\n");
     const network = setupNetworking();
 
-    if (boot_mode == .persistent) {
-        if (persistent_root_ready) {
-            const identity = readVmIdentity();
-            const cached = if (identity) |vm_identity| readCachedAzureDecision(vm_identity) else null;
-            startPersistentProvisioning(boot_config.azure_policy, network, identity, cached);
-        } else {
-            writeStr("[zvminit] persistent storage is unavailable; azagent and SSH will not start\r\n");
-        }
-    } else {
-        const media: provisioning_media.ProbeResult = if (boot_config.azure_policy == .auto) probeProvisioningMedia() else .indeterminate;
-        const evidence = azureEvidence(network, media);
-        const decision = resolveAzureDecision(boot_config.azure_policy, null, evidence);
-        logAzureDecision(decision, boot_config.azure_policy, evidence, null);
-        if (decision != .non_azure) _ = runAzagentIfPresent();
-        runSshdIfPresent();
+    if (boot_mode == .persistent and !persistent_root_ready) {
+        writeStr("[zvminit] persistent storage is unavailable; azagent and SSH will not start\r\n");
     }
-
-    writeStr("[zvminit] spawning shell on ttyS0\r\n");
-    shellLoop();
+    const persist_detection = boot_mode == .persistent and persistent_root_ready;
+    const identity = if (persist_detection) readVmIdentity() else null;
+    const cached = if (identity) |vm_identity| readCachedAzureDecision(vm_identity) else null;
+    var supervisor = initializeSupervisor(
+        boot_config,
+        network,
+        identity,
+        cached,
+        persist_detection,
+        boot_mode == .immutable or persistent_root_ready,
+        console_path,
+    );
+    supervisorLoop(&supervisor);
 }
 
-test "parseBootConfig defaults to immutable and automatic Azure detection" {
+test "parseBootConfig defaults to immutable automatic Azure detection and no shell" {
     const config = parseBootConfig("root=/dev/sda2 console=ttyS0");
     try std.testing.expectEqual(BootMode.immutable, config.mode);
     try std.testing.expectEqual(AzurePolicy.auto, config.azure_policy);
+    try std.testing.expect(!config.shell_enabled);
 }
 
-test "parseBootConfig accepts boot modes and Azure policies independently" {
-    const persistent = parseBootConfig("root=/dev/sda2 zvminit.mode=persistent zvminit.azure=on console=ttyS0");
+test "parseBootConfig accepts boot modes Azure policies and explicit shell setting independently" {
+    const persistent = parseBootConfig("root=/dev/sda2 zvminit.mode=persistent zvminit.azure=on zvminit.shell=on console=ttyS0");
     try std.testing.expectEqual(BootMode.persistent, persistent.mode);
     try std.testing.expectEqual(AzurePolicy.on, persistent.azure_policy);
+    try std.testing.expect(persistent.shell_enabled);
 
-    const immutable = parseBootConfig("zvminit.mode=immutable zvminit.azure=off");
+    const immutable = parseBootConfig("zvminit.mode=immutable zvminit.azure=off zvminit.shell=off");
     try std.testing.expectEqual(BootMode.immutable, immutable.mode);
     try std.testing.expectEqual(AzurePolicy.off, immutable.azure_policy);
+    try std.testing.expect(!immutable.shell_enabled);
 }
 
 test "parseBootConfig uses the last value for each setting" {
-    const config = parseBootConfig("zvminit.mode=persistent zvminit.azure=off zvminit.mode=immutable zvminit.azure=auto");
+    const config = parseBootConfig("zvminit.mode=persistent zvminit.azure=off zvminit.shell=on zvminit.mode=immutable zvminit.azure=auto zvminit.shell=off");
     try std.testing.expectEqual(BootMode.immutable, config.mode);
     try std.testing.expectEqual(AzurePolicy.auto, config.azure_policy);
+    try std.testing.expect(!config.shell_enabled);
     try std.testing.expectEqual(@as(?[]const u8, null), config.invalid_mode);
     try std.testing.expectEqual(@as(?[]const u8, null), config.invalid_azure_policy);
+    try std.testing.expectEqual(@as(?[]const u8, null), config.invalid_shell);
 }
 
 test "parseBootConfig allows later valid values to replace invalid ones" {
-    const config = parseBootConfig("zvminit.mode=invalid zvminit.azure=maybe zvminit.mode=persistent zvminit.azure=on");
+    const config = parseBootConfig("zvminit.mode=invalid zvminit.azure=maybe zvminit.shell=yes zvminit.mode=persistent zvminit.azure=on zvminit.shell=on");
     try std.testing.expectEqual(BootMode.persistent, config.mode);
     try std.testing.expectEqual(AzurePolicy.on, config.azure_policy);
+    try std.testing.expect(config.shell_enabled);
     try std.testing.expectEqual(@as(?[]const u8, null), config.invalid_mode);
     try std.testing.expectEqual(@as(?[]const u8, null), config.invalid_azure_policy);
+    try std.testing.expectEqual(@as(?[]const u8, null), config.invalid_shell);
 }
 
 test "parseBootConfig rejects invalid values with safe defaults" {
-    const config = parseBootConfig("zvminit.mode=writable zvminit.azure=maybe");
+    const config = parseBootConfig("zvminit.mode=writable zvminit.azure=maybe zvminit.shell=yes");
     try std.testing.expectEqual(BootMode.immutable, config.mode);
     try std.testing.expectEqual(AzurePolicy.auto, config.azure_policy);
+    try std.testing.expect(!config.shell_enabled);
     try std.testing.expectEqualStrings("writable", config.invalid_mode.?);
     try std.testing.expectEqualStrings("maybe", config.invalid_azure_policy.?);
+    try std.testing.expectEqualStrings("yes", config.invalid_shell.?);
+}
+
+test "serial console discovery prefers the last serial cmdline entry then active console" {
+    try std.testing.expectEqualStrings(
+        "ttyAMA1",
+        selectSerialConsole("console=tty0 console=ttyS0,115200 console=ttyAMA1,115200", "tty0 hvc0", .x86_64),
+    );
+    try std.testing.expectEqualStrings(
+        "hvc0",
+        selectSerialConsole("console=tty0", "tty0 hvc0", .x86_64),
+    );
+    try std.testing.expectEqualStrings("ttyS0", selectSerialConsole("", "tty0", .x86_64));
+    try std.testing.expectEqualStrings("ttyAMA0", selectSerialConsole("", "", .aarch64));
+}
+
+test "sshd restart backoff is exponential and bounded" {
+    try std.testing.expectEqual(@as(u32, 2), nextSshdBackoff(1));
+    try std.testing.expectEqual(@as(u32, 16), nextSshdBackoff(8));
+    try std.testing.expectEqual(sshd_max_backoff_seconds, nextSshdBackoff(16));
+    try std.testing.expectEqual(sshd_max_backoff_seconds, nextSshdBackoff(sshd_max_backoff_seconds));
+}
+
+test "service gates require Azure for azagent and provisioning for sshd" {
+    var supervisor: Supervisor = undefined;
+    supervisor.services_allowed = true;
+    supervisor.decision = .azure;
+    supervisor.azagent_done = false;
+    supervisor.azagent_pid = 0;
+    supervisor.azagent_retry = 0;
+    try std.testing.expect(shouldRunAzagent(&supervisor));
+    supervisor.decision = .non_azure;
+    try std.testing.expect(!shouldRunAzagent(&supervisor));
+
+    try std.testing.expect(!shouldStartSshd(true, false, 0, 0));
+    try std.testing.expect(shouldStartSshd(true, true, 0, 0));
+    try std.testing.expect(!shouldStartSshd(true, true, 42, 0));
+    try std.testing.expect(!shouldStartSshd(true, true, 0, 1));
 }
 
 test "parsePersistedHostname trims line endings and rejects invalid content" {

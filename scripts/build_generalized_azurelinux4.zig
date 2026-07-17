@@ -2471,6 +2471,8 @@ test "generalized UKI command line uses architecture-specific serial consoles" {
     );
     try std.testing.expectEqualStrings("console=ttyS0,115200n8", x86_64.serial_console);
     try std.testing.expectEqualStrings("console=ttyAMA0,115200n8", aarch64.serial_console);
+    try std.testing.expect(std.mem.indexOf(u8, x86_cmdline, "zvminit.shell=on") == null);
+    try std.testing.expect(std.mem.indexOf(u8, arm_cmdline, "zvminit.shell=on") == null);
     try std.testing.expectEqualStrings("512M", generalized_esp_size_arg);
 }
 

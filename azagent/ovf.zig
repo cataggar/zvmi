@@ -19,8 +19,9 @@
 //! Linux Agent, analyzed at /work/WALinuxAgent during planning).
 const std = @import("std");
 const xml = @import("wireserver").xml;
+const validation = @import("validation.zig");
 
-pub const ParseError = error{MissingField};
+pub const ParseError = error{ MissingField, InvalidUsername, InvalidPublicKey };
 
 /// A single `<PublicKey>` entry's `<Value>` (raw `ssh-<type> ...` text).
 /// The `<Fingerprint>`/certificate-thumbprint path is not supported (see
@@ -52,6 +53,7 @@ pub const OvfEnv = struct {
 
         const hostname = xml.findElement(conf_set, "HostName") orelse return error.MissingField;
         const username = xml.findElement(conf_set, "UserName") orelse return error.MissingField;
+        try validation.validateUsername(username);
 
         const disable_ssh_password_auth = if (xml.findElement(conf_set, "DisableSshPasswordAuthentication")) |v|
             std.ascii.eqlIgnoreCase(v, "true")
@@ -68,7 +70,7 @@ pub const OvfEnv = struct {
         while (it.next()) |pubkey_block| {
             if (result.public_keys_len >= max_public_keys) break;
             const value = xml.findElement(pubkey_block, "Value") orelse continue;
-            if (value.len == 0) continue;
+            try validation.validatePublicKey(value);
             result.public_keys_buf[result.public_keys_len] = .{ .value = value };
             result.public_keys_len += 1;
         }
@@ -166,4 +168,22 @@ test "OvfEnv.parse skips PublicKey entries with no Value (certificate-thumbprint
 test "OvfEnv.parse fails when a required field is missing" {
     try std.testing.expectError(error.MissingField, OvfEnv.parse("<LinuxProvisioningConfigurationSet></LinuxProvisioningConfigurationSet>"));
     try std.testing.expectError(error.MissingField, OvfEnv.parse("<Nope></Nope>"));
+}
+
+test "OvfEnv.parse validates usernames and every supplied public key" {
+    const unsafe_user =
+        \\<LinuxProvisioningConfigurationSet>
+        \\  <HostName>h</HostName><UserName>../root</UserName>
+        \\</LinuxProvisioningConfigurationSet>
+    ;
+    try std.testing.expectError(error.InvalidUsername, OvfEnv.parse(unsafe_user));
+
+    const injected_key =
+        \\<LinuxProvisioningConfigurationSet>
+        \\  <HostName>h</HostName><UserName>azureuser</UserName>
+        \\  <SSH><PublicKeys><PublicKey><Value>ssh-ed25519 AAAA
+        \\command="id"</Value></PublicKey></PublicKeys></SSH>
+        \\</LinuxProvisioningConfigurationSet>
+    ;
+    try std.testing.expectError(error.InvalidPublicKey, OvfEnv.parse(injected_key));
 }

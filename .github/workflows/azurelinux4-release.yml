@@ -122,29 +122,20 @@ jobs:
 
           set pid [exp_pid]
           expect {
-              -exact {[zvminit] spawning shell on ttyS0} {}
-              timeout { fail $pid "zvminit shell marker timeout" }
-              eof     { fail $pid "QEMU exited before zvminit shell" }
+              -exact {[zvminit] ZVMINIT_PID1_READY supervisor loop active} {}
+              timeout { fail $pid "zvminit PID 1 readiness marker timeout" }
+              eof     { fail $pid "QEMU exited before zvminit PID 1 readiness" }
           }
 
-          send -- "exe=\$(readlink /proc/1/exe); cmd=\$(tr '\\0' ' ' </proc/1/cmdline); status=BAD; test /proc/1/exe -ef /sbin/zvminit && test \"\$cmd\" = '/sbin/zvminit ' && status=OK; printf 'ZVMI_PID1_EXE=%s\\n' \"\$exe\"; printf 'ZVMI_PID1_CMDLINE=%s\\n' \"\$cmd\"; printf 'ZVMI_PID1_%s\\n' \"\$status\"; poweroff\r"
-
-          expect {
-              -exact {ZVMI_PID1_OK} {}
-              -exact {ZVMI_PID1_BAD} { fail $pid "PID 1 verification failed" }
-              timeout { fail $pid "PID 1 response timeout" }
-              eof     { fail $pid "QEMU exited before PID 1 verification" }
-          }
-
+          # SSH acceptance is tracked separately. Stop this smoke boot after
+          # the PID-1-owned supervisor announces readiness; no root shell is
+          # enabled in the release command line.
+          catch {exec kill -TERM $pid}
           expect {
               eof {}
-              timeout { fail $pid "guest did not power off" }
+              timeout { fail $pid "QEMU did not stop after readiness check" }
           }
-
-          set result [wait]
-          if {[lindex $result 2] != 0 || [lindex $result 3] != 0} {
-              exit 1
-          }
+          catch {wait}
           EXPECT
 
       - name: Replace release asset
