@@ -65,6 +65,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const guest_validation_mod = b.addModule("guest_validation", .{
+        .root_source_file = b.path("azagent/validation.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const qemu_host_tests = b.addTest(.{ .root_module = qemu_host_mod });
     const run_qemu_host_tests = b.addRunArtifact(qemu_host_tests);
 
@@ -111,6 +116,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "zvmi", .module = zvmi_mod },
                 .{ .name = "qemu_host", .module = qemu_host_mod },
+                .{ .name = "guest_validation", .module = guest_validation_mod },
             },
         }),
     });

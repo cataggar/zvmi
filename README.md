@@ -637,9 +637,11 @@ Existing images are never refreshed or overwritten. QEMU and its matching
 EDK2 firmware are resolved from the `cataggar/qemu` ghr installation first,
 then from a system QEMU/OVMF installation.
 
-The published image uses the direct UKI boot path described above. Local QEMU
+The published images use the direct UKI boot path described above. Local QEMU
 launches must keep Secure Boot disabled until the UKI signing work in issue
-#168 is complete.
+#168 is complete. `--architecture x86_64|aarch64` selects q35/OVMF or
+virt/AAVMF respectively; `--architecture auto` requires an unambiguous
+architecture-bearing GPT root/USR GUID or UKI PE header.
 
 The default boot is persistent: QEMU writes directly to the image, and a
 matching `AzureLinux-4.0-x86_64.vars.fd` UEFI variables file is created once
@@ -651,23 +653,23 @@ zvmi qemu --snapshot
 
 Snapshot mode uses the sibling `qemu-img` binary to create a temporary qcow2
 overlay plus a temporary UEFI variables copy; `zvmi` removes both when QEMU
-exits. The automatic accelerator is WHPX on x86_64 Windows, HVF on x86_64
-macOS, KVM on x86_64 Linux when `/dev/kvm` is available, and TCG otherwise.
-Override it when needed:
+exits. The automatic accelerator uses WHPX/HVF/KVM only when host and guest
+architectures match, and TCG otherwise. Override it when needed:
 
 ```text
 zvmi qemu --accel tcg
 ```
 
-An explicit image path must already exist and is still launched as an x86_64
-Gen2/UEFI VM:
+An explicit image path must already exist. Without an architecture option it
+keeps the x86_64 default; use `aarch64` or `auto` for Arm64 images:
 
 ```text
 zvmi qemu custom.qcow2
 ```
 
-Use `--qemu`, `--ovmf-code`, and `--ovmf-vars` for non-standard installations.
-Arguments after `--` are appended directly to QEMU. The terminal is attached to
+Use `--qemu`, `--firmware-code`, and `--firmware-vars` (or the compatible
+`--ovmf-code`/`--ovmf-vars` names) for non-standard installations. Arguments
+after `--` are appended directly to QEMU. The terminal is attached to
 QEMU's `-nographic` serial console; use QEMU's `Ctrl+A`, then `X`, escape to
 exit. With the default secure command line, a successful local boot reaches
 the PID 1 readiness marker without exposing a root shell:
@@ -677,6 +679,13 @@ the PID 1 readiness marker without exposing a root shell:
 [zvminit] diagnostic root shell disabled
 [zvminit] ZVMINIT_PID1_READY supervisor loop active
 ```
+
+To provision an administrator at launch, supply
+`--admin-username <name> --ssh-public-key <path>` together. `--ssh-port`
+(default `2222`) forwards localhost TCP to guest SSH. The command creates a
+short-lived hybrid `cidata` ISO containing NoCloud metadata/user-data, Azure
+`ovf-env.xml`, and the explicit `zvmi-local-provisioning` marker, then removes
+the seed and temporary launch state when QEMU exits.
 
 This command is intentionally a focused launcher for the published x86_64
 Gen2 Azure Linux image, not a general VM configuration manager.
