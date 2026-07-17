@@ -4184,22 +4184,13 @@ fn appendTarSpec(out: *std.Io.Writer.Allocating, spec: TarSpec) !void {
 }
 
 fn buildPaxRecord(allocator: std.mem.Allocator, key: []const u8, value: []const u8) ![]u8 {
-    var record = try std.fmt.allocPrint(allocator, "0 {s}={s}\n", .{ key, value });
-    errdefer allocator.free(record);
+    var record_len: usize = 0;
     while (true) {
-        const digits = paxDecimalDigits(record.len);
-        const needed = digits + 1 + key.len + 1 + value.len + 1;
-        if (needed == record.len) return record;
+        const record = try std.fmt.allocPrint(allocator, "{d} {s}={s}\n", .{ record_len, key, value });
+        if (record.len == record_len) return record;
+        record_len = record.len;
         allocator.free(record);
-        record = try std.fmt.allocPrint(allocator, "{d} {s}={s}\n", .{ needed, key, value });
     }
-}
-
-fn paxDecimalDigits(value: usize) usize {
-    var n = value;
-    var digits: usize = 1;
-    while (n >= 10) : (n /= 10) digits += 1;
-    return digits;
 }
 
 fn gzipBytes(allocator: std.mem.Allocator, data: []const u8) ![]u8 {

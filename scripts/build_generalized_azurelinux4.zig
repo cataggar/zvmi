@@ -67,6 +67,9 @@ const Provisioner = enum {
 /// x86_64/AArch64 EFI packages from the upstream bootstrap group are supplied
 /// separately by `ArchitectureDescriptor.full_efi_packages`.
 const vm_base_packages = [_][]const u8{
+    // vm-base's bootstrap group.  DNF resolves this exactly once together
+    // with the image group below, rather than through a separate transaction.
+    "filesystem",
     "azurelinux-release-cloud",
     "bash",
     "ca-certificates",
@@ -153,6 +156,7 @@ const core_required_rootfs_paths = [_][]const u8{
 const full_required_rootfs_paths = [_][]const u8{
     "usr/bin/bash",
     "usr/bin/cloud-init",
+    "usr/bin/rpm",
     "usr/bin/sshd",
     "usr/bin/waagent",
     "usr/lib/systemd/systemd",
@@ -1361,6 +1365,34 @@ fn trustedSigningKeyPath(
     );
 }
 
+fn canonicalTrustedSigningKeyPath(
+    gpa: Allocator,
+    io: Io,
+    work_dir: []const u8,
+    architecture: *const ArchitectureDescriptor,
+) ![]u8 {
+    const path = try trustedSigningKeyPath(gpa, work_dir, architecture);
+    defer gpa.free(path);
+    return Dir.cwd().realPathFileAlloc(io, path, gpa);
+}
+
+fn fileUriFromAbsolutePath(gpa: Allocator, path: []const u8) ![]u8 {
+    if (!std.fs.path.isAbsolute(path)) return error.RelativeFileUriPath;
+    var uri: std.Io.Writer.Allocating = .init(gpa);
+    errdefer uri.deinit();
+    try uri.writer.writeAll("file://");
+    for (path) |byte| {
+        const is_unreserved = std.ascii.isAlphanumeric(byte) or
+            std.mem.indexOfScalar(u8, "-._~/", byte) != null;
+        if (is_unreserved) {
+            try uri.writer.writeByte(byte);
+        } else {
+            try uri.writer.print("%{X:0>2}", .{byte});
+        }
+    }
+    return uri.toOwnedSlice();
+}
+
 fn validateTrustedSigningKey(
     gpa: Allocator,
     io: Io,
@@ -1396,10 +1428,12 @@ fn extractTrustedSigningKey(
     );
     defer gpa.free(signing_key_guest);
     const host_key = try trustedSigningKeyPath(gpa, work_dir, architecture);
-    errdefer gpa.free(host_key);
+    defer gpa.free(host_key);
     try sudo(gpa, io, &.{ "install", "-m", "0644", signing_key_guest, host_key });
-    try validateTrustedSigningKey(gpa, io, host_key);
-    return host_key;
+    const canonical_key = try canonicalTrustedSigningKeyPath(gpa, io, work_dir, architecture);
+    errdefer gpa.free(canonical_key);
+    try validateTrustedSigningKey(gpa, io, canonical_key);
+    return canonical_key;
 }
 
 fn bootstrapFullRootfs(
@@ -1508,6 +1542,37 @@ fn validateFullServiceFiles(
     }
 }
 
+fn validateFullMergedUsrLayout(
+    gpa: Allocator,
+    io: Io,
+    rootfs_path: []const u8,
+) !void {
+    const expected_links = [_]struct {
+        path: []const u8,
+        target: []const u8,
+    }{
+        .{ .path = "sbin", .target = "usr/sbin" },
+        .{ .path = "lib", .target = "usr/lib" },
+        .{ .path = "lib64", .target = "usr/lib64" },
+        .{ .path = "usr/bin/init", .target = "../lib/systemd/systemd" },
+    };
+    for (expected_links) |expected| {
+        const path = try rootfsPath(rootfs_path, gpa, expected.path);
+        defer gpa.free(path);
+        const stat = try Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
+        if (stat.kind != .sym_link) return error.InvalidMergedUsrLayout;
+        const target = try capture(gpa, io, &.{ "sudo", "readlink", path });
+        defer gpa.free(target);
+        if (!std.mem.eql(u8, std.mem.trim(u8, target, " \t\r\n"), expected.target)) {
+            return error.InvalidMergedUsrLayout;
+        }
+    }
+    const systemd = try rootfsPath(rootfs_path, gpa, "usr/lib/systemd/systemd");
+    defer gpa.free(systemd);
+    const systemd_stat = try Dir.cwd().statFile(io, systemd, .{ .follow_symlinks = false });
+    if (!isRegularNonemptyFile(systemd_stat.kind, systemd_stat.size)) return error.InvalidMergedUsrLayout;
+}
+
 fn configureFullGuest(
     gpa: Allocator,
     io: Io,
@@ -1610,9 +1675,28 @@ fn generalizeRootfs(
     try sudo(gpa, io, &.{ "rm", "-f", hostname, dbus_machine_id, random_seed });
     try sudo(gpa, io, &.{ "rm", "-rf", cloud_state, waagent_state, azagent_state, leases });
     if (flavor.flavor == .full) {
-        try sudo(gpa, io, &.{ "install", "-d", "-m", "0755", cloud_state, waagent_state });
+        try sudo(gpa, io, &.{ "install", "-d", "-m", "0755", cloud_state });
+        try sudo(gpa, io, &.{ "install", "-d", "-o", "root", "-g", "root", "-m", "0700", waagent_state });
     }
     try sudo(gpa, io, &.{ "truncate", "-s", "0", machine_id });
+}
+
+fn waagentStateContractMatches(uid: u32, gid: u32, mode: u16) bool {
+    return uid == 0 and gid == 0 and mode == 0o700;
+}
+
+fn validateFullWaagentState(
+    gpa: Allocator,
+    io: Io,
+    rootfs_path: []const u8,
+) !void {
+    const path = try rootfsPath(rootfs_path, gpa, "var/lib/waagent");
+    defer gpa.free(path);
+    const stat = try capture(gpa, io, &.{ "sudo", "stat", "-c", "%u:%g:%a", path });
+    defer gpa.free(stat);
+    if (!std.mem.eql(u8, std.mem.trim(u8, stat, " \t\r\n"), "0:0:700")) {
+        return error.InvalidWALinuxAgentStateMetadata;
+    }
 }
 
 fn validateGeneralizedRootfs(
@@ -1651,6 +1735,7 @@ fn validateGeneralizedRootfs(
         } else |_| {}
     }
     if (flavor.flavor == .full) {
+        try validateFullWaagentState(gpa, io, rootfs_path);
         const waagent_conf = try rootfsPath(rootfs_path, gpa, "etc/waagent.conf");
         defer gpa.free(waagent_conf);
         const content = try capture(gpa, io, &.{ "sudo", "cat", waagent_conf });
@@ -1723,7 +1808,13 @@ fn installGuestContent(
     }
 
     try validateTrustedSigningKey(gpa, io, trusted_key_path);
-    const gpgkey_opt = try std.fmt.allocPrint(gpa, "--setopt=" ++ dnf_repository_id ++ ".gpgkey=file://{s}", .{trusted_key_path});
+    const signing_key_uri = try fileUriFromAbsolutePath(gpa, trusted_key_path);
+    defer gpa.free(signing_key_uri);
+    const gpgkey_opt = try std.fmt.allocPrint(
+        gpa,
+        "--setopt=" ++ dnf_repository_id ++ ".gpgkey={s}",
+        .{signing_key_uri},
+    );
     defer gpa.free(gpgkey_opt);
     const forcearch_opt = try std.fmt.allocPrint(gpa, "--forcearch={s}", .{architecture.dnf_architecture});
     defer gpa.free(forcearch_opt);
@@ -1841,6 +1932,9 @@ fn installGuestContent(
     }
     try validateRequiredPackages(gpa, io, rootfs_path, flavor_packages);
     try validateForbiddenPackages(gpa, io, rootfs_path, flavor.forbidden_packages);
+    if (flavor.flavor == .full) {
+        try validateFullMergedUsrLayout(gpa, io, rootfs_path);
+    }
 
     switch (flavor.pid1) {
         .zvminit => try configureCoreGuest(
@@ -2598,6 +2692,10 @@ fn validateFinalizedImageRootfs(
         if (autorelabel.kind != .file) return error.MissingAutorelabel;
         const chrony_state = try rootfs.statPath(io, "var/lib/chrony");
         if (chrony_state.uid == 0 or chrony_state.gid == 0) return error.LostPackageOwnership;
+        const waagent_metadata = try rootfs.statPath(io, "var/lib/waagent");
+        if (!waagentStateContractMatches(waagent_metadata.uid, waagent_metadata.gid, waagent_metadata.mode)) {
+            return error.InvalidWALinuxAgentStateMetadata;
+        }
         const waagent_state = rootfs.listDir(io, gpa, "var/lib/waagent") catch |err| switch (err) {
             error.NotFound => return error.BakedProvisioningState,
             else => return err,
@@ -2980,7 +3078,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Check required external tools.
     var tools_ok = true;
-    for (&[_][]const u8{ "sudo", "tar", "dnf", "curl", "qemu-img", "file", "find", "gpg", "systemctl", "du", "mount", "umount" }) |tool| {
+    for (&[_][]const u8{ "sudo", "tar", "dnf", "curl", "qemu-img", "file", "find", "gpg", "systemctl", "du", "mount", "umount", "readlink" }) |tool| {
         if (!requireTool(gpa, io, tool)) {
             std.debug.print("error: required tool '{s}' not found in PATH\n", .{tool});
             tools_ok = false;
@@ -3013,7 +3111,7 @@ pub fn main(init: std.process.Init) !void {
     defer gpa.free(core_digest);
     const trusted_key_path = switch (flavor.flavor) {
         .core => try extractTrustedSigningKey(gpa, io, rootfs_path, work_dir, architecture),
-        .full => try trustedSigningKeyPath(gpa, work_dir, architecture),
+        .full => try canonicalTrustedSigningKeyPath(gpa, io, work_dir, architecture),
     };
     defer gpa.free(trusted_key_path);
 
@@ -3377,6 +3475,7 @@ test "full flavor encodes the pinned official vm-base package profile" {
     try std.testing.expectEqualStrings("vm-base", vm_base_profile_name);
     for (&[_][]const u8{
         "systemd",
+        "filesystem",
         "cloud-init",
         "WALinuxAgent",
         "openssh-server",
@@ -3410,6 +3509,7 @@ test "flavor contracts keep full systemd-only and core zvminit-only" {
     try std.testing.expect(argvContains(full.required_rootfs_paths, "usr/lib/systemd/systemd"));
     try std.testing.expect(argvContains(full.required_rootfs_paths, "usr/bin/sshd"));
     try std.testing.expect(argvContains(full.required_rootfs_paths, "usr/bin/waagent"));
+    try std.testing.expect(argvContains(full.required_rootfs_paths, "usr/bin/rpm"));
     try std.testing.expect(argvContains(full.required_rootfs_paths, ".autorelabel"));
     try std.testing.expect(!argvContains(full.required_rootfs_paths, "usr/sbin/waagent"));
     try std.testing.expect(!argvContains(&full_required_systemd_units, "cloud-init.service"));
@@ -3419,6 +3519,17 @@ test "flavor contracts keep full systemd-only and core zvminit-only" {
     try std.testing.expect(full.max_oci_layer_bytes > core.max_oci_layer_bytes);
     try std.testing.expectEqual(@as(usize, 3), ociLayerPlanCount(&core));
     try std.testing.expectEqual(@as(usize, 7), ociLayerPlanCount(&full));
+}
+
+test "full key URI and package-state contracts are canonical" {
+    const gpa = std.testing.allocator;
+    const uri = try fileUriFromAbsolutePath(gpa, "/work/key space#?.asc");
+    defer gpa.free(uri);
+    try std.testing.expectEqualStrings("file:///work/key%20space%23%3F.asc", uri);
+    try std.testing.expectError(error.RelativeFileUriPath, fileUriFromAbsolutePath(gpa, ".scratch/key.asc"));
+    try std.testing.expect(waagentStateContractMatches(0, 0, 0o700));
+    try std.testing.expect(!waagentStateContractMatches(1, 0, 0o700));
+    try std.testing.expect(!waagentStateContractMatches(0, 0, 0o755));
 }
 
 test "full OCI provenance records profile repomd and NEVRA closure" {

@@ -662,11 +662,7 @@ fn ensureParents(allocator: Allocator, entry_map: *StringHashMap(FileTree.Entry)
 fn ensureDirectory(allocator: Allocator, entry_map: *StringHashMap(FileTree.Entry), path: []const u8, mode: u32) LoadError!void {
     if (path.len == 0) return;
     if (entry_map.getPtr(path)) |existing| {
-        if (existing.kind == .directory) {
-            existing.mode = mode;
-            existing.size = 0;
-            return;
-        }
+        if (existing.kind == .directory) return;
     }
 
     const owned_path = try allocator.dupe(u8, path);
@@ -967,6 +963,61 @@ test "OCI layers preserve ownership and PAX xattrs across whiteouts and hardlink
     try std.testing.expectEqualStrings("user.hardlink", hard.xattrs[0].name);
 }
 
+test "OCI parent synthesis does not overwrite lower directory metadata" {
+    const allocator = std.testing.allocator;
+    const lower_uid = try buildPaxRecord(allocator, "uid", "444");
+    defer allocator.free(lower_uid);
+    const lower_gid = try buildPaxRecord(allocator, "gid", "555");
+    defer allocator.free(lower_gid);
+    const lower_xattr = try buildPaxRecord(allocator, "SCHILY.xattr.user.lower", "preserve");
+    defer allocator.free(lower_xattr);
+    const lower_pax = try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ lower_uid, lower_gid, lower_xattr });
+    defer allocator.free(lower_pax);
+    const upper_uid = try buildPaxRecord(allocator, "uid", "0");
+    defer allocator.free(upper_uid);
+    const upper_xattr = try buildPaxRecord(allocator, "SCHILY.xattr.user.upper", "replace");
+    defer allocator.free(upper_xattr);
+    const upper_pax = try std.fmt.allocPrint(allocator, "{s}{s}", .{ upper_uid, upper_xattr });
+    defer allocator.free(upper_pax);
+
+    const lower = try buildTarArchive(allocator, &.{
+        .{ .path = "PaxHeaders/private", .mode = 0o644, .typeflag = 'x', .content = lower_pax, .link_name = null },
+        .{ .path = "private/", .mode = 0o700, .typeflag = '5', .content = "", .link_name = null },
+    });
+    defer allocator.free(lower);
+    const child_only_upper = try buildTarArchive(allocator, &.{
+        .{ .path = "private/child", .mode = 0o644, .typeflag = '0', .content = "child", .link_name = null },
+    });
+    defer allocator.free(child_only_upper);
+    const explicit_upper = try buildTarArchive(allocator, &.{
+        .{ .path = "PaxHeaders/private", .mode = 0o644, .typeflag = 'x', .content = upper_pax, .link_name = null },
+        .{ .path = "private/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
+    });
+    defer allocator.free(explicit_upper);
+
+    var map = StringHashMap(FileTree.Entry).init(allocator);
+    var map_owned = true;
+    defer if (map_owned) deinitEntryMap(&map, allocator);
+    try applyLayerBytes(allocator, &map, null, lower, .{});
+    try applyLayerBytes(allocator, &map, null, child_only_upper, .{});
+    const preserved = map.get("private").?;
+    try std.testing.expectEqual(@as(u32, 0o700), preserved.mode);
+    try std.testing.expectEqual(@as(u32, 444), preserved.uid);
+    try std.testing.expectEqual(@as(u32, 555), preserved.gid);
+    try std.testing.expectEqualStrings("user.lower", preserved.xattrs[0].name);
+
+    try applyLayerBytes(allocator, &map, null, explicit_upper, .{});
+    var tree = try finalizeTree(allocator, &map);
+    map_owned = false;
+    defer tree.deinit();
+    const replaced = tree.get("private").?;
+    try std.testing.expectEqual(@as(u32, 0o755), replaced.mode);
+    try std.testing.expectEqual(@as(u32, 0), replaced.uid);
+    try std.testing.expectEqual(@as(usize, 1), replaced.xattrs.len);
+    try std.testing.expectEqualStrings("user.upper", replaced.xattrs[0].name);
+    try std.testing.expectEqualStrings("child", tree.get("private/child").?.content);
+}
+
 const FixtureLayout = struct {
     layer1_tar: []u8,
     layer2_tar: []u8,
@@ -1253,22 +1304,13 @@ fn appendTarSpec(out: *std.Io.Writer.Allocating, spec: TarSpec) !void {
 }
 
 fn buildPaxRecord(allocator: Allocator, key: []const u8, value: []const u8) ![]u8 {
-    var record = try std.fmt.allocPrint(allocator, "0 {s}={s}\n", .{ key, value });
-    errdefer allocator.free(record);
+    var record_len: usize = 0;
     while (true) {
-        const digits = paxDecimalDigits(record.len);
-        const needed = digits + 1 + key.len + 1 + value.len + 1;
-        if (needed == record.len) return record;
+        const record = try std.fmt.allocPrint(allocator, "{d} {s}={s}\n", .{ record_len, key, value });
+        if (record.len == record_len) return record;
+        record_len = record.len;
         allocator.free(record);
-        record = try std.fmt.allocPrint(allocator, "{d} {s}={s}\n", .{ needed, key, value });
     }
-}
-
-fn paxDecimalDigits(value: usize) usize {
-    var n = value;
-    var digits: usize = 1;
-    while (n >= 10) : (n /= 10) digits += 1;
-    return digits;
 }
 
 fn gzipBytes(allocator: Allocator, data: []const u8) ![]u8 {

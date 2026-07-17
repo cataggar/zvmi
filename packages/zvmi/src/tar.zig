@@ -148,7 +148,7 @@ pub const Reader = struct {
         while (cursor < content.len) {
             const len_end = std.mem.indexOfScalarPos(u8, content, cursor, ' ') orelse return error.InvalidPaxRecord;
             const record_len = std.fmt.parseInt(usize, content[cursor..len_end], 10) catch return error.InvalidPaxRecord;
-            if (record_len == 0 or cursor + record_len > content.len) return error.InvalidPaxRecord;
+            if (record_len == 0 or record_len > content.len - cursor) return error.InvalidPaxRecord;
 
             const record = content[cursor .. cursor + record_len];
             if (record[record.len - 1] != '\n') return error.InvalidPaxRecord;
@@ -512,23 +512,13 @@ fn appendTarEntry(out: *std.Io.Writer.Allocating, spec: ReaderTarSpec) !void {
 }
 
 fn buildPaxRecord(allocator: std.mem.Allocator, key: []const u8, value: []const u8) ![]u8 {
-    var record = try std.fmt.allocPrint(allocator, "0 {s}={s}\n", .{ key, value });
-    errdefer allocator.free(record);
-
+    var record_len: usize = 0;
     while (true) {
-        const len_digits = countBase10(record.len);
-        const needed_len = len_digits + 1 + key.len + 1 + value.len + 1;
-        if (needed_len == record.len) return record;
+        const record = try std.fmt.allocPrint(allocator, "{d} {s}={s}\n", .{ record_len, key, value });
+        if (record.len == record_len) return record;
+        record_len = record.len;
         allocator.free(record);
-        record = try std.fmt.allocPrint(allocator, "{d} {s}={s}\n", .{ needed_len, key, value });
     }
-}
-
-fn countBase10(value: usize) usize {
-    var n = value;
-    var digits: usize = 1;
-    while (n >= 10) : (n /= 10) digits += 1;
-    return digits;
 }
 
 fn writeOctalField(field: []u8, value: u64) !void {
@@ -689,6 +679,24 @@ test "reader rejects PAX xattrs beyond the per-entry bound" {
 
     var reader = Reader.init(bytes);
     try std.testing.expectError(error.PaxXattrLimitExceeded, reader.next());
+}
+
+test "reader rejects overflowing PAX record lengths without panicking" {
+    const allocator = std.testing.allocator;
+    const bytes = try buildTar(allocator, &.{
+        .{
+            .path = "PaxHeaders/overflow",
+            .mode = 0o644,
+            .typeflag = 'x',
+            .content = "18446744073709551615 path=overflow\n",
+            .link_name = null,
+        },
+        .{ .path = "placeholder", .mode = 0o644, .typeflag = '0', .content = "payload", .link_name = null },
+    });
+    defer allocator.free(bytes);
+
+    var reader = Reader.init(bytes);
+    try std.testing.expectError(error.InvalidPaxRecord, reader.next());
 }
 
 test "writes a small USTAR archive" {
