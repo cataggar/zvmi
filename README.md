@@ -511,11 +511,13 @@ The OpenSSH/sudo package transaction is also reproducibly locked: each
 descriptor pins the Azure Linux base repository's `repomd.xml` SHA-256. The
 builder verifies the live metadata, populates an isolated per-build DNF
 cache/persist directory, verifies DNF's cached `repomd.xml`, and performs the
-transaction in cache-only mode. DNF then verifies RPM signatures and package
-payload checksums from that pinned metadata. The live metadata is fetched and
-verified again after the transaction; a repository change fails the build.
-The newly installed, sorted NEVRA closure is emitted and recorded under the
-builder work directory's `provenance/` directory.
+transaction with metadata expiration disabled globally and for
+`azurelinux-base`. That prevents metadata refresh while allowing DNF to
+download uncached RPM payloads. DNF then verifies RPM signatures and package
+payload checksums from that pinned metadata. The cached and live metadata are
+verified again after the transaction; a repository change fails the build. The
+newly installed, sorted NEVRA closure is emitted and recorded under the builder
+work directory's `provenance/` directory.
 
 The image boots directly through `UEFI -> EFI/BOOT/BOOTX64.EFI` (x86_64) or
 `EFI/BOOT/BOOTAA64.EFI` (AArch64) `-> UKI -> kernel/initramfs -> zvminit`; it

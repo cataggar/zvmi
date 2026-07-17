@@ -861,6 +861,55 @@ fn writeNevraProvenance(
     });
 }
 
+/// Install from an already verified DNF metadata cache. `metadata_expire=never`
+/// prevents a refresh while deliberately omitting `-C`: package payloads that
+/// are referenced by the cached primary metadata may still be downloaded.
+fn dnfInstallArgs(
+    rootfs_path: []const u8,
+    forcearch_opt: []const u8,
+    gpgkey_opt: []const u8,
+    baseurl_opt: []const u8,
+    metalink_opt: []const u8,
+    mirrorlist_opt: []const u8,
+    metadata_expire_all_opt: []const u8,
+    metadata_expire_repo_opt: []const u8,
+    keepcache_opt: []const u8,
+    gpgcheck_opt: []const u8,
+    cache_opt: []const u8,
+    persist_opt: []const u8,
+) [21][]const u8 {
+    return .{
+        "dnf",
+        "-y",
+        "--installroot",
+        rootfs_path,
+        "--releasever=4.0",
+        forcearch_opt,
+        "--repo=azurelinux-base",
+        gpgkey_opt,
+        baseurl_opt,
+        metalink_opt,
+        mirrorlist_opt,
+        metadata_expire_all_opt,
+        metadata_expire_repo_opt,
+        keepcache_opt,
+        gpgcheck_opt,
+        cache_opt,
+        persist_opt,
+        "--setopt=install_weak_deps=False",
+        "install",
+        "openssh-server",
+        "sudo",
+    };
+}
+
+fn argvContains(argv: []const []const u8, needle: []const u8) bool {
+    for (argv) |arg| {
+        if (std.mem.eql(u8, arg, needle)) return true;
+    }
+    return false;
+}
+
 /// Install packages, binaries, and configuration into the rootfs.
 fn installGuestContent(
     gpa: Allocator,
@@ -931,9 +980,9 @@ fn installGuestContent(
     defer gpa.free(forcearch_opt);
 
     // Resolve only against a new, private cache. First pin the live endpoint,
-    // then populate and verify DNF's copy before switching DNF to cache-only
-    // mode for the package transaction. RPM payload checksums from that pinned
-    // primary metadata and the configured RPM signing key remain enforced.
+    // then populate and verify DNF's copy. The installation keeps that metadata
+    // non-expiring while allowing payload downloads checked by the pinned
+    // primary metadata and configured RPM signing key.
     try verifyRemoteRepositoryMetadata(gpa, io, work_dir, architecture);
     var dnf_cache = try prepareDnfCache(gpa, io, work_dir, architecture);
     defer dnf_cache.deinit(gpa);
@@ -943,50 +992,54 @@ fn installGuestContent(
         .{architecture.repository_base_url},
     );
     defer gpa.free(baseurl_opt);
-    const metadata_expire_opt = "--setopt=azurelinux-base.metadata_expire=never";
+    const metadata_expire_all_opt = "--setopt=metadata_expire=never";
+    const metadata_expire_repo_opt = "--setopt=azurelinux-base.metadata_expire=never";
     const metalink_opt = "--setopt=azurelinux-base.metalink=";
     const mirrorlist_opt = "--setopt=azurelinux-base.mirrorlist=";
     const keepcache_opt = "--setopt=keepcache=True";
     const gpgcheck_opt = "--setopt=azurelinux-base.gpgcheck=True";
     try sudo(gpa, io, &.{
-        "dnf",                              "-y",
-        "--installroot",                    rootfs_path,
-        "--releasever=4.0",                 forcearch_opt,
-        "--repo=azurelinux-base",           gpgkey_opt,
-        baseurl_opt,                        metalink_opt,
-        mirrorlist_opt,                     metadata_expire_opt,
-        keepcache_opt,                      gpgcheck_opt,
-        dnf_cache.cache_opt,                dnf_cache.persist_opt,
-        "--setopt=install_weak_deps=False", "makecache",
+        "dnf",                    "-y",
+        "--installroot",          rootfs_path,
+        "--releasever=4.0",       forcearch_opt,
+        "--repo=azurelinux-base", gpgkey_opt,
+        baseurl_opt,              metalink_opt,
+        mirrorlist_opt,           metadata_expire_all_opt,
+        metadata_expire_repo_opt, keepcache_opt,
+        gpgcheck_opt,             dnf_cache.cache_opt,
+        dnf_cache.persist_opt,    "--setopt=install_weak_deps=False",
+        "makecache",
     });
     try verifyCachedRepositoryMetadata(gpa, io, dnf_cache.cache_dir, architecture);
 
     const installed_before = try captureInstalledNevras(gpa, io, rootfs_path);
     defer gpa.free(installed_before);
-    try sudo(gpa, io, &.{
-        "dnf",                 "-C",
-        "-y",                  "--installroot",
-        rootfs_path,           "--releasever=4.0",
-        forcearch_opt,         "--repo=azurelinux-base",
-        gpgkey_opt,            baseurl_opt,
-        metalink_opt,          mirrorlist_opt,
-        metadata_expire_opt,   keepcache_opt,
-        gpgcheck_opt,          dnf_cache.cache_opt,
-        dnf_cache.persist_opt, "--setopt=install_weak_deps=False",
-        "install",             "openssh-server",
-        "sudo",
-    });
+    const package_install_argv = dnfInstallArgs(
+        rootfs_path,
+        forcearch_opt,
+        gpgkey_opt,
+        baseurl_opt,
+        metalink_opt,
+        mirrorlist_opt,
+        metadata_expire_all_opt,
+        metadata_expire_repo_opt,
+        keepcache_opt,
+        gpgcheck_opt,
+        dnf_cache.cache_opt,
+        dnf_cache.persist_opt,
+    );
+    try sudo(gpa, io, &package_install_argv);
 
     // Install the pinned local RPM in a separate, repository-free transaction.
     try sudo(gpa, io, &.{
-        "dnf",                              "-C",
-        "-y",                               "--installroot",
-        rootfs_path,                        "--releasever=4.0",
-        forcearch_opt,                      dnf_cache.cache_opt,
-        dnf_cache.persist_opt,              "--disablerepo=*",
-        "--setopt=install_weak_deps=False", "install",
-        systemd_boot_rpm_path,
+        "dnf",               "-y",
+        "--installroot",     rootfs_path,
+        "--releasever=4.0",  forcearch_opt,
+        dnf_cache.cache_opt, dnf_cache.persist_opt,
+        "--disablerepo=*",   "--setopt=install_weak_deps=False",
+        "install",           systemd_boot_rpm_path,
     });
+    try verifyCachedRepositoryMetadata(gpa, io, dnf_cache.cache_dir, architecture);
     const installed_after = try captureInstalledNevras(gpa, io, rootfs_path);
     defer gpa.free(installed_after);
     const installed_closure = try formatInstalledNevraClosure(gpa, installed_before, installed_after);
@@ -995,8 +1048,8 @@ fn installGuestContent(
 
     // Re-fetch the moving endpoint before proceeding to OCI publication. A
     // changed repomd.xml means the package transaction is no longer provably
-    // reproducible, even though cache-only DNF prevented it from changing this
-    // transaction's resolved package set.
+    // reproducible, even though non-expiring cached metadata prevented it from
+    // changing this transaction's resolved package set.
     try verifyRemoteRepositoryMetadata(gpa, io, work_dir, architecture);
     try sudo(gpa, io, &.{ "rm", "-rf", "--", dnf_cache.cache_dir, dnf_cache.persist_dir });
 
@@ -2284,6 +2337,33 @@ test "repository metadata mismatch is rejected for both architectures" {
     const moving_metadata = "<repomd>different transaction</repomd>";
     try std.testing.expect(!repositoryMetadataMatches(moving_metadata, &x86_64));
     try std.testing.expect(!repositoryMetadataMatches(moving_metadata, &aarch64));
+}
+
+test "DNF install permits payload downloads without refreshing verified metadata" {
+    const argv = dnfInstallArgs(
+        "/target-root",
+        "--forcearch=x86_64",
+        "--setopt=azurelinux-base.gpgkey=file:///key",
+        "--setopt=azurelinux-base.baseurl=https://example.invalid/base",
+        "--setopt=azurelinux-base.metalink=",
+        "--setopt=azurelinux-base.mirrorlist=",
+        "--setopt=metadata_expire=never",
+        "--setopt=azurelinux-base.metadata_expire=never",
+        "--setopt=keepcache=True",
+        "--setopt=azurelinux-base.gpgcheck=True",
+        "--setopt=cachedir=/private/cache",
+        "--setopt=persistdir=/private/persist",
+    );
+    try std.testing.expect(!argvContains(&argv, "-C"));
+    try std.testing.expect(!argvContains(&argv, "--cacheonly"));
+    try std.testing.expect(argvContains(&argv, "--setopt=metadata_expire=never"));
+    try std.testing.expect(argvContains(&argv, "--setopt=azurelinux-base.metadata_expire=never"));
+    try std.testing.expect(argvContains(&argv, "--setopt=cachedir=/private/cache"));
+    try std.testing.expect(argvContains(&argv, "--setopt=persistdir=/private/persist"));
+    try std.testing.expect(argvContains(&argv, "--setopt=azurelinux-base.gpgcheck=True"));
+    try std.testing.expectEqualStrings("install", argv[18]);
+    try std.testing.expectEqualStrings("openssh-server", argv[19]);
+    try std.testing.expectEqualStrings("sudo", argv[20]);
 }
 
 test "installed NEVRA closure is deterministically sorted" {
