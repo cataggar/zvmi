@@ -265,7 +265,7 @@ fn parseStub(allocator: std.mem.Allocator, stub: []const u8) GenerateError!Parse
         const header = stub[section_table_offset + index * section_header_size ..][0..section_header_size];
         const raw_size = std.mem.readInt(u32, header[16..20], .little);
         const raw_offset = std.mem.readInt(u32, header[20..24], .little);
-        const raw_end = raw_offset + raw_size;
+        const raw_end = std.math.add(u32, raw_offset, raw_size) catch return error.InvalidSectionTable;
         if (raw_size != 0 and raw_end > stub.len) return error.InvalidSectionTable;
 
         section.* = .{
@@ -341,23 +341,54 @@ fn sumUninitializedDataSize(sections: []const PeSection) u32 {
     return total;
 }
 
-const ParsedSectionView = struct {
+/// A PE section view whose contents borrow the image passed to `inspect`.
+pub const SectionView = struct {
     name: [8]u8,
     contents: []const u8,
+
+    pub fn nameSlice(self: *const SectionView) []const u8 {
+        return trimSectionName(&self.name);
+    }
 };
 
-fn parseSectionsAlloc(allocator: std.mem.Allocator, image: []const u8) ![]ParsedSectionView {
+/// Read-only PE/COFF details and section contents from a UKI or stub image.
+/// Call `deinit` with the allocator used by `inspect`; section contents borrow
+/// the inspected image and must not outlive it.
+pub const Inspection = struct {
+    machine: u16,
+    subsystem: u16,
+    sections: []SectionView,
+
+    pub fn deinit(self: *Inspection, allocator: std.mem.Allocator) void {
+        allocator.free(self.sections);
+        self.* = undefined;
+    }
+
+    pub fn findSection(self: *const Inspection, name: []const u8) ?SectionView {
+        for (self.sections) |section| {
+            if (std.mem.eql(u8, section.nameSlice(), name)) return section;
+        }
+        return null;
+    }
+};
+
+/// Inspects a PE32+ UKI without copying its section payloads.
+pub fn inspect(allocator: std.mem.Allocator, image: []const u8) GenerateError!Inspection {
     const parsed = try parseStub(allocator, image);
     defer allocator.free(parsed.sections);
 
-    var sections = try allocator.alloc(ParsedSectionView, parsed.sections.len);
+    var sections = try allocator.alloc(SectionView, parsed.sections.len);
     for (parsed.sections, 0..) |section, index| {
         sections[index] = .{
             .name = section.name,
-            .contents = section.source[0..section.virtual_size],
+            .contents = section.source[0..@min(section.source.len, section.virtual_size)],
         };
     }
-    return sections;
+    return .{
+        .machine = parsed.machine,
+        .subsystem = parsed.subsystem,
+        .sections = sections,
+    };
 }
 
 fn trimSectionName(name: *const [8]u8) []const u8 {
@@ -392,16 +423,18 @@ test "generate builds a structurally valid UKI with systemd-stub sections" {
     const pe_offset = std.mem.readInt(u32, image[0x3C..0x40], .little);
     try std.testing.expectEqualStrings(pe_signature, image[pe_offset .. pe_offset + pe_signature.len]);
 
-    const sections = try parseSectionsAlloc(std.testing.allocator, image);
-    defer std.testing.allocator.free(sections);
+    var inspection = try inspect(std.testing.allocator, image);
+    defer inspection.deinit(std.testing.allocator);
 
-    try expectSectionContents(sections, ".text", "\xC3");
-    try expectSectionContents(sections, ".linux", linux);
-    try expectSectionContents(sections, ".initrd", initrd);
-    try expectSectionContents(sections, ".cmdline", cmdline);
-    try expectSectionContents(sections, ".osrel", os_release);
-    try expectSectionContents(sections, ".uname", uname);
-    try expectSectionContents(sections, ".splash", splash);
+    try std.testing.expectEqual(@as(u16, 0x8664), inspection.machine);
+    try std.testing.expectEqual(efi_subsystem_application, inspection.subsystem);
+    try expectSectionContents(&inspection, ".text", "\xC3");
+    try expectSectionContents(&inspection, ".linux", linux);
+    try expectSectionContents(&inspection, ".initrd", initrd);
+    try expectSectionContents(&inspection, ".cmdline", cmdline);
+    try expectSectionContents(&inspection, ".osrel", os_release);
+    try expectSectionContents(&inspection, ".uname", uname);
+    try expectSectionContents(&inspection, ".splash", splash);
 
     const parsed = try parseStub(std.testing.allocator, image);
     defer std.testing.allocator.free(parsed.sections);
@@ -418,13 +451,31 @@ test "generate builds a structurally valid UKI with systemd-stub sections" {
     try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, image[security_directory_offset + 4 ..][0..4], .little));
 }
 
-fn expectSectionContents(sections: []const ParsedSectionView, name: []const u8, expected: []const u8) !void {
-    for (sections) |section| {
-        if (!std.mem.eql(u8, trimSectionName(&section.name), name)) continue;
-        try std.testing.expectEqualSlices(u8, expected, section.contents);
-        return;
-    }
-    return error.TestUnexpectedResult;
+test "inspect rejects overflowing PE section bounds" {
+    const image = try makeTestStubPe(std.testing.allocator, 0x8664);
+    defer std.testing.allocator.free(image);
+
+    const pe_offset = std.mem.readInt(u32, image[0x3C..0x40], .little);
+    const file_header_offset = pe_offset + pe_signature.len;
+    const optional_header_size = std.mem.readInt(
+        u16,
+        image[file_header_offset + file_header_size_of_optional_header_offset ..][0..2],
+        .little,
+    );
+    const section_table_offset = file_header_offset + file_header_size + optional_header_size;
+    const section = image[section_table_offset..][0..section_header_size];
+    std.mem.writeInt(u32, section[16..20], 1, .little);
+    std.mem.writeInt(u32, section[20..24], std.math.maxInt(u32), .little);
+
+    try std.testing.expectError(
+        error.InvalidSectionTable,
+        inspect(std.testing.allocator, image),
+    );
+}
+
+fn expectSectionContents(inspection: *const Inspection, name: []const u8, expected: []const u8) !void {
+    const section = inspection.findSection(name) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, expected, section.contents);
 }
 
 fn makeTestStubPe(allocator: std.mem.Allocator, machine: u16) ![]u8 {
