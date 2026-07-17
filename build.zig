@@ -2,6 +2,11 @@ const std = @import("std");
 
 const image_build = @import("build/image.zig");
 
+const AzureLinuxArchitecture = enum {
+    x86_64,
+    aarch64,
+};
+
 pub const ImageFormat = image_build.Format;
 pub const ImageGeneration = image_build.Generation;
 pub const ImageBootMode = image_build.BootMode;
@@ -25,6 +30,11 @@ pub const addPreservedImage = image_build.addPreserved;
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const azurelinux_architecture = b.option(
+        AzureLinuxArchitecture,
+        "azurelinux-arch",
+        "Azure Linux core guest architecture: x86_64 (default) or aarch64",
+    ) orelse .x86_64;
 
     // ---- packages/zvmi: the core disk-image library ----
     const zvmi_mod = b.addModule("zvmi", .{
@@ -407,15 +417,14 @@ pub fn build(b: *std.Build) void {
     const qcow2_exe_tests = b.addTest(.{ .root_module = qcow2_exe.root_module });
     const run_qcow2_exe_tests = b.addRunArtifact(qcow2_exe_tests);
 
-    // ---- zvminit: standalone minimal PID 1 for real-boot testing of
-    // --skip-iso-rootfs images ----
-    // zvminit always runs as PID 1 inside an x86_64 Azure Linux guest, so
-    // unlike the rest of this repo it hardcodes its target rather than
-    // using `target`/`optimize` above. Static linking keeps it fully
-    // self-contained: no libc, no kmod, no other runtime dependency needs
-    // to be present in the guest's root filesystem.
+    // ---- zvminit: standalone minimal PID 1 for generalized Azure Linux
+    // core images. Its guest target follows -Dazurelinux-arch, while the
+    // ordinary CLI, builder, and preload library remain host-native. ----
     const zvminit_target = b.resolveTargetQuery(.{
-        .cpu_arch = .x86_64,
+        .cpu_arch = switch (azurelinux_architecture) {
+            .x86_64 => .x86_64,
+            .aarch64 => .aarch64,
+        },
         .os_tag = .linux,
     });
     const zvminit_cdrom_mod = b.createModule(.{
@@ -501,7 +510,8 @@ pub fn build(b: *std.Build) void {
     if (b.graph.host.result.os.tag == .linux) {
 
         // Guest-targeted azagent for embedding in the generalized image.
-        // Must be x86_64-linux (static) and ReleaseSmall, matching zvminit.
+        // It follows -Dazurelinux-arch and is static/ReleaseSmall, matching
+        // zvminit.
         const zvmi_guest_mod = b.createModule(.{
             .root_source_file = b.path("packages/zvmi/src/root.zig"),
             .target = zvminit_target,
@@ -557,12 +567,26 @@ pub fn build(b: *std.Build) void {
         });
         b.installArtifact(builder_exe);
 
+        // Compile the complete selected-guest artifact set without executing
+        // the privileged image pipeline. This is also useful on an x86_64
+        // development host to verify the AArch64 cross-build graph.
+        const generalized_check_step = b.step(
+            "check-generalized-azurelinux4",
+            "Compile the selected Azure Linux core builder and guest artifacts",
+        );
+        generalized_check_step.dependOn(&builder_exe.step);
+        generalized_check_step.dependOn(&zvminit_exe.step);
+        generalized_check_step.dependOn(&azagent_guest_exe.step);
+        generalized_check_step.dependOn(&zstd_preload_lib.step);
+
         // `zig build generalized-azurelinux4 -- [--iso ...] [--output ...] ...`
         // Automatically passes the paths of the just-built native zvmi, guest
         // zvminit/azagent, and the preload library so the builder does not need to
         // invoke `zig build` itself.
         const run_builder = b.addRunArtifact(builder_exe);
         run_builder.step.dependOn(b.getInstallStep());
+        run_builder.addArg("--architecture");
+        run_builder.addArg(@tagName(azurelinux_architecture));
         run_builder.addArg("--zvmi");
         run_builder.addArtifactArg(cli_exe);
         run_builder.addArg("--zvminit");
@@ -586,6 +610,7 @@ pub fn build(b: *std.Build) void {
         const builder_test_step = b.step("test-generalized-azurelinux4", "Run build_generalized_azurelinux4 unit tests");
         builder_test_step.dependOn(&run_builder_tests.step);
         test_step.dependOn(&run_builder_tests.step);
+        test_step.dependOn(generalized_check_step);
 
         const freebsd_builder_mod = b.createModule(.{
             .root_source_file = b.path("scripts/build_generalized_freebsd15_aarch64.zig"),

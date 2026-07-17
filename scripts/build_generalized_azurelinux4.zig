@@ -6,15 +6,16 @@
 //! binary does not invoke `zig build` internally.
 //!
 //! CLI arguments accepted:
-//!   --iso <path>        Azure Linux 4 x86_64 ISO (downloaded if omitted)
-//!   --output <path>     Output QCOW2 path (default: zvmi-azurelinux4-generalized.qcow2)
+//!   --architecture <arch> Azure Linux guest architecture (injected by build.zig)
+//!   --iso <path>        Architecture-matched Azure Linux 4 ISO (downloaded if omitted)
+//!   --output <path>     Output QCOW2 path (architecture-specific default)
 //!   --size <size>       Disk size (default: 1184M)
-//!   --work-dir <dir>    Working directory (default: .scratch/generalized-azurelinux4)
+//!   --work-dir <dir>    Working directory (architecture-specific default)
 //!
 //! Arguments injected automatically by build.zig:
 //!   --zvmi <path>       Built native zvmi executable
-//!   --zvminit <path>    Built x86_64-linux zvminit binary
-//!   --azagent <path>    Built x86_64-linux azagent binary
+//!   --zvminit <path>    Built guest zvminit binary
+//!   --azagent <path>    Built guest azagent binary
 //!   --preload <path>    Built zstd_max_preload.so shared library
 
 const std = @import("std");
@@ -33,14 +34,113 @@ const linux = std.os.linux;
 const base_image = "azurelinux-beta/base/core";
 const base_tag = "4.0";
 const mcr_base = "https://mcr.microsoft.com/v2";
-const iso_url = "https://aka.ms/azurelinux-4.0-x86_64.iso";
-const iso_checksum_url = "https://aka.ms/azurelinux-4.0-x86_64-iso-checksum";
-const iso_name = "AzureLinux-4.0-x86_64.iso";
-const systemd_boot_unsigned_rpm_name = "systemd-boot-unsigned-258.4-4.azl4.x86_64.rpm";
-const systemd_boot_unsigned_rpm_url = "https://packages.microsoft.com/azurelinux/4.0/beta/base/x86_64/Packages/s/" ++ systemd_boot_unsigned_rpm_name;
-const systemd_boot_unsigned_rpm_sha256 = "85dd3ac0c532bceb09fc0a85c6568c51fc4ee84e0c478d1302b7a2d84e1bea5c";
+const AzureLinuxArchitecture = zvmi.bootconfig.Architecture;
+
+/// All target-dependent Azure Linux core-image inputs and output conventions.
+/// Keeping them together prevents a guest architecture from being selected in
+/// one stage while another stage silently retains x86_64 defaults.
+const ArchitectureDescriptor = struct {
+    architecture: AzureLinuxArchitecture,
+    target_cpu: std.Target.Cpu.Arch,
+    oci_architecture: []const u8,
+    dnf_architecture: []const u8,
+    iso_url: []const u8,
+    iso_name: []const u8,
+    iso_sha256: []const u8,
+    base_manifest_digest: []const u8,
+    signing_key_path: []const u8,
+    systemd_boot_rpm_name: []const u8,
+    systemd_boot_rpm_url: []const u8,
+    systemd_boot_rpm_sha256: []const u8,
+    systemd_boot_stub_path: []const u8,
+    fallback_efi_path: []const u8,
+    uki_pe_machine: u16,
+    root_role: zvmi.layout.PartitionRole,
+    root_type_guid: zvmi.guid.Guid,
+    serial_console: []const u8,
+    extra_kernel_options: []const u8,
+    binfmt_registration_name: []const u8,
+    binfmt_registration_path: [:0]const u8,
+    binfmt_static_name: []const u8,
+    elf_file_marker: []const u8,
+    default_output_path: []const u8,
+    default_work_dir: []const u8,
+};
+
+const x86_64 = ArchitectureDescriptor{
+    .architecture = .x86_64,
+    .target_cpu = .x86_64,
+    .oci_architecture = "amd64",
+    .dnf_architecture = "x86_64",
+    .iso_url = "https://aka.ms/azurelinux-4.0-x86_64.iso",
+    .iso_name = "AzureLinux-4.0-x86_64.iso",
+    // Official Azure Linux checksum resolved from the aka.ms endpoint on
+    // 2026-07-17. Pinning it prevents a moving endpoint changing the recipe.
+    .iso_sha256 = "d98f7d1ffaa916de7c9f66ffdadb150c174da691509e760835709ffa7829ca48",
+    .base_manifest_digest = "sha256:9070b05147f01e5a4bac47723c95f2555e11b9d3324c1df1910ff3545b7ce319",
+    .signing_key_path = "etc/pki/rpm-gpg/RPM-GPG-KEY-azurelinux-4.0-x86_64",
+    .systemd_boot_rpm_name = "systemd-boot-unsigned-258.4-4.azl4.x86_64.rpm",
+    .systemd_boot_rpm_url = "https://packages.microsoft.com/azurelinux/4.0/beta/base/x86_64/Packages/s/systemd-boot-unsigned-258.4-4.azl4.x86_64.rpm",
+    .systemd_boot_rpm_sha256 = "85dd3ac0c532bceb09fc0a85c6568c51fc4ee84e0c478d1302b7a2d84e1bea5c",
+    .systemd_boot_stub_path = "usr/lib/systemd/boot/efi/linuxx64.efi.stub",
+    .fallback_efi_path = "EFI/BOOT/BOOTX64.EFI",
+    .uki_pe_machine = 0x8664,
+    .root_role = .root_x86_64,
+    .root_type_guid = zvmi.guid.linux_root_x86_64,
+    .serial_console = "console=ttyS0,115200n8",
+    .extra_kernel_options = "init=/sbin/zvminit zvminit.mode=persistent zvminit.azure=auto console=tty0 console=ttyS0,115200n8",
+    .binfmt_registration_name = "qemu-x86_64",
+    .binfmt_registration_path = "/proc/sys/fs/binfmt_misc/qemu-x86_64",
+    .binfmt_static_name = "qemu-x86_64-static",
+    .elf_file_marker = "x86-64",
+    .default_output_path = "AzureLinux-4.0-x86_64.core.qcow2",
+    .default_work_dir = ".scratch/azurelinux4-core-x86_64",
+};
+
+const aarch64 = ArchitectureDescriptor{
+    .architecture = .aarch64,
+    .target_cpu = .aarch64,
+    .oci_architecture = "arm64",
+    .dnf_architecture = "aarch64",
+    .iso_url = "https://aka.ms/azurelinux-4.0-aarch64.iso",
+    .iso_name = "AzureLinux-4.0-aarch64.iso",
+    // Official Azure Linux checksum resolved from the aka.ms endpoint on
+    // 2026-07-17. Pinning it prevents a moving endpoint changing the recipe.
+    .iso_sha256 = "762039fde64a59806750ee86ca98132fad4f9df02e7684490017cdfda0c55157",
+    .base_manifest_digest = "sha256:e541db83a8511c25fa1dd989161263874b7395ddd588f5caaa25453ea4e23263",
+    .signing_key_path = "etc/pki/rpm-gpg/RPM-GPG-KEY-azurelinux-4.0-aarch64",
+    .systemd_boot_rpm_name = "systemd-boot-unsigned-258.4-4.azl4.aarch64.rpm",
+    .systemd_boot_rpm_url = "https://packages.microsoft.com/azurelinux/4.0/beta/base/aarch64/Packages/s/systemd-boot-unsigned-258.4-4.azl4.aarch64.rpm",
+    .systemd_boot_rpm_sha256 = "65aefdef9bc55f71f43c18b738fc1a61eeedd9fea7d803f0b0b06467fb748991",
+    .systemd_boot_stub_path = "usr/lib/systemd/boot/efi/linuxaa64.efi.stub",
+    .fallback_efi_path = "EFI/BOOT/BOOTAA64.EFI",
+    .uki_pe_machine = 0xaa64,
+    .root_role = .root_aarch64,
+    .root_type_guid = zvmi.guid.linux_root_aarch64,
+    .serial_console = "console=ttyAMA0,115200n8",
+    .extra_kernel_options = "init=/sbin/zvminit zvminit.mode=persistent zvminit.azure=auto console=tty0 console=ttyAMA0,115200n8",
+    .binfmt_registration_name = "qemu-aarch64",
+    .binfmt_registration_path = "/proc/sys/fs/binfmt_misc/qemu-aarch64",
+    .binfmt_static_name = "qemu-aarch64-static",
+    .elf_file_marker = "aarch64",
+    .default_output_path = "AzureLinux-4.0-aarch64.core.qcow2",
+    .default_work_dir = ".scratch/azurelinux4-core-aarch64",
+};
+
+fn architectureDescriptor(architecture: AzureLinuxArchitecture) *const ArchitectureDescriptor {
+    return switch (architecture) {
+        .x86_64 => &x86_64,
+        .aarch64 => &aarch64,
+    };
+}
+
+fn requireArchitecture(
+    architecture: ?AzureLinuxArchitecture,
+) error{MissingArchitecture}!*const ArchitectureDescriptor {
+    return architectureDescriptor(architecture orelse return error.MissingArchitecture);
+}
+
 const systemd_boot_unsigned_rpm_max_bytes: u64 = 16 * 1024 * 1024;
-const systemd_boot_stub_path = "usr/lib/systemd/boot/efi/linuxx64.efi.stub";
 const oci_manifest_type = "application/vnd.oci.image.manifest.v1+json";
 const oci_index_type = "application/vnd.oci.image.index.v1+json";
 const docker_manifest_type = "application/vnd.docker.distribution.manifest.v2+json";
@@ -50,13 +150,11 @@ const iso_max_bytes: u64 = 2 * 1024 * 1024 * 1024;
 const accept_header = oci_index_type ++ ", " ++ docker_index_type ++ ", " ++ oci_manifest_type ++ ", " ++ docker_manifest_type;
 const generalized_esp_size_bytes: u64 = 512 * 1024 * 1024;
 const generalized_esp_size_arg = "512M";
-const generalized_extra_kernel_options = "init=/sbin/zvminit zvminit.mode=persistent zvminit.azure=auto console=tty0 console=ttyS0,115200n8";
 const required_rootfs_files = [_][]const u8{
     "usr/bin/bash",
     "usr/bin/azagent",
     "usr/bin/zvminit",
     "usr/bin/sshd",
-    systemd_boot_stub_path,
 };
 const zvminit_symlink_paths = [_][]const u8{
     "usr/bin/init",
@@ -161,8 +259,12 @@ fn sha256File(io: Io, path: []const u8) ![64]u8 {
     );
 }
 
-fn systemdBootRpmCachePath(gpa: Allocator, work_dir: []const u8) ![]u8 {
-    return std.fmt.allocPrint(gpa, "{s}/downloads/{s}", .{ work_dir, systemd_boot_unsigned_rpm_name });
+fn systemdBootRpmCachePath(
+    gpa: Allocator,
+    work_dir: []const u8,
+    architecture: *const ArchitectureDescriptor,
+) ![]u8 {
+    return std.fmt.allocPrint(gpa, "{s}/downloads/{s}", .{ work_dir, architecture.systemd_boot_rpm_name });
 }
 
 fn isRegularNonemptyFile(kind: Io.File.Kind, size: u64) bool {
@@ -199,19 +301,20 @@ pub fn parseDigestHex(digest: []const u8) error{InvalidDigest}![]const u8 {
 
 // ─── OCI manifest resolution ─────────────────────────────────────────────────
 
-/// Walk the parsed JSON index and return an owned copy of the linux/amd64
-/// manifest digest string, or error.NoLinuxAmd64Manifest.
-pub fn selectLinuxAmd64Manifest(
+/// Walk the parsed JSON index and return an owned copy of the requested Linux
+/// platform manifest digest.
+pub fn selectLinuxManifest(
     gpa: Allocator,
     index_doc: std.json.Value,
+    oci_architecture: []const u8,
 ) ![]u8 {
     const manifests_val = switch (index_doc) {
-        .object => |obj| obj.get("manifests") orelse return error.NoLinuxAmd64Manifest,
-        else => return error.NoLinuxAmd64Manifest,
+        .object => |obj| obj.get("manifests") orelse return error.NoLinuxArchitectureManifest,
+        else => return error.NoLinuxArchitectureManifest,
     };
     const items = switch (manifests_val) {
         .array => |a| a.items,
-        else => return error.NoLinuxAmd64Manifest,
+        else => return error.NoLinuxArchitectureManifest,
     };
     for (items) |item| {
         const obj = switch (item) {
@@ -231,14 +334,14 @@ pub fn selectLinuxAmd64Manifest(
             else => continue,
         };
         if (!std.mem.eql(u8, os_str, "linux")) continue;
-        if (!std.mem.eql(u8, arch_str, "amd64")) continue;
+        if (!std.mem.eql(u8, arch_str, oci_architecture)) continue;
         const dig = switch (obj.get("digest") orelse continue) {
             .string => |s| s,
             else => continue,
         };
         return gpa.dupe(u8, dig);
     }
-    return error.NoLinuxAmd64Manifest;
+    return error.NoLinuxArchitectureManifest;
 }
 
 /// Fetch `url` with optional `Accept:` header via curl.
@@ -252,13 +355,15 @@ fn fetchBytes(gpa: Allocator, io: Io, url: []const u8, accept: ?[]const u8) ![]u
     return capture(gpa, io, &.{ "curl", "-fsSL", url });
 }
 
-/// Resolve `repository:reference` on MCR, following index → linux/amd64 if needed.
+/// Resolve `repository:reference` on MCR, following an index to the requested
+/// Linux architecture if needed.
 /// Returns manifest JSON bytes and the manifest's sha256 digest (both caller-owned).
 fn resolveManifest(
     gpa: Allocator,
     io: Io,
     repository: []const u8,
     reference: []const u8,
+    architecture: *const ArchitectureDescriptor,
 ) !struct { bytes: []u8, digest: []u8 } {
     const url = try std.fmt.allocPrint(gpa, "{s}/{s}/manifests/{s}", .{ mcr_base, repository, reference });
     defer gpa.free(url);
@@ -288,8 +393,8 @@ fn resolveManifest(
         return .{ .bytes = manifest_bytes, .digest = digest };
     }
 
-    // It's an index — find and fetch the linux/amd64 manifest.
-    const platform_digest = try selectLinuxAmd64Manifest(gpa, parsed.value);
+    // It's an index — find and fetch the requested Linux platform manifest.
+    const platform_digest = try selectLinuxManifest(gpa, parsed.value, architecture.oci_architecture);
     defer gpa.free(platform_digest);
 
     const m_url = try std.fmt.allocPrint(gpa, "{s}/{s}/manifests/{s}", .{ mcr_base, repository, platform_digest });
@@ -363,13 +468,18 @@ fn downloadBlob(
 }
 
 /// Acquire the pinned systemd UKI stub RPM in the work-directory cache.
-fn acquireSystemdBootRpm(gpa: Allocator, io: Io, work_dir: []const u8) ![:0]u8 {
-    const cache_path = try systemdBootRpmCachePath(gpa, work_dir);
+fn acquireSystemdBootRpm(
+    gpa: Allocator,
+    io: Io,
+    work_dir: []const u8,
+    architecture: *const ArchitectureDescriptor,
+) ![:0]u8 {
+    const cache_path = try systemdBootRpmCachePath(gpa, work_dir, architecture);
     defer gpa.free(cache_path);
     const cache_dir = std.fs.path.dirname(cache_path) orelse return error.InvalidCachePath;
     try Dir.cwd().createDirPath(io, cache_dir);
 
-    const expected_digest = artifact_pipeline.parseSha256(systemd_boot_unsigned_rpm_sha256) catch
+    const expected_digest = artifact_pipeline.parseSha256(architecture.systemd_boot_rpm_sha256) catch
         return error.InvalidSystemdBootRpmChecksum;
     var curl = artifact_pipeline.CurlDownloader{
         .executable_path = "curl",
@@ -378,7 +488,7 @@ fn acquireSystemdBootRpm(gpa: Allocator, io: Io, work_dir: []const u8) ![:0]u8 {
         gpa,
         io,
         .{
-            .url = systemd_boot_unsigned_rpm_url,
+            .url = architecture.systemd_boot_rpm_url,
             .destination_path = cache_path,
             .expected_sha256 = expected_digest,
             .max_size = systemd_boot_unsigned_rpm_max_bytes,
@@ -442,11 +552,19 @@ fn pullRootfs(
     io: Io,
     work_dir: []const u8,
     rootfs_path: []const u8,
+    architecture: *const ArchitectureDescriptor,
 ) ![]u8 {
     std.debug.print("Resolving mcr.microsoft.com/{s}:{s}...\n", .{ base_image, base_tag });
-    const manifest = try resolveManifest(gpa, io, base_image, base_tag);
+    const manifest = try resolveManifest(gpa, io, base_image, base_tag, architecture);
     defer gpa.free(manifest.bytes);
     std.debug.print("Resolved to {s}\n", .{manifest.digest});
+    if (!std.mem.eql(u8, manifest.digest, architecture.base_manifest_digest)) {
+        std.debug.print(
+            "error: {s} {s} manifest changed: expected {s}, got {s}\n",
+            .{ architecture.oci_architecture, base_tag, architecture.base_manifest_digest, manifest.digest },
+        );
+        return error.BaseManifestDigestMismatch;
+    }
 
     if (Dir.cwd().statFile(io, rootfs_path, .{})) |_| {
         try sudo(gpa, io, &.{ "rm", "-rf", "--", rootfs_path });
@@ -520,21 +638,26 @@ fn installGuestContent(
     zvminit_path: []const u8,
     azagent_path: []const u8,
     systemd_boot_rpm_path: []const u8,
+    architecture: *const ArchitectureDescriptor,
 ) !void {
-    // On non-x86_64 hosts, set up binfmt qemu interpreter inside the rootfs.
-    const is_x86_64 = builtin.target.cpu.arch == .x86_64;
+    // On a non-native builder, put the registered static interpreter in the
+    // target root just for RPM scriptlets, then remove it before layering.
+    const target_is_native = builtin.target.cpu.arch == architecture.target_cpu;
     var binfmt_interpreter: ?[]u8 = null;
     defer if (binfmt_interpreter) |b| gpa.free(b);
 
-    if (!is_x86_64) {
-        const reg = readPseudoFile(gpa, "/proc/sys/fs/binfmt_misc/qemu-x86_64") catch |err| {
-            std.debug.print("error: x86_64 binfmt not available ({s}); install qemu-user-static-x86\n", .{@errorName(err)});
+    if (!target_is_native) {
+        const reg = readPseudoFile(gpa, architecture.binfmt_registration_path) catch |err| {
+            std.debug.print(
+                "error: {s} binfmt not available ({s}); install {s}\n",
+                .{ architecture.binfmt_registration_name, @errorName(err), architecture.binfmt_static_name },
+            );
             return error.BinfmtMissing;
         };
         defer gpa.free(reg);
         var reg_lines = std.mem.splitScalar(u8, reg, '\n');
         if (!std.mem.eql(u8, reg_lines.next() orelse "", "enabled")) {
-            std.debug.print("error: qemu-x86_64 binfmt registration is disabled\n", .{});
+            std.debug.print("error: {s} binfmt registration is disabled\n", .{architecture.binfmt_registration_name});
             return error.BinfmtDisabled;
         }
         var interp_path: ?[]const u8 = null;
@@ -550,7 +673,7 @@ fn installGuestContent(
         };
         binfmt_interpreter = try gpa.dupe(u8, interp);
 
-        const qemu_static_bytes = try capture(gpa, io, &.{ "which", "qemu-x86_64-static" });
+        const qemu_static_bytes = try capture(gpa, io, &.{ "which", architecture.binfmt_static_name });
         defer gpa.free(qemu_static_bytes);
         const qemu_static = std.mem.trimEnd(u8, qemu_static_bytes, "\n\r ");
         const interp_rel = std.mem.trimStart(u8, interp, "/");
@@ -560,18 +683,24 @@ fn installGuestContent(
     }
 
     // Copy RPM signing key to host so dnf can verify it from outside the chroot.
-    const signing_key_guest = try std.fmt.allocPrint(gpa, "{s}/etc/pki/rpm-gpg/RPM-GPG-KEY-azurelinux-4.0-x86_64", .{rootfs_path});
+    const signing_key_guest = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ rootfs_path, architecture.signing_key_path });
     defer gpa.free(signing_key_guest);
-    const host_key = try std.fmt.allocPrint(gpa, "{s}/RPM-GPG-KEY-azurelinux-4.0-x86_64", .{work_dir});
+    const host_key = try std.fmt.allocPrint(
+        gpa,
+        "{s}/{s}",
+        .{ work_dir, std.fs.path.basename(architecture.signing_key_path) },
+    );
     defer gpa.free(host_key);
     try sudo(gpa, io, &.{ "install", "-m", "0644", signing_key_guest, host_key });
 
     const gpgkey_opt = try std.fmt.allocPrint(gpa, "--setopt=azurelinux-base.gpgkey=file://{s}", .{host_key});
     defer gpa.free(gpgkey_opt);
+    const forcearch_opt = try std.fmt.allocPrint(gpa, "--forcearch={s}", .{architecture.dnf_architecture});
+    defer gpa.free(forcearch_opt);
     try sudo(gpa, io, &.{
         "dnf",                              "-y",
         "--installroot",                    rootfs_path,
-        "--releasever=4.0",                 "--forcearch=x86_64",
+        "--releasever=4.0",                 forcearch_opt,
         "--repo=azurelinux-base",           gpgkey_opt,
         "--setopt=install_weak_deps=False", "install",
         "openssh-server",                   "sudo",
@@ -581,11 +710,11 @@ fn installGuestContent(
     try sudo(gpa, io, &.{
         "dnf",              "-y",
         "--installroot",    rootfs_path,
-        "--releasever=4.0", "--forcearch=x86_64",
+        "--releasever=4.0", forcearch_opt,
         "--disablerepo=*",  "--setopt=install_weak_deps=False",
         "install",          systemd_boot_rpm_path,
     });
-    const stub_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ rootfs_path, systemd_boot_stub_path });
+    const stub_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ rootfs_path, architecture.systemd_boot_stub_path });
     defer gpa.free(stub_path);
     const stub_stat = try Dir.cwd().statFile(io, stub_path, .{ .follow_symlinks = false });
     if (!isRegularNonemptyFile(stub_stat.kind, stub_stat.size)) {
@@ -658,8 +787,8 @@ fn installGuestContent(
 
     // Clean dnf caches.
     try sudo(gpa, io, &.{
-        "dnf",                "--installroot",          rootfs_path, "--releasever=4.0",
-        "--forcearch=x86_64", "--repo=azurelinux-base", "clean",     "all",
+        "dnf",         "--installroot",          rootfs_path, "--releasever=4.0",
+        forcearch_opt, "--repo=azurelinux-base", "clean",     "all",
     });
     const dnf_cache = try std.fmt.allocPrint(gpa, "{s}/var/cache/dnf", .{rootfs_path});
     defer gpa.free(dnf_cache);
@@ -805,6 +934,7 @@ fn createOciLayout(
     work_dir: []const u8,
     rootfs_path: []const u8,
     base_digest: []const u8,
+    architecture: *const ArchitectureDescriptor,
 ) ![]u8 {
     const layout_dir = try std.fmt.allocPrint(gpa, "{s}/oci-generalized", .{work_dir});
 
@@ -894,7 +1024,7 @@ fn createOciLayout(
 
     // Config JSON.
     const config = .{
-        .architecture = @as([]const u8, "amd64"),
+        .architecture = architecture.oci_architecture,
         .config = .{
             .Entrypoint = &[_][]const u8{"/sbin/zvminit"},
             .Env = &[_][]const u8{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
@@ -1026,10 +1156,33 @@ fn validateOsRelease(image: anytype) !void {
     }
 }
 
-fn validateGeneralizedOciLayout(gpa: Allocator, io: Io, layout_dir: []const u8) !void {
+fn ociConfigArchitectureMatches(
+    config_architecture: ?[]const u8,
+    architecture: *const ArchitectureDescriptor,
+) bool {
+    return if (config_architecture) |value|
+        std.mem.eql(u8, value, architecture.oci_architecture)
+    else
+        false;
+}
+
+fn validateGeneralizedOciLayout(
+    gpa: Allocator,
+    io: Io,
+    layout_dir: []const u8,
+    architecture: *const ArchitectureDescriptor,
+) !void {
     var image = try oci.loadLayout(io, gpa, layout_dir, .{});
     defer image.deinit();
 
+    const config_architecture = image.config.architecture orelse return error.MissingOciArchitecture;
+    if (!ociConfigArchitectureMatches(config_architecture, architecture)) {
+        std.debug.print(
+            "error: generated OCI config has architecture {s}, expected {s}\n",
+            .{ config_architecture, architecture.oci_architecture },
+        );
+        return error.UnexpectedOciArchitecture;
+    }
     try validateOsRelease(image);
 
     // Azure Linux uses merged-/usr symlinks, so OCI records these physical paths.
@@ -1043,6 +1196,14 @@ fn validateGeneralizedOciLayout(gpa: Allocator, io: Io, layout_dir: []const u8) 
             return error.IncompleteOciRootfs;
         }
     }
+    const stub = image.get(architecture.systemd_boot_stub_path) orelse {
+        std.debug.print(
+            "error: generated OCI layout is missing required UKI stub: /{s}\n",
+            .{architecture.systemd_boot_stub_path},
+        );
+        return error.IncompleteOciRootfs;
+    };
+    if (stub.kind != .file) return error.IncompleteOciRootfs;
     for (zvminit_symlink_paths) |path| {
         const entry = image.get(path) orelse {
             std.debug.print("error: generated OCI layout is missing required zvminit symlink: /{s}\n", .{path});
@@ -1062,10 +1223,19 @@ const GeneralizedImageValidationReport = struct {
     uki_size: usize,
 };
 
-fn planGeneralizedGen2Layout(gpa: Allocator, virtual_size: u64) ![]zvmi.layout.PlannedPartition {
+fn planGeneralizedGen2Layout(
+    gpa: Allocator,
+    virtual_size: u64,
+    architecture: *const ArchitectureDescriptor,
+) ![]zvmi.layout.PlannedPartition {
     const requests = [_]zvmi.layout.PartitionRequest{
         .{ .name = "ESP", .role = .esp, .size = .{ .fixed = generalized_esp_size_bytes } },
-        .{ .name = "root", .role = .root_x86_64, .size = .{ .percent = 100.0 } },
+        .{
+            .name = "root",
+            .role = architecture.root_role,
+            .size = .{ .percent = 100.0 },
+            .type_guid = architecture.root_type_guid,
+        },
     };
     return zvmi.layout.planLayout(gpa, virtual_size, &requests, null);
 }
@@ -1126,12 +1296,16 @@ fn requireNoGeneratedGrubConfigs(esp: *zvmi.fat32.FileSystem, gpa: Allocator, io
     }
 }
 
-fn expectedUkiCmdline(gpa: Allocator, root_guid: zvmi.guid.Guid) ![]u8 {
+fn expectedUkiCmdline(
+    gpa: Allocator,
+    root_guid: zvmi.guid.Guid,
+    architecture: *const ArchitectureDescriptor,
+) ![]u8 {
     var root_guid_text: [36]u8 = undefined;
     return std.fmt.allocPrint(
         gpa,
         "root=PARTUUID={s} {s}",
-        .{ zvmi.guid.formatLower(&root_guid_text, root_guid), generalized_extra_kernel_options },
+        .{ zvmi.guid.formatLower(&root_guid_text, root_guid), architecture.extra_kernel_options },
     );
 }
 
@@ -1146,12 +1320,13 @@ fn validateGeneralizedImage(
     io: Io,
     image_path: []const u8,
     expected_virtual_size: u64,
+    architecture: *const ArchitectureDescriptor,
 ) !GeneralizedImageValidationReport {
     var image = try zvmi.Image.openPathReadOnly(io, image_path);
     defer image.close(io);
     if (image.virtual_size != expected_virtual_size) return error.UnexpectedVirtualSize;
 
-    const expected_layout = try planGeneralizedGen2Layout(gpa, image.virtual_size);
+    const expected_layout = try planGeneralizedGen2Layout(gpa, image.virtual_size, architecture);
     defer gpa.free(expected_layout);
     const parsed = try zvmi.gpt.readGpt(image, io, gpa);
     defer gpa.free(parsed.partitions);
@@ -1167,7 +1342,7 @@ fn validateGeneralizedImage(
         .length = (esp_partition.last_lba - esp_partition.first_lba + 1) * zvmi.gpt.sector_size,
     });
 
-    const fallback_uki = try esp.readFileAlloc(io, gpa, "EFI/BOOT/BOOTX64.EFI");
+    const fallback_uki = try esp.readFileAlloc(io, gpa, architecture.fallback_efi_path);
     defer gpa.free(fallback_uki);
     const linux_entries = try esp.listDirAlloc(io, gpa, "EFI/Linux");
     defer zvmi.fat32.freeDirEntries(gpa, linux_entries);
@@ -1192,7 +1367,7 @@ fn validateGeneralizedImage(
 
     var inspection = try zvmi.uki.inspect(gpa, fallback_uki);
     defer inspection.deinit(gpa);
-    if (inspection.machine != 0x8664) return error.UnexpectedUkiMachine;
+    if (inspection.machine != architecture.uki_pe_machine) return error.UnexpectedUkiMachine;
     if (inspection.subsystem != 10) return error.UnexpectedUkiSubsystem;
     _ = try requireNonemptyUkiSection(&inspection, ".linux");
     _ = try requireNonemptyUkiSection(&inspection, ".initrd");
@@ -1200,7 +1375,7 @@ fn validateGeneralizedImage(
     _ = try requireNonemptyUkiSection(&inspection, ".osrel");
     _ = try requireNonemptyUkiSection(&inspection, ".uname");
 
-    const expected_cmdline = try expectedUkiCmdline(gpa, root_partition.unique_partition_guid);
+    const expected_cmdline = try expectedUkiCmdline(gpa, root_partition.unique_partition_guid, architecture);
     defer gpa.free(expected_cmdline);
     if (!std.mem.eql(u8, cmdline, expected_cmdline)) return error.UnexpectedUkiCmdline;
 
@@ -1218,16 +1393,39 @@ fn validateGeneralizedImage(
 
 // ─── ISO download ─────────────────────────────────────────────────────────────
 
-fn downloadIso(gpa: Allocator, io: Io, work_dir: []const u8) ![]u8 {
-    const iso_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ work_dir, iso_name });
+fn isoChecksumMatches(
+    actual: [64]u8,
+    architecture: *const ArchitectureDescriptor,
+) bool {
+    return std.mem.eql(u8, &actual, architecture.iso_sha256);
+}
+
+fn validateIso(io: Io, iso_path: []const u8, architecture: *const ArchitectureDescriptor) !void {
+    const stat = try Dir.cwd().statFile(io, iso_path, .{});
+    if (!isRegularNonemptyFile(stat.kind, stat.size) or stat.size > iso_max_bytes) {
+        return error.InvalidIso;
+    }
+    _ = artifact_pipeline.parseSha256(architecture.iso_sha256) catch return error.InvalidIsoChecksum;
+    const actual = try sha256File(io, iso_path);
+    if (!isoChecksumMatches(actual, architecture)) {
+        std.debug.print(
+            "error: ISO checksum mismatch for {s}: expected {s}, got {s}\n",
+            .{ iso_path, architecture.iso_sha256, &actual },
+        );
+        return error.IsoChecksumMismatch;
+    }
+}
+
+fn downloadIso(
+    gpa: Allocator,
+    io: Io,
+    work_dir: []const u8,
+    architecture: *const ArchitectureDescriptor,
+) ![]u8 {
+    const iso_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ work_dir, architecture.iso_name });
     errdefer gpa.free(iso_path);
 
-    std.debug.print("Fetching ISO checksum...\n", .{});
-    const checksum_bytes = try fetchBytes(gpa, io, iso_checksum_url, null);
-    defer gpa.free(checksum_bytes);
-    var checksum_fields = std.mem.tokenizeAny(u8, checksum_bytes, " \t\r\n");
-    const expected = checksum_fields.next() orelse return error.InvalidIsoChecksum;
-    const expected_digest = artifact_pipeline.parseSha256(expected) catch
+    const expected_digest = artifact_pipeline.parseSha256(architecture.iso_sha256) catch
         return error.InvalidIsoChecksum;
     var curl = artifact_pipeline.CurlDownloader{
         .executable_path = "curl",
@@ -1236,7 +1434,7 @@ fn downloadIso(gpa: Allocator, io: Io, work_dir: []const u8) ![]u8 {
         gpa,
         io,
         .{
-            .url = iso_url,
+            .url = architecture.iso_url,
             .destination_path = iso_path,
             .expected_sha256 = expected_digest,
             .max_size = iso_max_bytes,
@@ -1251,6 +1449,7 @@ fn downloadIso(gpa: Allocator, io: Io, work_dir: []const u8) ![]u8 {
     } else {
         std.debug.print("ISO downloaded: {s}\n", .{iso_path});
     }
+    try validateIso(io, iso_path, architecture);
     return iso_path;
 }
 
@@ -1262,13 +1461,38 @@ fn requireTool(gpa: Allocator, io: Io, name: []const u8) bool {
     return true;
 }
 
+fn guestArtifactMatchesArchitecture(
+    file_description: []const u8,
+    architecture: *const ArchitectureDescriptor,
+) bool {
+    return std.mem.indexOf(u8, file_description, architecture.elf_file_marker) != null;
+}
+
+fn validateGuestArtifact(
+    gpa: Allocator,
+    io: Io,
+    path: []const u8,
+    architecture: *const ArchitectureDescriptor,
+) !void {
+    const description = try capture(gpa, io, &.{ "file", "-b", path });
+    defer gpa.free(description);
+    if (!guestArtifactMatchesArchitecture(description, architecture)) {
+        std.debug.print(
+            "error: guest artifact {s} does not match requested {s}: {s}",
+            .{ path, @tagName(architecture.architecture), description },
+        );
+        return error.GuestArtifactArchitectureMismatch;
+    }
+}
+
 // ─── args ─────────────────────────────────────────────────────────────────────
 
 const Args = struct {
+    architecture: ?AzureLinuxArchitecture = null,
     iso: ?[]const u8 = null,
-    output: []const u8 = "zvmi-azurelinux4-generalized.qcow2",
+    output: ?[]const u8 = null,
     size: []const u8 = "1184M",
-    work_dir: []const u8 = ".scratch/generalized-azurelinux4",
+    work_dir: ?[]const u8 = null,
     zvmi_path: ?[]const u8 = null,
     zvminit_path: ?[]const u8 = null,
     azagent_path: ?[]const u8 = null,
@@ -1278,25 +1502,36 @@ const Args = struct {
 const help_text =
     \\Usage: build_generalized_azurelinux4 [options]
     \\
-    \\  --iso <path>        Azure Linux 4 x86_64 ISO (downloaded if omitted)
-    \\  --output <path>     Output QCOW2 (default: zvmi-azurelinux4-generalized.qcow2)
+    \\  --architecture <arch> x86_64 or aarch64 (injected by build.zig)
+    \\  --iso <path>        Architecture-matched Azure Linux 4 ISO (downloaded if omitted)
+    \\  --output <path>     Output QCOW2 (architecture-specific default)
     \\  --size <size>       Disk size (default: 1184M)
-    \\  --work-dir <dir>    Working directory (default: .scratch/generalized-azurelinux4)
+    \\  --work-dir <dir>    Working directory (architecture-specific default)
     \\  --zvmi <path>       zvmi executable (injected by build.zig)
-    \\  --zvminit <path>    x86_64-linux zvminit binary (injected by build.zig)
-    \\  --azagent <path>    x86_64-linux azagent binary (injected by build.zig)
+    \\  --zvminit <path>    guest zvminit binary (injected by build.zig)
+    \\  --azagent <path>    guest azagent binary (injected by build.zig)
     \\  --preload <path>    zstd_max_preload.so (injected by build.zig)
     \\
     \\Preferred invocation: zig build generalized-azurelinux4 -- [user options]
     \\
 ;
 
+pub fn parseArchitecture(value: []const u8) error{UnsupportedArchitecture}!AzureLinuxArchitecture {
+    if (std.mem.eql(u8, value, "x86_64")) return .x86_64;
+    if (std.mem.eql(u8, value, "aarch64")) return .aarch64;
+    return error.UnsupportedArchitecture;
+}
+
 fn parseArgs(argv: []const []const u8) !Args {
     var a = Args{};
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
-        if (std.mem.eql(u8, arg, "--iso")) {
+        if (std.mem.eql(u8, arg, "--architecture")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            a.architecture = try parseArchitecture(argv[i]);
+        } else if (std.mem.eql(u8, arg, "--iso")) {
             i += 1;
             if (i >= argv.len) return error.MissingValue;
             a.iso = argv[i];
@@ -1351,6 +1586,12 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("error: {s}\n{s}", .{ @errorName(err), help_text });
         std.process.exit(1);
     };
+    const architecture = requireArchitecture(args.architecture) catch {
+        std.debug.print("error: --architecture is required (provided by zig build)\n", .{});
+        std.process.exit(1);
+    };
+    const output_path = args.output orelse architecture.default_output_path;
+    const work_dir = args.work_dir orelse architecture.default_work_dir;
     const requested_size = zvmi.parseSize(args.size) catch |err| {
         std.debug.print("error: invalid --size ({s})\n", .{@errorName(err)});
         std.process.exit(1);
@@ -1390,25 +1631,27 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     if (!tools_ok) std.process.exit(1);
+    try validateGuestArtifact(gpa, io, zvminit_path, architecture);
+    try validateGuestArtifact(gpa, io, azagent_path, architecture);
 
-    const work_dir = args.work_dir;
     try Dir.cwd().createDirPath(io, work_dir);
 
-    const downloaded_iso_path = if (args.iso == null) try downloadIso(gpa, io, work_dir) else null;
+    const downloaded_iso_path = if (args.iso == null) try downloadIso(gpa, io, work_dir, architecture) else null;
     defer if (downloaded_iso_path) |path| gpa.free(path);
     const iso_path = args.iso orelse downloaded_iso_path.?;
     _ = Dir.cwd().statFile(io, iso_path, .{}) catch |err| {
         std.debug.print("error: ISO not found: {s} ({s})\n", .{ iso_path, @errorName(err) });
         std.process.exit(1);
     };
+    try validateIso(io, iso_path, architecture);
 
     const rootfs_path = try std.fmt.allocPrint(gpa, "{s}/rootfs", .{work_dir});
     defer gpa.free(rootfs_path);
 
-    const base_digest = try pullRootfs(gpa, io, work_dir, rootfs_path);
+    const base_digest = try pullRootfs(gpa, io, work_dir, rootfs_path, architecture);
     defer gpa.free(base_digest);
 
-    const systemd_boot_rpm_path = try acquireSystemdBootRpm(gpa, io, work_dir);
+    const systemd_boot_rpm_path = try acquireSystemdBootRpm(gpa, io, work_dir, architecture);
     defer gpa.free(systemd_boot_rpm_path);
     try installGuestContent(
         gpa,
@@ -1418,14 +1661,15 @@ pub fn main(init: std.process.Init) !void {
         zvminit_path,
         azagent_path,
         systemd_boot_rpm_path,
+        architecture,
     );
 
-    const layout_dir = try createOciLayout(gpa, io, work_dir, rootfs_path, base_digest);
+    const layout_dir = try createOciLayout(gpa, io, work_dir, rootfs_path, base_digest, architecture);
     defer gpa.free(layout_dir);
-    try validateGeneralizedOciLayout(gpa, io, layout_dir);
+    try validateGeneralizedOciLayout(gpa, io, layout_dir, architecture);
 
     // Ensure output parent directory exists.
-    if (std.fs.path.dirname(args.output)) |parent| {
+    if (std.fs.path.dirname(output_path)) |parent| {
         Dir.cwd().createDirPath(io, parent) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
@@ -1433,7 +1677,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Build the raw QCOW2 first (no compression).
-    const raw_qcow2 = try std.fmt.allocPrint(gpa, "{s}.raw.qcow2", .{args.output});
+    const raw_qcow2 = try std.fmt.allocPrint(gpa, "{s}.raw.qcow2", .{output_path});
     defer gpa.free(raw_qcow2);
     Dir.cwd().deleteFile(io, raw_qcow2) catch {};
 
@@ -1453,11 +1697,11 @@ pub fn main(init: std.process.Init) !void {
         "--boot-mode",
         "uki",
         "--stub-source-path",
-        systemd_boot_stub_path,
+        architecture.systemd_boot_stub_path,
         "--esp-size",
         generalized_esp_size_arg,
         "--extra-kernel-options",
-        generalized_extra_kernel_options,
+        architecture.extra_kernel_options,
         "-o",
         raw_qcow2,
         "-O",
@@ -1471,7 +1715,7 @@ pub fn main(init: std.process.Init) !void {
     defer env_map.deinit();
     try env_map.put("LD_PRELOAD", preload_path);
 
-    const staged_qcow2 = try std.fmt.allocPrint(gpa, "{s}.validated-stage", .{args.output});
+    const staged_qcow2 = try std.fmt.allocPrint(gpa, "{s}.validated-stage", .{output_path});
     defer gpa.free(staged_qcow2);
     const raw_metadata = try artifact_pipeline.hashFile(io, raw_qcow2);
     const finalized = artifact_pipeline.finalizeQcow2(
@@ -1498,7 +1742,7 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
 
-    const validation = validateGeneralizedImage(gpa, io, staged_qcow2, requested_size) catch |err| {
+    const validation = validateGeneralizedImage(gpa, io, staged_qcow2, requested_size, architecture) catch |err| {
         std.debug.print(
             "error: generalized image structural validation failed ({s}); keeping {s} and {s}\n",
             .{ @errorName(err), raw_qcow2, staged_qcow2 },
@@ -1510,10 +1754,10 @@ pub fn main(init: std.process.Init) !void {
         .{ validation.virtual_size, validation.esp_size, validation.root_size, validation.uki_size },
     );
 
-    Dir.cwd().rename(staged_qcow2, Dir.cwd(), args.output, io) catch |err| {
+    Dir.cwd().rename(staged_qcow2, Dir.cwd(), output_path, io) catch |err| {
         std.debug.print(
             "error: could not publish validated image {s} as {s} ({s}); keeping {s}\n",
-            .{ staged_qcow2, args.output, @errorName(err), raw_qcow2 },
+            .{ staged_qcow2, output_path, @errorName(err), raw_qcow2 },
         );
         return err;
     };
@@ -1525,7 +1769,7 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print(
         "Built {s} ({d} bytes, virtual size {d})\n",
-        .{ args.output, finalized.artifact.size, finalized.virtual_size },
+        .{ output_path, finalized.artifact.size, finalized.virtual_size },
     );
 }
 
@@ -1590,7 +1834,7 @@ test "parseDigestHex rejects short and invalid chars" {
     try std.testing.expectError(error.InvalidDigest, parseDigestHex("notahex"));
 }
 
-test "selectLinuxAmd64Manifest picks correct platform" {
+test "selectLinuxManifest picks each requested Linux platform" {
     const gpa = std.testing.allocator;
     const json_text =
         \\{"manifests":[
@@ -1600,19 +1844,25 @@ test "selectLinuxAmd64Manifest picks correct platform" {
     ;
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json_text, .{});
     defer parsed.deinit();
-    const digest = try selectLinuxAmd64Manifest(gpa, parsed.value);
-    defer gpa.free(digest);
-    try std.testing.expectEqualStrings("sha256:2222222222222222222222222222222222222222222222222222222222222222", digest);
+    const arm64_digest = try selectLinuxManifest(gpa, parsed.value, aarch64.oci_architecture);
+    defer gpa.free(arm64_digest);
+    try std.testing.expectEqualStrings("sha256:1111111111111111111111111111111111111111111111111111111111111111", arm64_digest);
+    const amd64_digest = try selectLinuxManifest(gpa, parsed.value, x86_64.oci_architecture);
+    defer gpa.free(amd64_digest);
+    try std.testing.expectEqualStrings("sha256:2222222222222222222222222222222222222222222222222222222222222222", amd64_digest);
 }
 
-test "selectLinuxAmd64Manifest errors when no linux/amd64" {
+test "selectLinuxManifest rejects an unavailable platform" {
     const gpa = std.testing.allocator;
     const json_text =
         \\{"manifests":[{"platform":{"os":"linux","architecture":"arm64"},"digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111"}]}
     ;
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json_text, .{});
     defer parsed.deinit();
-    try std.testing.expectError(error.NoLinuxAmd64Manifest, selectLinuxAmd64Manifest(gpa, parsed.value));
+    try std.testing.expectError(
+        error.NoLinuxArchitectureManifest,
+        selectLinuxManifest(gpa, parsed.value, x86_64.oci_architecture),
+    );
 }
 
 test "sha256Bytes produces known digest" {
@@ -1621,37 +1871,108 @@ test "sha256Bytes produces known digest" {
     try std.testing.expectEqualStrings("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824", &hex);
 }
 
-test "systemd boot RPM metadata is pinned and cached under the work directory" {
+test "architecture descriptors pin core inputs and output namespaces" {
     const gpa = std.testing.allocator;
-    const cache_path = try systemdBootRpmCachePath(gpa, ".scratch/work");
-    defer gpa.free(cache_path);
-
-    try std.testing.expectEqualStrings(
-        ".scratch/work/downloads/systemd-boot-unsigned-258.4-4.azl4.x86_64.rpm",
-        cache_path,
-    );
-    try std.testing.expectEqualStrings(
-        "https://packages.microsoft.com/azurelinux/4.0/beta/base/x86_64/Packages/s/systemd-boot-unsigned-258.4-4.azl4.x86_64.rpm",
-        systemd_boot_unsigned_rpm_url,
-    );
-    try std.testing.expectEqualStrings(
-        "85dd3ac0c532bceb09fc0a85c6568c51fc4ee84e0c478d1302b7a2d84e1bea5c",
-        systemd_boot_unsigned_rpm_sha256,
-    );
-    _ = try artifact_pipeline.parseSha256(systemd_boot_unsigned_rpm_sha256);
+    const cases = [_]*const ArchitectureDescriptor{ &x86_64, &aarch64 };
+    for (cases) |architecture| {
+        const cache_path = try systemdBootRpmCachePath(gpa, ".scratch/work", architecture);
+        defer gpa.free(cache_path);
+        const expected_cache_path = try std.fmt.allocPrint(
+            gpa,
+            ".scratch/work/downloads/{s}",
+            .{architecture.systemd_boot_rpm_name},
+        );
+        defer gpa.free(expected_cache_path);
+        try std.testing.expectEqualStrings(expected_cache_path, cache_path);
+        _ = try artifact_pipeline.parseSha256(architecture.iso_sha256);
+        _ = try artifact_pipeline.parseSha256(architecture.base_manifest_digest);
+        _ = try artifact_pipeline.parseSha256(architecture.systemd_boot_rpm_sha256);
+        try std.testing.expectEqual(architecture.root_type_guid, architecture.root_role.defaultTypeGuid());
+    }
     try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024), systemd_boot_unsigned_rpm_max_bytes);
+
+    try std.testing.expectEqualStrings("https://aka.ms/azurelinux-4.0-x86_64.iso", x86_64.iso_url);
+    try std.testing.expectEqualStrings("https://aka.ms/azurelinux-4.0-aarch64.iso", aarch64.iso_url);
+    try std.testing.expectEqualStrings("AzureLinux-4.0-x86_64.iso", x86_64.iso_name);
+    try std.testing.expectEqualStrings("AzureLinux-4.0-aarch64.iso", aarch64.iso_name);
+    try std.testing.expectEqualStrings(
+        "d98f7d1ffaa916de7c9f66ffdadb150c174da691509e760835709ffa7829ca48",
+        x86_64.iso_sha256,
+    );
+    try std.testing.expectEqualStrings(
+        "762039fde64a59806750ee86ca98132fad4f9df02e7684490017cdfda0c55157",
+        aarch64.iso_sha256,
+    );
+    try std.testing.expectEqualStrings(
+        "sha256:9070b05147f01e5a4bac47723c95f2555e11b9d3324c1df1910ff3545b7ce319",
+        x86_64.base_manifest_digest,
+    );
+    try std.testing.expectEqualStrings(
+        "sha256:e541db83a8511c25fa1dd989161263874b7395ddd588f5caaa25453ea4e23263",
+        aarch64.base_manifest_digest,
+    );
+    try std.testing.expectEqualStrings("AzureLinux-4.0-x86_64.core.qcow2", x86_64.default_output_path);
+    try std.testing.expectEqualStrings("AzureLinux-4.0-aarch64.core.qcow2", aarch64.default_output_path);
+    try std.testing.expectEqualStrings(".scratch/azurelinux4-core-x86_64", x86_64.default_work_dir);
+    try std.testing.expectEqualStrings(".scratch/azurelinux4-core-aarch64", aarch64.default_work_dir);
 }
 
-test "UKI stub is required OCI content" {
-    var stub_is_required = false;
-    for (required_rootfs_files) |path| {
-        if (std.mem.eql(u8, path, systemd_boot_stub_path)) {
-            stub_is_required = true;
-            break;
-        }
-    }
-    try std.testing.expect(stub_is_required);
-    try std.testing.expectEqualStrings("usr/lib/systemd/boot/efi/linuxx64.efi.stub", systemd_boot_stub_path);
+test "architecture descriptors select RPMs, stubs, EFI paths, and binfmt" {
+    try std.testing.expectEqualStrings(
+        "systemd-boot-unsigned-258.4-4.azl4.x86_64.rpm",
+        x86_64.systemd_boot_rpm_name,
+    );
+    try std.testing.expectEqualStrings(
+        "systemd-boot-unsigned-258.4-4.azl4.aarch64.rpm",
+        aarch64.systemd_boot_rpm_name,
+    );
+    try std.testing.expectEqualStrings("x86_64", x86_64.dnf_architecture);
+    try std.testing.expectEqualStrings("aarch64", aarch64.dnf_architecture);
+    try std.testing.expectEqual(std.Target.Cpu.Arch.x86_64, x86_64.target_cpu);
+    try std.testing.expectEqual(std.Target.Cpu.Arch.aarch64, aarch64.target_cpu);
+    try std.testing.expectEqualStrings(
+        "85dd3ac0c532bceb09fc0a85c6568c51fc4ee84e0c478d1302b7a2d84e1bea5c",
+        x86_64.systemd_boot_rpm_sha256,
+    );
+    try std.testing.expectEqualStrings(
+        "65aefdef9bc55f71f43c18b738fc1a61eeedd9fea7d803f0b0b06467fb748991",
+        aarch64.systemd_boot_rpm_sha256,
+    );
+    try std.testing.expectEqualStrings(
+        "etc/pki/rpm-gpg/RPM-GPG-KEY-azurelinux-4.0-x86_64",
+        x86_64.signing_key_path,
+    );
+    try std.testing.expectEqualStrings(
+        "etc/pki/rpm-gpg/RPM-GPG-KEY-azurelinux-4.0-aarch64",
+        aarch64.signing_key_path,
+    );
+    try std.testing.expectEqualStrings(
+        "usr/lib/systemd/boot/efi/linuxx64.efi.stub",
+        x86_64.systemd_boot_stub_path,
+    );
+    try std.testing.expectEqualStrings(
+        "usr/lib/systemd/boot/efi/linuxaa64.efi.stub",
+        aarch64.systemd_boot_stub_path,
+    );
+    try std.testing.expectEqualStrings("EFI/BOOT/BOOTX64.EFI", x86_64.fallback_efi_path);
+    try std.testing.expectEqualStrings("EFI/BOOT/BOOTAA64.EFI", aarch64.fallback_efi_path);
+    try std.testing.expectEqual(@as(u16, 0x8664), x86_64.uki_pe_machine);
+    try std.testing.expectEqual(@as(u16, 0xaa64), aarch64.uki_pe_machine);
+    try std.testing.expectEqual(zvmi.layout.PartitionRole.root_x86_64, x86_64.root_role);
+    try std.testing.expectEqual(zvmi.layout.PartitionRole.root_aarch64, aarch64.root_role);
+    try std.testing.expectEqual(zvmi.guid.linux_root_x86_64, x86_64.root_type_guid);
+    try std.testing.expectEqual(zvmi.guid.linux_root_aarch64, aarch64.root_type_guid);
+    try std.testing.expectEqualStrings("qemu-x86_64-static", x86_64.binfmt_static_name);
+    try std.testing.expectEqualStrings("qemu-aarch64-static", aarch64.binfmt_static_name);
+    try std.testing.expectEqualStrings("/proc/sys/fs/binfmt_misc/qemu-x86_64", x86_64.binfmt_registration_path);
+    try std.testing.expectEqualStrings("/proc/sys/fs/binfmt_misc/qemu-aarch64", aarch64.binfmt_registration_path);
+}
+
+test "OCI config architecture is required to match the descriptor" {
+    try std.testing.expect(ociConfigArchitectureMatches("amd64", &x86_64));
+    try std.testing.expect(ociConfigArchitectureMatches("arm64", &aarch64));
+    try std.testing.expect(!ociConfigArchitectureMatches("arm64", &x86_64));
+    try std.testing.expect(!ociConfigArchitectureMatches(null, &aarch64));
 }
 
 test "isRegularNonemptyFile accepts only nonempty regular files" {
@@ -1661,13 +1982,43 @@ test "isRegularNonemptyFile accepts only nonempty regular files" {
     try std.testing.expect(!isRegularNonemptyFile(.sym_link, 1));
 }
 
-test "parseArgs defaults to the UKI disk size and permits an override" {
+test "supplied ISO checksum must match the selected architecture" {
+    const wrong_checksum = sha256Bytes("not an Azure Linux ISO");
+    try std.testing.expect(!isoChecksumMatches(wrong_checksum, &x86_64));
+    try std.testing.expect(!isoChecksumMatches(wrong_checksum, &aarch64));
+}
+
+test "architecture and argument parsing accepts only supported values" {
+    try std.testing.expectEqual(AzureLinuxArchitecture.x86_64, try parseArchitecture("x86_64"));
+    try std.testing.expectEqual(AzureLinuxArchitecture.aarch64, try parseArchitecture("aarch64"));
+    try std.testing.expectError(error.UnsupportedArchitecture, parseArchitecture("amd64"));
+    try std.testing.expectError(error.UnsupportedArchitecture, parseArchitecture("arm64"));
+    try std.testing.expectError(error.MissingArchitecture, requireArchitecture(null));
     try std.testing.expectEqualStrings("1184M", (try parseArgs(&.{})).size);
     try std.testing.expectEqualStrings("2G", (try parseArgs(&.{ "--size", "2G" })).size);
+    try std.testing.expectEqual(
+        AzureLinuxArchitecture.aarch64,
+        (try parseArgs(&.{ "--architecture", "aarch64" })).architecture.?,
+    );
     try std.testing.expectEqualStrings(
         "zig-out/bin/zvminit",
         (try parseArgs(&.{ "--zvminit", "zig-out/bin/zvminit" })).zvminit_path.?,
     );
+}
+
+test "guest artifact architecture validation rejects mismatches" {
+    try std.testing.expect(guestArtifactMatchesArchitecture(
+        "ELF 64-bit LSB executable, x86-64, version 1 (SYSV)",
+        &x86_64,
+    ));
+    try std.testing.expect(guestArtifactMatchesArchitecture(
+        "ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV)",
+        &aarch64,
+    ));
+    try std.testing.expect(!guestArtifactMatchesArchitecture(
+        "ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV)",
+        &x86_64,
+    ));
 }
 
 test "zvminit rootfs layout requires relative command symlinks" {
@@ -1678,46 +2029,56 @@ test "zvminit rootfs layout requires relative command symlinks" {
     );
 }
 
-test "generalized Gen2 layout reserves a 512 MiB ESP and remaining root" {
+test "generalized Gen2 layout uses the descriptor root role and GUID" {
     const gpa = std.testing.allocator;
     const disk_size = try zvmi.parseSize("1184M");
-    const planned = try planGeneralizedGen2Layout(gpa, disk_size);
-    defer gpa.free(planned);
+    const cases = [_]*const ArchitectureDescriptor{ &x86_64, &aarch64 };
+    for (cases) |architecture| {
+        const planned = try planGeneralizedGen2Layout(gpa, disk_size, architecture);
+        defer gpa.free(planned);
 
-    try std.testing.expectEqual(@as(usize, 2), planned.len);
-    try std.testing.expectEqual(generalized_esp_size_bytes, planned[0].length_bytes);
-    try std.testing.expectEqual(@as(u64, 670 * 1024 * 1024), planned[1].length_bytes);
+        try std.testing.expectEqual(@as(usize, 2), planned.len);
+        try std.testing.expectEqual(generalized_esp_size_bytes, planned[0].length_bytes);
+        try std.testing.expectEqual(@as(u64, 670 * 1024 * 1024), planned[1].length_bytes);
+        try std.testing.expectEqual(architecture.root_role, planned[1].role);
+        try std.testing.expectEqual(architecture.root_type_guid, planned[1].type_guid);
+
+        var actual = [_]zvmi.gpt.PartitionEntry{
+            .{
+                .partition_type_guid = planned[0].type_guid,
+                .first_lba = planned[0].firstLba(),
+                .last_lba = planned[0].lastLba(),
+            },
+            .{
+                .partition_type_guid = planned[1].type_guid,
+                .first_lba = planned[1].firstLba(),
+                .last_lba = planned[1].lastLba(),
+            },
+        };
+        try validatePartitionLayout(&actual, planned);
+        actual[1].last_lba -= 1;
+        try std.testing.expectError(error.UnexpectedPartitionLayout, validatePartitionLayout(&actual, planned));
+    }
     try std.testing.expectEqual(disk_size, @as(u64, 1184 * 1024 * 1024));
-
-    var actual = [_]zvmi.gpt.PartitionEntry{
-        .{
-            .partition_type_guid = planned[0].type_guid,
-            .first_lba = planned[0].firstLba(),
-            .last_lba = planned[0].lastLba(),
-        },
-        .{
-            .partition_type_guid = planned[1].type_guid,
-            .first_lba = planned[1].firstLba(),
-            .last_lba = planned[1].lastLba(),
-        },
-    };
-    try validatePartitionLayout(&actual, planned);
-    actual[1].last_lba -= 1;
-    try std.testing.expectError(error.UnexpectedPartitionLayout, validatePartitionLayout(&actual, planned));
 }
 
-test "generalized UKI command line uses the root PARTUUID exactly" {
+test "generalized UKI command line uses architecture-specific serial consoles" {
     const gpa = std.testing.allocator;
-    const cmdline = try expectedUkiCmdline(
-        gpa,
-        zvmi.guid.parse("11111111-2222-3333-4444-555555555555"),
-    );
-    defer gpa.free(cmdline);
-
+    const root_guid = zvmi.guid.parse("11111111-2222-3333-4444-555555555555");
+    const x86_cmdline = try expectedUkiCmdline(gpa, root_guid, &x86_64);
+    defer gpa.free(x86_cmdline);
+    const arm_cmdline = try expectedUkiCmdline(gpa, root_guid, &aarch64);
+    defer gpa.free(arm_cmdline);
     try std.testing.expectEqualStrings(
         "root=PARTUUID=11111111-2222-3333-4444-555555555555 init=/sbin/zvminit zvminit.mode=persistent zvminit.azure=auto console=tty0 console=ttyS0,115200n8",
-        cmdline,
+        x86_cmdline,
     );
+    try std.testing.expectEqualStrings(
+        "root=PARTUUID=11111111-2222-3333-4444-555555555555 init=/sbin/zvminit zvminit.mode=persistent zvminit.azure=auto console=tty0 console=ttyAMA0,115200n8",
+        arm_cmdline,
+    );
+    try std.testing.expectEqualStrings("console=ttyS0,115200n8", x86_64.serial_console);
+    try std.testing.expectEqualStrings("console=ttyAMA0,115200n8", aarch64.serial_console);
     try std.testing.expectEqualStrings("512M", generalized_esp_size_arg);
 }
 

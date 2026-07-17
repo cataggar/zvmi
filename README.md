@@ -196,7 +196,7 @@ zig build test-freebsd15-aarch64-boot
                       # run opt-in FreeBSD AArch64 QEMU/SSH/reboot acceptance
 zig build run -- <args>   # run the CLI, e.g. `zig build run -- info foo.vhd`
 zig build run -- qemu     # download (if needed) and boot the Azure Linux image
-zig build generalized-azurelinux4 -- [--iso <path>] [--output <path>] [--size <size>] [--work-dir <dir>]
+zig build -Dazurelinux-arch=x86_64 generalized-azurelinux4 -- [--iso <path>] [--output <path>] [--size <size>] [--work-dir <dir>]
                       # build a generalized Azure Linux 4 Gen2 QCOW2 image
                       #   (Linux-only; requires root, curl, dnf, qemu-img, sudo)
 zig build generalized-freebsd15-aarch64 -- [--source <path>] [--output <path>] [--work-dir <dir>] [--base-only]
@@ -489,22 +489,63 @@ unknown layouts are left untouched.
 
 Host-side image builders can reuse `zvmi.artifact_pipeline` for bounded SHA-256-verified acquisition and transactional publication. Download callbacks receive only a pipeline-owned writer rather than a staging path, `decompressXz` requires an explicit XZ Utils executable plus compressed-input digest, memory limit, and output-size limit, and Linux-only `finalizeQcow2` converts a digest-pinned raw or standalone QCOW2 source to a validated standalone QCOW2. `zvmi.azure.deriveFixedVhd` converts a digest-pinned standalone GPT QCOW2 into a 1 MiB-aligned fixed VHD through a descriptor-pinned atomic stage, strictly cross-validates the primary and backup GPT copies, preserves the raw partition array and every partition extent, relocates the backup GPT, and revalidates the VHD and both GPT copies before publication. All operations preserve an existing destination until validation succeeds.
 
-`scripts/build_generalized_azurelinux4.zig` (run via `zig build generalized-azurelinux4`) provides the complete reproducible recipe used for the generalized Azure image: it downloads and verifies the official Azure Linux 4 ISO, pulls `mcr.microsoft.com/azurelinux-beta/base/core:4.0`, installs signed x86_64 `openssh-server` and `sudo` packages, injects static `zvminit`/`azagent`, and removes host identity. It also downloads the pinned Azure Linux `systemd-boot-unsigned-258.4-4.azl4.x86_64.rpm`, verifies its SHA-256 digest, and injects `linuxx64.efi.stub`. The recipe creates a bounded multi-layer OCI layout, builds a 1184 MiB Gen2 QCOW2 with a 512 MiB ESP and 670 MiB root partition, validates the finalized disk and UKI structure, and compresses it to maximum zstd level via an LD_PRELOAD intercept library (`scripts/zstd_max_preload.zig`).
+`scripts/build_generalized_azurelinux4.zig` (run via
+`zig build -Dazurelinux-arch=x86_64|aarch64 generalized-azurelinux4`) builds
+the architecture-matched **core** recipe from
+`mcr.microsoft.com/azurelinux-beta/base/core:4.0`: OpenSSH, static
+`zvminit`/`azagent`, and no host identity. The build graph compiles those two
+guest executables for the selected architecture while the CLI, builder, and
+preload library remain native to the build host. A single architecture
+descriptor pins and validates the official Azure Linux ISO digest, selected
+OCI manifest, RPM key/package/stub, OCI config architecture, GPT root type,
+UKI PE machine, fallback EFI filename, and serial console.
 
-The image boots directly through `UEFI -> EFI/BOOT/BOOTX64.EFI (UKI) ->
-kernel/initramfs -> zvminit`; it does not require shim, GRUB, or BLS
-configuration. The generated UKI is currently unsigned, so Secure Boot must
-remain disabled. UKI signing and Azure/QEMU trust are tracked in issue #168.
+The recipe creates a bounded multi-layer OCI layout, builds a 1184 MiB Gen2
+QCOW2 with a 512 MiB ESP and 670 MiB root partition, validates the finalized
+disk and UKI structure, and compresses it to maximum zstd level via an
+LD_PRELOAD intercept library (`scripts/zstd_max_preload.zig`). The x86_64
+image uses `linuxx64.efi.stub`, `EFI/BOOT/BOOTX64.EFI`, and `ttyS0`; AArch64
+uses `linuxaa64.efi.stub`, `EFI/BOOT/BOOTAA64.EFI`, and `ttyAMA0`.
 
-```
-zig build generalized-azurelinux4 -- \
+The image boots directly through `UEFI -> EFI/BOOT/BOOTX64.EFI` (x86_64) or
+`EFI/BOOT/BOOTAA64.EFI` (AArch64) `-> UKI -> kernel/initramfs -> zvminit`; it
+does not require shim, GRUB, or BLS configuration. The generated UKI is
+currently unsigned, so Secure Boot must remain disabled. UKI signing and
+Azure/QEMU trust are tracked in issue #168.
+
+```console
+# Defaults: AzureLinux-4.0-x86_64.core.qcow2 and
+# .scratch/azurelinux4-core-x86_64
+zig build -Dazurelinux-arch=x86_64 generalized-azurelinux4 --
+
+# Defaults: AzureLinux-4.0-aarch64.core.qcow2 and
+# .scratch/azurelinux4-core-aarch64
+zig build -Dazurelinux-arch=aarch64 generalized-azurelinux4 --
+
+# Either architecture may override its isolated output/cache namespace.
+zig build -Dazurelinux-arch=aarch64 generalized-azurelinux4 -- \
   --work-dir /path/to/build-cache \
-  --output /path/to/zvmi-azurelinux4-generalized.qcow2
+  --output /path/to/AzureLinux-4.0-aarch64.core.qcow2
 ```
 
-The builder requires Zig 0.16, `curl`, `dnf`, GNU tar, `qemu-img`, and passwordless or interactive `sudo`. On a non-x86_64 build host, x86_64 binfmt and `qemu-x86_64-static` are also required so RPM scriptlets can run inside the target rootfs; on Azure Linux install them with `sudo tdnf install -y qemu-user-static-x86`. Use `--iso` to supply an already-downloaded ISO and `--size` to override the 1184 MiB virtual disk size. The fixed 512 MiB ESP is retained when the total size is overridden, with the root partition consuming the remaining aligned capacity. The build system automatically passes the paths of the built native zvmi, guest zvminit/azagent binaries, and the preload library; no separate `zig build` invocation is needed.
+The builder requires Zig 0.16, `curl`, `dnf`, GNU tar, `qemu-img`, and
+passwordless or interactive `sudo`. On a host that differs from the selected
+guest architecture, the matching enabled binfmt registration plus
+`qemu-x86_64-static` or `qemu-aarch64-static` is required so RPM scriptlets
+can run inside the target rootfs; the temporary interpreter is removed before
+the OCI layout is produced. `--iso` accepts an already-downloaded ISO, but it
+is still validated against the architecture's pinned official SHA-256. Use
+`--size` to override the 1184 MiB virtual disk size. The fixed 512 MiB ESP is
+retained when the total size is overridden, with the root partition consuming
+the remaining aligned capacity. The build system automatically passes the
+selected architecture and paths of the built native zvmi, guest
+zvminit/azagent binaries, and preload library; no separate `zig build`
+invocation is needed.
 
-The manually dispatched **Rebuild Azure Linux 4 release image** GitHub Actions workflow builds this image from current `main`, validates its QCOW2 and UKI structure, boots the final compressed artifact under QEMU/OVMF with Secure Boot disabled, verifies `zvminit` is PID 1, and replaces `AzureLinux-4.0-x86_64.qcow2` in the `AzureLinux4.0-20260714` release while refreshing the published checksum and provenance.
+The release workflow matrix, QEMU acceptance, and Azure deployment remain
+separate issue #178 work. This builder slice only provides the reproducible
+architecture-aware core artifacts and structural validation; it does not
+publish or deploy either image.
 
 ### Generalized FreeBSD 15.1 AArch64 QCOW2
 
