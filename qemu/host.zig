@@ -167,6 +167,7 @@ pub fn findFirmwarePairAlloc(
                 .{ .code = "/usr/share/AAVMF/AAVMF_CODE.fd", .vars = "/usr/share/AAVMF/AAVMF_VARS.fd" },
                 .{ .code = "/usr/share/AAVMF/AAVMF_CODE_4M.fd", .vars = "/usr/share/AAVMF/AAVMF_VARS_4M.fd" },
                 .{ .code = "/usr/share/edk2/aarch64/QEMU_EFI.fd", .vars = "/usr/share/edk2/arm-vars.fd" },
+                .{ .code = "/usr/share/edk2/aarch64/QEMU_EFI-pflash.raw", .vars = "/usr/share/edk2/aarch64/vars-template-pflash.raw" },
                 .{ .code = "/usr/share/edk2/aarch64/AAVMF_CODE.fd", .vars = "/usr/share/edk2/aarch64/AAVMF_VARS.fd" },
                 .{ .code = "/usr/share/edk2/aarch64/edk2-aarch64-code.fd", .vars = "/usr/share/edk2/aarch64/edk2-arm-vars.fd" },
                 .{ .code = "/usr/share/edk2/aarch64/code.fd", .vars = "/usr/share/edk2/aarch64/vars.fd" },
@@ -203,6 +204,7 @@ fn findFirmwareInDataDirAlloc(
             .{ .code = "", .vars = "" },
             .{ .code = "", .vars = "" },
             .{ .code = "", .vars = "" },
+            .{ .code = "", .vars = "" },
         },
         .aarch64 => [_]FirmwareCandidate{
             .{ .code = "edk2-aarch64-code.fd", .vars = "edk2-arm-vars.fd" },
@@ -210,6 +212,7 @@ fn findFirmwareInDataDirAlloc(
             .{ .code = "AAVMF_CODE_4M.fd", .vars = "AAVMF_VARS_4M.fd" },
             .{ .code = "QEMU_EFI.fd", .vars = "AAVMF_VARS.fd" },
             .{ .code = "QEMU_EFI.fd", .vars = "vars.fd" },
+            .{ .code = "QEMU_EFI-pflash.raw", .vars = "vars-template-pflash.raw" },
             .{ .code = "code.fd", .vars = "vars.fd" },
         },
     };
@@ -328,6 +331,32 @@ test "find packaged AAVMF firmware in a data directory" {
     defer pair.deinit(allocator);
     try std.testing.expectEqualStrings("AAVMF_CODE.fd", std.fs.path.basename(pair.code_path));
     try std.testing.expectEqualStrings("AAVMF_VARS.fd", std.fs.path.basename(pair.vars_path));
+}
+
+test "find packaged AArch64 pflash firmware pair in a data directory" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDir(io, "share", .default_dir);
+    var code = try tmp.dir.createFile(io, "share/QEMU_EFI-pflash.raw", .{});
+    code.close(io);
+    var vars = try tmp.dir.createFile(io, "share/vars-template-pflash.raw", .{});
+    vars.close(io);
+
+    var root_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const data_dir = try std.fs.path.join(allocator, &.{ root_buf[0..root_len], "share" });
+    defer allocator.free(data_dir);
+
+    var pair = (try findFirmwarePairAlloc(allocator, io, .{
+        .architecture = .aarch64,
+        .data_dirs = &.{data_dir},
+    })).?;
+    defer pair.deinit(allocator);
+    try std.testing.expectEqualStrings("QEMU_EFI-pflash.raw", std.fs.path.basename(pair.code_path));
+    try std.testing.expectEqualStrings("vars-template-pflash.raw", std.fs.path.basename(pair.vars_path));
 }
 
 test "firmware overrides must be complete" {

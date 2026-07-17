@@ -82,6 +82,7 @@ const Options = struct {
     image_path: []const u8 = default_image_name,
     image_was_explicit: bool = false,
     architecture_request: ArchitectureRequest = .x86_64,
+    architecture_was_explicit: bool = false,
     snapshot: bool = false,
     accel: Accel = .auto,
     qemu_path: ?[]const u8 = null,
@@ -298,7 +299,15 @@ fn runVm(
     var qemu: ?ResolvedQemu = null;
     defer if (qemu) |*resolved| resolved.deinit(gpa);
 
-    if (options.architecture_request != .auto) {
+    if (options.architecture_request == .aarch64 and !options.image_was_explicit) {
+        std.debug.print(
+            "qemu: --architecture aarch64 requires an explicit AArch64 image path\n",
+            .{},
+        );
+        return 1;
+    }
+
+    if (options.architecture_request != .auto and !options.architecture_was_explicit) {
         const architecture = switch (options.architecture_request) {
             .x86_64 => qemu_host.GuestArchitecture.x86_64,
             .aarch64 => qemu_host.GuestArchitecture.aarch64,
@@ -349,10 +358,17 @@ fn runVm(
     };
 
     const architecture = resolveArchitecture(io, options, image_format) catch |err| {
-        std.debug.print(
-            "qemu: failed to determine guest architecture for '{s}': {s}\n",
-            .{ options.image_path, @errorName(err) },
-        );
+        if (err == error.ArchitectureMismatch) {
+            std.debug.print(
+                "qemu: --architecture {s} does not match the detected guest architecture in '{s}'\n",
+                .{ @tagName(options.architecture_request), options.image_path },
+            );
+        } else {
+            std.debug.print(
+                "qemu: failed to determine guest architecture for '{s}': {s}\n",
+                .{ options.image_path, @errorName(err) },
+            );
+        }
         return 1;
     };
 
@@ -482,6 +498,7 @@ fn parseArgs(args: []const []const u8) ParseResult {
             if (i >= args.len) return parseFailure(.missing_value, arg);
             options.architecture_request = ArchitectureRequest.parse(args[i]) orelse
                 return parseFailure(.invalid_architecture, args[i]);
+            options.architecture_was_explicit = true;
         } else if (std.mem.eql(u8, arg, "--accel")) {
             i += 1;
             if (i >= args.len) return parseFailure(.missing_value, arg);
@@ -602,6 +619,31 @@ fn resolveImage(options: Options, image_exists: bool) ImageResolution {
     return if (options.image_was_explicit) .missing_explicit else .download_default;
 }
 
+fn validateImageSelection(options: Options, image_exists: bool) !void {
+    if (options.architecture_request == .aarch64 and !options.image_was_explicit)
+        return error.ArchitectureImageRequired;
+    if (!image_exists and options.image_was_explicit)
+        return error.ExplicitImageNotFound;
+}
+
+fn validateArchitectureMatch(
+    requested: ArchitectureRequest,
+    was_explicit: bool,
+    detected: qemu_host.GuestArchitecture,
+) !qemu_host.GuestArchitecture {
+    return switch (requested) {
+        .auto => detected,
+        .x86_64 => if (was_explicit and detected != .x86_64)
+            error.ArchitectureMismatch
+        else
+            .x86_64,
+        .aarch64 => if (detected != .aarch64)
+            error.ArchitectureMismatch
+        else
+            .aarch64,
+    };
+}
+
 fn resolveAccel(
     requested: Accel,
     host: HostCapabilities,
@@ -674,11 +716,14 @@ fn resolveArchitecture(
     image_format: zvmi.Format,
 ) !qemu_host.GuestArchitecture {
     _ = image_format;
-    return switch (options.architecture_request) {
-        .x86_64 => .x86_64,
-        .aarch64 => .aarch64,
-        .auto => detectImageArchitecture(io, options.image_path),
-    };
+    if (options.architecture_request == .x86_64 and !options.architecture_was_explicit)
+        return .x86_64;
+    const detected = try detectImageArchitecture(io, options.image_path);
+    return validateArchitectureMatch(
+        options.architecture_request,
+        options.architecture_was_explicit,
+        detected,
+    );
 }
 
 fn detectImageArchitecture(io: std.Io, image_path: []const u8) !qemu_host.GuestArchitecture {
@@ -1266,8 +1311,7 @@ fn ensureImage(
     options: Options,
 ) !void {
     const exists = try qemu_host.pathAccessible(io, options.image_path, .{ .read = true });
-    if (!exists and !options.image_was_explicit and options.architecture_request == .aarch64)
-        return error.ArchitectureImageRequired;
+    try validateImageSelection(options, exists);
     switch (resolveImage(options, exists)) {
         .use_existing => return,
         .missing_explicit => return error.ExplicitImageNotFound,
@@ -1692,6 +1736,7 @@ test "qemu parser accepts architecture and defaults the provisioning port" {
     });
     const options = parsed.options;
     try std.testing.expectEqual(ArchitectureRequest.aarch64, options.architecture_request);
+    try std.testing.expect(options.architecture_was_explicit);
     try std.testing.expectEqual(@as(?u16, 2222), options.ssh_port);
 }
 
@@ -1760,6 +1805,49 @@ test "qemu image resolution only downloads the absent implicit default" {
     const explicit_options = parseArgs(&.{"custom.qcow2"}).options;
     try std.testing.expectEqual(ImageResolution.use_existing, resolveImage(explicit_options, true));
     try std.testing.expectEqual(ImageResolution.missing_explicit, resolveImage(explicit_options, false));
+}
+
+test "qemu image selection keeps the implicit x86 default downloadable" {
+    const implicit = parseArgs(&.{}).options;
+    try validateImageSelection(implicit, true);
+    try validateImageSelection(implicit, false);
+
+    const aarch64 = parseArgs(&.{ "--architecture", "aarch64", "arm.qcow2" }).options;
+    try validateImageSelection(aarch64, true);
+    try std.testing.expectError(error.ExplicitImageNotFound, validateImageSelection(aarch64, false));
+
+    const aarch64_without_image = parseArgs(&.{ "--architecture", "aarch64" }).options;
+    try std.testing.expectError(
+        error.ArchitectureImageRequired,
+        validateImageSelection(aarch64_without_image, true),
+    );
+    try std.testing.expectError(
+        error.ArchitectureImageRequired,
+        validateImageSelection(aarch64_without_image, false),
+    );
+}
+
+test "qemu explicit architectures must match detected image architecture" {
+    try std.testing.expectEqual(
+        qemu_host.GuestArchitecture.x86_64,
+        try validateArchitectureMatch(.x86_64, true, .x86_64),
+    );
+    try std.testing.expectEqual(
+        qemu_host.GuestArchitecture.aarch64,
+        try validateArchitectureMatch(.aarch64, true, .aarch64),
+    );
+    try std.testing.expectError(
+        error.ArchitectureMismatch,
+        validateArchitectureMatch(.x86_64, true, .aarch64),
+    );
+    try std.testing.expectError(
+        error.ArchitectureMismatch,
+        validateArchitectureMatch(.aarch64, true, .x86_64),
+    );
+    try std.testing.expectEqual(
+        qemu_host.GuestArchitecture.x86_64,
+        try validateArchitectureMatch(.x86_64, false, .aarch64),
+    );
 }
 
 test "qemu auto accelerator follows host capabilities" {
