@@ -1607,6 +1607,18 @@ fn printQemuResolutionError(
     }
 }
 
+fn qemuCpuName(
+    architecture: qemu_host.GuestArchitecture,
+    accel: Accel,
+) []const u8 {
+    if (architecture == .x86_64) return "Nehalem-v1";
+    return switch (accel) {
+        .kvm, .hvf, .whpx => "host",
+        .tcg => "max",
+        .auto => unreachable,
+    };
+}
+
 fn buildQemuArgv(
     allocator: std.mem.Allocator,
     plan: LaunchPlan,
@@ -1627,7 +1639,7 @@ fn buildQemuArgv(
         plan.accel.cliName(),
     });
     try result.append(allocator, "-cpu");
-    try result.append(allocator, if (plan.architecture == .x86_64) "Nehalem-v1" else "max");
+    try result.append(allocator, qemuCpuName(plan.architecture, plan.accel));
     try result.append(allocator, "-m");
     try result.append(allocator, "2G");
     try result.append(allocator, "-smp");
@@ -1684,6 +1696,31 @@ fn expectArgv(expected: []const []const u8, actual: []const []const u8) !void {
     for (expected, actual) |expected_arg, actual_arg| {
         try std.testing.expectEqualStrings(expected_arg, actual_arg);
     }
+}
+
+fn expectAarch64CpuArgv(accel: Accel, expected_cpu: []const u8) !void {
+    const allocator = std.testing.allocator;
+    var argv = try buildQemuArgv(allocator, .{
+        .qemu_path = "qemu-system-aarch64",
+        .qemu_data_dir = null,
+        .architecture = .aarch64,
+        .image_path = "disk.qcow2",
+        .image_format = .qcow2,
+        .ovmf_code_path = "AAVMF_CODE.fd",
+        .ovmf_vars_path = "vars.fd",
+        .accel = accel,
+    });
+    defer argv.deinit(allocator);
+
+    var cpu_index: ?usize = null;
+    for (argv.items.items, 0..) |item, index| {
+        if (std.mem.eql(u8, item, "-cpu")) {
+            cpu_index = index;
+            break;
+        }
+    }
+    try std.testing.expect(cpu_index != null);
+    try std.testing.expectEqualStrings(expected_cpu, argv.items.items[cpu_index.? + 1]);
 }
 
 test "qemu parser defaults to the release image" {
@@ -2143,6 +2180,23 @@ test "qemu AArch64 provisioning argv uses virt, SCSI CD, and host forwarding" {
         "user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:2222-:22",
         "-nographic",
     }, argv.items.items);
+}
+
+test "qemu AArch64 KVM argv selects the host CPU" {
+    try expectAarch64CpuArgv(.kvm, "host");
+}
+
+test "qemu AArch64 TCG argv selects the generic max CPU" {
+    try expectAarch64CpuArgv(.tcg, "max");
+}
+
+test "qemu AArch64 HVF argv selects the host CPU" {
+    try expectAarch64CpuArgv(.hvf, "host");
+}
+
+test "qemu x86 CPU selection remains stable across accelerators" {
+    try std.testing.expectEqualStrings("Nehalem-v1", qemuCpuName(.x86_64, .kvm));
+    try std.testing.expectEqualStrings("Nehalem-v1", qemuCpuName(.x86_64, .tcg));
 }
 
 test "qemu seed serializers escape XML and YAML user content" {
