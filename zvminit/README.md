@@ -1,11 +1,11 @@
-# azinit
+# zvminit
 
 A minimal (~160 KB), statically-linked PID 1 replacement for real-boot testing of images built with `zvmi build-image --skip-iso-rootfs`, e.g. against a real Azure VM. It exists to validate the fix for [issue #88](https://github.com/cataggar/zvmi/issues/88) end-to-end on real hardware rather than only structurally/in QEMU, and to serve as a small reference for what a from-scratch container-image init needs to do.
 
 ## What it does
 
-- Mounts `/proc`, `/sys`, `/dev`, and `/run`. Immutable mode is the default: root stays read-only, `/var` and `/tmp` use tmpfs, and `/etc` uses a tmpfs-backed overlay. The opt-in `azinit.mode=persistent` kernel option instead remounts root read-write, leaves `/etc`, `/var`, and `/home` persistent, and mounts only `/tmp` as tmpfs. If `/etc/machine-id` is empty after image generalization, azinit generates and persists a new 128-bit machine ID.
-- Loads the kernel modules this appliance needs directly via a raw `init_module()` syscall (decompressing the shipped `.ko.xz` with `std.compress.xz`): `overlay` for immutable `/etc`, `hv_netvsc` for Hyper-V networking, and `crc-itu-t`/`udf`/`isofs` for Azure's provisioning DVD. There's no udev/mdev daemon to drive `request_module()` through modprobe/kmod, so azinit loads the fixed dependency order itself.
+- Mounts `/proc`, `/sys`, `/dev`, and `/run`. Immutable mode is the default: root stays read-only, `/var` and `/tmp` use tmpfs, and `/etc` uses a tmpfs-backed overlay. The opt-in `zvminit.mode=persistent` kernel option instead remounts root read-write, leaves `/etc`, `/var`, and `/home` persistent, and mounts only `/tmp` as tmpfs. If `/etc/machine-id` is empty after image generalization, zvminit generates and persists a new 128-bit machine ID.
+- Loads the kernel modules this appliance needs directly via a raw `init_module()` syscall (decompressing the shipped `.ko.xz` with `std.compress.xz`): `overlay` for immutable `/etc`, `hv_netvsc` for Hyper-V networking, and `crc-itu-t`/`udf`/`isofs` for Azure's provisioning DVD. There's no udev/mdev daemon to drive `request_module()` through modprobe/kmod, so zvminit loads the fixed dependency order itself.
 - Mounts the ESP, sets the hostname, brings up loopback, then runs a small
   DHCP client on the first non-`lo` interface it finds and writes
   `/etc/resolv.conf`. DHCP replies are received on a raw `AF_PACKET` socket
@@ -37,21 +37,24 @@ A minimal (~160 KB), statically-linked PID 1 replacement for real-boot testing o
 
 ## Building
 
-Built as part of the repo-root build graph (there's no separate `azinit/build.zig`):
+Built as part of the repo-root build graph (there's no separate `zvminit/build.zig`):
 
 ```
 zig build
-zig build test-azinit
+zig build test-zvminit
 ```
 
 The installed executable always cross-compiles to static `x86_64-linux` regardless of host, since that's what these real Azure Gen2 VM fixtures run; there's no `-Doptimize=` toggle because the binary hardcodes `ReleaseSmall`. The tests build for the selected native test target.
 
 ## Using it
 
-Add the built `zig-out/bin/azinit` binary to a container image as `sbin/init` (plus `sbin/poweroff`/`sbin/reboot`/`sbin/shutdown` symlinks pointing at it), then build an immutable bootable disk image with:
+Add the built `zig-out/bin/zvminit` binary to a container image as
+`sbin/zvminit`, with relative `sbin/init`, `sbin/poweroff`, `sbin/reboot`, and
+`sbin/shutdown` symlinks pointing to `zvminit`, then build an immutable bootable
+disk image with:
 
 ```
-zvmi build-image --iso <azurelinux.iso> --container <oci-layout-with-azinit> \
+zvmi build-image --iso <azurelinux.iso> --container <oci-layout-with-zvminit> \
   --generation 2 --size 768M --skip-iso-rootfs \
   --extra-kernel-options "console=tty0 console=ttyS0,115200n8" \
   -o out.vhd -O vhd
@@ -60,15 +63,15 @@ zvmi build-image --iso <azurelinux.iso> --container <oci-layout-with-azinit> \
 For a generalized Azure image, include `/usr/sbin/azagent`, `/usr/sbin/sshd`, `ssh-keygen`, and their runtime dependencies in the container, then opt into persistent mode:
 
 ```
-zvmi build-image --iso <azurelinux.iso> --container <oci-layout-with-azinit-agent-sshd> \
+zvmi build-image --iso <azurelinux.iso> --container <oci-layout-with-zvminit-agent-sshd> \
   --generation 2 --size 768M --skip-iso-rootfs \
-  --extra-kernel-options "init=/sbin/init azinit.mode=persistent azinit.azure=auto console=tty0 console=ttyS0,115200n8" \
+  --extra-kernel-options "init=/sbin/zvminit zvminit.mode=persistent zvminit.azure=auto console=tty0 console=ttyS0,115200n8" \
   -o out.vhd -O vhd
 ```
 
-`init=/sbin/init` is required when the packaged OpenSSH dependency set includes systemd; otherwise the systemd-based initramfs selects `/usr/lib/systemd/systemd` directly instead of azinit. Persistent mode is intentionally incompatible with a read-only dm-verity root. If the root remount fails, azinit leaves provisioning and SSH disabled and retains serial-console access for diagnosis.
+`init=/sbin/zvminit` is required when the packaged OpenSSH dependency set includes systemd; otherwise the systemd-based initramfs selects `/usr/lib/systemd/systemd` directly instead of zvminit. Persistent mode is intentionally incompatible with a read-only dm-verity root. If the root remount fails, zvminit leaves provisioning and SSH disabled and retains serial-console access for diagnosis.
 
-`azinit.azure=auto` is the default. Use `azinit.azure=on` to force provisioning retries when Azure's early-boot signals are unavailable, or `azinit.azure=off` to suppress `azagent` explicitly. Overrides apply only to the current boot and do not replace the cached automatic decision. `zvmi azure deprovision` removes `/var/lib/azagent`, including both the provisioning sentinel and cached environment decision.
+`zvminit.azure=auto` is the default. Use `zvminit.azure=on` to force provisioning retries when Azure's early-boot signals are unavailable, or `zvminit.azure=off` to suppress `azagent` explicitly. Overrides apply only to the current boot and do not replace the cached automatic decision. `zvmi azure deprovision` removes `/var/lib/azagent`, including both the provisioning sentinel and cached environment decision.
 
 Generalized Azure deployments must still provide `adminUsername`; use `g` for
 the project image convention. With the builder's `waagent.conf`, azagent mounts

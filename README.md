@@ -103,8 +103,8 @@ zvmi/
         build_image.zig       # `zvmi build-image`
         qemu.zig              # `zvmi qemu`
         opts.zig              # shared `-o subformat=...` parsing
-  azinit/                   # minimal PID 1 for real-boot testing of
-                              #   --skip-iso-rootfs images (see azinit/README.md)
+  zvminit/                  # minimal PID 1 for real-boot testing of
+                              #   --skip-iso-rootfs images (see zvminit/README.md)
   qmp/                      # native Zig QEMU Machine Protocol (QMP) client,
                               #   MIT licensed (see qmp/README.md)
   qemu/
@@ -467,17 +467,17 @@ full (non-`--skip-iso-rootfs`) image, since its systemd comes from the
 merged distro content; a `--skip-iso-rootfs` image's `/sbin/init` is
 responsible for invoking `azagent` itself if it wants first-boot
 provisioning, since there's no guarantee of systemd being present at all in
-that minimal path (`azinit` does this -- see `azinit/README.md`). Generalized
-images using `azinit` must add `azinit.mode=persistent` to the kernel command
+that minimal path (`zvminit` does this -- see `zvminit/README.md`). Generalized
+images using `zvminit` must add `zvminit.mode=persistent` to the kernel command
 line so provisioned users, SSH keys, host keys, and the azagent sentinel are
-written to the root filesystem instead of ephemeral overlays. `azinit` defaults
-to `azinit.azure=auto`: readable provisioning media or DHCP option 245 selects
+written to the root filesystem instead of ephemeral overlays. `zvminit` defaults
+to `zvminit.azure=auto`: readable provisioning media or DHCP option 245 selects
 Azure, while a completed DHCP lease with neither signal selects non-Azure and
 skips `azagent`. Persistent decisions are stored under `/var/lib/azagent` and
 bound to the current DMI product UUID; `zvmi azure deprovision` clears them.
-Use `azinit.azure=on` or `off` as a per-boot diagnostic override. Also add
-`init=/sbin/init` when the container includes systemd as an OpenSSH dependency,
-ensuring the initramfs launches `azinit` rather than systemd directly.
+Use `zvminit.azure=on` or `off` as a per-boot diagnostic override. Also add
+`init=/sbin/zvminit` when the container includes systemd as an OpenSSH dependency,
+ensuring the initramfs launches `zvminit` rather than systemd directly.
 Azure still requires every generalized-VM deployment to supply an
 `adminUsername`; use `g` for this image convention. The generated
 `waagent.conf` mounts the temporary resource disk at `/d` and enables
@@ -489,10 +489,10 @@ unknown layouts are left untouched.
 
 Host-side image builders can reuse `zvmi.artifact_pipeline` for bounded SHA-256-verified acquisition and transactional publication. Download callbacks receive only a pipeline-owned writer rather than a staging path, `decompressXz` requires an explicit XZ Utils executable plus compressed-input digest, memory limit, and output-size limit, and Linux-only `finalizeQcow2` converts a digest-pinned raw or standalone QCOW2 source to a validated standalone QCOW2. `zvmi.azure.deriveFixedVhd` converts a digest-pinned standalone GPT QCOW2 into a 1 MiB-aligned fixed VHD through a descriptor-pinned atomic stage, strictly cross-validates the primary and backup GPT copies, preserves the raw partition array and every partition extent, relocates the backup GPT, and revalidates the VHD and both GPT copies before publication. All operations preserve an existing destination until validation succeeds.
 
-`scripts/build_generalized_azurelinux4.zig` (run via `zig build generalized-azurelinux4`) provides the complete reproducible recipe used for the generalized Azure image: it downloads and verifies the official Azure Linux 4 ISO, pulls `mcr.microsoft.com/azurelinux-beta/base/core:4.0`, installs signed x86_64 `openssh-server` and `sudo` packages, injects static `azinit`/`azagent`, and removes host identity. It also downloads the pinned Azure Linux `systemd-boot-unsigned-258.4-4.azl4.x86_64.rpm`, verifies its SHA-256 digest, and injects `linuxx64.efi.stub`. The recipe creates a bounded multi-layer OCI layout, builds a 1184 MiB Gen2 QCOW2 with a 512 MiB ESP and 670 MiB root partition, validates the finalized disk and UKI structure, and compresses it to maximum zstd level via an LD_PRELOAD intercept library (`scripts/zstd_max_preload.zig`).
+`scripts/build_generalized_azurelinux4.zig` (run via `zig build generalized-azurelinux4`) provides the complete reproducible recipe used for the generalized Azure image: it downloads and verifies the official Azure Linux 4 ISO, pulls `mcr.microsoft.com/azurelinux-beta/base/core:4.0`, installs signed x86_64 `openssh-server` and `sudo` packages, injects static `zvminit`/`azagent`, and removes host identity. It also downloads the pinned Azure Linux `systemd-boot-unsigned-258.4-4.azl4.x86_64.rpm`, verifies its SHA-256 digest, and injects `linuxx64.efi.stub`. The recipe creates a bounded multi-layer OCI layout, builds a 1184 MiB Gen2 QCOW2 with a 512 MiB ESP and 670 MiB root partition, validates the finalized disk and UKI structure, and compresses it to maximum zstd level via an LD_PRELOAD intercept library (`scripts/zstd_max_preload.zig`).
 
 The image boots directly through `UEFI -> EFI/BOOT/BOOTX64.EFI (UKI) ->
-kernel/initramfs -> azinit`; it does not require shim, GRUB, or BLS
+kernel/initramfs -> zvminit`; it does not require shim, GRUB, or BLS
 configuration. The generated UKI is currently unsigned, so Secure Boot must
 remain disabled. UKI signing and Azure/QEMU trust are tracked in issue #168.
 
@@ -502,9 +502,9 @@ zig build generalized-azurelinux4 -- \
   --output /path/to/zvmi-azurelinux4-generalized.qcow2
 ```
 
-The builder requires Zig 0.16, `curl`, `dnf`, GNU tar, `qemu-img`, and passwordless or interactive `sudo`. On a non-x86_64 build host, x86_64 binfmt and `qemu-x86_64-static` are also required so RPM scriptlets can run inside the target rootfs; on Azure Linux install them with `sudo tdnf install -y qemu-user-static-x86`. Use `--iso` to supply an already-downloaded ISO and `--size` to override the 1184 MiB virtual disk size. The fixed 512 MiB ESP is retained when the total size is overridden, with the root partition consuming the remaining aligned capacity. The build system automatically passes the paths of the built native zvmi, guest azinit/azagent binaries, and the preload library; no separate `zig build` invocation is needed.
+The builder requires Zig 0.16, `curl`, `dnf`, GNU tar, `qemu-img`, and passwordless or interactive `sudo`. On a non-x86_64 build host, x86_64 binfmt and `qemu-x86_64-static` are also required so RPM scriptlets can run inside the target rootfs; on Azure Linux install them with `sudo tdnf install -y qemu-user-static-x86`. Use `--iso` to supply an already-downloaded ISO and `--size` to override the 1184 MiB virtual disk size. The fixed 512 MiB ESP is retained when the total size is overridden, with the root partition consuming the remaining aligned capacity. The build system automatically passes the paths of the built native zvmi, guest zvminit/azagent binaries, and the preload library; no separate `zig build` invocation is needed.
 
-The manually dispatched **Rebuild Azure Linux 4 release image** GitHub Actions workflow builds this image from current `main`, validates its QCOW2 and UKI structure, boots the final compressed artifact under QEMU/OVMF with Secure Boot disabled, verifies `azinit` is PID 1, and replaces `AzureLinux-4.0-x86_64.qcow2` in the `AzureLinux4.0-20260714` release while refreshing the published checksum and provenance.
+The manually dispatched **Rebuild Azure Linux 4 release image** GitHub Actions workflow builds this image from current `main`, validates its QCOW2 and UKI structure, boots the final compressed artifact under QEMU/OVMF with Secure Boot disabled, verifies `zvminit` is PID 1, and replaces `AzureLinux-4.0-x86_64.qcow2` in the `AzureLinux4.0-20260714` release while refreshing the published checksum and provenance.
 
 ### Generalized FreeBSD 15.1 AArch64 QCOW2
 
@@ -601,7 +601,7 @@ QEMU's `-nographic` serial console; use QEMU's `Ctrl+A`, then `X`, escape to
 exit. A successful local boot reaches the root shell with:
 
 ```text
-[azinit] non-Azure environment detected; skipping azagent
+[zvminit] non-Azure environment detected; skipping azagent
 [root@azurelinux /]#
 ```
 

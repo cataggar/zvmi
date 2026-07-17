@@ -15,7 +15,7 @@
         "qmp",
         "nbd",
         "qcow2",
-        "azinit",
+        "zvminit",
         "azagent",
         "wireserver",
         "scripts",

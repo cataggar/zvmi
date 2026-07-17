@@ -60,7 +60,7 @@ pub fn build(b: *std.Build) void {
 
     // ---- azagent: minimal guest provisioning agent for first-boot Azure
     // VM setup (issue #112). Statically linked for self-containment
-    // (matching azinit's philosophy), but -- unlike azinit, which is
+    // (matching zvminit's philosophy), but -- unlike zvminit, which is
     // pinned to a single real-boot x86_64 QEMU test fixture -- built for
     // the standard target/optimize so it supports every Linux architecture
     // a given image targets (Azure supports Arm64 VMs too) and remains
@@ -407,55 +407,55 @@ pub fn build(b: *std.Build) void {
     const qcow2_exe_tests = b.addTest(.{ .root_module = qcow2_exe.root_module });
     const run_qcow2_exe_tests = b.addRunArtifact(qcow2_exe_tests);
 
-    // ---- azinit: standalone minimal PID 1 for real-boot testing of
+    // ---- zvminit: standalone minimal PID 1 for real-boot testing of
     // --skip-iso-rootfs images ----
-    // azinit always runs as PID 1 inside an x86_64 Azure Linux guest, so
+    // zvminit always runs as PID 1 inside an x86_64 Azure Linux guest, so
     // unlike the rest of this repo it hardcodes its target rather than
     // using `target`/`optimize` above. Static linking keeps it fully
     // self-contained: no libc, no kmod, no other runtime dependency needs
     // to be present in the guest's root filesystem.
-    const azinit_target = b.resolveTargetQuery(.{
+    const zvminit_target = b.resolveTargetQuery(.{
         .cpu_arch = .x86_64,
         .os_tag = .linux,
     });
-    const azinit_cdrom_mod = b.createModule(.{
+    const zvminit_cdrom_mod = b.createModule(.{
         .root_source_file = b.path("azagent/cdrom.zig"),
-        .target = azinit_target,
+        .target = zvminit_target,
         .optimize = .ReleaseSmall,
     });
-    const azinit_mod = b.createModule(.{
-        .root_source_file = b.path("azinit/init.zig"),
-        .target = azinit_target,
+    const zvminit_mod = b.createModule(.{
+        .root_source_file = b.path("zvminit/init.zig"),
+        .target = zvminit_target,
         .optimize = .ReleaseSmall,
         .imports = &.{
-            .{ .name = "provisioning_media", .module = azinit_cdrom_mod },
+            .{ .name = "provisioning_media", .module = zvminit_cdrom_mod },
         },
     });
-    const azinit_exe = b.addExecutable(.{
-        .name = "azinit",
-        .root_module = azinit_mod,
+    const zvminit_exe = b.addExecutable(.{
+        .name = "zvminit",
+        .root_module = zvminit_mod,
         .linkage = .static,
     });
-    b.installArtifact(azinit_exe);
+    b.installArtifact(zvminit_exe);
 
-    const azinit_test_cdrom_mod = b.createModule(.{
+    const zvminit_test_cdrom_mod = b.createModule(.{
         .root_source_file = b.path("azagent/cdrom.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const azinit_tests = b.addTest(.{
+    const zvminit_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("azinit/init.zig"),
+            .root_source_file = b.path("zvminit/init.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "provisioning_media", .module = azinit_test_cdrom_mod },
+                .{ .name = "provisioning_media", .module = zvminit_test_cdrom_mod },
             },
         }),
     });
-    const run_azinit_tests = b.addRunArtifact(azinit_tests);
-    const azinit_test_step = b.step("test-azinit", "Run azinit tests");
-    azinit_test_step.dependOn(&run_azinit_tests.step);
+    const run_zvminit_tests = b.addRunArtifact(zvminit_tests);
+    const zvminit_test_step = b.step("test-zvminit", "Run zvminit tests");
+    zvminit_test_step.dependOn(&run_zvminit_tests.step);
 
     const test_step = b.step("test", "Run all tests");
 
@@ -501,20 +501,20 @@ pub fn build(b: *std.Build) void {
     if (b.graph.host.result.os.tag == .linux) {
 
         // Guest-targeted azagent for embedding in the generalized image.
-        // Must be x86_64-linux (static) and ReleaseSmall, matching azinit.
+        // Must be x86_64-linux (static) and ReleaseSmall, matching zvminit.
         const zvmi_guest_mod = b.createModule(.{
             .root_source_file = b.path("packages/zvmi/src/root.zig"),
-            .target = azinit_target,
+            .target = zvminit_target,
             .optimize = .ReleaseSmall,
         });
         const wireserver_guest_mod = b.createModule(.{
             .root_source_file = b.path("wireserver/wireserver.zig"),
-            .target = azinit_target,
+            .target = zvminit_target,
             .optimize = .ReleaseSmall,
         });
         const azagent_guest_mod = b.createModule(.{
             .root_source_file = b.path("azagent/main.zig"),
-            .target = azinit_target,
+            .target = zvminit_target,
             .optimize = .ReleaseSmall,
             .imports = &.{
                 .{ .name = "wireserver", .module = wireserver_guest_mod },
@@ -559,14 +559,14 @@ pub fn build(b: *std.Build) void {
 
         // `zig build generalized-azurelinux4 -- [--iso ...] [--output ...] ...`
         // Automatically passes the paths of the just-built native zvmi, guest
-        // azinit/azagent, and the preload library so the builder does not need to
+        // zvminit/azagent, and the preload library so the builder does not need to
         // invoke `zig build` itself.
         const run_builder = b.addRunArtifact(builder_exe);
         run_builder.step.dependOn(b.getInstallStep());
         run_builder.addArg("--zvmi");
         run_builder.addArtifactArg(cli_exe);
-        run_builder.addArg("--azinit");
-        run_builder.addArtifactArg(azinit_exe);
+        run_builder.addArg("--zvminit");
+        run_builder.addArtifactArg(zvminit_exe);
         run_builder.addArg("--azagent");
         run_builder.addArtifactArg(azagent_guest_exe);
         run_builder.addArg("--preload");
@@ -645,7 +645,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_nbd_server_tests.step);
     test_step.dependOn(&run_qcow2_mod_tests.step);
     test_step.dependOn(&run_qcow2_exe_tests.step);
-    test_step.dependOn(&run_azinit_tests.step);
+    test_step.dependOn(&run_zvminit_tests.step);
     test_step.dependOn(&build_api_consumer_check.step);
     test_step.dependOn(&build_api_diagnostics_check.step);
     test_step.dependOn(&build_api_execution_diagnostics_check.step);

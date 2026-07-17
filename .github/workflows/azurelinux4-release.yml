@@ -122,12 +122,12 @@ jobs:
 
           set pid [exp_pid]
           expect {
-              -exact {[azinit] spawning shell on ttyS0} {}
-              timeout { fail $pid "azinit shell marker timeout" }
-              eof     { fail $pid "QEMU exited before azinit shell" }
+              -exact {[zvminit] spawning shell on ttyS0} {}
+              timeout { fail $pid "zvminit shell marker timeout" }
+              eof     { fail $pid "QEMU exited before zvminit shell" }
           }
 
-          send -- "exe=\$(readlink /proc/1/exe); cmd=\$(tr '\\0' ' ' </proc/1/cmdline); status=BAD; test /proc/1/exe -ef /sbin/init && test \"\$cmd\" = '/sbin/init ' && status=OK; printf 'ZVMI_PID1_EXE=%s\\n' \"\$exe\"; printf 'ZVMI_PID1_CMDLINE=%s\\n' \"\$cmd\"; printf 'ZVMI_PID1_%s\\n' \"\$status\"; poweroff\r"
+          send -- "exe=\$(readlink /proc/1/exe); cmd=\$(tr '\\0' ' ' </proc/1/cmdline); status=BAD; test /proc/1/exe -ef /sbin/zvminit && test \"\$cmd\" = '/sbin/zvminit ' && status=OK; printf 'ZVMI_PID1_EXE=%s\\n' \"\$exe\"; printf 'ZVMI_PID1_CMDLINE=%s\\n' \"\$cmd\"; printf 'ZVMI_PID1_%s\\n' \"\$status\"; poweroff\r"
 
           expect {
               -exact {ZVMI_PID1_OK} {}
@@ -166,7 +166,7 @@ jobs:
           Generalized x86_64 Azure Linux 4.0 Gen2 image built with zvmi from current \`main\`. The QCOW2 uses maximum-level zstd cluster compression and boots directly from a Unified Kernel Image (UKI) under UEFI.
 
           - Asset: \`$ASSET_NAME\`
-          - Boot path: \`UEFI -> EFI/BOOT/BOOTX64.EFI (UKI) -> kernel/initramfs -> azinit\`
+          - Boot path: \`UEFI -> EFI/BOOT/BOOTX64.EFI (UKI) -> kernel/initramfs -> zvminit\`
           - Secure Boot: disabled; UKI signing and trust are tracked in issue #168
           - Virtual disk size: 1184 MiB
           - EFI System Partition: 512 MiB
@@ -184,7 +184,7 @@ jobs:
           - UKI stub package: \`systemd-boot-unsigned-258.4-4.azl4.x86_64.rpm\`
           - UKI stub package SHA-256: \`85dd3ac0c532bceb09fc0a85c6568c51fc4ee84e0c478d1302b7a2d84e1bea5c\`
 
-          The builder validates the finalized QCOW2's GPT, ESP, UKI sections, and embedded command line. The release workflow then boots that exact compressed artifact with QEMU/OVMF and verifies \`azinit\` is PID 1. The base image identifies itself as Azure Linux 4.0 Container Image Beta with \`RELEASE_TYPE=development\`.
+          The builder validates the finalized QCOW2's GPT, ESP, UKI sections, and embedded command line. The release workflow then boots that exact compressed artifact with QEMU/OVMF and verifies \`zvminit\` is PID 1. The base image identifies itself as Azure Linux 4.0 Container Image Beta with \`RELEASE_TYPE=development\`.
           EOF
 
           gh release upload "$RELEASE_TAG" "dist/$ASSET_NAME" --clobber --repo "$GITHUB_REPOSITORY"
