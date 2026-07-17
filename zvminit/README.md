@@ -36,6 +36,11 @@ A minimal (~160 KB), statically-linked PID 1 replacement for real-boot testing o
   current DMI product UUID so moving the disk to a different VM forces
   redetection. Failed DHCP or not-yet-readable media remains unknown and is
   retried without repeatedly launching `azagent`.
+- Distinguishes synthetic local OVF media only by the explicit
+  `zvmi-local-provisioning` marker file. Marked media runs
+  `azagent --skip-ready` under the default automatic policy; an unmarked
+  `ovf-env.xml` remains Azure media and keeps fail-closed, retriable WireServer
+  Ready acknowledgement.
 - If `/usr/sbin/azagent` (the guest provisioning agent, see `azagent/`, issue
   #112) is present, runs it as a direct child after Azure is detected and
   retries failures every five seconds. A completed local-provisioning sentinel
@@ -46,9 +51,12 @@ A minimal (~160 KB), statically-linked PID 1 replacement for real-boot testing o
   persistent image never exposes SSH. The loop manages only these fixed
   processes and the optional shell; it is not a general service manager.
 - Emits `[zvminit] ZVMINIT_PID1_READY supervisor loop active` once PID 1 has
-  completed base initialization and entered its supervisor loop. This marker
-  does not claim that provisioning, WireServer Ready, or SSH acceptance has
-  completed.
+  verified its actual PID is 1, completed base initialization, and entered its
+  supervisor loop. This marker does not claim that provisioning, WireServer
+  Ready, or SSH acceptance has completed.
+- On shutdown, prevents new service starts, broadcasts `SIGTERM` to all
+  permitted guest processes, drains all direct and adopted children, then
+  escalates remaining processes to `SIGKILL` before rebooting or powering off.
 
 ## Building
 
@@ -94,6 +102,10 @@ zvmi build-image --iso <azurelinux.iso> --container <oci-layout-with-zvminit-age
 `zvminit.shell=off` is also the default. Add `zvminit.shell=on` only to a
 temporary diagnostic boot command line when unauthenticated serial root access
 is acceptable. Released builder command lines intentionally omit it.
+
+The `/sbin/poweroff`, `/sbin/reboot`, and `/sbin/shutdown` helper links signal
+PID 1 so the same complete child-drain path is used rather than rebooting
+around the supervisor.
 
 Generalized Azure deployments must still provide `adminUsername`; use `g` for
 the project image convention. With the builder's `waagent.conf`, azagent mounts

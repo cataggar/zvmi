@@ -492,9 +492,10 @@ authorized_keys key-type/base64 pair. Local provisioning writes the existing
 `/var/lib/azagent/provisioned` sentinel before Azure Ready acknowledgement.
 Every normal invocation reports Ready even when that sentinel already exists,
 and a WireServer failure is returned so `zvminit` retries without recreating
-the account or keys. `azagent --skip-ready` is the explicit controlled mode
-for future synthetic local OVF media; the default never infers that mode from
-the presence of an OVF document.
+the account or keys. Synthetic local OVF media must contain the explicit
+`zvmi-local-provisioning` marker; under the default `zvminit.azure=auto`,
+only that marker makes `zvminit` invoke `azagent --skip-ready`. An unmarked OVF
+document retains normal Azure Ready acknowledgement.
 Azure still requires every generalized-VM deployment to supply an
 `adminUsername`; use `g` for this image convention. The generated
 `waagent.conf` mounts the temporary resource disk at `/d` and enables
