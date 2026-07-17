@@ -31,7 +31,7 @@ const usage =
     \\  azure deprovision [--user <username>] <file>
     \\  cosi <disk-image> -o <output.cosi>
     \\  build-image --iso <file.iso> --container <oci-layout> --generation 1|2 --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}> [--skip-iso-rootfs] [--esp-size <size>] [--boot-mode bls|uki|both] [--stub-source-path <path>] [--verity]
-    \\  qemu [<image>] [--snapshot] [--accel auto|whpx|kvm|hvf|tcg] [--qemu <path>] [--ovmf-code <path>] [--ovmf-vars <path>] [-- <extra-qemu-args...>]
+    \\  qemu [<image>] [--architecture auto|x86_64|aarch64] [--admin-username <name>] [--ssh-public-key <path>] [--ssh-port <port>] [--snapshot] [--accel auto|whpx|kvm|hvf|tcg] [--qemu <path>] [--ovmf-code <path>] [--ovmf-vars <path>] [-- <extra-qemu-args...>]
     \\
     \\Formats: raw, vhd (alias: vpc), vhdx, qcow2
     \\Sizes accept K/M/G/T binary suffixes (e.g. 20G).

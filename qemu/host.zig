@@ -1,9 +1,21 @@
-//! Host-side QEMU executable and x86_64 OVMF firmware discovery.
+//! Host-side QEMU executable and architecture-aware UEFI firmware discovery.
 
 const std = @import("std");
 const builtin = @import("builtin");
 
 const Io = std.Io;
+
+pub const GuestArchitecture = enum {
+    x86_64,
+    aarch64,
+
+    pub fn cliName(self: GuestArchitecture) []const u8 {
+        return switch (self) {
+            .x86_64 => "x86_64",
+            .aarch64 => "aarch64",
+        };
+    }
+};
 
 pub const FirmwarePair = struct {
     code_path: []u8,
@@ -21,6 +33,7 @@ pub const FirmwareSearchOptions = struct {
     explicit_vars_path: ?[]const u8 = null,
     qemu_path: ?[]const u8 = null,
     data_dirs: []const []const u8 = &.{},
+    architecture: GuestArchitecture = .x86_64,
 };
 
 const FirmwareCandidate = struct {
@@ -38,6 +51,13 @@ pub fn pathAccessible(io: Io, path: []const u8, options: Io.Dir.AccessOptions) !
 
 pub fn executableName(comptime base: []const u8) []const u8 {
     return if (builtin.os.tag == .windows) base ++ ".exe" else base;
+}
+
+pub fn qemuSystemName(architecture: GuestArchitecture) []const u8 {
+    return switch (architecture) {
+        .x86_64 => executableName("qemu-system-x86_64"),
+        .aarch64 => executableName("qemu-system-aarch64"),
+    };
 }
 
 pub fn findExecutableInPathAlloc(
@@ -109,37 +129,56 @@ pub fn findFirmwarePairAlloc(
     }
 
     for (options.data_dirs) |data_dir| {
-        if (try findFirmwareInDataDirAlloc(allocator, io, data_dir)) |pair| return pair;
+        if (try findFirmwareInDataDirAlloc(allocator, io, data_dir, options.architecture)) |pair| return pair;
     }
 
     if (options.qemu_path) |qemu_path| {
         if (std.fs.path.dirname(qemu_path)) |bin_dir| {
             const adjacent_share = try std.fs.path.join(allocator, &.{ bin_dir, "share" });
             defer allocator.free(adjacent_share);
-            if (try findFirmwareInDataDirAlloc(allocator, io, adjacent_share)) |pair| return pair;
+            if (try findFirmwareInDataDirAlloc(allocator, io, adjacent_share, options.architecture)) |pair| return pair;
 
             if (std.fs.path.dirname(bin_dir)) |prefix| {
                 const prefix_share = try std.fs.path.join(allocator, &.{ prefix, "share", "qemu" });
                 defer allocator.free(prefix_share);
-                if (try findFirmwareInDataDirAlloc(allocator, io, prefix_share)) |pair| return pair;
+                if (try findFirmwareInDataDirAlloc(allocator, io, prefix_share, options.architecture)) |pair| return pair;
             }
         }
     }
 
-    const candidates: []const FirmwareCandidate = switch (builtin.os.tag) {
-        .linux => &.{
-            .{ .code = "/usr/share/OVMF/OVMF_CODE.fd", .vars = "/usr/share/OVMF/OVMF_VARS.fd" },
-            .{ .code = "/usr/share/OVMF/OVMF_CODE_4M.fd", .vars = "/usr/share/OVMF/OVMF_VARS_4M.fd" },
-            .{ .code = "/usr/share/edk2/ovmf/OVMF_CODE.fd", .vars = "/usr/share/edk2/ovmf/OVMF_VARS.fd" },
-            .{ .code = "/usr/share/edk2/x64/OVMF_CODE.fd", .vars = "/usr/share/edk2/x64/OVMF_VARS.fd" },
-            .{ .code = "/usr/share/qemu/edk2-x86_64-code.fd", .vars = "/usr/share/qemu/edk2-i386-vars.fd" },
+    const candidates: []const FirmwareCandidate = switch (options.architecture) {
+        .x86_64 => switch (builtin.os.tag) {
+            .linux => &.{
+                .{ .code = "/usr/share/OVMF/OVMF_CODE.fd", .vars = "/usr/share/OVMF/OVMF_VARS.fd" },
+                .{ .code = "/usr/share/OVMF/OVMF_CODE_4M.fd", .vars = "/usr/share/OVMF/OVMF_VARS_4M.fd" },
+                .{ .code = "/usr/share/edk2/ovmf/OVMF_CODE.fd", .vars = "/usr/share/edk2/ovmf/OVMF_VARS.fd" },
+                .{ .code = "/usr/share/edk2/x64/OVMF_CODE.fd", .vars = "/usr/share/edk2/x64/OVMF_VARS.fd" },
+                .{ .code = "/usr/share/qemu/edk2-x86_64-code.fd", .vars = "/usr/share/qemu/edk2-i386-vars.fd" },
+            },
+            .macos => &.{
+                .{ .code = "/opt/homebrew/share/qemu/edk2-x86_64-code.fd", .vars = "/opt/homebrew/share/qemu/edk2-i386-vars.fd" },
+                .{ .code = "/usr/local/share/qemu/edk2-x86_64-code.fd", .vars = "/usr/local/share/qemu/edk2-i386-vars.fd" },
+                .{ .code = "/opt/local/share/qemu/edk2-x86_64-code.fd", .vars = "/opt/local/share/qemu/edk2-i386-vars.fd" },
+            },
+            else => &.{},
         },
-        .macos => &.{
-            .{ .code = "/opt/homebrew/share/qemu/edk2-x86_64-code.fd", .vars = "/opt/homebrew/share/qemu/edk2-i386-vars.fd" },
-            .{ .code = "/usr/local/share/qemu/edk2-x86_64-code.fd", .vars = "/usr/local/share/qemu/edk2-i386-vars.fd" },
-            .{ .code = "/opt/local/share/qemu/edk2-x86_64-code.fd", .vars = "/opt/local/share/qemu/edk2-i386-vars.fd" },
+        .aarch64 => switch (builtin.os.tag) {
+            .linux => &.{
+                .{ .code = "/usr/share/AAVMF/AAVMF_CODE.fd", .vars = "/usr/share/AAVMF/AAVMF_VARS.fd" },
+                .{ .code = "/usr/share/AAVMF/AAVMF_CODE_4M.fd", .vars = "/usr/share/AAVMF/AAVMF_VARS_4M.fd" },
+                .{ .code = "/usr/share/edk2/aarch64/QEMU_EFI.fd", .vars = "/usr/share/edk2/arm-vars.fd" },
+                .{ .code = "/usr/share/edk2/aarch64/AAVMF_CODE.fd", .vars = "/usr/share/edk2/aarch64/AAVMF_VARS.fd" },
+                .{ .code = "/usr/share/edk2/aarch64/edk2-aarch64-code.fd", .vars = "/usr/share/edk2/aarch64/edk2-arm-vars.fd" },
+                .{ .code = "/usr/share/edk2/aarch64/code.fd", .vars = "/usr/share/edk2/aarch64/vars.fd" },
+                .{ .code = "/usr/share/qemu/edk2-aarch64-code.fd", .vars = "/usr/share/qemu/edk2-arm-vars.fd" },
+            },
+            .macos => &.{
+                .{ .code = "/opt/homebrew/share/qemu/edk2-aarch64-code.fd", .vars = "/opt/homebrew/share/qemu/edk2-arm-vars.fd" },
+                .{ .code = "/usr/local/share/qemu/edk2-aarch64-code.fd", .vars = "/usr/local/share/qemu/edk2-arm-vars.fd" },
+                .{ .code = "/opt/local/share/qemu/edk2-aarch64-code.fd", .vars = "/opt/local/share/qemu/edk2-arm-vars.fd" },
+            },
+            else => &.{},
         },
-        else => &.{},
     };
 
     for (candidates) |candidate| {
@@ -154,14 +193,29 @@ fn findFirmwareInDataDirAlloc(
     allocator: std.mem.Allocator,
     io: Io,
     data_dir: []const u8,
+    architecture: GuestArchitecture,
 ) !?FirmwarePair {
-    const names = [_]FirmwareCandidate{
-        .{ .code = "edk2-x86_64-code.fd", .vars = "edk2-i386-vars.fd" },
-        .{ .code = "OVMF_CODE.fd", .vars = "OVMF_VARS.fd" },
-        .{ .code = "OVMF_CODE_4M.fd", .vars = "OVMF_VARS_4M.fd" },
+    const names = switch (architecture) {
+        .x86_64 => [_]FirmwareCandidate{
+            .{ .code = "edk2-x86_64-code.fd", .vars = "edk2-i386-vars.fd" },
+            .{ .code = "OVMF_CODE.fd", .vars = "OVMF_VARS.fd" },
+            .{ .code = "OVMF_CODE_4M.fd", .vars = "OVMF_VARS_4M.fd" },
+            .{ .code = "", .vars = "" },
+            .{ .code = "", .vars = "" },
+            .{ .code = "", .vars = "" },
+        },
+        .aarch64 => [_]FirmwareCandidate{
+            .{ .code = "edk2-aarch64-code.fd", .vars = "edk2-arm-vars.fd" },
+            .{ .code = "AAVMF_CODE.fd", .vars = "AAVMF_VARS.fd" },
+            .{ .code = "AAVMF_CODE_4M.fd", .vars = "AAVMF_VARS_4M.fd" },
+            .{ .code = "QEMU_EFI.fd", .vars = "AAVMF_VARS.fd" },
+            .{ .code = "QEMU_EFI.fd", .vars = "vars.fd" },
+            .{ .code = "code.fd", .vars = "vars.fd" },
+        },
     };
 
     for (names) |names_pair| {
+        if (names_pair.code.len == 0) continue;
         const code_path = try std.fs.path.join(allocator, &.{ data_dir, names_pair.code });
         defer allocator.free(code_path);
         const vars_path = try std.fs.path.join(allocator, &.{ data_dir, names_pair.vars });
@@ -213,6 +267,17 @@ test "find executable in an explicit PATH value" {
     try std.testing.expectEqualStrings(name, std.fs.path.basename(found));
 }
 
+test "qemu executable names cover both guest architectures" {
+    try std.testing.expectEqualStrings(
+        executableName("qemu-system-x86_64"),
+        qemuSystemName(.x86_64),
+    );
+    try std.testing.expectEqualStrings(
+        executableName("qemu-system-aarch64"),
+        qemuSystemName(.aarch64),
+    );
+}
+
 test "find packaged edk2 firmware in a data directory" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -239,6 +304,32 @@ test "find packaged edk2 firmware in a data directory" {
     try std.testing.expectEqualStrings("edk2-i386-vars.fd", std.fs.path.basename(pair.vars_path));
 }
 
+test "find packaged AAVMF firmware in a data directory" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDir(io, "share", .default_dir);
+    var code = try tmp.dir.createFile(io, "share/AAVMF_CODE.fd", .{});
+    code.close(io);
+    var vars = try tmp.dir.createFile(io, "share/AAVMF_VARS.fd", .{});
+    vars.close(io);
+
+    var root_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const data_dir = try std.fs.path.join(allocator, &.{ root_buf[0..root_len], "share" });
+    defer allocator.free(data_dir);
+
+    var pair = (try findFirmwarePairAlloc(allocator, io, .{
+        .architecture = .aarch64,
+        .data_dirs = &.{data_dir},
+    })).?;
+    defer pair.deinit(allocator);
+    try std.testing.expectEqualStrings("AAVMF_CODE.fd", std.fs.path.basename(pair.code_path));
+    try std.testing.expectEqualStrings("AAVMF_VARS.fd", std.fs.path.basename(pair.vars_path));
+}
+
 test "firmware overrides must be complete" {
     try std.testing.expectError(
         error.IncompleteFirmwareOverride,
@@ -263,6 +354,7 @@ test "firmware search returns null when no candidate is readable" {
         std.testing.allocator,
         std.testing.io,
         "definitely-missing-qemu-data-dir",
+        .x86_64,
     );
     try std.testing.expectEqual(@as(?FirmwarePair, null), pair);
 }
