@@ -13,7 +13,7 @@
 //!
 //! Arguments injected automatically by build.zig:
 //!   --zvmi <path>       Built native zvmi executable
-//!   --azinit <path>     Built x86_64-linux azinit binary
+//!   --zvminit <path>    Built x86_64-linux zvminit binary
 //!   --azagent <path>    Built x86_64-linux azagent binary
 //!   --preload <path>    Built zstd_max_preload.so shared library
 
@@ -50,13 +50,19 @@ const iso_max_bytes: u64 = 2 * 1024 * 1024 * 1024;
 const accept_header = oci_index_type ++ ", " ++ docker_index_type ++ ", " ++ oci_manifest_type ++ ", " ++ docker_manifest_type;
 const generalized_esp_size_bytes: u64 = 512 * 1024 * 1024;
 const generalized_esp_size_arg = "512M";
-const generalized_extra_kernel_options = "init=/sbin/init azinit.mode=persistent azinit.azure=auto console=tty0 console=ttyS0,115200n8";
-const required_rootfs_paths = [_][]const u8{
+const generalized_extra_kernel_options = "init=/sbin/zvminit zvminit.mode=persistent zvminit.azure=auto console=tty0 console=ttyS0,115200n8";
+const required_rootfs_files = [_][]const u8{
     "usr/bin/bash",
     "usr/bin/azagent",
-    "usr/bin/init",
+    "usr/bin/zvminit",
     "usr/bin/sshd",
     systemd_boot_stub_path,
+};
+const zvminit_symlink_paths = [_][]const u8{
+    "usr/bin/init",
+    "usr/bin/poweroff",
+    "usr/bin/reboot",
+    "usr/bin/shutdown",
 };
 
 // ─── subprocess helpers ──────────────────────────────────────────────────────
@@ -511,7 +517,7 @@ fn installGuestContent(
     io: Io,
     rootfs_path: []const u8,
     work_dir: []const u8,
-    azinit_path: []const u8,
+    zvminit_path: []const u8,
     azagent_path: []const u8,
     systemd_boot_rpm_path: []const u8,
 ) !void {
@@ -587,16 +593,15 @@ fn installGuestContent(
         return error.InvalidSystemdBootStub;
     }
 
-    // Install azinit as /sbin/init.
-    const sbin_init = try std.fmt.allocPrint(gpa, "{s}/sbin/init", .{rootfs_path});
-    defer gpa.free(sbin_init);
-    try sudo(gpa, io, &.{ "rm", "-f", sbin_init });
-    try sudo(gpa, io, &.{ "install", "-m", "0755", azinit_path, sbin_init });
-    for (&[_][]const u8{ "poweroff", "reboot", "shutdown" }) |cmd| {
+    // Install zvminit and relative command symlinks.
+    const sbin_zvminit = try std.fmt.allocPrint(gpa, "{s}/sbin/zvminit", .{rootfs_path});
+    defer gpa.free(sbin_zvminit);
+    try sudo(gpa, io, &.{ "install", "-m", "0755", zvminit_path, sbin_zvminit });
+    for (&[_][]const u8{ "init", "poweroff", "reboot", "shutdown" }) |cmd| {
         const link = try std.fmt.allocPrint(gpa, "{s}/sbin/{s}", .{ rootfs_path, cmd });
         defer gpa.free(link);
         try sudo(gpa, io, &.{ "rm", "-f", link });
-        try sudo(gpa, io, &.{ "ln", "-s", "init", link });
+        try sudo(gpa, io, &.{ "ln", "-s", "zvminit", link });
     }
 
     // Install azagent.
@@ -605,7 +610,7 @@ fn installGuestContent(
     try sudo(gpa, io, &.{ "install", "-m", "0755", azagent_path, azagent_dest });
 
     // Write sshd config drop-in.
-    try writeRootFile(gpa, io, rootfs_path, work_dir, "etc/ssh/sshd_config.d/10-azinit.conf", "PasswordAuthentication no\n" ++
+    try writeRootFile(gpa, io, rootfs_path, work_dir, "etc/ssh/sshd_config.d/10-zvminit.conf", "PasswordAuthentication no\n" ++
         "PermitEmptyPasswords no\n" ++
         "PubkeyAuthentication yes\n", "0600");
 
@@ -663,7 +668,7 @@ fn installGuestContent(
     try sudo(gpa, io, &.{ "rm", "-rf", dnf_cache });
     try sudo(gpa, io, &.{ "rm", "-f", dnf_log });
 
-    try run(gpa, io, &.{ "file", sbin_init, azagent_dest });
+    try run(gpa, io, &.{ "file", sbin_zvminit, azagent_dest });
 }
 
 // ─── OCI layout creation ─────────────────────────────────────────────────────
@@ -891,7 +896,7 @@ fn createOciLayout(
     const config = .{
         .architecture = @as([]const u8, "amd64"),
         .config = .{
-            .Entrypoint = &[_][]const u8{"/sbin/init"},
+            .Entrypoint = &[_][]const u8{"/sbin/zvminit"},
             .Env = &[_][]const u8{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
         },
         .created = created_ts,
@@ -1028,13 +1033,23 @@ fn validateGeneralizedOciLayout(gpa: Allocator, io: Io, layout_dir: []const u8) 
     try validateOsRelease(image);
 
     // Azure Linux uses merged-/usr symlinks, so OCI records these physical paths.
-    for (required_rootfs_paths) |path| {
+    for (required_rootfs_files) |path| {
         const entry = image.get(path) orelse {
             std.debug.print("error: generated OCI layout is missing required rootfs path: /{s}\n", .{path});
             return error.IncompleteOciRootfs;
         };
         if (entry.kind != .file) {
             std.debug.print("error: generated OCI rootfs path is not a file: /{s}\n", .{path});
+            return error.IncompleteOciRootfs;
+        }
+    }
+    for (zvminit_symlink_paths) |path| {
+        const entry = image.get(path) orelse {
+            std.debug.print("error: generated OCI layout is missing required zvminit symlink: /{s}\n", .{path});
+            return error.IncompleteOciRootfs;
+        };
+        if (entry.kind != .symlink or !std.mem.eql(u8, entry.link_name orelse "", "zvminit")) {
+            std.debug.print("error: generated OCI rootfs path is not a relative symlink to zvminit: /{s}\n", .{path});
             return error.IncompleteOciRootfs;
         }
     }
@@ -1255,7 +1270,7 @@ const Args = struct {
     size: []const u8 = "1184M",
     work_dir: []const u8 = ".scratch/generalized-azurelinux4",
     zvmi_path: ?[]const u8 = null,
-    azinit_path: ?[]const u8 = null,
+    zvminit_path: ?[]const u8 = null,
     azagent_path: ?[]const u8 = null,
     preload_path: ?[]const u8 = null,
 };
@@ -1268,7 +1283,7 @@ const help_text =
     \\  --size <size>       Disk size (default: 1184M)
     \\  --work-dir <dir>    Working directory (default: .scratch/generalized-azurelinux4)
     \\  --zvmi <path>       zvmi executable (injected by build.zig)
-    \\  --azinit <path>     x86_64-linux azinit binary (injected by build.zig)
+    \\  --zvminit <path>    x86_64-linux zvminit binary (injected by build.zig)
     \\  --azagent <path>    x86_64-linux azagent binary (injected by build.zig)
     \\  --preload <path>    zstd_max_preload.so (injected by build.zig)
     \\
@@ -1301,10 +1316,10 @@ fn parseArgs(argv: []const []const u8) !Args {
             i += 1;
             if (i >= argv.len) return error.MissingValue;
             a.zvmi_path = argv[i];
-        } else if (std.mem.eql(u8, arg, "--azinit")) {
+        } else if (std.mem.eql(u8, arg, "--zvminit")) {
             i += 1;
             if (i >= argv.len) return error.MissingValue;
-            a.azinit_path = argv[i];
+            a.zvminit_path = argv[i];
         } else if (std.mem.eql(u8, arg, "--azagent")) {
             i += 1;
             if (i >= argv.len) return error.MissingValue;
@@ -1353,8 +1368,8 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("error: --zvmi is required (provided by zig build)\n", .{});
         std.process.exit(1);
     };
-    const azinit_path = args.azinit_path orelse {
-        std.debug.print("error: --azinit is required (provided by zig build)\n", .{});
+    const zvminit_path = args.zvminit_path orelse {
+        std.debug.print("error: --zvminit is required (provided by zig build)\n", .{});
         std.process.exit(1);
     };
     const azagent_path = args.azagent_path orelse {
@@ -1400,7 +1415,7 @@ pub fn main(init: std.process.Init) !void {
         io,
         rootfs_path,
         work_dir,
-        azinit_path,
+        zvminit_path,
         azagent_path,
         systemd_boot_rpm_path,
     );
@@ -1629,7 +1644,7 @@ test "systemd boot RPM metadata is pinned and cached under the work directory" {
 
 test "UKI stub is required OCI content" {
     var stub_is_required = false;
-    for (required_rootfs_paths) |path| {
+    for (required_rootfs_files) |path| {
         if (std.mem.eql(u8, path, systemd_boot_stub_path)) {
             stub_is_required = true;
             break;
@@ -1649,6 +1664,18 @@ test "isRegularNonemptyFile accepts only nonempty regular files" {
 test "parseArgs defaults to the UKI disk size and permits an override" {
     try std.testing.expectEqualStrings("1184M", (try parseArgs(&.{})).size);
     try std.testing.expectEqualStrings("2G", (try parseArgs(&.{ "--size", "2G" })).size);
+    try std.testing.expectEqualStrings(
+        "zig-out/bin/zvminit",
+        (try parseArgs(&.{ "--zvminit", "zig-out/bin/zvminit" })).zvminit_path.?,
+    );
+}
+
+test "zvminit rootfs layout requires relative command symlinks" {
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{ "usr/bin/init", "usr/bin/poweroff", "usr/bin/reboot", "usr/bin/shutdown" },
+        &zvminit_symlink_paths,
+    );
 }
 
 test "generalized Gen2 layout reserves a 512 MiB ESP and remaining root" {
@@ -1688,7 +1715,7 @@ test "generalized UKI command line uses the root PARTUUID exactly" {
     defer gpa.free(cmdline);
 
     try std.testing.expectEqualStrings(
-        "root=PARTUUID=11111111-2222-3333-4444-555555555555 init=/sbin/init azinit.mode=persistent azinit.azure=auto console=tty0 console=ttyS0,115200n8",
+        "root=PARTUUID=11111111-2222-3333-4444-555555555555 init=/sbin/zvminit zvminit.mode=persistent zvminit.azure=auto console=tty0 console=ttyS0,115200n8",
         cmdline,
     );
     try std.testing.expectEqualStrings("512M", generalized_esp_size_arg);

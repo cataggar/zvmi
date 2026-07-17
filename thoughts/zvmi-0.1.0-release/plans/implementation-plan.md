@@ -94,7 +94,7 @@ zvmi-0.1.0-<platform>/
 
 ## What We Are NOT Doing
 
-- Packaging `azagent`, `azinit`, `nbd`, `qmp`, `qcow2`, code generators, image
+- Packaging `azagent`, `zvminit`, `nbd`, `qmp`, `qcow2`, code generators, image
   builders, shared libraries, PDB files, or Azure Linux QCOW2 assets.
 - Adding a separately generated source archive; GitHub already exposes source
   archives for the tag.

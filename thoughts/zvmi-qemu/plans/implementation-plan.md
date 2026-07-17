@@ -47,7 +47,7 @@ Running `zvmi qemu` from an empty working directory:
 The successful console path should reach the Azure Linux root shell and include:
 
 ```text
-[azinit] non-Azure environment detected; skipping azagent
+[zvminit] non-Azure environment detected; skipping azagent
 [root@azurelinux /]#
 ```
 

@@ -16,7 +16,7 @@
 //!     it if it ever exits (PID 1 exiting panics the kernel), and reaping
 //!     all other zombie children along the way.
 //! Root stays mounted read-only by default (matches the dm-verity/immutable
-//! image philosophy elsewhere in this project). `azinit.mode=persistent`
+//! image philosophy elsewhere in this project). `zvminit.mode=persistent`
 //! opts into a writable root for generalized VM images whose provisioned
 //! accounts, SSH keys, host keys, and azagent sentinel must survive reboot.
 const std = @import("std");
@@ -26,7 +26,7 @@ const linux = std.os.linux;
 var log_fd: i32 = -1;
 
 fn openDebugLog() void {
-    const rc = linux.open("/run/azinit.log", .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644);
+    const rc = linux.open("/run/zvminit.log", .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644);
     const fd: i32 = @intCast(rc);
     if (linux.errno(rc) == .SUCCESS) log_fd = fd;
 }
@@ -91,7 +91,7 @@ fn tryMountEsp() void {
             const e = linux.errno(rc);
             if (e == .SUCCESS) {
                 var buf: [64]u8 = undefined;
-                const msg = std.fmt.bufPrint(&buf, "[azinit] mounted {s} at /boot/efi\r\n", .{dev}) catch "[azinit] mounted ESP\r\n";
+                const msg = std.fmt.bufPrint(&buf, "[zvminit] mounted {s} at /boot/efi\r\n", .{dev}) catch "[zvminit] mounted ESP\r\n";
                 writeStr(msg);
                 return;
             }
@@ -99,7 +99,7 @@ fn tryMountEsp() void {
         const req: linux.timespec = .{ .sec = 0, .nsec = 200_000_000 };
         _ = linux.nanosleep(&req, null);
     }
-    writeStr("[azinit] no ESP candidate device mounted (non-fatal)\r\n");
+    writeStr("[zvminit] no ESP candidate device mounted (non-fatal)\r\n");
 }
 
 // --- signal-driven / argv0-driven shutdown ---
@@ -152,14 +152,14 @@ fn readPersistedHostname(buf: []u8) ?[]const u8 {
         const read_error = linux.errno(read_rc);
         if (read_error == .INTR) continue;
         if (read_error != .SUCCESS) {
-            writeErrno("[azinit] reading /etc/hostname failed", read_error);
+            writeErrno("[zvminit] reading /etc/hostname failed", read_error);
             return null;
         }
         if (read_rc == 0) break;
         total += read_rc;
     }
     if (total == buf.len) {
-        writeStr("[azinit] /etc/hostname is too long; using default hostname\r\n");
+        writeStr("[zvminit] /etc/hostname is too long; using default hostname\r\n");
         return null;
     }
     return parsePersistedHostname(buf[0..total]);
@@ -225,7 +225,7 @@ fn ensureMachineId() void {
         const random_error = linux.errno(random_rc);
         if (random_error == .INTR) continue;
         if (random_error != .SUCCESS or random_rc == 0) {
-            writeErrno("[azinit] generating machine-id failed", random_error);
+            writeErrno("[zvminit] generating machine-id failed", random_error);
             return;
         }
         random_len += random_rc;
@@ -234,7 +234,7 @@ fn ensureMachineId() void {
     const content = formatMachineId(random);
     const fd_rc = linux.open("/etc/machine-id", .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o444);
     if (linux.errno(fd_rc) != .SUCCESS) {
-        writeErrno("[azinit] opening /etc/machine-id for writing failed", linux.errno(fd_rc));
+        writeErrno("[zvminit] opening /etc/machine-id for writing failed", linux.errno(fd_rc));
         return;
     }
     const fd: i32 = @intCast(fd_rc);
@@ -246,13 +246,13 @@ fn ensureMachineId() void {
         const write_error = linux.errno(write_rc);
         if (write_error == .INTR) continue;
         if (write_error != .SUCCESS or write_rc == 0) {
-            writeErrno("[azinit] writing /etc/machine-id failed", write_error);
+            writeErrno("[zvminit] writing /etc/machine-id failed", write_error);
             return;
         }
         written += write_rc;
     }
     _ = linux.fsync(fd);
-    writeStr("[azinit] generated /etc/machine-id\r\n");
+    writeStr("[zvminit] generated /etc/machine-id\r\n");
 }
 
 const BootMode = enum {
@@ -274,8 +274,8 @@ const BootConfig = struct {
 };
 
 fn parseBootConfig(cmdline: []const u8) BootConfig {
-    const mode_prefix = "azinit.mode=";
-    const azure_prefix = "azinit.azure=";
+    const mode_prefix = "zvminit.mode=";
+    const azure_prefix = "zvminit.azure=";
     var config: BootConfig = .{};
     var tokens = std.mem.tokenizeAny(u8, cmdline, " \t\r\n");
     while (tokens.next()) |token| {
@@ -318,7 +318,7 @@ fn readBootConfig() BootConfig {
         if (linux.errno(fd_rc) != .INTR) break;
     }
     if (linux.errno(fd_rc) != .SUCCESS) {
-        writeErrno("[azinit] opening /proc/cmdline failed; using boot defaults", linux.errno(fd_rc));
+        writeErrno("[zvminit] opening /proc/cmdline failed; using boot defaults", linux.errno(fd_rc));
         return .{};
     }
     const fd: i32 = @intCast(fd_rc);
@@ -331,24 +331,24 @@ fn readBootConfig() BootConfig {
         if (linux.errno(read_rc) != .INTR) break;
     }
     if (linux.errno(read_rc) != .SUCCESS) {
-        writeErrno("[azinit] reading /proc/cmdline failed; using boot defaults", linux.errno(read_rc));
+        writeErrno("[zvminit] reading /proc/cmdline failed; using boot defaults", linux.errno(read_rc));
         return .{};
     }
     if (read_rc == buf.len) {
-        writeStr("[azinit] /proc/cmdline is too long; using boot defaults\r\n");
+        writeStr("[zvminit] /proc/cmdline is too long; using boot defaults\r\n");
         return .{};
     }
 
     var config = parseBootConfig(buf[0..read_rc]);
     if (config.invalid_mode) |value| {
         var msg_buf: [128]u8 = undefined;
-        const msg = std.fmt.bufPrint(&msg_buf, "[azinit] invalid azinit.mode={s}; using immutable mode\r\n", .{value}) catch "[azinit] invalid azinit.mode; using immutable mode\r\n";
+        const msg = std.fmt.bufPrint(&msg_buf, "[zvminit] invalid zvminit.mode={s}; using immutable mode\r\n", .{value}) catch "[zvminit] invalid zvminit.mode; using immutable mode\r\n";
         writeStr(msg);
         config.invalid_mode = null;
     }
     if (config.invalid_azure_policy) |value| {
         var msg_buf: [128]u8 = undefined;
-        const msg = std.fmt.bufPrint(&msg_buf, "[azinit] invalid azinit.azure={s}; using auto\r\n", .{value}) catch "[azinit] invalid azinit.azure; using auto\r\n";
+        const msg = std.fmt.bufPrint(&msg_buf, "[zvminit] invalid zvminit.azure={s}; using auto\r\n", .{value}) catch "[zvminit] invalid zvminit.azure; using auto\r\n";
         writeStr(msg);
         config.invalid_azure_policy = null;
     }
@@ -491,12 +491,12 @@ fn persistAzureDecision(identity: ?[36]u8, decision: AzureDecision) void {
     mkdirIgnoreExists(environment_state_dir);
     const fd_rc = linux.open(environment_state_tmp_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
     if (linux.errno(fd_rc) != .SUCCESS) {
-        writeErrno("[azinit] opening Azure environment state failed", linux.errno(fd_rc));
+        writeErrno("[zvminit] opening Azure environment state failed", linux.errno(fd_rc));
         return;
     }
     const fd: i32 = @intCast(fd_rc);
     if (!writeAll(fd, content)) {
-        writeStr("[azinit] writing Azure environment state failed\r\n");
+        writeStr("[zvminit] writing Azure environment state failed\r\n");
         _ = linux.close(fd);
         _ = linux.unlink(environment_state_tmp_path);
         return;
@@ -505,14 +505,14 @@ fn persistAzureDecision(identity: ?[36]u8, decision: AzureDecision) void {
     const sync_error = linux.errno(sync_rc);
     _ = linux.close(fd);
     if (sync_error != .SUCCESS) {
-        writeErrno("[azinit] syncing Azure environment state failed", sync_error);
+        writeErrno("[zvminit] syncing Azure environment state failed", sync_error);
         _ = linux.unlink(environment_state_tmp_path);
         return;
     }
 
     const rename_rc = linux.rename(environment_state_tmp_path, environment_state_path);
     if (linux.errno(rename_rc) != .SUCCESS) {
-        writeErrno("[azinit] replacing Azure environment state failed", linux.errno(rename_rc));
+        writeErrno("[zvminit] replacing Azure environment state failed", linux.errno(rename_rc));
         _ = linux.unlink(environment_state_tmp_path);
         return;
     }
@@ -530,11 +530,11 @@ fn isProvisioned() bool {
 }
 
 fn probeProvisioningMedia() provisioning_media.ProbeResult {
-    mkdirIgnoreExists("/run/azinit");
-    mkdirIgnoreExists("/run/azinit/provision-media");
+    mkdirIgnoreExists("/run/zvminit");
+    mkdirIgnoreExists("/run/zvminit/provision-media");
     return provisioning_media.probe(
-        "/run/azinit/provision-media",
-        "/run/azinit/provision-media/ovf-env.xml",
+        "/run/zvminit/provision-media",
+        "/run/zvminit/provision-media/ovf-env.xml",
     );
 }
 
@@ -542,10 +542,10 @@ fn remountRootWritable() bool {
     const rc = linux.mount(null, "/", null, linux.MS.REMOUNT, 0);
     const e = linux.errno(rc);
     if (e != .SUCCESS) {
-        writeErrno("[azinit] remounting / read-write failed", e);
+        writeErrno("[zvminit] remounting / read-write failed", e);
         return false;
     }
-    writeStr("[azinit] persistent mode: remounted / read-write\r\n");
+    writeStr("[zvminit] persistent mode: remounted / read-write\r\n");
     return true;
 }
 
@@ -574,7 +574,7 @@ fn mountEtcOverlay() void {
     const rc = linux.mount("overlay", "/etc", "overlay", 0, @intFromPtr("lowerdir=/etc,upperdir=/run/etc-upper,workdir=/run/etc-work"));
     const e = linux.errno(rc);
     if (e != .SUCCESS) {
-        writeErrno("[azinit] /etc overlay mount failed", e);
+        writeErrno("[zvminit] /etc overlay mount failed", e);
         etc_writable = false;
     } else {
         etc_writable = true;
@@ -630,7 +630,7 @@ fn loadModuleAt(gpa: std.mem.Allocator, release: []const u8, rel_path: []const u
 
     const compressed = readWholeFileAlloc(gpa, path) orelse {
         var buf: [128]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "[azinit] module {s} not found (non-fatal)\r\n", .{rel_path}) catch "[azinit] module not found\r\n";
+        const msg = std.fmt.bufPrint(&buf, "[zvminit] module {s} not found (non-fatal)\r\n", .{rel_path}) catch "[zvminit] module not found\r\n";
         writeStr(msg);
         return;
     };
@@ -638,7 +638,7 @@ fn loadModuleAt(gpa: std.mem.Allocator, release: []const u8, rel_path: []const u
 
     const image = decompressXzAlloc(gpa, compressed) orelse {
         var buf: [128]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "[azinit] module {s} decompress failed (non-fatal)\r\n", .{rel_path}) catch "[azinit] module decompress failed\r\n";
+        const msg = std.fmt.bufPrint(&buf, "[zvminit] module {s} decompress failed (non-fatal)\r\n", .{rel_path}) catch "[zvminit] module decompress failed\r\n";
         writeStr(msg);
         return;
     };
@@ -648,10 +648,10 @@ fn loadModuleAt(gpa: std.mem.Allocator, release: []const u8, rel_path: []const u
     const e = linux.errno(rc);
     var buf: [160]u8 = undefined;
     if (e == .SUCCESS or e == .EXIST) {
-        const msg = std.fmt.bufPrint(&buf, "[azinit] loaded module {s}\r\n", .{rel_path}) catch "[azinit] module loaded\r\n";
+        const msg = std.fmt.bufPrint(&buf, "[zvminit] loaded module {s}\r\n", .{rel_path}) catch "[zvminit] module loaded\r\n";
         writeStr(msg);
     } else {
-        const msg = std.fmt.bufPrint(&buf, "[azinit] init_module {s} failed: errno={d}\r\n", .{ rel_path, @intFromEnum(e) }) catch "[azinit] init_module failed\r\n";
+        const msg = std.fmt.bufPrint(&buf, "[zvminit] init_module {s} failed: errno={d}\r\n", .{ rel_path, @intFromEnum(e) }) catch "[zvminit] init_module failed\r\n";
         writeStr(msg);
     }
 }
@@ -660,7 +660,7 @@ fn loadBootModules(mode: BootMode) void {
     const gpa = std.heap.page_allocator;
     var uts: linux.utsname = undefined;
     if (linux.errno(linux.uname(&uts)) != .SUCCESS) {
-        writeStr("[azinit] uname failed; skipping module autoload\r\n");
+        writeStr("[zvminit] uname failed; skipping module autoload\r\n");
         return;
     }
     const release = std.mem.sliceTo(&uts.release, 0);
@@ -907,14 +907,14 @@ fn ifIndex(fd: i32, name: []const u8) ?i32 {
 
 fn openRawIpRecvSocket(ctl_fd: i32, iface: []const u8) ?i32 {
     const index = ifIndex(ctl_fd, iface) orelse {
-        writeStr("[azinit] dhcp: SIOCGIFINDEX failed\r\n");
+        writeStr("[zvminit] dhcp: SIOCGIFINDEX failed\r\n");
         return null;
     };
 
     const sock_rc = linux.socket(linux.AF.PACKET, linux.SOCK.DGRAM, std.mem.nativeToBig(u16, ETH_P_IP));
     const sock: i32 = @intCast(sock_rc);
     if (linux.errno(sock_rc) != .SUCCESS) {
-        writeErrno("[azinit] dhcp: AF_PACKET socket() failed", linux.errno(sock_rc));
+        writeErrno("[zvminit] dhcp: AF_PACKET socket() failed", linux.errno(sock_rc));
         return null;
     }
 
@@ -928,7 +928,7 @@ fn openRawIpRecvSocket(ctl_fd: i32, iface: []const u8) ?i32 {
     };
     const bind_rc = linux.bind(sock, @ptrCast(&addr), @sizeOf(linux.sockaddr.ll));
     if (linux.errno(bind_rc) != .SUCCESS) {
-        writeErrno("[azinit] dhcp: AF_PACKET bind failed", linux.errno(bind_rc));
+        writeErrno("[zvminit] dhcp: AF_PACKET bind failed", linux.errno(bind_rc));
         _ = linux.close(sock);
         return null;
     }
@@ -962,12 +962,12 @@ fn runDhcp(iface: []const u8) DhcpAttempt {
     var hw_req: linux.ifreq = std.mem.zeroes(linux.ifreq);
     @memcpy(hw_req.ifrn.name[0..iface.len], iface);
     const hw_rc = linux.ioctl(ctl_fd, linux.SIOCGIFHWADDR, @intFromPtr(&hw_req));
-    if (linux.errno(hw_rc) != .SUCCESS) writeErrno("[azinit] dhcp: SIOCGIFHWADDR failed", linux.errno(hw_rc));
+    if (linux.errno(hw_rc) != .SUCCESS) writeErrno("[zvminit] dhcp: SIOCGIFHWADDR failed", linux.errno(hw_rc));
     var mac: [6]u8 = undefined;
     @memcpy(&mac, hw_req.ifru.hwaddr.data[0..6]);
     {
         var mbuf: [64]u8 = undefined;
-        const m = std.fmt.bufPrint(&mbuf, "[azinit] dhcp: mac={x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}\r\n", .{ mac[0], mac[1], mac[2], mac[3], mac[4], mac[5] }) catch "[azinit] dhcp: mac read\r\n";
+        const m = std.fmt.bufPrint(&mbuf, "[zvminit] dhcp: mac={x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}\r\n", .{ mac[0], mac[1], mac[2], mac[3], mac[4], mac[5] }) catch "[zvminit] dhcp: mac read\r\n";
         writeStr(m);
     }
 
@@ -976,7 +976,7 @@ fn runDhcp(iface: []const u8) DhcpAttempt {
     const sock_rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM, 0);
     const sock: i32 = @intCast(sock_rc);
     if (linux.errno(sock_rc) != .SUCCESS) {
-        writeErrno("[azinit] dhcp: socket() failed", linux.errno(sock_rc));
+        writeErrno("[zvminit] dhcp: socket() failed", linux.errno(sock_rc));
         return result;
     }
     defer _ = linux.close(sock);
@@ -984,15 +984,15 @@ fn runDhcp(iface: []const u8) DhcpAttempt {
     var one: i32 = 1;
     _ = linux.setsockopt(sock, linux.SOL.SOCKET, linux.SO.BROADCAST, std.mem.asBytes(&one), @sizeOf(i32));
     const bindtodev_rc = linux.setsockopt(sock, linux.SOL.SOCKET, linux.SO.BINDTODEVICE, iface.ptr, @intCast(iface.len));
-    if (linux.errno(bindtodev_rc) != .SUCCESS) writeErrno("[azinit] dhcp: SO_BINDTODEVICE failed", linux.errno(bindtodev_rc));
+    if (linux.errno(bindtodev_rc) != .SUCCESS) writeErrno("[zvminit] dhcp: SO_BINDTODEVICE failed", linux.errno(bindtodev_rc));
 
     const bind_addr = sockaddrInPort(0, std.mem.nativeToBig(u16, 68));
     const bind_rc = linux.bind(sock, &bind_addr, @sizeOf(linux.sockaddr));
     if (linux.errno(bind_rc) != .SUCCESS) {
-        writeErrno("[azinit] dhcp bind failed", linux.errno(bind_rc));
+        writeErrno("[zvminit] dhcp bind failed", linux.errno(bind_rc));
         return result;
     }
-    writeStr("[azinit] dhcp: bound to udp/68\r\n");
+    writeStr("[zvminit] dhcp: bound to udp/68\r\n");
 
     var recv_sock = sock;
     var recv_is_raw = false;
@@ -1000,7 +1000,7 @@ fn runDhcp(iface: []const u8) DhcpAttempt {
         recv_sock = raw_sock;
         recv_is_raw = true;
     } else {
-        writeStr("[azinit] dhcp: falling back to udp recv (may miss replies on some networks)\r\n");
+        writeStr("[zvminit] dhcp: falling back to udp recv (may miss replies on some networks)\r\n");
     }
     defer if (recv_is_raw) {
         _ = linux.close(recv_sock);
@@ -1019,7 +1019,7 @@ fn runDhcp(iface: []const u8) DhcpAttempt {
     const send_rc = linux.sendto(sock, &packet, send_len, 0, &dest_addr, @sizeOf(linux.sockaddr));
     {
         var sbuf: [64]u8 = undefined;
-        const smsg = std.fmt.bufPrint(&sbuf, "[azinit] dhcp: sent DISCOVER, sendto_rc={d}\r\n", .{send_rc}) catch "[azinit] dhcp: sent DISCOVER\r\n";
+        const smsg = std.fmt.bufPrint(&sbuf, "[zvminit] dhcp: sent DISCOVER, sendto_rc={d}\r\n", .{send_rc}) catch "[zvminit] dhcp: sent DISCOVER\r\n";
         writeStr(smsg);
     }
 
@@ -1035,7 +1035,7 @@ fn runDhcp(iface: []const u8) DhcpAttempt {
         const n_signed: isize = @bitCast(n_rc);
         {
             var rbuf: [80]u8 = undefined;
-            const rmsg = std.fmt.bufPrint(&rbuf, "[azinit] dhcp: recvfrom attempt {d} -> {d}\r\n", .{ attempt, n_signed }) catch "[azinit] dhcp: recv attempt\r\n";
+            const rmsg = std.fmt.bufPrint(&rbuf, "[zvminit] dhcp: recvfrom attempt {d} -> {d}\r\n", .{ attempt, n_signed }) catch "[zvminit] dhcp: recv attempt\r\n";
             writeStr(rmsg);
         }
         const payload: ?[]const u8 = if (n_signed <= 0)
@@ -1048,7 +1048,7 @@ fn runDhcp(iface: []const u8) DhcpAttempt {
             if (parseDhcpReply(data, data.len, xid)) |reply| {
                 recordDhcpEvidence(&result, reply);
                 var pbuf: [64]u8 = undefined;
-                const pmsg = std.fmt.bufPrint(&pbuf, "[azinit] dhcp: parsed reply msg_type={d}\r\n", .{reply.msg_type}) catch "[azinit] dhcp: parsed reply\r\n";
+                const pmsg = std.fmt.bufPrint(&pbuf, "[zvminit] dhcp: parsed reply msg_type={d}\r\n", .{reply.msg_type}) catch "[zvminit] dhcp: parsed reply\r\n";
                 writeStr(pmsg);
                 if (reply.msg_type == 2) { // DHCPOFFER
                     offer_ip = reply.your_ip;
@@ -1056,7 +1056,7 @@ fn runDhcp(iface: []const u8) DhcpAttempt {
                     got_offer = true;
                 }
             } else if (n_signed > 0) {
-                writeStr("[azinit] dhcp: recv'd packet failed to parse (xid/magic mismatch?)\r\n");
+                writeStr("[zvminit] dhcp: recv'd packet failed to parse (xid/magic mismatch?)\r\n");
             }
         } else {
             send_len = buildDhcpPacket(&packet, xid, mac, 1, 0, 0);
@@ -1064,7 +1064,7 @@ fn runDhcp(iface: []const u8) DhcpAttempt {
         }
     }
     if (!got_offer) {
-        writeStr("[azinit] dhcp: no offer received\r\n");
+        writeStr("[zvminit] dhcp: no offer received\r\n");
         return result;
     }
 
@@ -1099,7 +1099,7 @@ fn runDhcp(iface: []const u8) DhcpAttempt {
             _ = linux.sendto(sock, &packet, send_len, 0, &dest_addr, @sizeOf(linux.sockaddr));
         }
     }
-    if (got_ack == null) writeStr("[azinit] dhcp: no ack received\r\n");
+    if (got_ack == null) writeStr("[zvminit] dhcp: no ack received\r\n");
     result.lease = got_ack;
     return result;
 }
@@ -1123,7 +1123,7 @@ fn addDefaultRoute(iface: []const u8, gateway_be: u32) void {
 
     const rc = linux.ioctl(sock, linux.SIOCADDRT, @intFromPtr(&route));
     const e = linux.errno(rc);
-    if (e != .SUCCESS) writeErrno("[azinit] add default route failed", e);
+    if (e != .SUCCESS) writeErrno("[zvminit] add default route failed", e);
 }
 
 fn writeResolvConf(dns: [2]u32) void {
@@ -1131,11 +1131,11 @@ fn writeResolvConf(dns: [2]u32) void {
     const fd_rc = linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
     const fd: i32 = @intCast(fd_rc);
     if (linux.errno(fd_rc) != .SUCCESS) {
-        writeErrno("[azinit] writing resolv.conf failed", linux.errno(fd_rc));
+        writeErrno("[zvminit] writing resolv.conf failed", linux.errno(fd_rc));
         return;
     }
     defer _ = linux.close(fd);
-    if (!etc_writable) writeStr("[azinit] /etc not writable (no overlayfs); wrote /run/resolv.conf instead\r\n");
+    if (!etc_writable) writeStr("[zvminit] /etc not writable (no overlayfs); wrote /run/resolv.conf instead\r\n");
 
     var buf: [128]u8 = undefined;
     for (dns) |d| {
@@ -1161,11 +1161,11 @@ fn setupNetworking() NetworkResult {
 
     var iface_buf: [linux.IFNAMESIZE]u8 = undefined;
     const iface = findPrimaryInterface(&iface_buf) orelse {
-        writeStr("[azinit] no non-lo network interface found\r\n");
+        writeStr("[zvminit] no non-lo network interface found\r\n");
         return .{};
     };
     var msg_buf: [96]u8 = undefined;
-    const msg = std.fmt.bufPrint(&msg_buf, "[azinit] running DHCP on {s}\r\n", .{iface}) catch "[azinit] running DHCP\r\n";
+    const msg = std.fmt.bufPrint(&msg_buf, "[zvminit] running DHCP on {s}\r\n", .{iface}) catch "[zvminit] running DHCP\r\n";
     writeStr(msg);
 
     const attempt = runDhcp(iface);
@@ -1189,7 +1189,7 @@ fn setupNetworking() NetworkResult {
 
     const ip_bytes = std.mem.asBytes(&lease.your_ip);
     var ok_buf: [96]u8 = undefined;
-    const ok_msg = std.fmt.bufPrint(&ok_buf, "[azinit] {s} configured: {d}.{d}.{d}.{d}\r\n", .{ iface, ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3] }) catch "[azinit] network configured\r\n";
+    const ok_msg = std.fmt.bufPrint(&ok_buf, "[zvminit] {s} configured: {d}.{d}.{d}.{d}\r\n", .{ iface, ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3] }) catch "[zvminit] network configured\r\n";
     writeStr(ok_msg);
     return network_result;
 }
@@ -1213,9 +1213,9 @@ fn runAzagentIfPresent() AzagentResult {
     const access_rc = linux.access(azagent_path, linux.F_OK);
     if (linux.errno(access_rc) != .SUCCESS) return .absent;
 
-    writeStr("[azinit] running azagent...\r\n");
+    writeStr("[zvminit] running azagent...\r\n");
 
-    const pid = forkProcess("[azinit] fork() for azagent failed") orelse return .failed;
+    const pid = forkProcess("[zvminit] fork() for azagent failed") orelse return .failed;
     if (pid == 0) {
         const argv = [_:null]?[*:0]const u8{ azagent_path, null };
         const envp = [_:null]?[*:0]const u8{
@@ -1223,7 +1223,7 @@ fn runAzagentIfPresent() AzagentResult {
             null,
         };
         _ = linux.execve(azagent_path, &argv, &envp);
-        writeStr("[azinit] execve(azagent) failed\r\n");
+        writeStr("[zvminit] execve(azagent) failed\r\n");
         linux.exit(127);
     }
     var status: u32 = 0;
@@ -1232,16 +1232,16 @@ fn runAzagentIfPresent() AzagentResult {
         const wait_error = linux.errno(wait_rc);
         if (wait_error == .INTR) continue;
         if (wait_error != .SUCCESS) {
-            writeErrno("[azinit] waitpid() for azagent failed", wait_error);
+            writeErrno("[zvminit] waitpid() for azagent failed", wait_error);
             return .failed;
         }
         break;
     }
     if (linux.W.IFEXITED(status) and linux.W.EXITSTATUS(status) == 0) {
-        writeStr("[azinit] azagent completed successfully\r\n");
+        writeStr("[zvminit] azagent completed successfully\r\n");
         return .success;
     } else {
-        writeStr("[azinit] azagent exited non-zero\r\n");
+        writeStr("[zvminit] azagent exited non-zero\r\n");
         return .failed;
     }
 }
@@ -1253,7 +1253,7 @@ fn runAzagentIfPresent() AzagentResult {
 // reached over SSH -- otherwise a "successfully provisioned" minimal
 // container has no way to be reached at all (see issue #129). Called after
 // runAzagentIfPresent() so host keys already exist by the time sshd
-// starts. Tolerant of sshd being entirely absent (most azinit-based test
+// starts. Tolerant of sshd being entirely absent (most zvminit-based test
 // images, including the boot-smoke QEMU tests, won't have it).
 //
 // Unlike azagent (a run-once step we wait for), sshd daemonizes itself and
@@ -1273,9 +1273,9 @@ fn runSshdIfPresent() void {
     // already exist rather than creating it themselves.
     mkdirIgnoreExists("/run/sshd");
 
-    writeStr("[azinit] running sshd...\r\n");
+    writeStr("[zvminit] running sshd...\r\n");
 
-    const pid = forkProcess("[azinit] fork() for sshd failed") orelse return;
+    const pid = forkProcess("[zvminit] fork() for sshd failed") orelse return;
     if (pid == 0) {
         const argv = [_:null]?[*:0]const u8{ sshd_path, null };
         const envp = [_:null]?[*:0]const u8{
@@ -1283,7 +1283,7 @@ fn runSshdIfPresent() void {
             null,
         };
         _ = linux.execve(sshd_path, &argv, &envp);
-        writeStr("[azinit] execve(sshd) failed\r\n");
+        writeStr("[zvminit] execve(sshd) failed\r\n");
         linux.exit(127);
     }
     // Do not waitpid here -- sshd daemonizes and runs forever; shellLoop's
@@ -1316,22 +1316,22 @@ fn persistObservedAzureDecision(
 
 fn logAzureDecision(decision: AzureDecision, policy: AzurePolicy, evidence: AzureEvidence, cached: ?AzureDecision) void {
     switch (policy) {
-        .on => writeStr("[azinit] Azure environment forced on by azinit.azure=on\r\n"),
-        .off => writeStr("[azinit] Azure environment forced off by azinit.azure=off\r\n"),
+        .on => writeStr("[zvminit] Azure environment forced on by zvminit.azure=on\r\n"),
+        .off => writeStr("[zvminit] Azure environment forced off by zvminit.azure=off\r\n"),
         .auto => switch (decision) {
             .azure => if (evidence.saw_option_245)
-                writeStr("[azinit] Azure environment detected from DHCP option 245\r\n")
+                writeStr("[zvminit] Azure environment detected from DHCP option 245\r\n")
             else if (evidence.media == .present)
-                writeStr("[azinit] Azure environment detected from provisioning media\r\n")
+                writeStr("[zvminit] Azure environment detected from provisioning media\r\n")
             else if (cached == .azure)
-                writeStr("[azinit] Azure environment restored from persistent state\r\n")
+                writeStr("[zvminit] Azure environment restored from persistent state\r\n")
             else
-                writeStr("[azinit] Azure environment detected\r\n"),
+                writeStr("[zvminit] Azure environment detected\r\n"),
             .non_azure => if (cached == .non_azure)
-                writeStr("[azinit] non-Azure environment restored from persistent state; skipping azagent\r\n")
+                writeStr("[zvminit] non-Azure environment restored from persistent state; skipping azagent\r\n")
             else
-                writeStr("[azinit] non-Azure environment detected; skipping azagent\r\n"),
-            .unknown => writeStr("[azinit] Azure environment is unknown; retrying detection\r\n"),
+                writeStr("[zvminit] non-Azure environment detected; skipping azagent\r\n"),
+            .unknown => writeStr("[zvminit] Azure environment is unknown; retrying detection\r\n"),
         },
     }
 }
@@ -1353,7 +1353,7 @@ fn runPersistentSupervisor(
         switch (decision) {
             .azure => {
                 if (linux.errno(linux.access(azagent_path, linux.F_OK)) != .SUCCESS) {
-                    writeStr("[azinit] persistent mode requires /usr/sbin/azagent; SSH will not start\r\n");
+                    writeStr("[zvminit] persistent mode requires /usr/sbin/azagent; SSH will not start\r\n");
                     linux.exit(1);
                 }
                 switch (runAzagentIfPresent()) {
@@ -1363,11 +1363,11 @@ fn runPersistentSupervisor(
                         linux.exit(0);
                     },
                     .absent => {
-                        writeStr("[azinit] azagent disappeared; SSH will not start\r\n");
+                        writeStr("[zvminit] azagent disappeared; SSH will not start\r\n");
                         linux.exit(1);
                     },
                     .failed => {
-                        writeStr("[azinit] retrying azagent in 5 seconds\r\n");
+                        writeStr("[zvminit] retrying azagent in 5 seconds\r\n");
                     },
                 }
             },
@@ -1409,8 +1409,8 @@ fn startPersistentProvisioning(policy: AzurePolicy, network: NetworkResult, iden
         return;
     }
 
-    const supervisor_pid = forkProcess("[azinit] fork() for provisioning supervisor failed") orelse {
-        if (isProvisioned()) runSshdIfPresent() else writeStr("[azinit] SSH will not start\r\n");
+    const supervisor_pid = forkProcess("[zvminit] fork() for provisioning supervisor failed") orelse {
+        if (isProvisioned()) runSshdIfPresent() else writeStr("[zvminit] SSH will not start\r\n");
         return;
     };
     if (supervisor_pid == 0) {
@@ -1426,7 +1426,7 @@ fn shellLoop() noreturn {
 
         const tty_fd_raw = linux.open("/dev/ttyS0", .{ .ACCMODE = .RDWR }, 0);
         if (linux.errno(tty_fd_raw) != .SUCCESS) {
-            writeStr("[azinit] failed to open /dev/ttyS0, retrying in 1s\r\n");
+            writeStr("[zvminit] failed to open /dev/ttyS0, retrying in 1s\r\n");
             const req: linux.timespec = .{ .sec = 1, .nsec = 0 };
             _ = linux.nanosleep(&req, null);
             continue;
@@ -1436,7 +1436,7 @@ fn shellLoop() noreturn {
         _ = linux.setsid();
         _ = linux.ioctl(tty_fd, linux.T.IOCSCTTY, 0);
 
-        const pid = forkProcess("[azinit] fork() for shell failed") orelse {
+        const pid = forkProcess("[zvminit] fork() for shell failed") orelse {
             _ = linux.close(tty_fd);
             const req: linux.timespec = .{ .sec = 1, .nsec = 0 };
             _ = linux.nanosleep(&req, null);
@@ -1456,7 +1456,7 @@ fn shellLoop() noreturn {
                 null,
             };
             _ = linux.execve("/usr/bin/bash", &argv, &envp);
-            writeStr("[azinit] execve(/usr/bin/bash) failed\r\n");
+            writeStr("[zvminit] execve(/usr/bin/bash) failed\r\n");
             linux.exit(127);
         }
 
@@ -1474,7 +1474,7 @@ fn shellLoop() noreturn {
         }
 
         if (shutdown_requested) doReboot(.POWER_OFF);
-        writeStr("\r\n[azinit] shell exited, respawning...\r\n");
+        writeStr("\r\n[zvminit] shell exited, respawning...\r\n");
     }
 }
 
@@ -1509,7 +1509,7 @@ pub fn main(init: std.process.Init.Minimal) noreturn {
     setHostname(boot_mode, persistent_root_ready);
     ensureMachineId();
 
-    writeStr("\r\n[azinit] base mounts ready; configuring network...\r\n");
+    writeStr("\r\n[zvminit] base mounts ready; configuring network...\r\n");
     const network = setupNetworking();
 
     if (boot_mode == .persistent) {
@@ -1518,7 +1518,7 @@ pub fn main(init: std.process.Init.Minimal) noreturn {
             const cached = if (identity) |vm_identity| readCachedAzureDecision(vm_identity) else null;
             startPersistentProvisioning(boot_config.azure_policy, network, identity, cached);
         } else {
-            writeStr("[azinit] persistent storage is unavailable; azagent and SSH will not start\r\n");
+            writeStr("[zvminit] persistent storage is unavailable; azagent and SSH will not start\r\n");
         }
     } else {
         const media: provisioning_media.ProbeResult = if (boot_config.azure_policy == .auto) probeProvisioningMedia() else .indeterminate;
@@ -1529,7 +1529,7 @@ pub fn main(init: std.process.Init.Minimal) noreturn {
         runSshdIfPresent();
     }
 
-    writeStr("[azinit] spawning shell on ttyS0\r\n");
+    writeStr("[zvminit] spawning shell on ttyS0\r\n");
     shellLoop();
 }
 
@@ -1540,17 +1540,17 @@ test "parseBootConfig defaults to immutable and automatic Azure detection" {
 }
 
 test "parseBootConfig accepts boot modes and Azure policies independently" {
-    const persistent = parseBootConfig("root=/dev/sda2 azinit.mode=persistent azinit.azure=on console=ttyS0");
+    const persistent = parseBootConfig("root=/dev/sda2 zvminit.mode=persistent zvminit.azure=on console=ttyS0");
     try std.testing.expectEqual(BootMode.persistent, persistent.mode);
     try std.testing.expectEqual(AzurePolicy.on, persistent.azure_policy);
 
-    const immutable = parseBootConfig("azinit.mode=immutable azinit.azure=off");
+    const immutable = parseBootConfig("zvminit.mode=immutable zvminit.azure=off");
     try std.testing.expectEqual(BootMode.immutable, immutable.mode);
     try std.testing.expectEqual(AzurePolicy.off, immutable.azure_policy);
 }
 
 test "parseBootConfig uses the last value for each setting" {
-    const config = parseBootConfig("azinit.mode=persistent azinit.azure=off azinit.mode=immutable azinit.azure=auto");
+    const config = parseBootConfig("zvminit.mode=persistent zvminit.azure=off zvminit.mode=immutable zvminit.azure=auto");
     try std.testing.expectEqual(BootMode.immutable, config.mode);
     try std.testing.expectEqual(AzurePolicy.auto, config.azure_policy);
     try std.testing.expectEqual(@as(?[]const u8, null), config.invalid_mode);
@@ -1558,7 +1558,7 @@ test "parseBootConfig uses the last value for each setting" {
 }
 
 test "parseBootConfig allows later valid values to replace invalid ones" {
-    const config = parseBootConfig("azinit.mode=invalid azinit.azure=maybe azinit.mode=persistent azinit.azure=on");
+    const config = parseBootConfig("zvminit.mode=invalid zvminit.azure=maybe zvminit.mode=persistent zvminit.azure=on");
     try std.testing.expectEqual(BootMode.persistent, config.mode);
     try std.testing.expectEqual(AzurePolicy.on, config.azure_policy);
     try std.testing.expectEqual(@as(?[]const u8, null), config.invalid_mode);
@@ -1566,7 +1566,7 @@ test "parseBootConfig allows later valid values to replace invalid ones" {
 }
 
 test "parseBootConfig rejects invalid values with safe defaults" {
-    const config = parseBootConfig("azinit.mode=writable azinit.azure=maybe");
+    const config = parseBootConfig("zvminit.mode=writable zvminit.azure=maybe");
     try std.testing.expectEqual(BootMode.immutable, config.mode);
     try std.testing.expectEqual(AzurePolicy.auto, config.azure_policy);
     try std.testing.expectEqualStrings("writable", config.invalid_mode.?);
