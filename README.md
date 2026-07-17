@@ -528,6 +528,8 @@ cloud-init plus WALinuxAgent 2.15 (`Provisioning.Agent=auto`,
 `ResourceDisk.Format=n`), key-only OpenSSH, and no custom `zvminit` or
 `azagent`. It uses the profile's explicit 5 GiB default and rejects a root
 partition that cannot retain 1 GiB free. Core retains its 1184 MiB default.
+Full writes `/.autorelabel`, so SELinux policy labels are established on first
+boot rather than asserted from an unlabelled DNF installroot.
 
 Both flavors use `--skip-iso-rootfs`: the ISO supplies only the
 architecture-matched kernel, initramfs, and UEFI assets. Full never publishes
@@ -544,7 +546,9 @@ transactional QCOW2 publication. The x86_64 image uses `linuxx64.efi.stub`,
 `EFI/BOOT/BOOTX64.EFI`, and `ttyS0`; AArch64 uses `linuxaa64.efi.stub`,
 `EFI/BOOT/BOOTAA64.EFI`, and `ttyAMA0`. Core UKIs retain the `zvminit`
 contract; full UKIs contain only the root PARTUUID and architecture serial
-console.
+console. OCI ingestion preserves USTAR uid/gid plus bounded relevant PAX
+`user.*`, `trusted.*`, `security.*`, and `system.*` xattrs, including file
+capabilities; absent tar metadata remains root:root with no xattrs.
 
 The OpenSSH/sudo package transaction is also reproducibly locked: each
 descriptor pins the Azure Linux base repository's `repomd.xml` SHA-256. The

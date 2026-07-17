@@ -27,6 +27,11 @@ pub const EntryKind = enum {
     hardlink,
 };
 
+pub const Xattr = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
 pub const FileTree = struct {
     allocator: Allocator,
     entries: []Entry,
@@ -35,9 +40,12 @@ pub const FileTree = struct {
         path: []const u8,
         kind: EntryKind,
         mode: u32,
+        uid: u32 = 0,
+        gid: u32 = 0,
         size: u64,
         link_name: ?[]const u8 = null,
         content: []const u8 = &.{},
+        xattrs: []const Xattr = &.{},
 
         pub fn reader(self: Entry) Io.Reader {
             return .fixed(self.content);
@@ -60,6 +68,7 @@ pub const FileTree = struct {
             self.allocator.free(entry.path);
             if (entry.link_name) |link_name| self.allocator.free(link_name);
             if (entry.kind == .file) self.allocator.free(entry.content);
+            freeXattrs(self.allocator, entry.xattrs);
         }
         self.allocator.free(self.entries);
         self.* = undefined;
@@ -76,6 +85,36 @@ pub const FileTree = struct {
         return null;
     }
 };
+
+fn freeXattrs(allocator: Allocator, xattrs: []const Xattr) void {
+    if (xattrs.len == 0) return;
+    for (xattrs) |xattr| {
+        allocator.free(xattr.name);
+        allocator.free(xattr.value);
+    }
+    allocator.free(xattrs);
+}
+
+fn dupeTarXattrs(allocator: Allocator, xattrs: []const tar.Xattr) ![]const Xattr {
+    if (xattrs.len == 0) return &.{};
+    const owned = try allocator.alloc(Xattr, xattrs.len);
+    var completed: usize = 0;
+    errdefer {
+        for (owned[0..completed]) |xattr| {
+            allocator.free(xattr.name);
+            allocator.free(xattr.value);
+        }
+        allocator.free(owned);
+    }
+    for (xattrs, 0..) |xattr, index| {
+        owned[index] = .{
+            .name = try allocator.dupe(u8, xattr.name),
+            .value = try allocator.dupe(u8, xattr.value),
+        };
+        completed += 1;
+    }
+    return owned;
+}
 
 pub const Config = struct {
     architecture: ?[]const u8 = null,
@@ -488,7 +527,7 @@ fn applyLayerEntry(
 
     if (std.mem.eql(u8, basename, ".wh..wh..opq")) {
         try ensureParents(allocator, entry_map, dirname);
-        if (dirname.len != 0) try upsertDirectory(allocator, entry_map, dirname, 0o755);
+        if (dirname.len != 0) try ensureDirectory(allocator, entry_map, dirname, 0o755);
         try removeOpaqueLowerEntries(entry_map, allocator, lower_paths, dirname);
         return;
     }
@@ -503,18 +542,37 @@ fn applyLayerEntry(
     try ensureParents(allocator, entry_map, dirname);
 
     switch (layer_entry.kind) {
-        .directory => try upsertDirectory(allocator, entry_map, normalized_path, nonZeroMode(layer_entry.mode, 0o755)),
+        .directory => {
+            const owned_path = try allocator.dupe(u8, normalized_path);
+            errdefer allocator.free(owned_path);
+            const xattrs = try dupeTarXattrs(allocator, layer_entry.xattrs);
+            errdefer freeXattrs(allocator, xattrs);
+            try putEntry(allocator, entry_map, .{
+                .path = owned_path,
+                .kind = .directory,
+                .mode = nonZeroMode(layer_entry.mode, 0o755),
+                .uid = layer_entry.uid,
+                .gid = layer_entry.gid,
+                .size = 0,
+                .xattrs = xattrs,
+            });
+        },
         .file => {
             const content = try allocator.dupe(u8, layer_entry.content);
             errdefer allocator.free(content);
             const owned_path = try allocator.dupe(u8, normalized_path);
             errdefer allocator.free(owned_path);
+            const xattrs = try dupeTarXattrs(allocator, layer_entry.xattrs);
+            errdefer freeXattrs(allocator, xattrs);
             try putEntry(allocator, entry_map, .{
                 .path = owned_path,
                 .kind = .file,
                 .mode = nonZeroMode(layer_entry.mode, 0o644),
+                .uid = layer_entry.uid,
+                .gid = layer_entry.gid,
                 .size = content.len,
                 .content = content,
+                .xattrs = xattrs,
             });
         },
         .symlink => {
@@ -522,25 +580,41 @@ fn applyLayerEntry(
             errdefer allocator.free(link_name);
             const owned_path = try allocator.dupe(u8, normalized_path);
             errdefer allocator.free(owned_path);
+            const xattrs = try dupeTarXattrs(allocator, layer_entry.xattrs);
+            errdefer freeXattrs(allocator, xattrs);
             try putEntry(allocator, entry_map, .{
                 .path = owned_path,
                 .kind = .symlink,
                 .mode = nonZeroMode(layer_entry.mode, 0o777),
+                .uid = layer_entry.uid,
+                .gid = layer_entry.gid,
                 .size = link_name.len,
                 .link_name = link_name,
+                .xattrs = xattrs,
             });
         },
         .hardlink => {
-            const link_name = try allocator.dupe(u8, layer_entry.link_name orelse return error.InvalidLayerPath);
+            const normalized_link_name = try normalizeLayerPath(
+                allocator,
+                layer_entry.link_name orelse return error.InvalidLayerPath,
+            );
+            defer allocator.free(normalized_link_name);
+            if (normalized_link_name.len == 0) return error.InvalidLayerPath;
+            const link_name = try allocator.dupe(u8, normalized_link_name);
             errdefer allocator.free(link_name);
             const owned_path = try allocator.dupe(u8, normalized_path);
             errdefer allocator.free(owned_path);
+            const xattrs = try dupeTarXattrs(allocator, layer_entry.xattrs);
+            errdefer freeXattrs(allocator, xattrs);
             try putEntry(allocator, entry_map, .{
                 .path = owned_path,
                 .kind = .hardlink,
                 .mode = nonZeroMode(layer_entry.mode, 0o644),
+                .uid = layer_entry.uid,
+                .gid = layer_entry.gid,
                 .size = 0,
                 .link_name = link_name,
+                .xattrs = xattrs,
             });
         },
     }
@@ -579,13 +653,13 @@ fn ensureParents(allocator: Allocator, entry_map: *StringHashMap(FileTree.Entry)
     while (cursor < path.len) {
         const slash = std.mem.indexOfScalarPos(u8, path, cursor, '/') orelse break;
         const parent = path[0..slash];
-        try upsertDirectory(allocator, entry_map, parent, 0o755);
+        try ensureDirectory(allocator, entry_map, parent, 0o755);
         cursor = slash + 1;
     }
-    try upsertDirectory(allocator, entry_map, path, 0o755);
+    try ensureDirectory(allocator, entry_map, path, 0o755);
 }
 
-fn upsertDirectory(allocator: Allocator, entry_map: *StringHashMap(FileTree.Entry), path: []const u8, mode: u32) LoadError!void {
+fn ensureDirectory(allocator: Allocator, entry_map: *StringHashMap(FileTree.Entry), path: []const u8, mode: u32) LoadError!void {
     if (path.len == 0) return;
     if (entry_map.getPtr(path)) |existing| {
         if (existing.kind == .directory) {
@@ -695,6 +769,7 @@ fn freeEntry(allocator: Allocator, entry: FileTree.Entry) void {
     allocator.free(entry.path);
     if (entry.link_name) |link_name| allocator.free(link_name);
     if (entry.kind == .file) allocator.free(entry.content);
+    freeXattrs(allocator, entry.xattrs);
 }
 
 fn deinitArchiveEntries(entries: *StringHashMap(ArchiveEntry), allocator: Allocator) void {
@@ -836,6 +911,60 @@ test "loadLayout merges zstd-compressed OCI layers" {
     defer image.deinit();
 
     try expectMergedFixtureImage(image);
+}
+
+test "OCI layers preserve ownership and PAX xattrs across whiteouts and hardlinks" {
+    const allocator = std.testing.allocator;
+    const uid = try buildPaxRecord(allocator, "uid", "321");
+    defer allocator.free(uid);
+    const gid = try buildPaxRecord(allocator, "gid", "654");
+    defer allocator.free(gid);
+    const capability = try buildPaxRecord(allocator, "SCHILY.xattr.security.capability", "cap-v3");
+    defer allocator.free(capability);
+    const base_pax = try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ uid, gid, capability });
+    defer allocator.free(base_pax);
+
+    const hardlink_uid = try buildPaxRecord(allocator, "uid", "777");
+    defer allocator.free(hardlink_uid);
+    const hardlink_xattr = try buildPaxRecord(allocator, "SCHILY.xattr.user.hardlink", "metadata");
+    defer allocator.free(hardlink_xattr);
+    const hardlink_pax = try std.fmt.allocPrint(allocator, "{s}{s}", .{ hardlink_uid, hardlink_xattr });
+    defer allocator.free(hardlink_pax);
+
+    const layer_one = try buildTarArchive(allocator, &.{
+        .{ .path = "PaxHeaders/source", .mode = 0o644, .typeflag = 'x', .content = base_pax, .link_name = null },
+        .{ .path = "source", .mode = 0o640, .uid = 1, .gid = 2, .typeflag = '0', .content = "source-bytes", .link_name = null },
+        .{ .path = "remove-me", .mode = 0o600, .uid = 44, .gid = 55, .typeflag = '0', .content = "remove", .link_name = null },
+    });
+    defer allocator.free(layer_one);
+    const layer_two = try buildTarArchive(allocator, &.{
+        .{ .path = ".wh.remove-me", .mode = 0, .typeflag = '0', .content = "", .link_name = null },
+        .{ .path = "PaxHeaders/hard", .mode = 0o644, .typeflag = 'x', .content = hardlink_pax, .link_name = null },
+        .{ .path = "hard", .mode = 0o640, .gid = 888, .typeflag = '1', .content = "", .link_name = "./source" },
+    });
+    defer allocator.free(layer_two);
+
+    var map = StringHashMap(FileTree.Entry).init(allocator);
+    var map_owned = true;
+    defer if (map_owned) deinitEntryMap(&map, allocator);
+    try applyLayerBytes(allocator, &map, null, layer_one, .{});
+    try applyLayerBytes(allocator, &map, null, layer_two, .{});
+    var tree = try finalizeTree(allocator, &map);
+    map_owned = false;
+    defer tree.deinit();
+
+    try std.testing.expect(tree.get("remove-me") == null);
+    const source = tree.get("source").?;
+    try std.testing.expectEqual(@as(u32, 321), source.uid);
+    try std.testing.expectEqual(@as(u32, 654), source.gid);
+    try std.testing.expectEqual(@as(usize, 1), source.xattrs.len);
+    try std.testing.expectEqualStrings("security.capability", source.xattrs[0].name);
+    const hard = tree.get("hard").?;
+    try std.testing.expectEqual(EntryKind.hardlink, hard.kind);
+    try std.testing.expectEqual(@as(u32, 777), hard.uid);
+    try std.testing.expectEqual(@as(u32, 888), hard.gid);
+    try std.testing.expectEqualStrings("source", hard.link_name.?);
+    try std.testing.expectEqualStrings("user.hardlink", hard.xattrs[0].name);
 }
 
 const FixtureLayout = struct {
@@ -1079,6 +1208,8 @@ fn writeBlobAndDigest(allocator: Allocator, io: Io, dir: Io.Dir, data: []const u
 const TarSpec = struct {
     path: []const u8,
     mode: u32,
+    uid: u32 = 0,
+    gid: u32 = 0,
     typeflag: u8,
     content: []const u8,
     link_name: ?[]const u8,
@@ -1098,8 +1229,8 @@ fn appendTarSpec(out: *std.Io.Writer.Allocating, spec: TarSpec) !void {
     if (spec.path.len > 100) return error.InvalidHeader;
     @memcpy(header[0..spec.path.len], spec.path);
     try writeOctalField(header[100..108], spec.mode);
-    try writeOctalField(header[108..116], 0);
-    try writeOctalField(header[116..124], 0);
+    try writeOctalField(header[108..116], spec.uid);
+    try writeOctalField(header[116..124], spec.gid);
     try writeOctalField(header[124..136], spec.content.len);
     try writeOctalField(header[136..148], 0);
     @memset(header[148..156], ' ');
@@ -1119,6 +1250,25 @@ fn appendTarSpec(out: *std.Io.Writer.Allocating, spec: TarSpec) !void {
     try out.writer.writeAll(spec.content);
     const padding = std.mem.alignForward(usize, spec.content.len, 512) - spec.content.len;
     if (padding > 0) try out.writer.splatByteAll(0, padding);
+}
+
+fn buildPaxRecord(allocator: Allocator, key: []const u8, value: []const u8) ![]u8 {
+    var record = try std.fmt.allocPrint(allocator, "0 {s}={s}\n", .{ key, value });
+    errdefer allocator.free(record);
+    while (true) {
+        const digits = paxDecimalDigits(record.len);
+        const needed = digits + 1 + key.len + 1 + value.len + 1;
+        if (needed == record.len) return record;
+        allocator.free(record);
+        record = try std.fmt.allocPrint(allocator, "{d} {s}={s}\n", .{ needed, key, value });
+    }
+}
+
+fn paxDecimalDigits(value: usize) usize {
+    var n = value;
+    var digits: usize = 1;
+    while (n >= 10) : (n /= 10) digits += 1;
+    return digits;
 }
 
 fn gzipBytes(allocator: Allocator, data: []const u8) ![]u8 {

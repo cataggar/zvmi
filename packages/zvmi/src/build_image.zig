@@ -2086,19 +2086,17 @@ fn collectOciEntries(
         const bytes: []const u8 = switch (entry.kind) {
             .file => entry.content,
             .symlink => entry.link_name.?,
-            .hardlink => blk: {
-                const target = image.get(entry.link_name orelse return error.MissingHardlinkTarget) orelse return error.MissingHardlinkTarget;
-                if (target.kind != .file) return error.UnsupportedHardlinkTarget;
-                break :blk target.content;
-            },
+            .hardlink => try resolveOciHardlinkContent(image, entry),
             .directory => "",
         };
+        const xattrs = try dedupeOwnedXattrs(allocator, try dupeOciXattrs(allocator, entry.xattrs));
+        errdefer ext4.freeXattrs(allocator, xattrs);
         try overlayEntry(allocator, pending, path_index, .{
             .path = try allocator.dupe(u8, entry.path),
             .kind = kind,
             .mode = normalizeMode(kind, entry.mode),
-            .uid = 0,
-            .gid = 0,
+            .uid = entry.uid,
+            .gid = entry.gid,
             .size = switch (kind) {
                 .directory => 0,
                 .file, .symlink => bytes.len,
@@ -2107,8 +2105,42 @@ fn collectOciEntries(
                 .directory => .none,
                 .file, .symlink => .{ .bytes = bytes },
             },
+            .xattrs = xattrs,
         });
     }
+}
+
+fn dupeOciXattrs(allocator: std.mem.Allocator, xattrs: []const oci.Xattr) ![]ext4.OwnedXattr {
+    if (xattrs.len == 0) return allocator.alloc(ext4.OwnedXattr, 0);
+    const owned = try allocator.alloc(ext4.OwnedXattr, xattrs.len);
+    var completed: usize = 0;
+    errdefer {
+        for (owned[0..completed]) |xattr| {
+            allocator.free(xattr.name);
+            allocator.free(xattr.value);
+        }
+        allocator.free(owned);
+    }
+    for (xattrs, 0..) |xattr, index| {
+        owned[index] = .{
+            .name = try allocator.dupe(u8, xattr.name),
+            .value = try allocator.dupe(u8, xattr.value),
+        };
+        completed += 1;
+    }
+    return owned;
+}
+
+fn resolveOciHardlinkContent(image: *const oci.Image, initial: oci.FileTree.Entry) ![]const u8 {
+    var entry = initial;
+    var depth: usize = 0;
+    while (entry.kind == .hardlink) : (depth += 1) {
+        if (depth == 32) return error.HardlinkDepthExceeded;
+        entry = image.get(entry.link_name orelse return error.MissingHardlinkTarget) orelse
+            return error.MissingHardlinkTarget;
+    }
+    if (entry.kind != .file) return error.UnsupportedHardlinkTarget;
+    return entry.content;
 }
 
 fn overlayEntry(
@@ -2927,6 +2959,13 @@ test "build-image can skip the ISO rootfs while retaining boot assets" {
     const app_file = try root_reader.readFileAlloc(io, allocator, "app/hello.txt");
     defer allocator.free(app_file);
     try std.testing.expectEqualStrings("hello from minimal container rootfs\n", app_file);
+
+    const chronyd = try root_reader.statPath(io, "usr/bin/chronyd");
+    try std.testing.expectEqual(@as(u32, 991), chronyd.uid);
+    try std.testing.expectEqual(@as(u32, 991), chronyd.gid);
+    const capability = try root_reader.readXattrAlloc(io, allocator, "usr/bin/chronyd", "security.capability");
+    defer allocator.free(capability);
+    try std.testing.expectEqualStrings("chronyd-capability", capability);
 
     try std.testing.expectError(error.NotFound, root_reader.readFileAlloc(io, allocator, "etc/hostname"));
 }
@@ -4049,9 +4088,15 @@ fn createContainerRootfsOnlyBuildImageOciLayout(
     defer dir.close(io);
     try dir.createDirPath(io, "blobs/sha256");
 
+    const capability = try buildPaxRecord(allocator, "SCHILY.xattr.security.capability", "chronyd-capability");
+    defer allocator.free(capability);
     const layer_tar = try buildTarArchive(allocator, &.{
         .{ .path = "app/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
         .{ .path = "app/hello.txt", .mode = 0o644, .typeflag = '0', .content = "hello from minimal container rootfs\n", .link_name = null },
+        .{ .path = "usr/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
+        .{ .path = "usr/bin/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
+        .{ .path = "PaxHeaders/chronyd", .mode = 0o644, .typeflag = 'x', .content = capability, .link_name = null },
+        .{ .path = "usr/bin/chronyd", .mode = 0o755, .uid = 991, .gid = 991, .typeflag = '0', .content = "chronyd", .link_name = null },
         .{ .path = "EFI/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
         .{ .path = "EFI/BOOT/", .mode = 0o755, .typeflag = '5', .content = "", .link_name = null },
         .{ .path = "EFI/BOOT/BOOTX64.EFI", .mode = 0o644, .typeflag = '0', .content = "bootx64-from-oci", .link_name = null },
@@ -4094,6 +4139,8 @@ fn createContainerRootfsOnlyBuildImageOciLayout(
 const TarSpec = struct {
     path: []const u8,
     mode: u32,
+    uid: u32 = 0,
+    gid: u32 = 0,
     typeflag: u8,
     content: []const u8,
     link_name: ?[]const u8,
@@ -4113,8 +4160,8 @@ fn appendTarSpec(out: *std.Io.Writer.Allocating, spec: TarSpec) !void {
     if (spec.path.len > 100) return error.InvalidHeader;
     @memcpy(header[0..spec.path.len], spec.path);
     try writeOctalField(header[100..108], spec.mode);
-    try writeOctalField(header[108..116], 0);
-    try writeOctalField(header[116..124], 0);
+    try writeOctalField(header[108..116], spec.uid);
+    try writeOctalField(header[116..124], spec.gid);
     try writeOctalField(header[124..136], spec.content.len);
     try writeOctalField(header[136..148], 0);
     @memset(header[148..156], ' ');
@@ -4134,6 +4181,25 @@ fn appendTarSpec(out: *std.Io.Writer.Allocating, spec: TarSpec) !void {
     try out.writer.writeAll(spec.content);
     const padding = std.mem.alignForward(usize, spec.content.len, 512) - spec.content.len;
     if (padding > 0) try out.writer.splatByteAll(0, padding);
+}
+
+fn buildPaxRecord(allocator: std.mem.Allocator, key: []const u8, value: []const u8) ![]u8 {
+    var record = try std.fmt.allocPrint(allocator, "0 {s}={s}\n", .{ key, value });
+    errdefer allocator.free(record);
+    while (true) {
+        const digits = paxDecimalDigits(record.len);
+        const needed = digits + 1 + key.len + 1 + value.len + 1;
+        if (needed == record.len) return record;
+        allocator.free(record);
+        record = try std.fmt.allocPrint(allocator, "{d} {s}={s}\n", .{ needed, key, value });
+    }
+}
+
+fn paxDecimalDigits(value: usize) usize {
+    var n = value;
+    var digits: usize = 1;
+    while (n >= 10) : (n /= 10) digits += 1;
+    return digits;
 }
 
 fn gzipBytes(allocator: std.mem.Allocator, data: []const u8) ![]u8 {

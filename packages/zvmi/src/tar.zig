@@ -12,14 +12,25 @@ pub const Kind = enum {
     hardlink,
 };
 
+pub const Xattr = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
 pub const Entry = struct {
     path: []const u8,
     kind: Kind,
     mode: u32,
+    uid: u32 = 0,
+    gid: u32 = 0,
     size: u64,
     content: []const u8,
     link_name: ?[]const u8 = null,
+    xattrs: []const Xattr = &.{},
 };
+
+const max_pax_xattrs_per_entry = 256;
+const max_pax_xattr_bytes_per_entry = 1024 * 1024;
 
 pub const Error = std.Io.Writer.Error || error{
     InvalidHeader,
@@ -33,6 +44,7 @@ pub const Error = std.Io.Writer.Error || error{
     SizeMismatch,
     PathTooLong,
     ValueTooLarge,
+    PaxXattrLimitExceeded,
 } || std.mem.Allocator.Error || Io.File.ReadPositionalError || Io.File.StatError;
 
 pub const Reader = struct {
@@ -40,6 +52,11 @@ pub const Reader = struct {
     offset: usize = 0,
     pending_pax_path: ?[]const u8 = null,
     pending_pax_link_path: ?[]const u8 = null,
+    pending_pax_uid: ?u32 = null,
+    pending_pax_gid: ?u32 = null,
+    pending_pax_xattrs: [max_pax_xattrs_per_entry]Xattr = undefined,
+    pending_pax_xattr_count: usize = 0,
+    pending_pax_xattr_bytes: usize = 0,
     path_buffer: [256]u8 = undefined,
 
     pub fn init(data: []const u8) Reader {
@@ -55,8 +72,7 @@ pub const Reader = struct {
             self.offset += block_size;
 
             if (isZeroBlock(header)) {
-                self.pending_pax_path = null;
-                self.pending_pax_link_path = null;
+                self.clearPendingPax();
                 return null;
             }
 
@@ -71,8 +87,7 @@ pub const Reader = struct {
             switch (typeflag) {
                 0, '0', '1', '2', '5' => {
                     const entry = try self.parseEntry(header, typeflag, content, size);
-                    self.pending_pax_path = null;
-                    self.pending_pax_link_path = null;
+                    self.clearPendingPax();
                     return entry;
                 },
                 'x', 'g' => {
@@ -102,6 +117,8 @@ pub const Reader = struct {
         if (raw_path.len == 0) return error.InvalidHeader;
 
         const mode: u32 = @intCast(try parseOctal(trimField(header[100..108])));
+        const header_uid = std.math.cast(u32, try parseOctal(trimField(header[108..116]))) orelse return error.InvalidOctal;
+        const header_gid = std.math.cast(u32, try parseOctal(trimField(header[116..124]))) orelse return error.InvalidOctal;
         const link_name = if (self.pending_pax_link_path) |path| path else blk: {
             const trimmed = trimField(header[157..257]);
             break :blk if (trimmed.len == 0) null else trimmed;
@@ -117,9 +134,12 @@ pub const Reader = struct {
                 else => unreachable,
             },
             .mode = mode,
+            .uid = self.pending_pax_uid orelse header_uid,
+            .gid = self.pending_pax_gid orelse header_gid,
             .size = size,
             .content = content,
             .link_name = link_name,
+            .xattrs = self.pending_pax_xattrs[0..self.pending_pax_xattr_count],
         };
     }
 
@@ -143,13 +163,62 @@ pub const Reader = struct {
                     self.pending_pax_path = value;
                 } else if (std.mem.eql(u8, key, "linkpath")) {
                     self.pending_pax_link_path = value;
+                } else if (std.mem.eql(u8, key, "uid")) {
+                    self.pending_pax_uid = std.fmt.parseInt(u32, value, 10) catch return error.InvalidPaxRecord;
+                } else if (std.mem.eql(u8, key, "gid")) {
+                    self.pending_pax_gid = std.fmt.parseInt(u32, value, 10) catch return error.InvalidPaxRecord;
+                } else if (paxXattrName(key)) |name| {
+                    try self.appendPaxXattr(name, value);
                 }
             }
 
             cursor += record_len;
         }
     }
+
+    fn clearPendingPax(self: *Reader) void {
+        self.pending_pax_path = null;
+        self.pending_pax_link_path = null;
+        self.pending_pax_uid = null;
+        self.pending_pax_gid = null;
+        self.pending_pax_xattr_count = 0;
+        self.pending_pax_xattr_bytes = 0;
+    }
+
+    fn appendPaxXattr(self: *Reader, name: []const u8, value: []const u8) Error!void {
+        if (!isRelevantXattrName(name)) return;
+        if (self.pending_pax_xattr_count == max_pax_xattrs_per_entry) return error.PaxXattrLimitExceeded;
+        const bytes = std.math.add(usize, name.len, value.len) catch return error.PaxXattrLimitExceeded;
+        const total = std.math.add(usize, self.pending_pax_xattr_bytes, bytes) catch return error.PaxXattrLimitExceeded;
+        if (total > max_pax_xattr_bytes_per_entry) return error.PaxXattrLimitExceeded;
+        self.pending_pax_xattrs[self.pending_pax_xattr_count] = .{ .name = name, .value = value };
+        self.pending_pax_xattr_count += 1;
+        self.pending_pax_xattr_bytes = total;
+    }
 };
+
+fn paxXattrName(key: []const u8) ?[]const u8 {
+    inline for (.{
+        "SCHILY.xattr.",
+        "LIBARCHIVE.xattr.",
+    }) |prefix| {
+        if (std.mem.startsWith(u8, key, prefix)) return key[prefix.len..];
+    }
+    return null;
+}
+
+fn isRelevantXattrName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 255) return false;
+    inline for (.{
+        "user.",
+        "trusted.",
+        "security.",
+        "system.",
+    }) |prefix| {
+        if (std.mem.startsWith(u8, name, prefix)) return name.len > prefix.len;
+    }
+    return false;
+}
 
 pub const OwnedArchive = struct {
     bytes: []u8,
@@ -396,6 +465,8 @@ fn writeChecksum(field: []u8, checksum: u32) void {
 const ReaderTarSpec = struct {
     path: []const u8,
     mode: u32,
+    uid: u32 = 0,
+    gid: u32 = 0,
     typeflag: u8,
     content: []const u8,
     link_name: ?[]const u8,
@@ -417,8 +488,8 @@ fn appendTarEntry(out: *std.Io.Writer.Allocating, spec: ReaderTarSpec) !void {
     if (spec.path.len > 100) return error.InvalidHeader;
     @memcpy(header[0..spec.path.len], spec.path);
     try writeOctalField(header[100..108], spec.mode);
-    try writeOctalField(header[108..116], 0);
-    try writeOctalField(header[116..124], 0);
+    try writeOctalField(header[108..116], spec.uid);
+    try writeOctalField(header[116..124], spec.gid);
     try writeOctalField(header[124..136], spec.content.len);
     try writeOctalField(header[136..148], 0);
     @memset(header[148..156], ' ');
@@ -568,6 +639,56 @@ test "reader honors pax path override" {
     try std.testing.expectEqualStrings(long_path, entry.path);
     try std.testing.expectEqualSlices(u8, "payload", entry.content);
     try std.testing.expect((try reader.next()) == null);
+}
+
+test "reader preserves USTAR ownership and bounded relevant PAX xattrs" {
+    const allocator = std.testing.allocator;
+    const uid = try buildPaxRecord(allocator, "uid", "4242");
+    defer allocator.free(uid);
+    const gid = try buildPaxRecord(allocator, "gid", "4343");
+    defer allocator.free(gid);
+    const capability = try buildPaxRecord(allocator, "SCHILY.xattr.security.capability", "cap-bytes");
+    defer allocator.free(capability);
+    const ignored = try buildPaxRecord(allocator, "SCHILY.xattr.invalid.namespace", "ignored");
+    defer allocator.free(ignored);
+    const pax = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}", .{ uid, gid, capability, ignored });
+    defer allocator.free(pax);
+
+    const bytes = try buildTar(allocator, &.{
+        .{ .path = "PaxHeaders/meta", .mode = 0o644, .typeflag = 'x', .content = pax, .link_name = null },
+        .{ .path = "owned", .mode = 0o640, .uid = 1, .gid = 2, .typeflag = '0', .content = "payload", .link_name = null },
+    });
+    defer allocator.free(bytes);
+
+    var reader = Reader.init(bytes);
+    const entry = (try reader.next()).?;
+    try std.testing.expectEqualStrings("owned", entry.path);
+    try std.testing.expectEqual(@as(u32, 4242), entry.uid);
+    try std.testing.expectEqual(@as(u32, 4343), entry.gid);
+    try std.testing.expectEqual(@as(usize, 1), entry.xattrs.len);
+    try std.testing.expectEqualStrings("security.capability", entry.xattrs[0].name);
+    try std.testing.expectEqualStrings("cap-bytes", entry.xattrs[0].value);
+}
+
+test "reader rejects PAX xattrs beyond the per-entry bound" {
+    const allocator = std.testing.allocator;
+    var pax = std.Io.Writer.Allocating.init(allocator);
+    defer pax.deinit();
+    for (0..max_pax_xattrs_per_entry + 1) |index| {
+        const value = try std.fmt.allocPrint(allocator, "{d}", .{index});
+        defer allocator.free(value);
+        const record = try buildPaxRecord(allocator, "SCHILY.xattr.user.bound", value);
+        defer allocator.free(record);
+        try pax.writer.writeAll(record);
+    }
+    const bytes = try buildTar(allocator, &.{
+        .{ .path = "PaxHeaders/overflow", .mode = 0o644, .typeflag = 'x', .content = pax.written(), .link_name = null },
+        .{ .path = "overflow", .mode = 0o644, .typeflag = '0', .content = "payload", .link_name = null },
+    });
+    defer allocator.free(bytes);
+
+    var reader = Reader.init(bytes);
+    try std.testing.expectError(error.PaxXattrLimitExceeded, reader.next());
 }
 
 test "writes a small USTAR archive" {

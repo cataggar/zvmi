@@ -36,6 +36,7 @@ const base_image = "azurelinux-beta/base/core";
 const base_tag = "4.0";
 const mcr_base = "https://mcr.microsoft.com/v2";
 const AzureLinuxArchitecture = zvmi.bootconfig.Architecture;
+const dnf_repository_id = "zvmi-azurelinux-base";
 
 /// The full image package manifest is vendored from this exact upstream KIWI
 /// profile.  KIWI itself is deliberately not part of the build: DNF consumes
@@ -153,10 +154,10 @@ const full_required_rootfs_paths = [_][]const u8{
     "usr/bin/bash",
     "usr/bin/cloud-init",
     "usr/bin/sshd",
+    "usr/bin/waagent",
     "usr/lib/systemd/systemd",
-    "usr/sbin/sshd",
-    "usr/sbin/waagent",
     "etc/waagent.conf",
+    ".autorelabel",
 };
 
 const core_forbidden_rootfs_paths = [_][]const u8{};
@@ -167,6 +168,28 @@ const full_forbidden_rootfs_paths = [_][]const u8{
     "usr/bin/azagent",
     "etc/ssh/sshd_config.d/10-zvminit.conf",
     "var/lib/azagent/provisioned",
+};
+
+const full_required_systemd_units = [_][]const u8{
+    "cloud-init-local.service",
+    "cloud-init-main.service",
+    "cloud-init-network.service",
+    "cloud-config.service",
+    "cloud-final.service",
+    "waagent.service",
+    "sshd.service",
+    "systemd-networkd.service",
+};
+
+const full_enabled_systemd_units = [_][]const u8{
+    "cloud-init-local.service",
+    "cloud-init-main.service",
+    "cloud-init-network.service",
+    "cloud-config.service",
+    "cloud-final.service",
+    "waagent.service",
+    "sshd.service",
+    "systemd-networkd.service",
 };
 
 const FlavorDescriptor = struct {
@@ -956,16 +979,27 @@ fn verifyCachedRepositoryMetadata(
 }
 
 const DnfCachePaths = struct {
+    // Guest-visible cache used by the installroot transaction.
     cache_dir: []u8,
     persist_dir: []u8,
     cache_opt: []u8,
     persist_opt: []u8,
+    // Host cache used only to acquire and verify pinned repository metadata
+    // before it is copied into the guest-visible cache.
+    metadata_cache_dir: []u8,
+    metadata_persist_dir: []u8,
+    metadata_cache_opt: []u8,
+    metadata_persist_opt: []u8,
 
     fn deinit(self: *DnfCachePaths, gpa: Allocator) void {
         gpa.free(self.cache_dir);
         gpa.free(self.persist_dir);
         gpa.free(self.cache_opt);
         gpa.free(self.persist_opt);
+        gpa.free(self.metadata_cache_dir);
+        gpa.free(self.metadata_persist_dir);
+        gpa.free(self.metadata_cache_opt);
+        gpa.free(self.metadata_persist_opt);
         self.* = undefined;
     }
 };
@@ -973,37 +1007,63 @@ const DnfCachePaths = struct {
 fn prepareDnfCache(
     gpa: Allocator,
     io: Io,
+    rootfs_path: []const u8,
     work_dir: []const u8,
     architecture: *const ArchitectureDescriptor,
     flavor: *const FlavorDescriptor,
 ) !DnfCachePaths {
-    const cache_dir = try std.fmt.allocPrint(
+    const cache_guest_dir = try std.fmt.allocPrint(
         gpa,
-        "{s}/dnf-cache-{s}-{s}",
-        .{ work_dir, @tagName(flavor.flavor), architecture.dnf_architecture },
+        "/var/cache/zvmi-dnf-{s}-{s}",
+        .{ @tagName(flavor.flavor), architecture.dnf_architecture },
     );
+    defer gpa.free(cache_guest_dir);
+    const persist_guest_dir = try std.fmt.allocPrint(
+        gpa,
+        "/var/lib/zvmi-dnf-{s}-{s}",
+        .{ @tagName(flavor.flavor), architecture.dnf_architecture },
+    );
+    defer gpa.free(persist_guest_dir);
+    const cache_dir = try std.fmt.allocPrint(gpa, "{s}{s}", .{ rootfs_path, cache_guest_dir });
     errdefer gpa.free(cache_dir);
-    const persist_dir = try std.fmt.allocPrint(
+    const persist_dir = try std.fmt.allocPrint(gpa, "{s}{s}", .{ rootfs_path, persist_guest_dir });
+    errdefer gpa.free(persist_dir);
+    const cache_opt = try std.fmt.allocPrint(gpa, "--setopt=cachedir={s}", .{cache_guest_dir});
+    errdefer gpa.free(cache_opt);
+    const persist_opt = try std.fmt.allocPrint(gpa, "--setopt=persistdir={s}", .{persist_guest_dir});
+    errdefer gpa.free(persist_opt);
+    const metadata_cache_dir = try std.fmt.allocPrint(
         gpa,
-        "{s}/dnf-persist-{s}-{s}",
+        "{s}/dnf-metadata-{s}-{s}",
         .{ work_dir, @tagName(flavor.flavor), architecture.dnf_architecture },
     );
-    errdefer gpa.free(persist_dir);
-    const cache_opt = try std.fmt.allocPrint(gpa, "--setopt=cachedir={s}", .{cache_dir});
-    errdefer gpa.free(cache_opt);
-    const persist_opt = try std.fmt.allocPrint(gpa, "--setopt=persistdir={s}", .{persist_dir});
-    errdefer gpa.free(persist_opt);
+    errdefer gpa.free(metadata_cache_dir);
+    const metadata_persist_dir = try std.fmt.allocPrint(
+        gpa,
+        "{s}/dnf-metadata-persist-{s}-{s}",
+        .{ work_dir, @tagName(flavor.flavor), architecture.dnf_architecture },
+    );
+    errdefer gpa.free(metadata_persist_dir);
+    const metadata_cache_opt = try std.fmt.allocPrint(gpa, "--setopt=cachedir={s}", .{metadata_cache_dir});
+    errdefer gpa.free(metadata_cache_opt);
+    const metadata_persist_opt = try std.fmt.allocPrint(gpa, "--setopt=persistdir={s}", .{metadata_persist_dir});
+    errdefer gpa.free(metadata_persist_opt);
 
     // DNF runs under sudo, so remove stale root-owned directories explicitly
-    // before making a fresh, builder-scoped cache and persist store.
-    try sudo(gpa, io, &.{ "rm", "-rf", "--", cache_dir, persist_dir });
-    try Dir.cwd().createDirPath(io, cache_dir);
-    try Dir.cwd().createDirPath(io, persist_dir);
+    // before making fresh, flavor-scoped metadata and installroot stores.
+    try sudo(gpa, io, &.{ "rm", "-rf", "--", cache_dir, persist_dir, metadata_cache_dir, metadata_persist_dir });
+    try sudo(gpa, io, &.{ "install", "-d", "-m", "0755", cache_dir, persist_dir });
+    try Dir.cwd().createDirPath(io, metadata_cache_dir);
+    try Dir.cwd().createDirPath(io, metadata_persist_dir);
     return .{
         .cache_dir = cache_dir,
         .persist_dir = persist_dir,
         .cache_opt = cache_opt,
         .persist_opt = persist_opt,
+        .metadata_cache_dir = metadata_cache_dir,
+        .metadata_persist_dir = metadata_persist_dir,
+        .metadata_cache_opt = metadata_cache_opt,
+        .metadata_persist_opt = metadata_persist_opt,
     };
 }
 
@@ -1093,6 +1153,7 @@ fn dnfInstallArgs(
     gpa: Allocator,
     rootfs_path: []const u8,
     forcearch_opt: []const u8,
+    repofrompath_opt: []const u8,
     gpgkey_opt: []const u8,
     baseurl_opt: []const u8,
     metalink_opt: []const u8,
@@ -1114,7 +1175,9 @@ fn dnfInstallArgs(
         rootfs_path,
         "--releasever=4.0",
         forcearch_opt,
-        "--repo=azurelinux-base",
+        "--disablerepo=*",
+        repofrompath_opt,
+        "--enablerepo=" ++ dnf_repository_id,
         gpgkey_opt,
         baseurl_opt,
         metalink_opt,
@@ -1132,11 +1195,78 @@ fn dnfInstallArgs(
     return args.toOwnedSlice();
 }
 
+fn dnfSeedMakecacheArgs(
+    forcearch_opt: []const u8,
+    repofrompath_opt: []const u8,
+    gpgkey_opt: []const u8,
+    baseurl_opt: []const u8,
+    metalink_opt: []const u8,
+    mirrorlist_opt: []const u8,
+    metadata_expire_all_opt: []const u8,
+    metadata_expire_repo_opt: []const u8,
+    keepcache_opt: []const u8,
+    gpgcheck_opt: []const u8,
+    cache_opt: []const u8,
+    persist_opt: []const u8,
+) [18][]const u8 {
+    return .{
+        "dnf",
+        "-y",
+        "--releasever=4.0",
+        forcearch_opt,
+        "--disablerepo=*",
+        repofrompath_opt,
+        "--enablerepo=" ++ dnf_repository_id,
+        gpgkey_opt,
+        baseurl_opt,
+        metalink_opt,
+        mirrorlist_opt,
+        metadata_expire_all_opt,
+        metadata_expire_repo_opt,
+        keepcache_opt,
+        gpgcheck_opt,
+        cache_opt,
+        persist_opt,
+        "makecache",
+    };
+}
+
+const InitialNevraState = enum {
+    query_existing_installroot,
+    empty_fresh_installroot,
+};
+
+fn initialNevraState(flavor: *const FlavorDescriptor) InitialNevraState {
+    return switch (flavor.flavor) {
+        .core => .query_existing_installroot,
+        .full => .empty_fresh_installroot,
+    };
+}
+
+fn initialInstalledNevras(
+    gpa: Allocator,
+    io: Io,
+    rootfs_path: []const u8,
+    flavor: *const FlavorDescriptor,
+) ![]u8 {
+    return switch (initialNevraState(flavor)) {
+        .query_existing_installroot => captureInstalledNevras(gpa, io, rootfs_path),
+        .empty_fresh_installroot => gpa.dupe(u8, ""),
+    };
+}
+
 fn argvContains(argv: []const []const u8, needle: []const u8) bool {
     for (argv) |arg| {
         if (std.mem.eql(u8, arg, needle)) return true;
     }
     return false;
+}
+
+fn argvIndex(argv: []const []const u8, needle: []const u8) ?usize {
+    for (argv, 0..) |arg, index| {
+        if (std.mem.eql(u8, arg, needle)) return index;
+    }
+    return null;
 }
 
 fn packagesForFlavor(
@@ -1293,6 +1423,23 @@ fn bootstrapFullRootfs(
     return core_digest;
 }
 
+/// DNF creates the RPM database itself.  A full rootfs is intentionally empty
+/// here (apart from these directories and a temporary binfmt interpreter), so
+/// no guest `rpm` command may run before the first package transaction.
+fn initializeFreshFullInstallroot(
+    gpa: Allocator,
+    io: Io,
+    rootfs_path: []const u8,
+) !void {
+    const rpm_db = try std.fmt.allocPrint(gpa, "{s}/var/lib/rpm", .{rootfs_path});
+    defer gpa.free(rpm_db);
+    const dnf_state = try std.fmt.allocPrint(gpa, "{s}/var/lib/dnf", .{rootfs_path});
+    defer gpa.free(dnf_state);
+    const etc = try std.fmt.allocPrint(gpa, "{s}/etc", .{rootfs_path});
+    defer gpa.free(etc);
+    try sudo(gpa, io, &.{ "install", "-d", "-m", "0755", rootfs_path, etc, rpm_db, dnf_state });
+}
+
 fn configValueEquals(content: []const u8, key: []const u8, expected: []const u8) bool {
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
@@ -1350,16 +1497,7 @@ fn validateFullServiceFiles(
     io: Io,
     rootfs_path: []const u8,
 ) !void {
-    const units = [_][]const u8{
-        "cloud-init-local.service",
-        "cloud-init.service",
-        "cloud-config.service",
-        "cloud-final.service",
-        "waagent.service",
-        "sshd.service",
-        "systemd-networkd.service",
-    };
-    for (units) |unit| {
+    for (full_required_systemd_units) |unit| {
         const path = try std.fmt.allocPrint(gpa, "{s}/usr/lib/systemd/system/{s}", .{ rootfs_path, unit });
         defer gpa.free(path);
         const stat = Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch {
@@ -1394,15 +1532,20 @@ fn configureFullGuest(
     }
     try validateFullServiceFiles(gpa, io, rootfs_path);
     try sudo(gpa, io, &.{ "systemctl", "--root", rootfs_path, "preset-all" });
-    try sudo(gpa, io, &.{ "systemctl", "--root", rootfs_path, "enable", "waagent.service", "sshd.service", "systemd-networkd.service" });
-    for (&[_][]const u8{ "waagent.service", "sshd.service", "systemd-networkd.service" }) |unit| {
+    var enable_argv = std.array_list.Managed([]const u8).init(gpa);
+    defer enable_argv.deinit();
+    try enable_argv.appendSlice(&.{ "systemctl", "--root", rootfs_path, "enable" });
+    try enable_argv.appendSlice(&full_enabled_systemd_units);
+    try sudo(gpa, io, enable_argv.items);
+    for (full_enabled_systemd_units) |unit| {
         const enabled = try capture(gpa, io, &.{ "systemctl", "--root", rootfs_path, "is-enabled", unit });
         defer gpa.free(enabled);
         if (!std.mem.eql(u8, std.mem.trim(u8, enabled, " \t\r\n"), "enabled")) {
             return error.FullServiceNotEnabled;
         }
     }
-    try sudo(gpa, io, &.{ "chroot", rootfs_path, "/usr/sbin/sshd", "-t" });
+    try writeRootFile(gpa, io, rootfs_path, work_dir, ".autorelabel", "", "0600");
+    try sudo(gpa, io, &.{ "chroot", rootfs_path, "/usr/bin/sshd", "-t" });
 }
 
 fn configureCoreGuest(
@@ -1533,6 +1676,10 @@ fn installGuestContent(
     architecture: *const ArchitectureDescriptor,
     flavor: *const FlavorDescriptor,
 ) ![]u8 {
+    if (flavor.flavor == .full) {
+        try initializeFreshFullInstallroot(gpa, io, rootfs_path);
+    }
+
     // On a non-native builder, put the registered static interpreter in the
     // target root just for RPM scriptlets, then remove it before layering.
     const target_is_native = builtin.target.cpu.arch == architecture.target_cpu;
@@ -1576,7 +1723,7 @@ fn installGuestContent(
     }
 
     try validateTrustedSigningKey(gpa, io, trusted_key_path);
-    const gpgkey_opt = try std.fmt.allocPrint(gpa, "--setopt=azurelinux-base.gpgkey=file://{s}", .{trusted_key_path});
+    const gpgkey_opt = try std.fmt.allocPrint(gpa, "--setopt=" ++ dnf_repository_id ++ ".gpgkey=file://{s}", .{trusted_key_path});
     defer gpa.free(gpgkey_opt);
     const forcearch_opt = try std.fmt.allocPrint(gpa, "--forcearch={s}", .{architecture.dnf_architecture});
     defer gpa.free(forcearch_opt);
@@ -1586,35 +1733,55 @@ fn installGuestContent(
     // non-expiring while allowing payload downloads checked by the pinned
     // primary metadata and configured RPM signing key.
     try verifyRemoteRepositoryMetadata(gpa, io, work_dir, architecture);
-    var dnf_cache = try prepareDnfCache(gpa, io, work_dir, architecture, flavor);
+    var dnf_cache = try prepareDnfCache(gpa, io, rootfs_path, work_dir, architecture, flavor);
     defer dnf_cache.deinit(gpa);
     const baseurl_opt = try std.fmt.allocPrint(
         gpa,
-        "--setopt=azurelinux-base.baseurl={s}",
+        "--setopt=" ++ dnf_repository_id ++ ".baseurl={s}",
         .{architecture.repository_base_url},
     );
     defer gpa.free(baseurl_opt);
+    const repofrompath_opt = try std.fmt.allocPrint(
+        gpa,
+        "--repofrompath=" ++ dnf_repository_id ++ ",{s}",
+        .{architecture.repository_base_url},
+    );
+    defer gpa.free(repofrompath_opt);
     const metadata_expire_all_opt = "--setopt=metadata_expire=never";
-    const metadata_expire_repo_opt = "--setopt=azurelinux-base.metadata_expire=never";
-    const metalink_opt = "--setopt=azurelinux-base.metalink=";
-    const mirrorlist_opt = "--setopt=azurelinux-base.mirrorlist=";
+    const metadata_expire_repo_opt = "--setopt=" ++ dnf_repository_id ++ ".metadata_expire=never";
+    const metalink_opt = "--setopt=" ++ dnf_repository_id ++ ".metalink=";
+    const mirrorlist_opt = "--setopt=" ++ dnf_repository_id ++ ".mirrorlist=";
     const keepcache_opt = "--setopt=keepcache=True";
-    const gpgcheck_opt = "--setopt=azurelinux-base.gpgcheck=True";
-    try sudo(gpa, io, &.{
-        "dnf",                    "-y",
-        "--installroot",          rootfs_path,
-        "--releasever=4.0",       forcearch_opt,
-        "--repo=azurelinux-base", gpgkey_opt,
-        baseurl_opt,              metalink_opt,
-        mirrorlist_opt,           metadata_expire_all_opt,
-        metadata_expire_repo_opt, keepcache_opt,
-        gpgcheck_opt,             dnf_cache.cache_opt,
-        dnf_cache.persist_opt,    "--setopt=install_weak_deps=False",
-        "makecache",
-    });
+    const gpgcheck_opt = "--setopt=" ++ dnf_repository_id ++ ".gpgcheck=True";
+    const makecache_argv = dnfSeedMakecacheArgs(
+        forcearch_opt,
+        repofrompath_opt,
+        gpgkey_opt,
+        baseurl_opt,
+        metalink_opt,
+        mirrorlist_opt,
+        metadata_expire_all_opt,
+        metadata_expire_repo_opt,
+        keepcache_opt,
+        gpgcheck_opt,
+        dnf_cache.metadata_cache_opt,
+        dnf_cache.metadata_persist_opt,
+    );
+    try sudo(gpa, io, &makecache_argv);
+    try verifyCachedRepositoryMetadata(gpa, io, dnf_cache.metadata_cache_dir, architecture);
+    const metadata_cache_contents = try std.fmt.allocPrint(gpa, "{s}/.", .{dnf_cache.metadata_cache_dir});
+    defer gpa.free(metadata_cache_contents);
+    const metadata_persist_contents = try std.fmt.allocPrint(gpa, "{s}/.", .{dnf_cache.metadata_persist_dir});
+    defer gpa.free(metadata_persist_contents);
+    const cache_contents = try std.fmt.allocPrint(gpa, "{s}/.", .{dnf_cache.cache_dir});
+    defer gpa.free(cache_contents);
+    const persist_contents = try std.fmt.allocPrint(gpa, "{s}/.", .{dnf_cache.persist_dir});
+    defer gpa.free(persist_contents);
+    try sudo(gpa, io, &.{ "cp", "-a", metadata_cache_contents, cache_contents });
+    try sudo(gpa, io, &.{ "cp", "-a", metadata_persist_contents, persist_contents });
     try verifyCachedRepositoryMetadata(gpa, io, dnf_cache.cache_dir, architecture);
 
-    const installed_before = try captureInstalledNevras(gpa, io, rootfs_path);
+    const installed_before = try initialInstalledNevras(gpa, io, rootfs_path, flavor);
     defer gpa.free(installed_before);
     const flavor_packages = try packagesForFlavor(gpa, flavor, architecture);
     defer gpa.free(flavor_packages);
@@ -1622,6 +1789,7 @@ fn installGuestContent(
         gpa,
         rootfs_path,
         forcearch_opt,
+        repofrompath_opt,
         gpgkey_opt,
         baseurl_opt,
         metalink_opt,
@@ -1658,7 +1826,11 @@ fn installGuestContent(
     // reproducible, even though non-expiring cached metadata prevented it from
     // changing this transaction's resolved package set.
     try verifyRemoteRepositoryMetadata(gpa, io, work_dir, architecture);
-    try sudo(gpa, io, &.{ "rm", "-rf", "--", dnf_cache.cache_dir, dnf_cache.persist_dir });
+    try sudo(gpa, io, &.{
+        "rm",                           "-rf",                 "--",
+        dnf_cache.cache_dir,            dnf_cache.persist_dir, dnf_cache.metadata_cache_dir,
+        dnf_cache.metadata_persist_dir,
+    });
 
     const stub_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ rootfs_path, architecture.systemd_boot_stub_path });
     defer gpa.free(stub_path);
@@ -1798,8 +1970,8 @@ fn createOciLayer(
     var argv = std.array_list.Managed([]const u8).init(gpa);
     defer argv.deinit();
     try argv.appendSlice(&.{
-        "tar",          "--sort=name",                            "--mtime=@0", "--numeric-owner",
-        "--format=pax", "--pax-option=delete=atime,delete=ctime",
+        "tar",          "--sort=name", "--mtime=@0",         "--numeric-owner",
+        "--format=pax", "--xattrs",    "--xattrs-include=*", "--pax-option=delete=atime,delete=ctime",
     });
     for (excludes) |e| {
         const flag = try std.fmt.allocPrint(gpa, "--exclude={s}", .{e});
@@ -1811,7 +1983,7 @@ fn createOciLayer(
     try sudo(gpa, io, argv.items);
 
     // Free the --exclude=... strings we duped.
-    const exclude_start = 6; // after the fixed args
+    const exclude_start = 8; // after the fixed args
     for (argv.items[exclude_start .. exclude_start + excludes.len]) |s| gpa.free(s);
 
     // Re-own the tar so we can read it.
@@ -2422,6 +2594,10 @@ fn validateFinalizedImageRootfs(
     const machine_id = try rootfs.statPath(io, "etc/machine-id");
     if (machine_id.size != 0) return error.GeneratedMachineId;
     if (flavor.flavor == .full) {
+        const autorelabel = try rootfs.statPath(io, ".autorelabel");
+        if (autorelabel.kind != .file) return error.MissingAutorelabel;
+        const chrony_state = try rootfs.statPath(io, "var/lib/chrony");
+        if (chrony_state.uid == 0 or chrony_state.gid == 0) return error.LostPackageOwnership;
         const waagent_state = rootfs.listDir(io, gpa, "var/lib/waagent") catch |err| switch (err) {
             error.NotFound => return error.BakedProvisioningState,
             else => return err,
@@ -3232,7 +3408,14 @@ test "flavor contracts keep full systemd-only and core zvminit-only" {
         try std.testing.expect(argvContains(full.forbidden_rootfs_paths, path));
     }
     try std.testing.expect(argvContains(full.required_rootfs_paths, "usr/lib/systemd/systemd"));
-    try std.testing.expect(argvContains(full.required_rootfs_paths, "usr/sbin/waagent"));
+    try std.testing.expect(argvContains(full.required_rootfs_paths, "usr/bin/sshd"));
+    try std.testing.expect(argvContains(full.required_rootfs_paths, "usr/bin/waagent"));
+    try std.testing.expect(argvContains(full.required_rootfs_paths, ".autorelabel"));
+    try std.testing.expect(!argvContains(full.required_rootfs_paths, "usr/sbin/waagent"));
+    try std.testing.expect(!argvContains(&full_required_systemd_units, "cloud-init.service"));
+    try std.testing.expect(argvContains(&full_required_systemd_units, "cloud-init-main.service"));
+    try std.testing.expect(argvContains(&full_required_systemd_units, "cloud-init-network.service"));
+    try std.testing.expectEqualSlices([]const u8, &full_required_systemd_units, &full_enabled_systemd_units);
     try std.testing.expect(full.max_oci_layer_bytes > core.max_oci_layer_bytes);
     try std.testing.expectEqual(@as(usize, 3), ociLayerPlanCount(&core));
     try std.testing.expectEqual(@as(usize, 7), ociLayerPlanCount(&full));
@@ -3296,6 +3479,7 @@ test "DNF install permits payload downloads without refreshing verified metadata
         gpa,
         "/target-root",
         "--forcearch=x86_64",
+        "--repofrompath=zvmi-azurelinux-base,https://example.invalid/base",
         "--setopt=azurelinux-base.gpgkey=file:///key",
         "--setopt=azurelinux-base.baseurl=https://example.invalid/base",
         "--setopt=azurelinux-base.metalink=",
@@ -3316,9 +3500,56 @@ test "DNF install permits payload downloads without refreshing verified metadata
     try std.testing.expect(argvContains(argv, "--setopt=cachedir=/private/cache"));
     try std.testing.expect(argvContains(argv, "--setopt=persistdir=/private/persist"));
     try std.testing.expect(argvContains(argv, "--setopt=azurelinux-base.gpgcheck=True"));
-    try std.testing.expectEqualStrings("install", argv[18]);
-    try std.testing.expectEqualStrings("openssh-server", argv[19]);
-    try std.testing.expectEqualStrings("sudo", argv[20]);
+    try std.testing.expect(argvContains(argv, "--disablerepo=*"));
+    try std.testing.expect(argvContains(argv, "--enablerepo=zvmi-azurelinux-base"));
+    try std.testing.expectEqualStrings("install", argv[20]);
+    try std.testing.expectEqualStrings("openssh-server", argv[21]);
+    try std.testing.expectEqualStrings("sudo", argv[22]);
+}
+
+test "fresh full installroot defines the repository before transactions" {
+    const repofrompath = "--repofrompath=zvmi-azurelinux-base,https://example.invalid/base";
+    const makecache = dnfSeedMakecacheArgs(
+        "--forcearch=x86_64",
+        repofrompath,
+        "--setopt=azurelinux-base.gpgkey=file:///key",
+        "--setopt=azurelinux-base.baseurl=https://example.invalid/base",
+        "--setopt=azurelinux-base.metalink=",
+        "--setopt=azurelinux-base.mirrorlist=",
+        "--setopt=metadata_expire=never",
+        "--setopt=azurelinux-base.metadata_expire=never",
+        "--setopt=keepcache=True",
+        "--setopt=azurelinux-base.gpgcheck=True",
+        "--setopt=cachedir=/private/cache",
+        "--setopt=persistdir=/private/persist",
+    );
+    const install = try dnfInstallArgs(
+        std.testing.allocator,
+        "/fresh-root",
+        "--forcearch=x86_64",
+        repofrompath,
+        "--setopt=azurelinux-base.gpgkey=file:///key",
+        "--setopt=azurelinux-base.baseurl=https://example.invalid/base",
+        "--setopt=azurelinux-base.metalink=",
+        "--setopt=azurelinux-base.mirrorlist=",
+        "--setopt=metadata_expire=never",
+        "--setopt=azurelinux-base.metadata_expire=never",
+        "--setopt=keepcache=True",
+        "--setopt=azurelinux-base.gpgcheck=True",
+        "--setopt=cachedir=/private/cache",
+        "--setopt=persistdir=/private/persist",
+        &.{"systemd"},
+    );
+    defer std.testing.allocator.free(install);
+    for (&[_][]const []const u8{ &makecache, install }) |argv| {
+        const repo = argvIndex(argv, repofrompath).?;
+        const action = argvIndex(argv, if (std.mem.eql(u8, argv[argv.len - 1], "makecache")) "makecache" else "install").?;
+        try std.testing.expect(repo < action);
+        try std.testing.expect(!argvContains(argv, "chroot"));
+        try std.testing.expect(!argvContains(argv, "/usr/bin/rpm"));
+    }
+    try std.testing.expectEqual(InitialNevraState.empty_fresh_installroot, initialNevraState(&full));
+    try std.testing.expectEqual(InitialNevraState.query_existing_installroot, initialNevraState(&core));
 }
 
 test "installed NEVRA closure is deterministically sorted" {
