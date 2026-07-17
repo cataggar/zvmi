@@ -1514,13 +1514,15 @@ const ChildDrainState = enum {
 const ShutdownPhase = enum {
     term,
     kill,
+    final_reap,
     reboot,
 };
 
 fn phaseAfterDrain(phase: ShutdownPhase, state: ChildDrainState) ShutdownPhase {
     return switch (phase) {
         .term => if (state == .drained) .reboot else .kill,
-        .kill => .reboot,
+        .kill => if (state == .drained) .reboot else .final_reap,
+        .final_reap => if (state == .drained) .reboot else .final_reap,
         .reboot => .reboot,
     };
 }
@@ -1551,6 +1553,23 @@ fn boundedChildDrain(supervisor: *Supervisor, attempts: u32) ChildDrainState {
     return drainExitedChildren(supervisor);
 }
 
+fn reapUntilNoChildren(supervisor: *Supervisor) void {
+    while (true) {
+        var status: u32 = 0;
+        const wait_rc = linux.waitpid(-1, &status, 0);
+        const wait_error = linux.errno(wait_rc);
+        if (wait_error == .INTR) continue;
+        if (wait_error == .CHILD) return;
+        if (wait_error == .SUCCESS) {
+            noteChildExit(supervisor, @intCast(wait_rc), status);
+            continue;
+        }
+        writeErrno("[zvminit] final shutdown waitpid() failed; retrying", wait_error);
+        const req: linux.timespec = .{ .sec = 1, .nsec = 0 };
+        _ = linux.nanosleep(&req, null);
+    }
+}
+
 fn isPid1(pid: linux.pid_t) bool {
     return pid == 1;
 }
@@ -1578,6 +1597,11 @@ fn shutdownSupervisor(supervisor: *Supervisor) noreturn {
         writeStr("[zvminit] forcing remaining guest processes to exit\r\n");
         broadcastGuestSignal(.KILL);
         phase = phaseAfterDrain(phase, boundedChildDrain(supervisor, 50));
+    }
+    if (phase == .final_reap) {
+        writeStr("[zvminit] waiting for all killed children to be reaped\r\n");
+        reapUntilNoChildren(supervisor);
+        phase = phaseAfterDrain(phase, .drained);
     }
     std.debug.assert(phase == .reboot);
     doReboot(if (shutdown_signal == 2) .RESTART else .POWER_OFF);
@@ -1872,7 +1896,10 @@ test "shutdown policy broadcasts only as PID 1 and escalates after bounded drain
     try std.testing.expect(!isPid1(2));
     try std.testing.expectEqual(ShutdownPhase.reboot, phaseAfterDrain(.term, .drained));
     try std.testing.expectEqual(ShutdownPhase.kill, phaseAfterDrain(.term, .remaining));
-    try std.testing.expectEqual(ShutdownPhase.reboot, phaseAfterDrain(.kill, .remaining));
+    try std.testing.expectEqual(ShutdownPhase.reboot, phaseAfterDrain(.kill, .drained));
+    try std.testing.expectEqual(ShutdownPhase.final_reap, phaseAfterDrain(.kill, .remaining));
+    try std.testing.expectEqual(ShutdownPhase.final_reap, phaseAfterDrain(.final_reap, .remaining));
+    try std.testing.expectEqual(ShutdownPhase.reboot, phaseAfterDrain(.final_reap, .drained));
 }
 
 test "parsePersistedHostname trims line endings and rejects invalid content" {

@@ -187,7 +187,9 @@ jobs:
 
           inspect_guest=$(cat <<'GUEST'
           set -eu
-          test "$(readlink -f /proc/1/exe)" = /sbin/zvminit
+          resolved_pid1=$(readlink -f /proc/1/exe)
+          printf 'PID1_EXE=%s\n' "$resolved_pid1" >&2
+          test /proc/1/exe -ef /sbin/zvminit
           test -b /dev/sr0
           test -f /var/lib/azagent/provisioned
           find_sshd_master() {
