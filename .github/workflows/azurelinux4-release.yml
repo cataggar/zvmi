@@ -38,7 +38,8 @@ jobs:
       - name: Install image build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends dnf file jq qemu-utils
+          sudo apt-get install -y --no-install-recommends \
+            dnf expect file jq ovmf qemu-system-x86 qemu-utils
           # Ubuntu defaults to ~/.rpmdb; use the database shipped in the Azure Linux rootfs.
           echo '%_dbpath /usr/lib/sysimage/rpm' | sudo tee /root/.rpmmacros
           test "$(sudo rpm --eval '%{_dbpath}')" = /usr/lib/sysimage/rpm
@@ -70,14 +71,81 @@ jobs:
           set -o pipefail
           zig build generalized-azurelinux4 -- \
             --work-dir "$GITHUB_WORKSPACE/$WORK_DIR" \
+            --size 1184M \
             --output "$GITHUB_WORKSPACE/dist/$ASSET_NAME" 2>&1 | tee "$RUNNER_TEMP/azurelinux4-build.log"
 
       - name: Validate release image
         run: |
           qemu-img check "dist/$ASSET_NAME"
           test "$(qemu-img info --output=json "dist/$ASSET_NAME" | jq -r '.format')" = qcow2
-          test "$(qemu-img info --output=json "dist/$ASSET_NAME" | jq -r '."virtual-size"')" = 805306368
+          test "$(qemu-img info --output=json "dist/$ASSET_NAME" | jq -r '."virtual-size"')" = 1241513984
           sha256sum "dist/$ASSET_NAME"
+
+      - name: Boot finalized UKI QCOW2
+        timeout-minutes: 6
+        env:
+          IMAGE: ${{ github.workspace }}/dist/${{ env.ASSET_NAME }}
+          OVMF_CODE: /usr/share/OVMF/OVMF_CODE_4M.fd
+          OVMF_TEMPLATE: /usr/share/OVMF/OVMF_VARS_4M.fd
+          OVMF_VARS: ${{ runner.temp }}/azurelinux4-OVMF_VARS.fd
+        run: |
+          set -euo pipefail
+          test -x /usr/bin/qemu-system-x86_64
+          test -r "$OVMF_CODE"
+          test -r "$OVMF_TEMPLATE"
+          test -r "$IMAGE"
+
+          cp "$OVMF_TEMPLATE" "$OVMF_VARS"
+          trap 'rm -f "$OVMF_VARS"' EXIT
+
+          timeout --signal=TERM --kill-after=10s 300s expect <<'EXPECT'
+          set timeout 240
+
+          proc fail {pid message} {
+              puts stderr "FAIL: $message"
+              catch {exec kill -TERM $pid}
+              after 2000
+              catch {exec kill -KILL $pid}
+              catch {wait}
+              exit 1
+          }
+
+          spawn -noecho qemu-system-x86_64 \
+              -machine q35,accel=tcg,smm=off \
+              -m 2048 \
+              -display none -monitor none \
+              -serial stdio -no-reboot -snapshot \
+              -drive if=pflash,unit=0,format=raw,readonly=on,file=$env(OVMF_CODE) \
+              -drive if=pflash,unit=1,format=raw,file=$env(OVMF_VARS) \
+              -drive file=$env(IMAGE),format=qcow2,if=virtio \
+              -nic user,model=virtio-net-pci
+
+          set pid [exp_pid]
+          expect {
+              -exact {[azinit] spawning shell on ttyS0} {}
+              timeout { fail $pid "azinit shell marker timeout" }
+              eof     { fail $pid "QEMU exited before azinit shell" }
+          }
+
+          send -- "exe=\$(readlink /proc/1/exe); cmd=\$(tr '\\0' ' ' </proc/1/cmdline); status=BAD; test /proc/1/exe -ef /sbin/init && test \"\$cmd\" = '/sbin/init ' && status=OK; printf 'ZVMI_PID1_EXE=%s\\n' \"\$exe\"; printf 'ZVMI_PID1_CMDLINE=%s\\n' \"\$cmd\"; printf 'ZVMI_PID1_%s\\n' \"\$status\"; poweroff\r"
+
+          expect {
+              -exact {ZVMI_PID1_OK} {}
+              -exact {ZVMI_PID1_BAD} { fail $pid "PID 1 verification failed" }
+              timeout { fail $pid "PID 1 response timeout" }
+              eof     { fail $pid "QEMU exited before PID 1 verification" }
+          }
+
+          expect {
+              eof {}
+              timeout { fail $pid "guest did not power off" }
+          }
+
+          set result [wait]
+          if {[lindex $result 2] != 0 || [lindex $result 3] != 0} {
+              exit 1
+          }
+          EXPECT
 
       - name: Replace release asset
         env:
@@ -95,10 +163,14 @@ jobs:
           fi
 
           cat > "$RUNNER_TEMP/release-notes.md" <<EOF
-          Generalized x86_64 Azure Linux 4.0 Gen2 image built with zvmi from current \`main\`. The QCOW2 uses maximum-level zstd cluster compression and is directly bootable with UEFI QEMU.
+          Generalized x86_64 Azure Linux 4.0 Gen2 image built with zvmi from current \`main\`. The QCOW2 uses maximum-level zstd cluster compression and boots directly from a Unified Kernel Image (UKI) under UEFI.
 
           - Asset: \`$ASSET_NAME\`
-          - Virtual disk size: 768 MiB
+          - Boot path: \`UEFI -> EFI/BOOT/BOOTX64.EFI (UKI) -> kernel/initramfs -> azinit\`
+          - Secure Boot: disabled; UKI signing and trust are tracked in issue #168
+          - Virtual disk size: 1184 MiB
+          - EFI System Partition: 512 MiB
+          - Root partition: 670 MiB
           - File size: $asset_bytes bytes
           - SHA-256: \`$asset_sha256\`
           - Source commit: \`$source_commit\`
@@ -109,8 +181,10 @@ jobs:
           - Source ISO: \`AzureLinux-4.0-x86_64.iso\`
           - ISO SHA-256: \`$iso_sha256\`
           - Base OCI manifest: \`$base_digest\`
+          - UKI stub package: \`systemd-boot-unsigned-258.4-4.azl4.x86_64.rpm\`
+          - UKI stub package SHA-256: \`85dd3ac0c532bceb09fc0a85c6568c51fc4ee84e0c478d1302b7a2d84e1bea5c\`
 
-          The base image identifies itself as Azure Linux 4.0 Container Image Beta with \`RELEASE_TYPE=development\`.
+          The builder validates the finalized QCOW2's GPT, ESP, UKI sections, and embedded command line. The release workflow then boots that exact compressed artifact with QEMU/OVMF and verifies \`azinit\` is PID 1. The base image identifies itself as Azure Linux 4.0 Container Image Beta with \`RELEASE_TYPE=development\`.
           EOF
 
           gh release upload "$RELEASE_TAG" "dist/$ASSET_NAME" --clobber --repo "$GITHUB_REPOSITORY"

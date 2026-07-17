@@ -8,7 +8,7 @@
 //! CLI arguments accepted:
 //!   --iso <path>        Azure Linux 4 x86_64 ISO (downloaded if omitted)
 //!   --output <path>     Output QCOW2 path (default: zvmi-azurelinux4-generalized.qcow2)
-//!   --size <size>       Disk size (default: 768M)
+//!   --size <size>       Disk size (default: 1184M)
 //!   --work-dir <dir>    Working directory (default: .scratch/generalized-azurelinux4)
 //!
 //! Arguments injected automatically by build.zig:
@@ -36,6 +36,11 @@ const mcr_base = "https://mcr.microsoft.com/v2";
 const iso_url = "https://aka.ms/azurelinux-4.0-x86_64.iso";
 const iso_checksum_url = "https://aka.ms/azurelinux-4.0-x86_64-iso-checksum";
 const iso_name = "AzureLinux-4.0-x86_64.iso";
+const systemd_boot_unsigned_rpm_name = "systemd-boot-unsigned-258.4-4.azl4.x86_64.rpm";
+const systemd_boot_unsigned_rpm_url = "https://packages.microsoft.com/azurelinux/4.0/beta/base/x86_64/Packages/s/" ++ systemd_boot_unsigned_rpm_name;
+const systemd_boot_unsigned_rpm_sha256 = "85dd3ac0c532bceb09fc0a85c6568c51fc4ee84e0c478d1302b7a2d84e1bea5c";
+const systemd_boot_unsigned_rpm_max_bytes: u64 = 16 * 1024 * 1024;
+const systemd_boot_stub_path = "usr/lib/systemd/boot/efi/linuxx64.efi.stub";
 const oci_manifest_type = "application/vnd.oci.image.manifest.v1+json";
 const oci_index_type = "application/vnd.oci.image.index.v1+json";
 const docker_manifest_type = "application/vnd.docker.distribution.manifest.v2+json";
@@ -43,6 +48,16 @@ const docker_index_type = "application/vnd.docker.distribution.manifest.list.v2+
 const zvmi_max_layer_bytes: u64 = 128 * 1024 * 1024;
 const iso_max_bytes: u64 = 2 * 1024 * 1024 * 1024;
 const accept_header = oci_index_type ++ ", " ++ docker_index_type ++ ", " ++ oci_manifest_type ++ ", " ++ docker_manifest_type;
+const generalized_esp_size_bytes: u64 = 512 * 1024 * 1024;
+const generalized_esp_size_arg = "512M";
+const generalized_extra_kernel_options = "init=/sbin/init azinit.mode=persistent azinit.azure=auto console=tty0 console=ttyS0,115200n8";
+const required_rootfs_paths = [_][]const u8{
+    "usr/bin/bash",
+    "usr/bin/azagent",
+    "usr/bin/init",
+    "usr/bin/sshd",
+    systemd_boot_stub_path,
+};
 
 // ─── subprocess helpers ──────────────────────────────────────────────────────
 
@@ -138,6 +153,14 @@ fn sha256File(io: Io, path: []const u8) ![64]u8 {
     return artifact_pipeline.formatSha256(
         (try artifact_pipeline.hashFile(io, path)).sha256,
     );
+}
+
+fn systemdBootRpmCachePath(gpa: Allocator, work_dir: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "{s}/downloads/{s}", .{ work_dir, systemd_boot_unsigned_rpm_name });
+}
+
+fn isRegularNonemptyFile(kind: Io.File.Kind, size: u64) bool {
+    return kind == .file and size != 0;
 }
 
 // ─── path safety ─────────────────────────────────────────────────────────────
@@ -333,6 +356,37 @@ fn downloadBlob(
     }
 }
 
+/// Acquire the pinned systemd UKI stub RPM in the work-directory cache.
+fn acquireSystemdBootRpm(gpa: Allocator, io: Io, work_dir: []const u8) ![:0]u8 {
+    const cache_path = try systemdBootRpmCachePath(gpa, work_dir);
+    defer gpa.free(cache_path);
+    const cache_dir = std.fs.path.dirname(cache_path) orelse return error.InvalidCachePath;
+    try Dir.cwd().createDirPath(io, cache_dir);
+
+    const expected_digest = artifact_pipeline.parseSha256(systemd_boot_unsigned_rpm_sha256) catch
+        return error.InvalidSystemdBootRpmChecksum;
+    var curl = artifact_pipeline.CurlDownloader{
+        .executable_path = "curl",
+    };
+    const acquired = try artifact_pipeline.acquireVerified(
+        gpa,
+        io,
+        .{
+            .url = systemd_boot_unsigned_rpm_url,
+            .destination_path = cache_path,
+            .expected_sha256 = expected_digest,
+            .max_size = systemd_boot_unsigned_rpm_max_bytes,
+        },
+        curl.downloader(),
+    );
+    if (acquired.reused_cache) {
+        std.debug.print("Systemd boot RPM cached at {s}\n", .{cache_path});
+    } else {
+        std.debug.print("Systemd boot RPM downloaded and verified: {s}\n", .{cache_path});
+    }
+    return Dir.cwd().realPathFileAlloc(io, cache_path, gpa);
+}
+
 // ─── layer extraction ────────────────────────────────────────────────────────
 
 /// Extract OCI layer `layer_path` into `rootfs_path`, applying whiteouts.
@@ -459,6 +513,7 @@ fn installGuestContent(
     work_dir: []const u8,
     azinit_path: []const u8,
     azagent_path: []const u8,
+    systemd_boot_rpm_path: []const u8,
 ) !void {
     // On non-x86_64 hosts, set up binfmt qemu interpreter inside the rootfs.
     const is_x86_64 = builtin.target.cpu.arch == .x86_64;
@@ -515,6 +570,22 @@ fn installGuestContent(
         "--setopt=install_weak_deps=False", "install",
         "openssh-server",                   "sudo",
     });
+
+    // Install the pinned local RPM in a separate, repository-free transaction.
+    try sudo(gpa, io, &.{
+        "dnf",              "-y",
+        "--installroot",    rootfs_path,
+        "--releasever=4.0", "--forcearch=x86_64",
+        "--disablerepo=*",  "--setopt=install_weak_deps=False",
+        "install",          systemd_boot_rpm_path,
+    });
+    const stub_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ rootfs_path, systemd_boot_stub_path });
+    defer gpa.free(stub_path);
+    const stub_stat = try Dir.cwd().statFile(io, stub_path, .{ .follow_symlinks = false });
+    if (!isRegularNonemptyFile(stub_stat.kind, stub_stat.size)) {
+        std.debug.print("error: installed systemd boot stub is not a nonempty regular file: {s}\n", .{stub_path});
+        return error.InvalidSystemdBootStub;
+    }
 
     // Install azinit as /sbin/init.
     const sbin_init = try std.fmt.allocPrint(gpa, "{s}/sbin/init", .{rootfs_path});
@@ -957,13 +1028,7 @@ fn validateGeneralizedOciLayout(gpa: Allocator, io: Io, layout_dir: []const u8) 
     try validateOsRelease(image);
 
     // Azure Linux uses merged-/usr symlinks, so OCI records these physical paths.
-    const required_paths = [_][]const u8{
-        "usr/bin/bash",
-        "usr/bin/azagent",
-        "usr/bin/init",
-        "usr/bin/sshd",
-    };
-    for (required_paths) |path| {
+    for (required_rootfs_paths) |path| {
         const entry = image.get(path) orelse {
             std.debug.print("error: generated OCI layout is missing required rootfs path: /{s}\n", .{path});
             return error.IncompleteOciRootfs;
@@ -975,10 +1040,172 @@ fn validateGeneralizedOciLayout(gpa: Allocator, io: Io, layout_dir: []const u8) 
     }
 }
 
+const GeneralizedImageValidationReport = struct {
+    virtual_size: u64,
+    esp_size: u64,
+    root_size: u64,
+    uki_size: usize,
+};
+
+fn planGeneralizedGen2Layout(gpa: Allocator, virtual_size: u64) ![]zvmi.layout.PlannedPartition {
+    const requests = [_]zvmi.layout.PartitionRequest{
+        .{ .name = "ESP", .role = .esp, .size = .{ .fixed = generalized_esp_size_bytes } },
+        .{ .name = "root", .role = .root_x86_64, .size = .{ .percent = 100.0 } },
+    };
+    return zvmi.layout.planLayout(gpa, virtual_size, &requests, null);
+}
+
+fn validatePartitionLayout(
+    partitions: []const zvmi.gpt.PartitionEntry,
+    expected: []const zvmi.layout.PlannedPartition,
+) !void {
+    if (partitions.len != expected.len) return error.UnexpectedPartitionCount;
+    for (partitions, expected) |partition, planned| {
+        if (!std.mem.eql(u8, &partition.partition_type_guid, &planned.type_guid)) {
+            return error.UnexpectedPartitionType;
+        }
+        if (partition.first_lba != planned.firstLba() or partition.last_lba != planned.lastLba()) {
+            return error.UnexpectedPartitionLayout;
+        }
+        if (partition.last_lba < partition.first_lba) return error.UnexpectedPartitionLayout;
+        const offset_bytes = partition.first_lba * zvmi.gpt.sector_size;
+        const length_bytes = (partition.last_lba - partition.first_lba + 1) * zvmi.gpt.sector_size;
+        if (offset_bytes != planned.offset_bytes or length_bytes != planned.length_bytes) {
+            return error.UnexpectedPartitionLayout;
+        }
+    }
+}
+
+fn requireAbsentFile(esp: *zvmi.fat32.FileSystem, gpa: Allocator, io: Io, path: []const u8) !void {
+    const bytes = esp.readFileAlloc(io, gpa, path) catch |err| switch (err) {
+        error.PathNotFound => return,
+        else => return err,
+    };
+    gpa.free(bytes);
+    return error.UnexpectedGeneratedBootConfig;
+}
+
+fn requireNoBlsEntries(esp: *zvmi.fat32.FileSystem, gpa: Allocator, io: Io) !void {
+    const entries = esp.listDirAlloc(io, gpa, "loader/entries") catch |err| switch (err) {
+        error.PathNotFound => return,
+        else => return err,
+    };
+    defer zvmi.fat32.freeDirEntries(gpa, entries);
+    for (entries) |entry| {
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".conf")) {
+            return error.UnexpectedGeneratedBootConfig;
+        }
+    }
+}
+
+fn requireNoGeneratedGrubConfigs(esp: *zvmi.fat32.FileSystem, gpa: Allocator, io: Io) !void {
+    try requireAbsentFile(esp, gpa, io, "EFI/BOOT/grub.cfg");
+
+    const efi_entries = try esp.listDirAlloc(io, gpa, "EFI");
+    defer zvmi.fat32.freeDirEntries(gpa, efi_entries);
+    for (efi_entries) |entry| {
+        if (entry.kind != .directory or std.ascii.eqlIgnoreCase(entry.name, "BOOT")) continue;
+        const path = try std.fmt.allocPrint(gpa, "EFI/{s}/grub.cfg", .{entry.name});
+        defer gpa.free(path);
+        try requireAbsentFile(esp, gpa, io, path);
+    }
+}
+
+fn expectedUkiCmdline(gpa: Allocator, root_guid: zvmi.guid.Guid) ![]u8 {
+    var root_guid_text: [36]u8 = undefined;
+    return std.fmt.allocPrint(
+        gpa,
+        "root=PARTUUID={s} {s}",
+        .{ zvmi.guid.formatLower(&root_guid_text, root_guid), generalized_extra_kernel_options },
+    );
+}
+
+fn requireNonemptyUkiSection(inspection: *const zvmi.uki.Inspection, name: []const u8) ![]const u8 {
+    const section = inspection.findSection(name) orelse return error.MissingUkiSection;
+    if (section.contents.len == 0) return error.EmptyUkiSection;
+    return section.contents;
+}
+
+fn validateGeneralizedImage(
+    gpa: Allocator,
+    io: Io,
+    image_path: []const u8,
+    expected_virtual_size: u64,
+) !GeneralizedImageValidationReport {
+    var image = try zvmi.Image.openPathReadOnly(io, image_path);
+    defer image.close(io);
+    if (image.virtual_size != expected_virtual_size) return error.UnexpectedVirtualSize;
+
+    const expected_layout = try planGeneralizedGen2Layout(gpa, image.virtual_size);
+    defer gpa.free(expected_layout);
+    const parsed = try zvmi.gpt.readGpt(image, io, gpa);
+    defer gpa.free(parsed.partitions);
+    try validatePartitionLayout(parsed.partitions, expected_layout);
+
+    const esp_partition = parsed.partitions[0];
+    const root_partition = parsed.partitions[1];
+    if (std.mem.eql(u8, &root_partition.unique_partition_guid, &zvmi.guid.nil)) {
+        return error.InvalidRootPartitionGuid;
+    }
+    var esp = try zvmi.fat32.open(&image, io, .{
+        .offset = esp_partition.first_lba * zvmi.gpt.sector_size,
+        .length = (esp_partition.last_lba - esp_partition.first_lba + 1) * zvmi.gpt.sector_size,
+    });
+
+    const fallback_uki = try esp.readFileAlloc(io, gpa, "EFI/BOOT/BOOTX64.EFI");
+    defer gpa.free(fallback_uki);
+    const linux_entries = try esp.listDirAlloc(io, gpa, "EFI/Linux");
+    defer zvmi.fat32.freeDirEntries(gpa, linux_entries);
+
+    var found_named_uki = false;
+    var fallback_matches_named_uki = false;
+    for (linux_entries) |entry| {
+        if (entry.kind != .file or entry.name.len < 4 or
+            !std.ascii.eqlIgnoreCase(entry.name[entry.name.len - 4 ..], ".efi")) continue;
+        found_named_uki = true;
+        const path = try std.fmt.allocPrint(gpa, "EFI/Linux/{s}", .{entry.name});
+        defer gpa.free(path);
+        const bytes = try esp.readFileAlloc(io, gpa, path);
+        defer gpa.free(bytes);
+        if (std.mem.eql(u8, fallback_uki, bytes)) {
+            fallback_matches_named_uki = true;
+            break;
+        }
+    }
+    if (!found_named_uki) return error.MissingNamedUki;
+    if (!fallback_matches_named_uki) return error.FallbackUkiMismatch;
+
+    var inspection = try zvmi.uki.inspect(gpa, fallback_uki);
+    defer inspection.deinit(gpa);
+    if (inspection.machine != 0x8664) return error.UnexpectedUkiMachine;
+    if (inspection.subsystem != 10) return error.UnexpectedUkiSubsystem;
+    _ = try requireNonemptyUkiSection(&inspection, ".linux");
+    _ = try requireNonemptyUkiSection(&inspection, ".initrd");
+    const cmdline = try requireNonemptyUkiSection(&inspection, ".cmdline");
+    _ = try requireNonemptyUkiSection(&inspection, ".osrel");
+    _ = try requireNonemptyUkiSection(&inspection, ".uname");
+
+    const expected_cmdline = try expectedUkiCmdline(gpa, root_partition.unique_partition_guid);
+    defer gpa.free(expected_cmdline);
+    if (!std.mem.eql(u8, cmdline, expected_cmdline)) return error.UnexpectedUkiCmdline;
+
+    try requireAbsentFile(&esp, gpa, io, "loader/loader.conf");
+    try requireNoBlsEntries(&esp, gpa, io);
+    try requireNoGeneratedGrubConfigs(&esp, gpa, io);
+
+    return .{
+        .virtual_size = image.virtual_size,
+        .esp_size = expected_layout[0].length_bytes,
+        .root_size = expected_layout[1].length_bytes,
+        .uki_size = fallback_uki.len,
+    };
+}
+
 // ─── ISO download ─────────────────────────────────────────────────────────────
 
-fn downloadIso(gpa: Allocator, io: Io, work_dir: []const u8) ![]const u8 {
+fn downloadIso(gpa: Allocator, io: Io, work_dir: []const u8) ![]u8 {
     const iso_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ work_dir, iso_name });
+    errdefer gpa.free(iso_path);
 
     std.debug.print("Fetching ISO checksum...\n", .{});
     const checksum_bytes = try fetchBytes(gpa, io, iso_checksum_url, null);
@@ -1025,7 +1252,7 @@ fn requireTool(gpa: Allocator, io: Io, name: []const u8) bool {
 const Args = struct {
     iso: ?[]const u8 = null,
     output: []const u8 = "zvmi-azurelinux4-generalized.qcow2",
-    size: []const u8 = "768M",
+    size: []const u8 = "1184M",
     work_dir: []const u8 = ".scratch/generalized-azurelinux4",
     zvmi_path: ?[]const u8 = null,
     azinit_path: ?[]const u8 = null,
@@ -1038,7 +1265,7 @@ const help_text =
     \\
     \\  --iso <path>        Azure Linux 4 x86_64 ISO (downloaded if omitted)
     \\  --output <path>     Output QCOW2 (default: zvmi-azurelinux4-generalized.qcow2)
-    \\  --size <size>       Disk size (default: 768M)
+    \\  --size <size>       Disk size (default: 1184M)
     \\  --work-dir <dir>    Working directory (default: .scratch/generalized-azurelinux4)
     \\  --zvmi <path>       zvmi executable (injected by build.zig)
     \\  --azinit <path>     x86_64-linux azinit binary (injected by build.zig)
@@ -1152,7 +1379,9 @@ pub fn main(init: std.process.Init) !void {
     const work_dir = args.work_dir;
     try Dir.cwd().createDirPath(io, work_dir);
 
-    const iso_path = if (args.iso) |p| p else try downloadIso(gpa, io, work_dir);
+    const downloaded_iso_path = if (args.iso == null) try downloadIso(gpa, io, work_dir) else null;
+    defer if (downloaded_iso_path) |path| gpa.free(path);
+    const iso_path = args.iso orelse downloaded_iso_path.?;
     _ = Dir.cwd().statFile(io, iso_path, .{}) catch |err| {
         std.debug.print("error: ISO not found: {s} ({s})\n", .{ iso_path, @errorName(err) });
         std.process.exit(1);
@@ -1164,7 +1393,17 @@ pub fn main(init: std.process.Init) !void {
     const base_digest = try pullRootfs(gpa, io, work_dir, rootfs_path);
     defer gpa.free(base_digest);
 
-    try installGuestContent(gpa, io, rootfs_path, work_dir, azinit_path, azagent_path);
+    const systemd_boot_rpm_path = try acquireSystemdBootRpm(gpa, io, work_dir);
+    defer gpa.free(systemd_boot_rpm_path);
+    try installGuestContent(
+        gpa,
+        io,
+        rootfs_path,
+        work_dir,
+        azinit_path,
+        azagent_path,
+        systemd_boot_rpm_path,
+    );
 
     const layout_dir = try createOciLayout(gpa, io, work_dir, rootfs_path, base_digest);
     defer gpa.free(layout_dir);
@@ -1196,8 +1435,14 @@ pub fn main(init: std.process.Init) !void {
         "--size",
         args.size,
         "--skip-iso-rootfs",
+        "--boot-mode",
+        "uki",
+        "--stub-source-path",
+        systemd_boot_stub_path,
+        "--esp-size",
+        generalized_esp_size_arg,
         "--extra-kernel-options",
-        "init=/sbin/init azinit.mode=persistent azinit.azure=auto console=tty0 console=ttyS0,115200n8",
+        generalized_extra_kernel_options,
         "-o",
         raw_qcow2,
         "-O",
@@ -1211,6 +1456,8 @@ pub fn main(init: std.process.Init) !void {
     defer env_map.deinit();
     try env_map.put("LD_PRELOAD", preload_path);
 
+    const staged_qcow2 = try std.fmt.allocPrint(gpa, "{s}.validated-stage", .{args.output});
+    defer gpa.free(staged_qcow2);
     const raw_metadata = try artifact_pipeline.hashFile(io, raw_qcow2);
     const finalized = artifact_pipeline.finalizeQcow2(
         gpa,
@@ -1222,7 +1469,7 @@ pub fn main(init: std.process.Init) !void {
             .source_format = .qcow2,
             .expected_virtual_size = requested_size,
             .max_virtual_size = requested_size,
-            .output_path = args.output,
+            .output_path = staged_qcow2,
             .max_output_size = max_qcow2_file_size,
             .qemu_img_path = "qemu-img",
             .compression = .zstd,
@@ -1232,6 +1479,26 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print(
             "error: QCOW2 finalization failed ({s}); keeping {s}\n",
             .{ @errorName(err), raw_qcow2 },
+        );
+        return err;
+    };
+
+    const validation = validateGeneralizedImage(gpa, io, staged_qcow2, requested_size) catch |err| {
+        std.debug.print(
+            "error: generalized image structural validation failed ({s}); keeping {s} and {s}\n",
+            .{ @errorName(err), raw_qcow2, staged_qcow2 },
+        );
+        return err;
+    };
+    std.debug.print(
+        "Validated generalized QCOW2: virtual {d} bytes, ESP {d} bytes, root {d} bytes, UKI {d} bytes\n",
+        .{ validation.virtual_size, validation.esp_size, validation.root_size, validation.uki_size },
+    );
+
+    Dir.cwd().rename(staged_qcow2, Dir.cwd(), args.output, io) catch |err| {
+        std.debug.print(
+            "error: could not publish validated image {s} as {s} ({s}); keeping {s}\n",
+            .{ staged_qcow2, args.output, @errorName(err), raw_qcow2 },
         );
         return err;
     };
@@ -1337,6 +1604,94 @@ test "sha256Bytes produces known digest" {
     const hex = sha256Bytes("hello");
     // echo -n hello | sha256sum => 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
     try std.testing.expectEqualStrings("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824", &hex);
+}
+
+test "systemd boot RPM metadata is pinned and cached under the work directory" {
+    const gpa = std.testing.allocator;
+    const cache_path = try systemdBootRpmCachePath(gpa, ".scratch/work");
+    defer gpa.free(cache_path);
+
+    try std.testing.expectEqualStrings(
+        ".scratch/work/downloads/systemd-boot-unsigned-258.4-4.azl4.x86_64.rpm",
+        cache_path,
+    );
+    try std.testing.expectEqualStrings(
+        "https://packages.microsoft.com/azurelinux/4.0/beta/base/x86_64/Packages/s/systemd-boot-unsigned-258.4-4.azl4.x86_64.rpm",
+        systemd_boot_unsigned_rpm_url,
+    );
+    try std.testing.expectEqualStrings(
+        "85dd3ac0c532bceb09fc0a85c6568c51fc4ee84e0c478d1302b7a2d84e1bea5c",
+        systemd_boot_unsigned_rpm_sha256,
+    );
+    _ = try artifact_pipeline.parseSha256(systemd_boot_unsigned_rpm_sha256);
+    try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024), systemd_boot_unsigned_rpm_max_bytes);
+}
+
+test "UKI stub is required OCI content" {
+    var stub_is_required = false;
+    for (required_rootfs_paths) |path| {
+        if (std.mem.eql(u8, path, systemd_boot_stub_path)) {
+            stub_is_required = true;
+            break;
+        }
+    }
+    try std.testing.expect(stub_is_required);
+    try std.testing.expectEqualStrings("usr/lib/systemd/boot/efi/linuxx64.efi.stub", systemd_boot_stub_path);
+}
+
+test "isRegularNonemptyFile accepts only nonempty regular files" {
+    try std.testing.expect(isRegularNonemptyFile(.file, 1));
+    try std.testing.expect(!isRegularNonemptyFile(.file, 0));
+    try std.testing.expect(!isRegularNonemptyFile(.directory, 1));
+    try std.testing.expect(!isRegularNonemptyFile(.sym_link, 1));
+}
+
+test "parseArgs defaults to the UKI disk size and permits an override" {
+    try std.testing.expectEqualStrings("1184M", (try parseArgs(&.{})).size);
+    try std.testing.expectEqualStrings("2G", (try parseArgs(&.{ "--size", "2G" })).size);
+}
+
+test "generalized Gen2 layout reserves a 512 MiB ESP and remaining root" {
+    const gpa = std.testing.allocator;
+    const disk_size = try zvmi.parseSize("1184M");
+    const planned = try planGeneralizedGen2Layout(gpa, disk_size);
+    defer gpa.free(planned);
+
+    try std.testing.expectEqual(@as(usize, 2), planned.len);
+    try std.testing.expectEqual(generalized_esp_size_bytes, planned[0].length_bytes);
+    try std.testing.expectEqual(@as(u64, 670 * 1024 * 1024), planned[1].length_bytes);
+    try std.testing.expectEqual(disk_size, @as(u64, 1184 * 1024 * 1024));
+
+    var actual = [_]zvmi.gpt.PartitionEntry{
+        .{
+            .partition_type_guid = planned[0].type_guid,
+            .first_lba = planned[0].firstLba(),
+            .last_lba = planned[0].lastLba(),
+        },
+        .{
+            .partition_type_guid = planned[1].type_guid,
+            .first_lba = planned[1].firstLba(),
+            .last_lba = planned[1].lastLba(),
+        },
+    };
+    try validatePartitionLayout(&actual, planned);
+    actual[1].last_lba -= 1;
+    try std.testing.expectError(error.UnexpectedPartitionLayout, validatePartitionLayout(&actual, planned));
+}
+
+test "generalized UKI command line uses the root PARTUUID exactly" {
+    const gpa = std.testing.allocator;
+    const cmdline = try expectedUkiCmdline(
+        gpa,
+        zvmi.guid.parse("11111111-2222-3333-4444-555555555555"),
+    );
+    defer gpa.free(cmdline);
+
+    try std.testing.expectEqualStrings(
+        "root=PARTUUID=11111111-2222-3333-4444-555555555555 init=/sbin/init azinit.mode=persistent azinit.azure=auto console=tty0 console=ttyS0,115200n8",
+        cmdline,
+    );
+    try std.testing.expectEqualStrings("512M", generalized_esp_size_arg);
 }
 
 test "gzipFile streams the complete source" {
