@@ -1110,6 +1110,7 @@ const MergedSourceTree = struct {
     ) !MergedSourceTree {
         var pending = std.array_list.Managed(PendingEntry).init(allocator);
         defer pending.deinit();
+        errdefer deinitPendingEntries(allocator, pending.items);
 
         var path_index = std.StringHashMap(usize).init(allocator);
         defer path_index.deinit();
@@ -1141,11 +1142,7 @@ const MergedSourceTree = struct {
 
         var live_count: usize = 0;
         for (pending.items) |*entry| {
-            if (entry.alive) {
-                live_count += 1;
-            } else {
-                deinitPendingEntry(allocator, entry);
-            }
+            if (entry.alive) live_count += 1;
         }
 
         const entries = try allocator.alloc(MergedEntry, live_count);
@@ -1169,10 +1166,15 @@ const MergedSourceTree = struct {
 
         sortMergedEntries(entries);
 
+        const owned_nested_sources = try nested_sources.toOwnedSlice();
+        for (pending.items) |*entry| {
+            if (!entry.alive) deinitPendingEntry(allocator, entry);
+        }
+
         return .{
             .io = io,
             .entries = entries,
-            .nested_sources = try nested_sources.toOwnedSlice(),
+            .nested_sources = owned_nested_sources,
             .view = .{ .ctx = undefined, .next_fn = next, .reset_fn = reset },
         };
     }
@@ -1433,6 +1435,10 @@ fn deinitPendingEntry(allocator: std.mem.Allocator, entry: *MergedSourceTree.Pen
     entry.* = undefined;
 }
 
+fn deinitPendingEntries(allocator: std.mem.Allocator, entries: []MergedSourceTree.PendingEntry) void {
+    for (entries) |*entry| deinitPendingEntry(allocator, entry);
+}
+
 fn deinitMergedEntry(allocator: std.mem.Allocator, entry: *MergedSourceTree.MergedEntry) void {
     deinitContentSource(allocator, &entry.content);
     if (entry.xattrs) |xattrs| ext4.freeXattrs(allocator, xattrs);
@@ -1469,8 +1475,11 @@ fn isValidOwnedXattrName(name: []const u8) bool {
     return true;
 }
 
+/// Consumes `xattrs`. On success, the caller owns the returned slice; on
+/// error, this function frees the complete input.
 fn dedupeOwnedXattrs(allocator: std.mem.Allocator, xattrs: []ext4.OwnedXattr) ![]ext4.OwnedXattr {
     if (xattrs.len == 0) return xattrs;
+    errdefer ext4.freeXattrs(allocator, xattrs);
 
     const keep = try allocator.alloc(bool, xattrs.len);
     defer allocator.free(keep);
@@ -1549,7 +1558,8 @@ fn collectSquashfsEntries(
             try allocator.dupe(u8, child.name)
         else
             try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, child.name });
-        errdefer allocator.free(full_path);
+        var full_path_owned = true;
+        errdefer if (full_path_owned) allocator.free(full_path);
 
         const entry = reader.getEntry(child.index);
         const mode = normalizeMode(switch (entry.kind) {
@@ -1567,6 +1577,7 @@ fn collectSquashfsEntries(
                     .gid = entry.gid,
                     .size = 0,
                 });
+                full_path_owned = false;
                 try collectSquashfsEntries(
                     allocator,
                     io,
@@ -1607,6 +1618,7 @@ fn collectSquashfsEntries(
                     .size = entry.size,
                     .content = .{ .squashfs_file = .{ .io = io, .reader = reader, .index = child.index } },
                 });
+                full_path_owned = false;
             },
             .symlink => {
                 const target = try reader.readLink(child.index);
@@ -1619,6 +1631,7 @@ fn collectSquashfsEntries(
                     .size = target.len,
                     .content = .{ .bytes = target },
                 });
+                full_path_owned = false;
             },
         }
     }
@@ -1821,11 +1834,13 @@ fn collectExt4Entries(
             try allocator.dupe(u8, child.name)
         else
             try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, child.name });
-        errdefer allocator.free(full_path);
+        var full_path_owned = true;
+        errdefer if (full_path_owned) allocator.free(full_path);
 
         const stat = try reader.statPath(io, full_path);
         const xattrs = try dedupeOwnedXattrs(allocator, try reader.readXattrsAlloc(io, allocator, full_path));
-        errdefer ext4.freeXattrs(allocator, xattrs);
+        var xattrs_owned = true;
+        errdefer if (xattrs_owned) ext4.freeXattrs(allocator, xattrs);
 
         switch (child.kind) {
             .directory => {
@@ -1838,6 +1853,8 @@ fn collectExt4Entries(
                     .size = 0,
                     .xattrs = xattrs,
                 });
+                full_path_owned = false;
+                xattrs_owned = false;
                 try collectExt4Entries(allocator, io, pending, path_index, reader, full_path);
             },
             .file => {
@@ -1851,10 +1868,13 @@ fn collectExt4Entries(
                     .content = .{ .nested_ext4_file = .{ .io = io, .reader = reader, .path = full_path } },
                     .xattrs = xattrs,
                 });
+                full_path_owned = false;
+                xattrs_owned = false;
             },
             .symlink => {
                 const target = try reader.readLinkAlloc(io, allocator, full_path);
-                errdefer allocator.free(target);
+                var target_owned = true;
+                errdefer if (target_owned) allocator.free(target);
                 try overlayEntry(allocator, pending, path_index, .{
                     .path = full_path,
                     .kind = .symlink,
@@ -1865,6 +1885,9 @@ fn collectExt4Entries(
                     .content = .{ .owned_bytes = target },
                     .xattrs = xattrs,
                 });
+                full_path_owned = false;
+                xattrs_owned = false;
+                target_owned = false;
             },
         }
     }
@@ -1918,7 +1941,8 @@ fn collectIsoEntries(
             try allocator.dupe(u8, child.name)
         else
             try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, child.name });
-        errdefer allocator.free(full_path);
+        var full_path_owned = true;
+        errdefer if (full_path_owned) allocator.free(full_path);
 
         if (std.ascii.eqlIgnoreCase(full_path, rootfs_path_in_iso)) {
             allocator.free(full_path);
@@ -1943,6 +1967,7 @@ fn collectIsoEntries(
                     .gid = entry.gid,
                     .size = 0,
                 });
+                full_path_owned = false;
                 try collectIsoEntries(allocator, io, pending, path_index, reader, child.index, full_path, rootfs_path_in_iso);
             },
             .file => {
@@ -1969,6 +1994,7 @@ fn collectIsoEntries(
                     .size = entry.size,
                     .content = .{ .iso_file = .{ .io = io, .reader = reader, .index = child.index } },
                 });
+                full_path_owned = false;
             },
             .symlink => {
                 if (path_index.contains(full_path) and
@@ -1987,6 +2013,7 @@ fn collectIsoEntries(
                     .size = target.len,
                     .content = .{ .bytes = target },
                 });
+                full_path_owned = false;
             },
         }
     }
@@ -2090,9 +2117,13 @@ fn collectOciEntries(
             .directory => "",
         };
         const xattrs = try dedupeOwnedXattrs(allocator, try dupeOciXattrs(allocator, entry.xattrs));
-        errdefer ext4.freeXattrs(allocator, xattrs);
+        var xattrs_owned = true;
+        errdefer if (xattrs_owned) ext4.freeXattrs(allocator, xattrs);
+        const path = try allocator.dupe(u8, entry.path);
+        var path_owned = true;
+        errdefer if (path_owned) allocator.free(path);
         try overlayEntry(allocator, pending, path_index, .{
-            .path = try allocator.dupe(u8, entry.path),
+            .path = path,
             .kind = kind,
             .mode = normalizeMode(kind, entry.mode),
             .uid = entry.uid,
@@ -2107,6 +2138,8 @@ fn collectOciEntries(
             },
             .xattrs = xattrs,
         });
+        path_owned = false;
+        xattrs_owned = false;
     }
 }
 
@@ -2154,13 +2187,38 @@ fn overlayEntry(
     path_index: *std.StringHashMap(usize),
     entry: MergedSourceTree.PendingEntry,
 ) !void {
-    try removeAncestorConflicts(pending, path_index, entry.path);
+    // Reserve every fallible insertion before changing the overlay state.
+    // On error, the caller still owns the complete entry; on success, pending
+    // owns it and releases it through deinitPendingEntry.
+    try pending.ensureUnusedCapacity(1);
+    try path_index.ensureUnusedCapacity(1);
+
+    removeAncestorConflicts(pending, path_index, entry.path);
     if (entry.kind != .directory) removeDescendants(pending, path_index, entry.path);
     if (path_index.get(entry.path)) |existing_index| deactivateEntry(pending, path_index, existing_index);
 
-    try pending.append(entry);
-    try path_index.put(pending.items[pending.items.len - 1].path, pending.items.len - 1);
+    const entry_index = pending.items.len;
+    pending.appendAssumeCapacity(entry);
+    path_index.putAssumeCapacity(pending.items[entry_index].path, entry_index);
     _ = allocator;
+}
+
+fn overlaySyntheticDirectory(
+    allocator: std.mem.Allocator,
+    pending: *std.array_list.Managed(MergedSourceTree.PendingEntry),
+    path_index: *std.StringHashMap(usize),
+    path: []const u8,
+) !void {
+    const owned_path = try allocator.dupe(u8, path);
+    errdefer allocator.free(owned_path);
+    try overlayEntry(allocator, pending, path_index, .{
+        .path = owned_path,
+        .kind = .directory,
+        .mode = 0o755,
+        .uid = 0,
+        .gid = 0,
+        .size = 0,
+    });
 }
 
 fn synthesizeMissingParents(
@@ -2177,25 +2235,10 @@ fn synthesizeMissingParents(
             const parent = path[0..end];
             if (path_index.get(parent)) |existing_index| {
                 if (pending.items[existing_index].kind != .directory) {
-                    deactivateEntry(pending, path_index, existing_index);
-                    try overlayEntry(allocator, pending, path_index, .{
-                        .path = try allocator.dupe(u8, parent),
-                        .kind = .directory,
-                        .mode = 0o755,
-                        .uid = 0,
-                        .gid = 0,
-                        .size = 0,
-                    });
+                    try overlaySyntheticDirectory(allocator, pending, path_index, parent);
                 }
             } else {
-                try overlayEntry(allocator, pending, path_index, .{
-                    .path = try allocator.dupe(u8, parent),
-                    .kind = .directory,
-                    .mode = 0o755,
-                    .uid = 0,
-                    .gid = 0,
-                    .size = 0,
-                });
+                try overlaySyntheticDirectory(allocator, pending, path_index, parent);
             }
             end = std.mem.lastIndexOfScalar(u8, parent, '/') orelse break;
         }
@@ -2206,7 +2249,7 @@ fn removeAncestorConflicts(
     pending: *std.array_list.Managed(MergedSourceTree.PendingEntry),
     path_index: *std.StringHashMap(usize),
     path: []const u8,
-) !void {
+) void {
     var end_opt = std.mem.lastIndexOfScalar(u8, path, '/');
     while (end_opt) |end| {
         const parent = path[0..end];
@@ -2518,6 +2561,138 @@ fn extractImageRegionToPath(
         try file.writePositionalAll(io, buffer[0..want], copied);
         copied += got;
     }
+}
+
+test "dedupeOwnedXattrs frees owned input on allocation failures" {
+    const source = [_]oci.Xattr{
+        .{ .name = "user.duplicate", .value = "first" },
+        .{ .name = "user.duplicate", .value = "second" },
+        .{ .name = "user.unique", .value = "third" },
+    };
+
+    for (0..3) |failure_offset| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        const allocator = failing.allocator();
+        const input = try dupeOciXattrs(allocator, &source);
+        failing.fail_index = failing.alloc_index + failure_offset;
+
+        const deduped = dedupeOwnedXattrs(allocator, input) catch |err| {
+            try std.testing.expect(failure_offset < 2);
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+            continue;
+        };
+        try std.testing.expectEqual(@as(usize, 2), failure_offset);
+        try std.testing.expectEqual(@as(usize, 2), deduped.len);
+        ext4.freeXattrs(allocator, deduped);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}
+
+fn overlayEntryForAllocationTest(
+    allocator: std.mem.Allocator,
+    failing: *std.testing.FailingAllocator,
+    failure_offset: usize,
+) !void {
+    var pending = std.array_list.Managed(MergedSourceTree.PendingEntry).init(allocator);
+    defer {
+        deinitPendingEntries(allocator, pending.items);
+        pending.deinit();
+    }
+    var path_index = std.StringHashMap(usize).init(allocator);
+    defer path_index.deinit();
+
+    const path = try allocator.dupe(u8, "parent/child");
+    errdefer allocator.free(path);
+    const source = [_]oci.Xattr{.{ .name = "user.overlay", .value = "metadata" }};
+    const xattrs = try dupeOciXattrs(allocator, &source);
+    errdefer ext4.freeXattrs(allocator, xattrs);
+
+    failing.fail_index = failing.alloc_index + failure_offset;
+    overlayEntry(allocator, &pending, &path_index, .{
+        .path = path,
+        .kind = .file,
+        .mode = 0o640,
+        .uid = 42,
+        .gid = 43,
+        .size = 7,
+        .content = .{ .bytes = "payload" },
+        .xattrs = xattrs,
+    }) catch |err| {
+        try std.testing.expectEqual(@as(usize, 0), pending.items.len);
+        try std.testing.expectEqual(@as(usize, 0), path_index.count());
+        return err;
+    };
+}
+
+test "overlayEntry is transactional across allocation failures" {
+    var saw_success = false;
+    var induced_failures: usize = 0;
+    var failure_offset: usize = 0;
+    while (failure_offset < 8 and !saw_success) : (failure_offset += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        overlayEntryForAllocationTest(failing.allocator(), &failing, failure_offset) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+            induced_failures += 1;
+            continue;
+        };
+        saw_success = true;
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+    try std.testing.expect(saw_success);
+    try std.testing.expect(induced_failures >= 2);
+}
+
+fn appendPendingEntryForAllocationTest(
+    allocator: std.mem.Allocator,
+    pending: *std.array_list.Managed(MergedSourceTree.PendingEntry),
+    path_index: *std.StringHashMap(usize),
+    path: []const u8,
+) !void {
+    const owned_path = try allocator.dupe(u8, path);
+    errdefer allocator.free(owned_path);
+    const source = [_]oci.Xattr{.{ .name = "user.pending", .value = "metadata" }};
+    const xattrs = try dupeOciXattrs(allocator, &source);
+    errdefer ext4.freeXattrs(allocator, xattrs);
+    try overlayEntry(allocator, pending, path_index, .{
+        .path = owned_path,
+        .kind = .file,
+        .mode = 0o600,
+        .uid = 42,
+        .gid = 43,
+        .size = 0,
+        .xattrs = xattrs,
+    });
+}
+
+fn failAfterAccumulatingPendingEntries(
+    allocator: std.mem.Allocator,
+    failing: *std.testing.FailingAllocator,
+) !void {
+    var pending = std.array_list.Managed(MergedSourceTree.PendingEntry).init(allocator);
+    defer pending.deinit();
+    errdefer deinitPendingEntries(allocator, pending.items);
+    var path_index = std.StringHashMap(usize).init(allocator);
+    defer path_index.deinit();
+
+    try appendPendingEntryForAllocationTest(allocator, &pending, &path_index, "first");
+    try appendPendingEntryForAllocationTest(allocator, &pending, &path_index, "second");
+
+    failing.fail_index = failing.alloc_index;
+    _ = try allocator.alloc(MergedSourceTree.MergedEntry, pending.items.len);
+}
+
+test "merged source initialization frees accumulated pending entries on allocation failure" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    try std.testing.expectError(
+        error.OutOfMemory,
+        failAfterAccumulatingPendingEntries(failing.allocator(), &failing),
+    );
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
 }
 
 test "customization sources cannot alias output or internal scratch paths" {
