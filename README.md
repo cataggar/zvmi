@@ -196,8 +196,10 @@ zig build test-freebsd15-aarch64-boot
                       # run opt-in FreeBSD AArch64 QEMU/SSH/reboot acceptance
 zig build run -- <args>   # run the CLI, e.g. `zig build run -- info foo.vhd`
 zig build run -- qemu     # download (if needed) and boot the Azure Linux image
-zig build -Dazurelinux-arch=x86_64 generalized-azurelinux4 -- [--iso <path>] [--output <path>] [--size <size>] [--work-dir <dir>]
-                      # build a generalized Azure Linux 4 Gen2 QCOW2 image
+zig build -Dazurelinux-arch=x86_64 -Dazurelinux-flavor=core generalized-azurelinux4 -- [--iso <path>] [--output <path>] [--size <size>] [--work-dir <dir>]
+                      # build a generalized Azure Linux 4 core Gen2 QCOW2 image
+zig build -Dazurelinux-arch=x86_64 -Dazurelinux-flavor=full generalized-azurelinux4 -- [--iso <path>] [--output <path>] [--size <size>] [--work-dir <dir>]
+                      # build a generalized Azure Linux 4 full Gen2 QCOW2 image
                       #   (Linux-only; requires root, curl, dnf, qemu-img, sudo)
 zig build generalized-freebsd15-aarch64 -- [--source <path>] [--output <path>] [--work-dir <dir>] [--base-only]
                       # build a generalized FreeBSD 15.1 AArch64 QCOW2
@@ -503,27 +505,50 @@ managed-data-disk activation by stable Azure LUN at `/e` through `/z`. Managed
 disks are mount-only: existing ext4 partition 1 is mounted, while blank and
 unknown layouts are left untouched.
 
-### Minimal generalized Azure Linux 4 QCOW2
+### Generalized Azure Linux 4 core and full QCOW2
 
 Host-side image builders can reuse `zvmi.artifact_pipeline` for bounded SHA-256-verified acquisition and transactional publication. Download callbacks receive only a pipeline-owned writer rather than a staging path, `decompressXz` requires an explicit XZ Utils executable plus compressed-input digest, memory limit, and output-size limit, and Linux-only `finalizeQcow2` converts a digest-pinned raw or standalone QCOW2 source to a validated standalone QCOW2. `zvmi.azure.deriveFixedVhd` converts a digest-pinned standalone GPT QCOW2 into a 1 MiB-aligned fixed VHD through a descriptor-pinned atomic stage, strictly cross-validates the primary and backup GPT copies, preserves the raw partition array and every partition extent, relocates the backup GPT, and revalidates the VHD and both GPT copies before publication. All operations preserve an existing destination until validation succeeds.
 
 `scripts/build_generalized_azurelinux4.zig` (run via
-`zig build -Dazurelinux-arch=x86_64|aarch64 generalized-azurelinux4`) builds
-the architecture-matched **core** recipe from
+`zig build -Dazurelinux-arch=x86_64|aarch64 -Dazurelinux-flavor=core|full generalized-azurelinux4`)
+builds the architecture-matched **core** or **full** recipe. Core remains the
+compatible default and is built from
 `mcr.microsoft.com/azurelinux-beta/base/core:4.0`: OpenSSH, static
 `zvminit`/`azagent`, and no host identity. The build graph compiles those two
-guest executables for the selected architecture while the CLI, builder, and
-preload library remain native to the build host. A single architecture
-descriptor pins and validates the official Azure Linux ISO digest, selected
-OCI manifest, RPM key/package/stub, OCI config architecture, GPT root type,
-UKI PE machine, fallback EFI filename, and serial console.
+guest executables only for the core flavor; the CLI, builder, and preload
+library remain native to the build host.
 
-The recipe creates a bounded multi-layer OCI layout, builds a 1184 MiB Gen2
-QCOW2 with a 512 MiB ESP and 670 MiB root partition, validates the finalized
-disk and UKI structure, and compresses it to maximum zstd level via an
-LD_PRELOAD intercept library (`scripts/zstd_max_preload.zig`). The x86_64
-image uses `linuxx64.efi.stub`, `EFI/BOOT/BOOTX64.EFI`, and `ttyS0`; AArch64
-uses `linuxaa64.efi.stub`, `EFI/BOOT/BOOTAA64.EFI`, and `ttyAMA0`.
+Full materializes a fresh rootfs with the official Azure Linux
+[`base/images/vm-base/vm-base.kiwi`](https://github.com/microsoft/azurelinux/blob/5b41bff6ebaf7e8fc78637b564efee23b66e7d67/base/images/vm-base/vm-base.kiwi)
+`vm-base` package profile, pinned to commit
+`5b41bff6ebaf7e8fc78637b564efee23b66e7d67` and blob
+`8c870852e711273275c83f0b94ecd914ff709af8`. Its package manifest is encoded
+in the builder, so KIWI is not a build dependency. Full uses systemd PID 1,
+cloud-init plus WALinuxAgent 2.15 (`Provisioning.Agent=auto`,
+`ResourceDisk.Format=n`), key-only OpenSSH, and no custom `zvminit` or
+`azagent`. It uses the profile's explicit 5 GiB default and rejects a root
+partition that cannot retain 1 GiB free. Core retains its 1184 MiB default.
+Full writes `/.autorelabel`, so SELinux policy labels are established on first
+boot rather than asserted from an unlabelled DNF installroot.
+
+Both flavors use `--skip-iso-rootfs`: the ISO supplies only the
+architecture-matched kernel, initramfs, and UEFI assets. Full never publishes
+the ISO LiveOS/Anaconda rootfs. A pinned core OCI is used only to extract and
+checksum/fingerprint-validate the RPM signing key before its filesystem is
+discarded. Full verifies ISO kernel/initramfs releases against installed
+kernel-core/kernel-modules rather than emitting an incoherent userspace/module
+mix.
+
+The recipe creates bounded flavor-specific OCI layers, validates rootfs
+identity cleanup, GPT/root GUIDs, fallback EFI, UKI PE sections/cmdline,
+partition geometry, free space, and OCI architecture/provenance before
+transactional QCOW2 publication. The x86_64 image uses `linuxx64.efi.stub`,
+`EFI/BOOT/BOOTX64.EFI`, and `ttyS0`; AArch64 uses `linuxaa64.efi.stub`,
+`EFI/BOOT/BOOTAA64.EFI`, and `ttyAMA0`. Core UKIs retain the `zvminit`
+contract; full UKIs contain only the root PARTUUID and architecture serial
+console. OCI ingestion preserves USTAR uid/gid plus bounded relevant PAX
+`user.*`, `trusted.*`, `security.*`, and `system.*` xattrs, including file
+capabilities; absent tar metadata remains root:root with no xattrs.
 
 The OpenSSH/sudo package transaction is also reproducibly locked: each
 descriptor pins the Azure Linux base repository's `repomd.xml` SHA-256. The
@@ -544,18 +569,17 @@ currently unsigned, so Secure Boot must remain disabled. UKI signing and
 Azure/QEMU trust are tracked in issue #168.
 
 ```console
-# Defaults: AzureLinux-4.0-x86_64.core.qcow2 and
-# .scratch/azurelinux4-core-x86_64
-zig build -Dazurelinux-arch=x86_64 generalized-azurelinux4 --
+# Defaults: AzureLinux-4.0-x86_64.core.qcow2 and .scratch/azurelinux4-core-x86_64
+zig build -Dazurelinux-arch=x86_64 -Dazurelinux-flavor=core generalized-azurelinux4 --
 
-# Defaults: AzureLinux-4.0-aarch64.core.qcow2 and
-# .scratch/azurelinux4-core-aarch64
-zig build -Dazurelinux-arch=aarch64 generalized-azurelinux4 --
+# Defaults: AzureLinux-4.0-aarch64.core.qcow2 and .scratch/azurelinux4-core-aarch64
+zig build -Dazurelinux-arch=aarch64 -Dazurelinux-flavor=core generalized-azurelinux4 --
 
-# Either architecture may override its isolated output/cache namespace.
-zig build -Dazurelinux-arch=aarch64 generalized-azurelinux4 -- \
-  --work-dir /path/to/build-cache \
-  --output /path/to/AzureLinux-4.0-aarch64.core.qcow2
+# Defaults: AzureLinux-4.0-x86_64.qcow2 and .scratch/azurelinux4-full-x86_64
+zig build -Dazurelinux-arch=x86_64 -Dazurelinux-flavor=full generalized-azurelinux4 --
+
+# Defaults: AzureLinux-4.0-aarch64.qcow2 and .scratch/azurelinux4-full-aarch64
+zig build -Dazurelinux-arch=aarch64 -Dazurelinux-flavor=full generalized-azurelinux4 --
 ```
 
 The builder requires Zig 0.16, `curl`, `dnf`, GNU tar, `qemu-img`, and
@@ -565,17 +589,17 @@ guest architecture, the matching enabled binfmt registration plus
 can run inside the target rootfs; the temporary interpreter is removed before
 the OCI layout is produced. `--iso` accepts an already-downloaded ISO, but it
 is still validated against the architecture's pinned official SHA-256. Use
-`--size` to override the 1184 MiB virtual disk size. The fixed 512 MiB ESP is
-retained when the total size is overridden, with the root partition consuming
-the remaining aligned capacity. The build system automatically passes the
-selected architecture and paths of the built native zvmi, guest
-zvminit/azagent binaries, and preload library; no separate `zig build`
-invocation is needed.
+`--size` overrides the flavor default (1184 MiB core, 5 GiB full). The fixed
+512 MiB ESP is retained when the total size is overridden, with the root
+partition consuming the remaining aligned capacity; full still requires 1 GiB
+root free space. The build system automatically passes the selected
+architecture, flavor, native zvmi, and preload library, plus the guest
+zvminit/azagent binaries for core only; no separate `zig build` invocation is
+needed.
 
-The release workflow matrix, QEMU acceptance, and Azure deployment remain
-separate issue #178 work. This builder slice only provides the reproducible
-architecture-aware core artifacts and structural validation; it does not
-publish or deploy either image.
+The final four-image workflow, four-image boot acceptance, Azure deployment,
+and release publication remain separate issue #178 work. This builder slice
+does not publish or deploy an image.
 
 ### Generalized FreeBSD 15.1 AArch64 QCOW2
 
