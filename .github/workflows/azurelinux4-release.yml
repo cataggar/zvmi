@@ -43,7 +43,7 @@ jobs:
   build:
     name: build/local ${{ matrix.key }}
     needs: prepare
-    runs-on: [self-hosted, Linux, "${{ matrix.runner_arch }}"]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
     strategy:
       fail-fast: false
@@ -52,7 +52,7 @@ jobs:
           - key: x86_64-full
             architecture: x86_64
             flavor: full
-            runner_arch: X64
+            runner: ubuntu-24.04
             deb_arch: amd64
             asset_name: AzureLinux-4.0-x86_64.qcow2
             virtual_size: 5368709120
@@ -61,7 +61,7 @@ jobs:
           - key: aarch64-full
             architecture: aarch64
             flavor: full
-            runner_arch: ARM64
+            runner: ubuntu-24.04-arm
             deb_arch: arm64
             asset_name: AzureLinux-4.0-aarch64.qcow2
             virtual_size: 5368709120
@@ -70,7 +70,7 @@ jobs:
           - key: x86_64-core
             architecture: x86_64
             flavor: core
-            runner_arch: X64
+            runner: ubuntu-24.04
             deb_arch: amd64
             asset_name: AzureLinux-4.0-x86_64.core.qcow2
             virtual_size: 1241513984
@@ -79,7 +79,7 @@ jobs:
           - key: aarch64-core
             architecture: aarch64
             flavor: core
-            runner_arch: ARM64
+            runner: ubuntu-24.04-arm
             deb_arch: arm64
             asset_name: AzureLinux-4.0-aarch64.core.qcow2
             virtual_size: 1241513984

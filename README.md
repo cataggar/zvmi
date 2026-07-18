@@ -659,10 +659,10 @@ profile. The UKIs are unsigned, so Secure Boot remains disabled pending issue
 core file explicitly when needed.
 
 The manual release workflow builds all four candidates on native ephemeral
-self-hosted Ubuntu runners with the standard `self-hosted`, `Linux`, and
-`X64`/`ARM64` labels. Each runner must provide passwordless sudo, native KVM,
-and enough workspace for a 5 GiB candidate. The workflow installs the
-remaining image/QEMU packages and never substitutes TCG for acceptance.
+GitHub-hosted `ubuntu-24.04` and `ubuntu-24.04-arm` runners. Each runner must
+provide passwordless sudo, native KVM, and enough workspace for a 5 GiB
+candidate. The workflow installs the remaining image/QEMU packages and never
+substitutes TCG for acceptance.
 
 Real-Azure validation and publication use the protected
 `azurelinux4-release` GitHub environment. Configure it with required

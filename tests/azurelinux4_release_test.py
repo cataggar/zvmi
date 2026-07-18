@@ -197,6 +197,14 @@ class AzureLinuxReleaseTest(unittest.TestCase):
             self.assertIn("${{ needs.prepare.outputs.source_commit }}", reference)
             self.assertIn("${{ github.run_attempt }}", reference)
 
+    def test_release_builds_use_native_github_hosted_runners(self):
+        workflow = (ROOT / ".github/workflows/azurelinux4-release.yml").read_text()
+        self.assertIn("runs-on: ${{ matrix.runner }}", workflow)
+        self.assertEqual(workflow.count("runner: ubuntu-24.04\n"), 2)
+        self.assertEqual(workflow.count("runner: ubuntu-24.04-arm\n"), 2)
+        self.assertNotIn("self-hosted", workflow)
+        self.assertNotIn("runner_arch:", workflow)
+
     def test_ci_actions_are_pinned_to_audited_commits(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         actions = re.findall(
