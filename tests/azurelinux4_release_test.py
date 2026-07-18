@@ -235,6 +235,10 @@ class AzureLinuxReleaseTest(unittest.TestCase):
             ["bash", script, "riscv64"], check=False, capture_output=True
         )
         self.assertEqual(result.returncode, 2)
+        text = script.read_text()
+        self.assertIn("timeout --signal=TERM --kill-after=2s 2s", text)
+        self.assertNotIn("-daemonize", text)
+        self.assertNotIn("-pidfile", text)
 
     def test_resource_group_state_precedes_create_and_cleanup_is_guarded(self):
         script = (ROOT / "scripts/azurelinux4_azure_acceptance.sh").read_text()

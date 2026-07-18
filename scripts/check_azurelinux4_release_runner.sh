@@ -55,38 +55,24 @@ sudo -n true
     exit 1
 }
 command -v "$qemu" >/dev/null
+command -v timeout >/dev/null
 
-work_dir=$(mktemp -d)
-pid=
-cleanup() {
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-        kill "$pid"
-        for _ in {1..50}; do
-            kill -0 "$pid" 2>/dev/null || break
-            sleep 0.1
-        done
-        if kill -0 "$pid" 2>/dev/null; then
-            kill -KILL "$pid"
-        fi
-    fi
-    rm -rf -- "$work_dir"
-}
-trap cleanup EXIT INT TERM
+probe_log=$(mktemp)
+trap 'rm -f -- "$probe_log"' EXIT
 
-"$qemu" \
+status=0
+timeout --signal=TERM --kill-after=2s 2s "$qemu" \
     -machine "$machine,accel=kvm" \
     -cpu host \
     -nodefaults \
     -display none \
     -monitor none \
     -serial none \
-    -S \
-    -daemonize \
-    -pidfile "$work_dir/qemu.pid"
-
-[[ -s "$work_dir/qemu.pid" ]]
-pid=$(<"$work_dir/qemu.pid")
-[[ "$pid" =~ ^[0-9]+$ ]]
-kill -0 "$pid"
+    -S >"$probe_log" 2>&1 || status=$?
+if [[ $status -ne 124 ]]; then
+    cat "$probe_log" >&2
+    echo "QEMU did not remain running with KVM (exit $status)" >&2
+    exit 1
+fi
 
 echo "Azure Linux 4 release runner ready: architecture=$architecture accelerator=kvm"
