@@ -112,3 +112,10 @@ the project image convention. With the builder's `waagent.conf`, azagent mounts
 the temporary resource disk at `/d`, then mounts existing ext4 partition 1 on
 managed disks by stable Azure LUN at `/e` through `/z`. Blank and unknown
 managed-disk layouts are never modified.
+
+The released `AzureLinux-4.0-*.core.qcow2` images use this `zvminit` +
+`azagent` contract. They require a valid public SSH key in the Azure
+provisioning profile; there is no password or baked fallback credential.
+Unsuffixed full images instead use systemd, cloud-init, WALinuxAgent, and
+`sshd.service`. Release SHA-256 digests are documented in release notes and
+workflow summaries only, never as checksum sidecar assets.

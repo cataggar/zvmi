@@ -11,7 +11,7 @@ const qemu_host = @import("qemu_host");
 const guest_validation = @import("guest_validation");
 
 const default_image_name = "AzureLinux-4.0-x86_64.qcow2";
-const default_image_spec = "cataggar/zvmi/AzureLinux-4.0-x86_64.qcow2@AzureLinux4.0-20260714";
+const default_image_spec = "cataggar/zvmi/AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260717";
 const default_ssh_port: u16 = 2222;
 const max_ssh_port: u16 = 65535;
 const local_provisioning_marker = "zvmi-local-provisioning";
@@ -2231,9 +2231,9 @@ test "qemu-img snapshot overlay argv is explicit" {
     }, &argv);
 }
 
-test "qemu release download spec remains pinned to the replace-in-place release" {
+test "qemu release download spec remains pinned to the validated Azure Linux release" {
     try std.testing.expectEqualStrings(
-        "cataggar/zvmi/AzureLinux-4.0-x86_64.qcow2@AzureLinux4.0-20260714",
+        "cataggar/zvmi/AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260717",
         default_image_spec,
     );
 }
@@ -2243,7 +2243,7 @@ test "qemu default image download argv is exact and verified by ghr defaults" {
     try expectArgv(&.{
         "ghr",
         "download",
-        "cataggar/zvmi/AzureLinux-4.0-x86_64.qcow2@AzureLinux4.0-20260714",
+        "cataggar/zvmi/AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260717",
         "--output",
         "AzureLinux-4.0-x86_64.qcow2",
     }, &argv);
