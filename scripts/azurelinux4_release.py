@@ -31,6 +31,8 @@ AZURE_CONTRACTS = {
     "reboot-reconnect",
     "runtime-flavor-identity",
 }
+AZURE_VHD_ALIGNMENT = 1024 * 1024
+VHD_FOOTER_BYTES = 512
 
 
 def fail(message: str) -> None:
@@ -55,6 +57,25 @@ def require_commit(value: object, label: str = "source_commit") -> str:
     if not isinstance(value, str) or COMMIT_RE.fullmatch(value) is None:
         fail(f"{label} is not a full lowercase commit SHA")
     return value
+
+
+def validate_azure_vhd_info(info: dict[str, object], file_size: int) -> int:
+    if info.get("format") != "vpc":
+        fail("derived upload image is not VHD/VPC")
+    data = (info.get("format-specific") or {})
+    if not isinstance(data, dict):
+        fail("derived upload VHD format metadata is invalid")
+    format_data = data.get("data") or {}
+    if not isinstance(format_data, dict) or format_data.get("type") != "fixed":
+        fail("derived upload VHD is not fixed")
+    virtual_size = info.get("virtual-size")
+    if type(virtual_size) is not int or virtual_size <= 0:
+        fail("derived upload VHD virtual size is invalid")
+    if virtual_size % AZURE_VHD_ALIGNMENT != 0:
+        fail("derived upload VHD virtual size is not 1 MiB aligned")
+    if file_size != virtual_size + VHD_FOOTER_BYTES:
+        fail("derived upload VHD file size does not equal virtual size plus footer")
+    return virtual_size
 
 
 def read_json(path: Path) -> dict[str, object]:
@@ -248,6 +269,16 @@ def verify_candidate_command(args: argparse.Namespace) -> None:
     print(document["sha256"])
     print(document["bytes"])
     print(document["virtual_size"])
+
+
+def verify_vhd_command(args: argparse.Namespace) -> None:
+    vhd = args.vhd.resolve()
+    if not vhd.is_file():
+        fail(f"derived VHD is missing: {vhd}")
+    file_size = vhd.stat().st_size
+    virtual_size = validate_azure_vhd_info(read_json(args.info), file_size)
+    print(virtual_size)
+    print(file_size)
 
 
 def azure_result_command(args: argparse.Namespace) -> None:
@@ -472,6 +503,11 @@ def parser() -> argparse.ArgumentParser:
     verify.add_argument("--key", required=True)
     verify.add_argument("--source-commit", required=True)
     verify.set_defaults(function=verify_candidate_command)
+
+    verify_vhd = commands.add_parser("verify-vhd")
+    verify_vhd.add_argument("--info", type=Path, required=True)
+    verify_vhd.add_argument("--vhd", type=Path, required=True)
+    verify_vhd.set_defaults(function=verify_vhd_command)
 
     azure = commands.add_parser("azure-result")
     azure.add_argument("--manifest", type=Path, required=True)

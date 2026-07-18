@@ -95,7 +95,7 @@ jobs:
       ISO_SHA256: ${{ matrix.iso_sha256 }}
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
       WORK_DIR: .scratch/azurelinux4-release-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.key }}
-      BUNDLE_DIR: .release/bundles/${{ matrix.key }}
+      BUNDLE_DIR: artifact-staging/candidates/${{ matrix.key }}
     steps:
       - name: Check out accepted source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -238,7 +238,7 @@ jobs:
       - name: Upload exact accepted candidate
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: azurelinux4-candidate-${{ matrix.key }}-${{ needs.prepare.outputs.source_commit }}
+          name: azurelinux4-candidate-${{ matrix.key }}-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
           path: ${{ env.BUNDLE_DIR }}/
           if-no-files-found: error
           compression-level: 0
@@ -310,7 +310,7 @@ jobs:
       ASSET_NAME: ${{ matrix.asset_name }}
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
       CANDIDATE_DIR: .release/azure/${{ matrix.key }}/candidate
-      RESULT_DIR: .release/azure/${{ matrix.key }}/result
+      RESULT_DIR: artifact-staging/azure-results/${{ matrix.key }}
       STATE_FILE: .release/azure/${{ matrix.key }}/resource-group
       AZURE_LOCATION: ${{ vars[matrix.location_variable] }}
       AZURE_VM_SIZE: ${{ vars[matrix.size_variable] }}
@@ -324,7 +324,7 @@ jobs:
       - name: Download exact local-accepted candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: azurelinux4-candidate-${{ matrix.key }}-${{ needs.prepare.outputs.source_commit }}
+          name: azurelinux4-candidate-${{ matrix.key }}-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
           path: ${{ env.CANDIDATE_DIR }}
 
       - name: Fail closed on missing protected configuration
@@ -412,14 +412,14 @@ jobs:
         if: success()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: azurelinux4-azure-${{ matrix.key }}-${{ needs.prepare.outputs.source_commit }}
+          name: azurelinux4-azure-${{ matrix.key }}-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
           path: ${{ env.RESULT_DIR }}/azure-result.json
           if-no-files-found: error
           retention-days: 2
 
       - name: Remove derived VHD and local credentials
         if: always()
-        run: rm -rf -- ".release/azure/$CANDIDATE_KEY"
+        run: rm -rf -- ".release/azure/$CANDIDATE_KEY" "$RESULT_DIR"
 
   publish:
     name: verify four-by-four gate and publish
@@ -456,14 +456,14 @@ jobs:
       - name: Download all local-accepted candidates
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: azurelinux4-candidate-*-${{ needs.prepare.outputs.source_commit }}
+          pattern: azurelinux4-candidate-*-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
           path: ${{ env.CANDIDATES_DIR }}
           merge-multiple: false
 
       - name: Download all Azure acceptance results
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: azurelinux4-azure-*-${{ needs.prepare.outputs.source_commit }}
+          pattern: azurelinux4-azure-*-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
           path: ${{ env.AZURE_RESULTS_DIR }}
           merge-multiple: false
 

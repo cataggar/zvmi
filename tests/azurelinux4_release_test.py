@@ -1,11 +1,15 @@
 import json
 import os
+import re
 import shutil
 import types
 import unittest
 from pathlib import Path
 
 from scripts import azurelinux4_release as release
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class AzureLinuxReleaseTest(unittest.TestCase):
@@ -133,6 +137,110 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         path.write_text("tampered\n", encoding="utf-8")
         with self.assertRaises(SystemExit):
             self.stage()
+
+    def test_fixed_vhd_alignment_applies_to_virtual_size_not_footer(self):
+        virtual_size = 2 * release.AZURE_VHD_ALIGNMENT
+        info = {
+            "format": "vpc",
+            "virtual-size": virtual_size,
+            "format-specific": {"data": {"type": "fixed"}},
+        }
+        file_size = virtual_size + release.VHD_FOOTER_BYTES
+        self.assertNotEqual(file_size % release.AZURE_VHD_ALIGNMENT, 0)
+        self.assertEqual(
+            release.validate_azure_vhd_info(info, file_size), virtual_size
+        )
+
+    def test_fixed_vhd_rejects_unaligned_virtual_size(self):
+        virtual_size = 2 * release.AZURE_VHD_ALIGNMENT + 512
+        info = {
+            "format": "vpc",
+            "virtual-size": virtual_size,
+            "format-specific": {"data": {"type": "fixed"}},
+        }
+        with self.assertRaises(SystemExit):
+            release.validate_azure_vhd_info(
+                info, virtual_size + release.VHD_FOOTER_BYTES
+            )
+
+    def test_fixed_vhd_requires_exact_footer_relationship(self):
+        virtual_size = 2 * release.AZURE_VHD_ALIGNMENT
+        info = {
+            "format": "vpc",
+            "virtual-size": virtual_size,
+            "format-specific": {"data": {"type": "fixed"}},
+        }
+        with self.assertRaises(SystemExit):
+            release.validate_azure_vhd_info(info, virtual_size)
+
+    def test_release_artifacts_use_visible_attempt_bound_staging(self):
+        workflow = (ROOT / ".github/workflows/azurelinux4-release.yml").read_text()
+        staging = dict(
+            (name, value.strip())
+            for name, value in re.findall(
+                r"^[ \t]+(BUNDLE_DIR|RESULT_DIR):[ \t]+([^\n]+)$",
+                workflow,
+                re.MULTILINE,
+            )
+        )
+        self.assertEqual(set(staging), {"BUNDLE_DIR", "RESULT_DIR"})
+        for path in staging.values():
+            self.assertFalse(any(part.startswith(".") for part in Path(path).parts))
+
+        artifact_references = [
+            line.strip()
+            for line in workflow.splitlines()
+            if re.match(r"\s+(name|pattern): azurelinux4-(candidate|azure)-", line)
+        ]
+        self.assertEqual(len(artifact_references), 5)
+        for reference in artifact_references:
+            self.assertIn("${{ needs.prepare.outputs.source_commit }}", reference)
+            self.assertIn("${{ github.run_attempt }}", reference)
+
+    def test_ci_actions_are_pinned_to_audited_commits(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        actions = re.findall(
+            r"^[ \t]*-?[ \t]*uses:[ \t]+(\S+)[ \t]+#[ \t]+(\S+)$",
+            workflow,
+            re.MULTILINE,
+        )
+        self.assertEqual(
+            actions,
+            [
+                (
+                    "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5",
+                    "v4",
+                ),
+                (
+                    "cataggar/ghr/actions/install@"
+                    "7d8c3ef0886dd428a97727fce3b74909d6eace78",
+                    "v0.6.6",
+                ),
+            ],
+        )
+        for action, _ in actions:
+            self.assertRegex(action, r"@[0-9a-f]{40}$")
+
+    def test_resource_group_state_precedes_create_and_cleanup_is_guarded(self):
+        script = (ROOT / "scripts/azurelinux4_azure_acceptance.sh").read_text()
+        persist = script.index("printf '%s\\n' \"$resource_group\" >\"$STATE_FILE\"")
+        create = script.index("if ! az group create")
+        self.assertLess(persist, create)
+        self.assertIn('[[ "$resource_group" == "$expected_resource_group" ]]', script)
+        ownership_guard = script.index("if ! python3 - \"$metadata_file\"")
+        delete = script.index("if ! az group delete")
+        self.assertLess(ownership_guard, delete)
+
+    def test_qemu_readme_distinguishes_default_full_and_core_output(self):
+        readme = (ROOT / "README.md").read_text()
+        section = readme.split("### Booting the release image with QEMU", 1)[1]
+        self.assertIn("full image's systemd startup and login prompt", section)
+        self.assertIn("only when an explicit `*.core.qcow2` image", section)
+        self.assertNotIn(
+            "default secure command line, a successful local boot reaches\n"
+            "the PID 1 readiness marker",
+            section,
+        )
 
 
 if __name__ == "__main__":

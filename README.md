@@ -803,13 +803,13 @@ Use `--qemu`, `--firmware-code`, and `--firmware-vars` (or the compatible
 after `--` are appended directly to QEMU. The terminal is attached to
 QEMU's `-nographic` serial console; use QEMU's `Ctrl+A`, then `X`, escape to
 exit. With the default secure command line, a successful local boot reaches
-the PID 1 readiness marker without exposing a root shell:
+the full image's systemd startup and login prompt. It does not emit
+`zvminit` readiness markers.
 
-```text
-[zvminit] non-Azure environment detected; skipping azagent
-[zvminit] diagnostic root shell disabled
-[zvminit] ZVMINIT_PID1_READY supervisor loop active
-```
+Those markers apply only when an explicit `*.core.qcow2` image is selected.
+A successful core boot reports that non-Azure `azagent` provisioning was
+skipped, the diagnostic root shell is disabled, and the
+`ZVMINIT_PID1_READY supervisor loop active` marker.
 
 To provision an administrator at launch, supply
 `--admin-username <name> --ssh-public-key <path>` together. `--ssh-port`

@@ -16,18 +16,32 @@ cleanup_group() {
     echo "::error::Azure CLI is unavailable during cleanup"
     return 1
   }
-  local resource_group metadata_file
+  local resource_group metadata_file group_exists expected_resource_group suffix
   resource_group=$(<"$STATE_FILE")
-  [[ "$resource_group" =~ ^zvmi-al4-[0-9]+-[0-9]+-(x86-64|aarch64)-(full|core)$ ]] || {
-    echo "::error::Refusing cleanup of malformed resource-group name"
+  suffix=${CANDIDATE_KEY//_/-}
+  expected_resource_group="zvmi-al4-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${suffix}"
+  [[ "$resource_group" == "$expected_resource_group" ]] || {
+    echo "::error::Refusing cleanup of unexpected resource-group name"
     return 1
   }
-  if [[ $(az group exists --name "$resource_group" --output tsv) != true ]]; then
-    return 0
+  if ! group_exists=$(az group exists --name "$resource_group" --output tsv); then
+    echo "::error::Could not determine whether the temporary resource group exists"
+    return 1
   fi
+  case "$group_exists" in
+    false) return 0 ;;
+    true) ;;
+    *)
+      echo "::error::Azure returned an invalid resource-group existence result"
+      return 1
+      ;;
+  esac
   metadata_file="${STATE_FILE}.group.json"
-  az group show --name "$resource_group" --output json >"$metadata_file"
-  python3 - "$metadata_file" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$CANDIDATE_KEY" <<'PY'
+  if ! az group show --name "$resource_group" --output json >"$metadata_file"; then
+    echo "::error::Could not inspect temporary resource-group ownership"
+    return 1
+  fi
+  if ! python3 - "$metadata_file" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$CANDIDATE_KEY" <<'PY'
 import json
 import sys
 
@@ -41,7 +55,13 @@ expected = {
 if tags != expected:
     raise SystemExit(f"refusing to delete resource group with non-exact ownership tags: {tags!r}")
 PY
-  az group delete --name "$resource_group" --yes
+  then
+    return 1
+  fi
+  if ! az group delete --name "$resource_group" --yes; then
+    echo "::error::Failed to delete owned temporary resource group"
+    return 1
+  fi
 }
 
 if [[ "$command_name" == cleanup ]]; then
@@ -68,7 +88,7 @@ fi
 [[ "$AZURE_VM_SIZE" =~ ^Standard_[A-Za-z0-9_]+$ ]]
 [[ -x "$ZVMI" ]]
 
-for tool in az azcopy python3 qemu-img sha256sum ssh ssh-keygen stat; do
+for tool in az azcopy python3 qemu-img sha256sum ssh ssh-keygen; do
   command -v "$tool" >/dev/null || {
     echo "::error::Required Azure acceptance tool $tool is unavailable"
     exit 1
@@ -107,6 +127,7 @@ vhd="$RESULT_DIR/${CANDIDATE_KEY}.vhd"
 private_key="$RESULT_DIR/id_ed25519"
 boot_log="$RESULT_DIR/boot.log"
 sku_json="$RESULT_DIR/sku.json"
+mkdir -p "$(dirname -- "$STATE_FILE")"
 rm -f -- "$STATE_FILE" "${STATE_FILE}.group.json" "$vhd" "$private_key" "$private_key.pub"
 
 cleanup_on_exit() {
@@ -121,19 +142,35 @@ cleanup_on_exit() {
 trap cleanup_on_exit EXIT
 trap 'exit 130' INT TERM
 
-if [[ $(az group exists --name "$resource_group" --output tsv) == true ]]; then
-  echo "::error::Collision-resistant resource group already exists: $resource_group"
+if ! group_exists=$(az group exists --name "$resource_group" --output tsv); then
+  echo "::error::Could not check for a resource-group collision"
   exit 1
 fi
-az group create \
+case "$group_exists" in
+  true)
+    echo "::error::Collision-resistant resource group already exists: $resource_group"
+    exit 1
+    ;;
+  false) ;;
+  *)
+    echo "::error::Azure returned an invalid resource-group existence result"
+    exit 1
+    ;;
+esac
+printf '%s\n' "$resource_group" >"$STATE_FILE"
+if ! az group create \
   --name "$resource_group" \
   --location "$AZURE_LOCATION" \
   --tags \
     zvmi-owner=azurelinux4-release \
     "zvmi-run-id=$GITHUB_RUN_ID" \
     "zvmi-run-attempt=$GITHUB_RUN_ATTEMPT" \
-    "zvmi-candidate=$CANDIDATE_KEY"
-printf '%s\n' "$resource_group" >"$STATE_FILE"
+    "zvmi-candidate=$CANDIDATE_KEY" \
+  --output none
+then
+  echo "::error::Failed to create the persisted temporary resource group"
+  exit 1
+fi
 
 az vm list-skus \
   --location "$AZURE_LOCATION" \
@@ -178,19 +215,16 @@ test "$source_before" = "$qcow_sha256"
 test "$(sha256sum "$asset" | awk '{print $1}')" = "$qcow_sha256"
 qemu-img check -f vpc "$vhd"
 qemu-img info --output=json "$vhd" >"$RESULT_DIR/vhd-info.json"
-python3 - "$RESULT_DIR/vhd-info.json" <<'PY'
-import json
-import sys
-
-info = json.load(open(sys.argv[1], encoding="utf-8"))
-if info.get("format") != "vpc":
-    raise SystemExit("derived upload image is not VHD/VPC")
-data = (info.get("format-specific") or {}).get("data") or {}
-if data.get("type") != "fixed":
-    raise SystemExit("derived upload VHD is not fixed")
-PY
-vhd_bytes=$(stat --format='%s' "$vhd")
-test $((vhd_bytes % 1048576)) -eq 0
+readarray -t vhd_geometry < <(
+  python3 scripts/azurelinux4_release.py verify-vhd \
+    --info "$RESULT_DIR/vhd-info.json" \
+    --vhd "$vhd"
+)
+test "${#vhd_geometry[@]}" -eq 2
+vhd_virtual_size=${vhd_geometry[0]}
+vhd_bytes=${vhd_geometry[1]}
+expected_vhd_virtual_size=$(((virtual_size + 1048575) / 1048576 * 1048576))
+test "$vhd_virtual_size" -eq "$expected_vhd_virtual_size"
 vhd_sha256=$(sha256sum "$vhd" | awk '{print $1}')
 [[ "$vhd_sha256" =~ ^[0-9a-f]{64}$ ]]
 
