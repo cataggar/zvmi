@@ -620,8 +620,11 @@ zig build -Dazurelinux-arch=x86_64 -Dazurelinux-flavor=core \
   test-azurelinux4-acceptance
 ```
 
-The step requires a native Linux runner with `/dev/kvm`; it explicitly refuses
-TCG. It validates the supplied standalone zstd QCOW2, GPT root GUID, UKI
+When `ZVMI_AZURELINUX4_IMAGE` is absent, the opt-in test skips cleanly. Once it
+is set, the invocation fails closed: native Linux/KVM, matching host
+architecture, QEMU and support tools, readable image, and matching UEFI
+firmware are all mandatory. The step explicitly refuses TCG. It validates the
+supplied standalone zstd QCOW2, GPT root GUID, UKI
 architecture and flavor command line, then boots two concurrent disposable
 overlays with independent UEFI variables and hybrid NoCloud/OVF seed media.
 It proves key-only SSH as `zvmitest`, first boot, reboot/reconnect, per-guest

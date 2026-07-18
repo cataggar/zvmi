@@ -263,28 +263,58 @@ fn requireImageAlloc(
     return image_path;
 }
 
+fn validateNativeKvmPrerequisites(
+    host_is_linux: bool,
+    host_architecture: std.Target.Cpu.Arch,
+    kvm_available: bool,
+    candidate: Candidate,
+) !void {
+    if (!host_is_linux) {
+        std.debug.print(
+            "Azure Linux 4 acceptance requires a Linux host for native KVM QEMU\n",
+            .{},
+        );
+        return error.NativeKvmRequiresLinux;
+    }
+    if (host_architecture != candidate.architecture.nativeCpu()) {
+        std.debug.print(
+            "Azure Linux 4 acceptance requires a native {s} runner; TCG is forbidden\n",
+            .{@tagName(candidate.architecture.nativeCpu())},
+        );
+        return error.NativeKvmRequiresMatchingHostArchitecture;
+    }
+    if (!kvm_available) {
+        std.debug.print(
+            "Azure Linux 4 acceptance requires readable and writable /dev/kvm; TCG is forbidden\n",
+            .{},
+        );
+        return error.KvmUnavailable;
+    }
+}
+
 fn requireNativeKvm(io: Io, candidate: Candidate) !void {
-    if (builtin.os.tag != .linux) {
+    const host_is_linux = builtin.os.tag == .linux;
+    const host_is_native = builtin.cpu.arch == candidate.architecture.nativeCpu();
+    const kvm_available = if (host_is_linux and host_is_native)
+        try qemu_host.pathAccessible(io, "/dev/kvm", .{ .read = true, .write = true })
+    else
+        false;
+    try validateNativeKvmPrerequisites(
+        host_is_linux,
+        builtin.cpu.arch,
+        kvm_available,
+        candidate,
+    );
+}
+
+fn requireFoundTool(path: ?[]u8, name: []const u8) ![]u8 {
+    return path orelse {
         std.debug.print(
-            "skipping Azure Linux 4 acceptance: native KVM QEMU is Linux-only\n",
-            .{},
+            "Azure Linux 4 acceptance requires {s} in PATH\n",
+            .{name},
         );
-        return error.SkipZigTest;
-    }
-    if (builtin.cpu.arch != candidate.architecture.nativeCpu()) {
-        std.debug.print(
-            "skipping Azure Linux 4 acceptance: {s} must run on a native {s} runner (TCG is forbidden)\n",
-            .{ @tagName(candidate.architecture), @tagName(candidate.architecture.nativeCpu()) },
-        );
-        return error.SkipZigTest;
-    }
-    if (!try qemu_host.pathAccessible(io, "/dev/kvm", .{ .read = true, .write = true })) {
-        std.debug.print(
-            "skipping Azure Linux 4 acceptance: /dev/kvm is unavailable (TCG is forbidden)\n",
-            .{},
-        );
-        return error.SkipZigTest;
-    }
+        return error.RequiredToolNotFound;
+    };
 }
 
 fn requireToolAlloc(
@@ -292,18 +322,15 @@ fn requireToolAlloc(
     io: Io,
     name: []const u8,
 ) ![]u8 {
-    return try qemu_host.findExecutableInPathAlloc(
-        allocator,
-        io,
-        std.testing.environ,
+    return requireFoundTool(
+        try qemu_host.findExecutableInPathAlloc(
+            allocator,
+            io,
+            std.testing.environ,
+            name,
+        ),
         name,
-    ) orelse {
-        std.debug.print(
-            "skipping Azure Linux 4 acceptance: {s} is not in PATH\n",
-            .{name},
-        );
-        return error.SkipZigTest;
-    };
+    );
 }
 
 fn requireToolOverrideAlloc(
@@ -319,6 +346,16 @@ fn requireToolOverrideAlloc(
         return path;
     }
     return requireToolAlloc(allocator, io, default_name);
+}
+
+fn requireFoundFirmware(firmware: ?Firmware) !Firmware {
+    return firmware orelse {
+        std.debug.print(
+            "Azure Linux 4 acceptance requires matching UEFI firmware; set ZVMI_AZURELINUX4_UEFI_CODE and ZVMI_AZURELINUX4_UEFI_VARS\n",
+            .{},
+        );
+        return error.RequiredFirmwareNotFound;
+    };
 }
 
 fn requireFirmwareAlloc(
@@ -338,18 +375,12 @@ fn requireFirmwareAlloc(
     );
     defer if (explicit_vars) |path| allocator.free(path);
 
-    return (try qemu_host.findFirmwarePairAlloc(allocator, io, .{
+    return requireFoundFirmware(try qemu_host.findFirmwarePairAlloc(allocator, io, .{
         .explicit_code_path = explicit_code,
         .explicit_vars_path = explicit_vars,
         .qemu_path = qemu_path,
         .architecture = architecture.guestArchitecture(),
-    })) orelse {
-        std.debug.print(
-            "skipping Azure Linux 4 acceptance: matching UEFI firmware was not found; set ZVMI_AZURELINUX4_UEFI_CODE and ZVMI_AZURELINUX4_UEFI_VARS\n",
-            .{},
-        );
-        return error.SkipZigTest;
-    };
+    }));
 }
 
 fn runCommand(
@@ -1134,14 +1165,39 @@ test "Azure Linux 4 acceptance candidate names are exact" {
     );
 }
 
+test "Azure Linux 4 configured acceptance prerequisites fail closed" {
+    const candidate = Candidate{ .architecture = .x86_64, .flavor = .core };
+
+    try std.testing.expectError(
+        error.NativeKvmRequiresLinux,
+        validateNativeKvmPrerequisites(false, .x86_64, false, candidate),
+    );
+    try std.testing.expectError(
+        error.NativeKvmRequiresMatchingHostArchitecture,
+        validateNativeKvmPrerequisites(true, .aarch64, false, candidate),
+    );
+    try std.testing.expectError(
+        error.KvmUnavailable,
+        validateNativeKvmPrerequisites(true, .x86_64, false, candidate),
+    );
+    try std.testing.expectError(
+        error.RequiredToolNotFound,
+        requireFoundTool(null, "not-a-real-azurelinux4-acceptance-tool"),
+    );
+    try std.testing.expectError(
+        error.RequiredFirmwareNotFound,
+        requireFoundFirmware(null),
+    );
+}
+
 test "Azure Linux 4 finalized QCOW2 boots, provisions, restarts, and powers off" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const candidate = try selectedCandidate();
-    try requireNativeKvm(io, candidate);
 
     const image_path = try requireImageAlloc(allocator, io, candidate);
     defer allocator.free(image_path);
+    try requireNativeKvm(io, candidate);
     const absolute_image = try Dir.cwd().realPathFileAlloc(io, image_path, allocator);
     defer allocator.free(absolute_image);
     if (!std.mem.eql(u8, std.fs.path.basename(absolute_image), candidate.expectedFileName()))
