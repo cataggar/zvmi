@@ -107,9 +107,14 @@ fn dupeTarXattrs(allocator: Allocator, xattrs: []const tar.Xattr) ![]const Xattr
         allocator.free(owned);
     }
     for (xattrs, 0..) |xattr, index| {
+        const name = try allocator.dupe(u8, xattr.name);
+        const value = allocator.dupe(u8, xattr.value) catch |err| {
+            allocator.free(name);
+            return err;
+        };
         owned[index] = .{
-            .name = try allocator.dupe(u8, xattr.name),
-            .value = try allocator.dupe(u8, xattr.value),
+            .name = name,
+            .value = value,
         };
         completed += 1;
     }
@@ -675,9 +680,11 @@ fn ensureDirectory(allocator: Allocator, entry_map: *StringHashMap(FileTree.Entr
     });
 }
 
+/// On error, the caller retains ownership of every allocation in `entry`.
+/// On success, `entry_map` owns the complete entry and frees it through
+/// `freeEntry`. This makes allocation failures from descendant removal and
+/// `entry_map.put` safe for all entry kinds and their xattrs.
 fn putEntry(allocator: Allocator, entry_map: *StringHashMap(FileTree.Entry), entry: FileTree.Entry) LoadError!void {
-    errdefer freeEntry(allocator, entry);
-
     if (entry.kind != .directory) {
         try removeChildrenOnly(entry_map, allocator, entry.path);
     }
@@ -1016,6 +1023,81 @@ test "OCI parent synthesis does not overwrite lower directory metadata" {
     try std.testing.expectEqual(@as(usize, 1), replaced.xattrs.len);
     try std.testing.expectEqualStrings("user.upper", replaced.xattrs[0].name);
     try std.testing.expectEqualStrings("child", tree.get("private/child").?.content);
+}
+
+fn applySingleEntryForAllocationTest(allocator: Allocator, entry: tar.Entry) !void {
+    var map = StringHashMap(FileTree.Entry).init(allocator);
+    defer deinitEntryMap(&map, allocator);
+    try applyLayerEntry(allocator, &map, &.{}, entry);
+}
+
+test "OCI putEntry callers retain ownership through allocation failures" {
+    const xattrs = [_]tar.Xattr{.{ .name = "user.allocation", .value = "metadata" }};
+    const entries = [_]tar.Entry{
+        .{ .path = "directory", .kind = .directory, .mode = 0o700, .uid = 42, .gid = 43, .size = 0, .content = "", .xattrs = &xattrs },
+        .{ .path = "file", .kind = .file, .mode = 0o640, .uid = 42, .gid = 43, .size = 7, .content = "payload", .xattrs = &xattrs },
+        .{ .path = "symlink", .kind = .symlink, .mode = 0o777, .uid = 42, .gid = 43, .size = 4, .content = "", .link_name = "file", .xattrs = &xattrs },
+        .{ .path = "hardlink", .kind = .hardlink, .mode = 0o640, .uid = 42, .gid = 43, .size = 0, .content = "", .link_name = "file", .xattrs = &xattrs },
+    };
+
+    for (entries) |entry| {
+        var saw_success = false;
+        var failure_index: usize = 0;
+        while (failure_index < 64 and !saw_success) : (failure_index += 1) {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+                .fail_index = failure_index,
+            });
+            const allocator = failing.allocator();
+            applySingleEntryForAllocationTest(allocator, entry) catch |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                try std.testing.expect(failing.has_induced_failure);
+                try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+                continue;
+            };
+            saw_success = true;
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        }
+        try std.testing.expect(saw_success);
+    }
+}
+
+fn replaceDirectoryWithFileForAllocationTest(allocator: Allocator) !void {
+    var map = StringHashMap(FileTree.Entry).init(allocator);
+    defer deinitEntryMap(&map, allocator);
+    try applyLayerEntry(allocator, &map, &.{}, .{
+        .path = "parent/child",
+        .kind = .file,
+        .mode = 0o644,
+        .size = 5,
+        .content = "child",
+    });
+    try applyLayerEntry(allocator, &map, &.{}, .{
+        .path = "parent",
+        .kind = .file,
+        .mode = 0o600,
+        .size = 6,
+        .content = "parent",
+    });
+}
+
+test "OCI putEntry retains caller cleanup through descendant removal and map insertion failures" {
+    var saw_success = false;
+    var failure_index: usize = 0;
+    while (failure_index < 64 and !saw_success) : (failure_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+            .fail_index = failure_index,
+        });
+        const allocator = failing.allocator();
+        replaceDirectoryWithFileForAllocationTest(allocator) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+            continue;
+        };
+        saw_success = true;
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+    try std.testing.expect(saw_success);
 }
 
 const FixtureLayout = struct {

@@ -2122,9 +2122,14 @@ fn dupeOciXattrs(allocator: std.mem.Allocator, xattrs: []const oci.Xattr) ![]ext
         allocator.free(owned);
     }
     for (xattrs, 0..) |xattr, index| {
+        const name = try allocator.dupe(u8, xattr.name);
+        const value = allocator.dupe(u8, xattr.value) catch |err| {
+            allocator.free(name);
+            return err;
+        };
         owned[index] = .{
-            .name = try allocator.dupe(u8, xattr.name),
-            .value = try allocator.dupe(u8, xattr.value),
+            .name = name,
+            .value = value,
         };
         completed += 1;
     }
