@@ -1,306 +1,476 @@
-name: Rebuild Azure Linux 4 release image
+name: Build, validate, and publish Azure Linux 4 images
 
 on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: azurelinux4-release-image
+  group: azurelinux4-release-20260717
   cancel-in-progress: false
 
 env:
-  RELEASE_TAG: AzureLinux4.0-20260714
-  RELEASE_TITLE: Azure Linux 4.0 - 20260714
-  ASSET_NAME: AzureLinux-4.0-x86_64.qcow2
-  WORK_DIR: .scratch/generalized-azurelinux4
+  RELEASE_TAG: AzureLinux-4.0-20260717
+  RELEASE_TITLE: Azure Linux 4.0 - 20260717
 
 jobs:
-  rebuild:
-    name: rebuild and replace release asset
+  prepare:
+    name: resolve immutable main source
+    if: github.repository == 'cataggar/zvmi' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 10
+    outputs:
+      source_commit: ${{ steps.source.outputs.commit }}
     steps:
-      - name: Check out latest main
-        uses: actions/checkout@v4
+      - name: Check out merged main
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           ref: main
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Bind release to source commit
+        id: source
+        run: |
+          set -euo pipefail
+          commit=$(git rev-parse HEAD)
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse origin/main)" = "$commit"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "Accepted source commit: \`$commit\`" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: build/local ${{ matrix.key }}
+    needs: prepare
+    runs-on: [self-hosted, Linux, "${{ matrix.runner_arch }}"]
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - key: x86_64-full
+            architecture: x86_64
+            flavor: full
+            runner_arch: X64
+            deb_arch: amd64
+            asset_name: AzureLinux-4.0-x86_64.qcow2
+            virtual_size: 5368709120
+            iso_name: AzureLinux-4.0-x86_64.iso
+            iso_sha256: d98f7d1ffaa916de7c9f66ffdadb150c174da691509e760835709ffa7829ca48
+          - key: aarch64-full
+            architecture: aarch64
+            flavor: full
+            runner_arch: ARM64
+            deb_arch: arm64
+            asset_name: AzureLinux-4.0-aarch64.qcow2
+            virtual_size: 5368709120
+            iso_name: AzureLinux-4.0-aarch64.iso
+            iso_sha256: 762039fde64a59806750ee86ca98132fad4f9df02e7684490017cdfda0c55157
+          - key: x86_64-core
+            architecture: x86_64
+            flavor: core
+            runner_arch: X64
+            deb_arch: amd64
+            asset_name: AzureLinux-4.0-x86_64.core.qcow2
+            virtual_size: 1241513984
+            iso_name: AzureLinux-4.0-x86_64.iso
+            iso_sha256: d98f7d1ffaa916de7c9f66ffdadb150c174da691509e760835709ffa7829ca48
+          - key: aarch64-core
+            architecture: aarch64
+            flavor: core
+            runner_arch: ARM64
+            deb_arch: arm64
+            asset_name: AzureLinux-4.0-aarch64.core.qcow2
+            virtual_size: 1241513984
+            iso_name: AzureLinux-4.0-aarch64.iso
+            iso_sha256: 762039fde64a59806750ee86ca98132fad4f9df02e7684490017cdfda0c55157
+    env:
+      CANDIDATE_KEY: ${{ matrix.key }}
+      ARCHITECTURE: ${{ matrix.architecture }}
+      FLAVOR: ${{ matrix.flavor }}
+      ASSET_NAME: ${{ matrix.asset_name }}
+      VIRTUAL_SIZE: ${{ matrix.virtual_size }}
+      ISO_NAME: ${{ matrix.iso_name }}
+      ISO_SHA256: ${{ matrix.iso_sha256 }}
+      SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+      WORK_DIR: .scratch/azurelinux4-release-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.key }}
+      BUNDLE_DIR: artifact-staging/candidates/${{ matrix.key }}
+    steps:
+      - name: Check out accepted source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
+          persist-credentials: false
+
+      - name: Require native Ubuntu KVM runner
+        env:
+          EXPECTED_DEB_ARCH: ${{ matrix.deb_arch }}
+        run: |
+          set -euo pipefail
+          test "$(dpkg --print-architecture)" = "$EXPECTED_DEB_ARCH"
+          test -r /dev/kvm
+          test -w /dev/kvm
+          sudo -n true
 
       - name: Install Zig via ghr
-        uses: cataggar/ghr/actions/install@v0.6.6
+        uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         with:
+          ghr-version: 0.6.6
           tools: |
             cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
-      - name: Install image build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            dnf file jq openssh-client ovmf qemu-system-x86 qemu-utils xorriso
-          # Ubuntu defaults to ~/.rpmdb; use the database shipped in the Azure Linux rootfs.
-          echo '%_dbpath /usr/lib/sysimage/rpm' | sudo tee /root/.rpmmacros
-          test "$(sudo rpm --eval '%{_dbpath}')" = /usr/lib/sysimage/rpm
-
-      - name: Verify target release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY"
-
-      - name: Resolve ISO cache key
-        id: iso
-        run: |
-          checksum=$(curl -fsSL https://aka.ms/azurelinux-4.0-x86_64-iso-checksum | awk '{print $1}')
-          if [[ ! "$checksum" =~ ^[0-9a-f]{64}$ ]]; then
-            echo "::error::Unexpected Azure Linux ISO checksum: $checksum"
-            exit 1
-          fi
-          echo "sha256=$checksum" >> "$GITHUB_OUTPUT"
-
-      - name: Cache Azure Linux ISO
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.WORK_DIR }}/AzureLinux-4.0-x86_64.iso
-          key: azurelinux-4.0-x86_64-iso-${{ steps.iso.outputs.sha256 }}
-
-      - name: Build maximum-zstd QCOW2
-        run: |
-          mkdir -p dist
-          set -o pipefail
-          zig build generalized-azurelinux4 -- \
-            --work-dir "$GITHUB_WORKSPACE/$WORK_DIR" \
-            --size 1184M \
-            --output "$GITHUB_WORKSPACE/dist/$ASSET_NAME" 2>&1 | tee "$RUNNER_TEMP/azurelinux4-build.log"
-
-      - name: Validate release image
-        run: |
-          qemu-img check "dist/$ASSET_NAME"
-          test "$(qemu-img info --output=json "dist/$ASSET_NAME" | jq -r '.format')" = qcow2
-          test "$(qemu-img info --output=json "dist/$ASSET_NAME" | jq -r '."virtual-size"')" = 1241513984
-          sha256sum "dist/$ASSET_NAME"
-
-      - name: Boot finalized UKI QCOW2
-        timeout-minutes: 8
-        env:
-          IMAGE: ${{ github.workspace }}/dist/${{ env.ASSET_NAME }}
-          OVMF_CODE: /usr/share/OVMF/OVMF_CODE_4M.fd
-          OVMF_TEMPLATE: /usr/share/OVMF/OVMF_VARS_4M.fd
-          OVMF_VARS: ${{ runner.temp }}/azurelinux4-OVMF_VARS.fd
-          OVF_DIR: ${{ runner.temp }}/zvmi-local-ovf
-          OVF_ISO: ${{ runner.temp }}/zvmi-local-ovf.iso
-          SSH_KEY: ${{ runner.temp }}/zvmi-test-ed25519
-          SERIAL_LOG: ${{ runner.temp }}/zvmi-serial.log
-          SSH_PORT: "2222"
+      - name: Install image and acceptance dependencies
         run: |
           set -euo pipefail
-          test -x /usr/bin/qemu-system-x86_64
-          test -r "$OVMF_CODE"
-          test -r "$OVMF_TEMPLATE"
-          test -r "$IMAGE"
-
-          source_sha256=$(sha256sum "$IMAGE" | awk '{print $1}')
-          cp "$OVMF_TEMPLATE" "$OVMF_VARS"
-          mkdir -p "$OVF_DIR"
-          ssh-keygen -q -t ed25519 -N '' -C zvmi-ci -f "$SSH_KEY"
-          public_key=$(cat "$SSH_KEY.pub")
-          cat > "$OVF_DIR/ovf-env.xml" <<EOF
-          <?xml version="1.0" encoding="utf-8"?>
-          <Environment xmlns="http://schemas.dmtf.org/ovf/environment/1" xmlns:wa="http://schemas.microsoft.com/windowsazure">
-            <wa:ProvisioningSection>
-              <LinuxProvisioningConfigurationSet xmlns="http://schemas.microsoft.com/windowsazure">
-                <HostName>zvmi-ci</HostName>
-                <UserName>zvmitest</UserName>
-                <DisableSshPasswordAuthentication>true</DisableSshPasswordAuthentication>
-                <SSH><PublicKeys><PublicKey>
-                  <Path>/home/zvmitest/.ssh/authorized_keys</Path>
-                  <Value>$public_key</Value>
-                </PublicKey></PublicKeys></SSH>
-              </LinuxProvisioningConfigurationSet>
-            </wa:ProvisioningSection>
-          </Environment>
-          EOF
-          : > "$OVF_DIR/zvmi-local-provisioning"
-          xorriso -as mkisofs -quiet -iso-level 3 -R -J \
-            -V OVFENV -o "$OVF_ISO" "$OVF_DIR"
-          chmod 0444 "$OVF_ISO"
-
-          qemu_pid=
-          cleanup() {
-            status=$?
-            set +e
-            if [[ -n "$qemu_pid" ]] && kill -0 "$qemu_pid" 2>/dev/null; then
-              kill -TERM "$qemu_pid"
-              sleep 2
-              if kill -0 "$qemu_pid" 2>/dev/null; then
-                kill -KILL "$qemu_pid"
-              fi
-              wait "$qemu_pid"
-            fi
-            if [[ $status -ne 0 && -r "$SERIAL_LOG" ]]; then
-              cat "$SERIAL_LOG"
-            fi
-            rm -rf "$OVF_DIR"
-            rm -f "$OVF_ISO" "$OVMF_VARS" "$SSH_KEY" "$SSH_KEY.pub" "$SERIAL_LOG"
-            exit "$status"
-          }
-          trap cleanup EXIT
-
-          qemu-system-x86_64 \
-            -machine q35,accel=tcg,smm=off \
-            -m 2048 \
-            -display none -monitor none \
-            -serial "file:$SERIAL_LOG" -no-reboot -snapshot \
-            -drive "if=pflash,unit=0,format=raw,readonly=on,file=$OVMF_CODE" \
-            -drive "if=pflash,unit=1,format=raw,file=$OVMF_VARS" \
-            -drive "file=$IMAGE,format=qcow2,if=virtio" \
-            -drive "if=none,id=ovf,format=raw,media=cdrom,readonly=on,file=$OVF_ISO" \
-            -device ide-cd,drive=ovf,bus=ide.1 \
-            -nic "user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22" &
-          qemu_pid=$!
-
-          ssh_options=(
-            -i "$SSH_KEY"
-            -p "$SSH_PORT"
-            -o BatchMode=yes
-            -o ConnectTimeout=3
-            -o IdentitiesOnly=yes
-            -o KbdInteractiveAuthentication=no
-            -o PasswordAuthentication=no
-            -o PreferredAuthentications=publickey
-            -o StrictHostKeyChecking=no
-            -o UserKnownHostsFile=/dev/null
+          sudo apt-get update
+          packages=(
+            curl dnf file jq openssh-client qemu-utils rpm tar xorriso
           )
-          ssh_ready=false
-          for _ in $(seq 1 120); do
-            if ssh "${ssh_options[@]}" zvmitest@127.0.0.1 true >/dev/null 2>&1; then
-              ssh_ready=true
-              break
-            fi
-            kill -0 "$qemu_pid"
-            sleep 2
-          done
-          test "$ssh_ready" = true
-          grep -Fq '[zvminit] ZVMINIT_PID1_READY supervisor loop active' "$SERIAL_LOG"
-          grep -Fq '[zvminit] azagent completed successfully' "$SERIAL_LOG"
+          if [[ "$ARCHITECTURE" == x86_64 ]]; then
+            packages+=(ovmf qemu-system-x86)
+          else
+            packages+=(qemu-efi-aarch64 qemu-system-arm)
+          fi
+          sudo apt-get install -y --no-install-recommends "${packages[@]}"
+          echo '%_dbpath /usr/lib/sysimage/rpm' | sudo tee /root/.rpmmacros >/dev/null
+          test "$(sudo rpm --eval '%{_dbpath}')" = /usr/lib/sysimage/rpm
 
-          inspect_guest=$(cat <<'GUEST'
-          set -eu
-          resolved_pid1=$(readlink -f /proc/1/exe)
-          printf 'PID1_EXE=%s\n' "$resolved_pid1" >&2
-          test /proc/1/exe -ef /sbin/zvminit
-          test -b /dev/sr0
-          test -f /var/lib/azagent/provisioned
-          find_sshd_master() {
-            for proc in /proc/[0-9]*; do
-              test -r "$proc/status" || continue
-              name=
-              ppid=
-              while read -r key value _; do
-                case "$key" in
-                  Name:) name=$value ;;
-                  PPid:) ppid=$value ;;
-                esac
-              done < "$proc/status"
-              test "$name" = sshd && test "$ppid" = 1 || continue
-              cmdline=$(tr '\0' ' ' < "$proc/cmdline")
-              case "$cmdline" in
-                *"/usr/sbin/sshd -D -e"*) printf '%s\n' "${proc##*/}"; return 0 ;;
-              esac
-            done
-            return 1
-          }
-          find_sshd_master
-          GUEST
-          )
+      - name: Cache pinned Azure Linux ISO
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ env.WORK_DIR }}/${{ env.ISO_NAME }}
+          key: azurelinux4-${{ matrix.architecture }}-iso-${{ matrix.iso_sha256 }}
 
-          initial_master=$(ssh "${ssh_options[@]}" zvmitest@127.0.0.1 "$inspect_guest")
-          [[ "$initial_master" =~ ^[0-9]+$ ]]
-          ssh "${ssh_options[@]}" zvmitest@127.0.0.1 \
-            "sudo /usr/bin/bash -c 'kill -KILL $initial_master'" >/dev/null 2>&1 || true
+      - name: Build exact finalized QCOW2
+        run: |
+          set -euo pipefail
+          unset ZIG_LOCAL_CACHE_DIR
+          export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
+          rm -rf -- "$BUNDLE_DIR"
+          mkdir -p "$BUNDLE_DIR/internal-provenance"
+          set -o pipefail
+          zig build \
+            -Dazurelinux-arch="$ARCHITECTURE" \
+            -Dazurelinux-flavor="$FLAVOR" \
+            generalized-azurelinux4 -- \
+            --work-dir "$GITHUB_WORKSPACE/$WORK_DIR" \
+            --output "$GITHUB_WORKSPACE/$BUNDLE_DIR/$ASSET_NAME" \
+            2>&1 | tee "$BUNDLE_DIR/internal-provenance/build.log"
 
-          restarted_master=
-          for _ in $(seq 1 60); do
-            candidate=$(ssh "${ssh_options[@]}" zvmitest@127.0.0.1 "$inspect_guest" 2>/dev/null || true)
-            if [[ "$candidate" =~ ^[0-9]+$ && "$candidate" != "$initial_master" ]]; then
-              restarted_master=$candidate
-              break
-            fi
-            kill -0 "$qemu_pid"
-            sleep 2
-          done
-          test -n "$restarted_master"
+      - name: Validate exact finalized QCOW2
+        run: |
+          set -euo pipefail
+          asset="$BUNDLE_DIR/$ASSET_NAME"
+          test -f "$asset"
+          qemu-img check "$asset"
+          qemu-img info --output=json "$asset" > "$BUNDLE_DIR/internal-provenance/qemu-img-info.json"
+          python3 - "$BUNDLE_DIR/internal-provenance/qemu-img-info.json" "$VIRTUAL_SIZE" <<'PY'
+          import json
+          import sys
+          info = json.load(open(sys.argv[1], encoding="utf-8"))
+          if info.get("format") != "qcow2":
+              raise SystemExit("candidate is not QCOW2")
+          if info.get("virtual-size") != int(sys.argv[2]):
+              raise SystemExit("candidate virtual size mismatch")
+          if info.get("backing-filename") or info.get("full-backing-filename"):
+              raise SystemExit("candidate has a backing file")
+          data = (info.get("format-specific") or {}).get("data") or {}
+          if data.get("compression-type") != "zstd":
+              raise SystemExit("candidate does not use zstd cluster compression")
+          PY
+          digest=$(sha256sum "$asset" | awk '{print $1}')
+          [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
 
-          ssh "${ssh_options[@]}" zvmitest@127.0.0.1 \
-            'sudo /sbin/poweroff' >/dev/null 2>&1 || true
-          qemu_exited=false
-          for _ in $(seq 1 60); do
-            if ! kill -0 "$qemu_pid" 2>/dev/null; then
-              qemu_exited=true
-              break
-            fi
-            sleep 1
-          done
-          test "$qemu_exited" = true
-          set +e
-          wait "$qemu_pid"
-          qemu_status=$?
-          set -e
-          qemu_pid=
-          test "$qemu_status" -eq 0
-          test "$(sha256sum "$IMAGE" | awk '{print $1}')" = "$source_sha256"
+      - name: Run native finalized-image acceptance
+        env:
+          ZVMI_AZURELINUX4_IMAGE: ${{ github.workspace }}/${{ env.BUNDLE_DIR }}/${{ env.ASSET_NAME }}
+        run: |
+          set -euo pipefail
+          unset ZIG_LOCAL_CACHE_DIR
+          export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
+          before=$(sha256sum "$ZVMI_AZURELINUX4_IMAGE" | awk '{print $1}')
+          zig build \
+            -Dazurelinux-arch="$ARCHITECTURE" \
+            -Dazurelinux-flavor="$FLAVOR" \
+            test-azurelinux4-acceptance
+          after=$(sha256sum "$ZVMI_AZURELINUX4_IMAGE" | awk '{print $1}')
+          test "$after" = "$before"
+          printf '%s\n' "$after" > "$BUNDLE_DIR/internal-provenance/local-accepted-digest"
 
-      - name: Replace release asset
+      - name: Bind candidate metadata
+        env:
+          RUNNER_NAME_VALUE: ${{ runner.name }}
+          RUN_ID_VALUE: ${{ github.run_id }}
+          RUN_ATTEMPT_VALUE: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          test -d "$WORK_DIR/provenance"
+          cp -a "$WORK_DIR/provenance/." "$BUNDLE_DIR/internal-provenance/"
+          accepted=$(<"$BUNDLE_DIR/internal-provenance/local-accepted-digest")
+          qemu_binary=qemu-system-x86_64
+          if [[ "$ARCHITECTURE" == aarch64 ]]; then
+            qemu_binary=qemu-system-aarch64
+          fi
+          qemu_version=$("$qemu_binary" --version | head -n 1)
+          python3 scripts/azurelinux4_release.py candidate \
+            --key "$CANDIDATE_KEY" \
+            --architecture "$ARCHITECTURE" \
+            --flavor "$FLAVOR" \
+            --asset "$BUNDLE_DIR/$ASSET_NAME" \
+            --accepted-sha256 "$accepted" \
+            --virtual-size "$VIRTUAL_SIZE" \
+            --source-commit "$SOURCE_COMMIT" \
+            --provenance-dir "$BUNDLE_DIR/internal-provenance" \
+            --runner "$RUNNER_NAME_VALUE" \
+            --qemu-version "$qemu_version" \
+            --run-id "$RUN_ID_VALUE" \
+            --run-attempt "$RUN_ATTEMPT_VALUE" \
+            --output "$BUNDLE_DIR/candidate.json"
+          python3 scripts/azurelinux4_release.py verify-candidate \
+            --manifest "$BUNDLE_DIR/candidate.json" \
+            --asset "$BUNDLE_DIR/$ASSET_NAME" \
+            --key "$CANDIDATE_KEY" \
+            --source-commit "$SOURCE_COMMIT"
+
+      - name: Upload exact accepted candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: azurelinux4-candidate-${{ matrix.key }}-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ env.BUNDLE_DIR }}/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 2
+
+      - name: Summarize local acceptance
+        env:
+          RUNNER_NAME_VALUE: ${{ runner.name }}
+        run: |
+          set -euo pipefail
+          digest=$(sha256sum "$BUNDLE_DIR/$ASSET_NAME" | awk '{print $1}')
+          {
+            echo "### Local acceptance: $ASSET_NAME"
+            echo
+            echo "- Source: \`$SOURCE_COMMIT\`"
+            echo "- SHA-256: \`$digest\`"
+            echo "- Native runner: \`$RUNNER_NAME_VALUE\`"
+            echo "- TCG: not used"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean privileged build state
+        if: always()
+        run: |
+          sudo rm -rf -- "$WORK_DIR"
+          rm -rf -- "$BUNDLE_DIR"
+
+  azure_acceptance:
+    name: Azure ${{ matrix.key }}
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    environment: azurelinux4-release
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - key: x86_64-full
+            architecture: x86_64
+            flavor: full
+            asset_name: AzureLinux-4.0-x86_64.qcow2
+            location_variable: AZURE_LOCATION_X64
+            size_variable: AZURE_VM_SIZE_X64
+          - key: aarch64-full
+            architecture: aarch64
+            flavor: full
+            asset_name: AzureLinux-4.0-aarch64.qcow2
+            location_variable: AZURE_LOCATION_ARM64
+            size_variable: AZURE_VM_SIZE_ARM64
+          - key: x86_64-core
+            architecture: x86_64
+            flavor: core
+            asset_name: AzureLinux-4.0-x86_64.core.qcow2
+            location_variable: AZURE_LOCATION_X64
+            size_variable: AZURE_VM_SIZE_X64
+          - key: aarch64-core
+            architecture: aarch64
+            flavor: core
+            asset_name: AzureLinux-4.0-aarch64.core.qcow2
+            location_variable: AZURE_LOCATION_ARM64
+            size_variable: AZURE_VM_SIZE_ARM64
+    env:
+      AZURE_CORE_OUTPUT: none
+      CANDIDATE_KEY: ${{ matrix.key }}
+      ARCHITECTURE: ${{ matrix.architecture }}
+      FLAVOR: ${{ matrix.flavor }}
+      ASSET_NAME: ${{ matrix.asset_name }}
+      SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+      CANDIDATE_DIR: .release/azure/${{ matrix.key }}/candidate
+      RESULT_DIR: artifact-staging/azure-results/${{ matrix.key }}
+      STATE_FILE: .release/azure/${{ matrix.key }}/resource-group
+      AZURE_LOCATION: ${{ vars[matrix.location_variable] }}
+      AZURE_VM_SIZE: ${{ vars[matrix.size_variable] }}
+    steps:
+      - name: Check out accepted source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
+          persist-credentials: false
+
+      - name: Download exact local-accepted candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: azurelinux4-candidate-${{ matrix.key }}-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ env.CANDIDATE_DIR }}
+
+      - name: Fail closed on missing protected configuration
+        env:
+          AZURE_CLIENT_ID_VALUE: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID_VALUE: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID_VALUE: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          set -euo pipefail
+          uuid='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+          [[ "$AZURE_CLIENT_ID_VALUE" =~ $uuid ]]
+          [[ "$AZURE_TENANT_ID_VALUE" =~ $uuid ]]
+          [[ "$AZURE_SUBSCRIPTION_ID_VALUE" =~ $uuid ]]
+          [[ "$AZURE_LOCATION" =~ ^[a-z0-9-]+$ ]]
+          [[ "$AZURE_VM_SIZE" =~ ^Standard_[A-Za-z0-9_]+$ ]]
+
+      - name: Log in to Azure with protected-environment OIDC
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          asset_sha256=$(sha256sum "dist/$ASSET_NAME" | awk '{print $1}')
-          asset_bytes=$(stat --format='%s' "dist/$ASSET_NAME")
-          iso_sha256=$(sha256sum "$WORK_DIR/AzureLinux-4.0-x86_64.iso" | awk '{print $1}')
-          base_digest=$(sed -n 's/^Resolved to \(sha256:[0-9a-f]\{64\}\)$/\1/p' "$RUNNER_TEMP/azurelinux4-build.log" | tail -n 1)
-          source_commit=$(git rev-parse HEAD)
+        with:
+          ghr-version: 0.6.6
+          tools: |
+            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
-          if [[ ! "$base_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "::error::Could not recover the base OCI manifest digest from the build log"
+      - name: Require Azure acceptance tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends openssh-client qemu-utils
+          for tool in az azcopy qemu-img ssh ssh-keygen python3; do
+            command -v "$tool" >/dev/null
+          done
+          az version --output json > /dev/null
+
+      - name: Build accepted-source zvmi
+        run: |
+          set -euo pipefail
+          unset ZIG_LOCAL_CACHE_DIR
+          export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
+          zig build -Doptimize=ReleaseSafe
+          test -x zig-out/bin/zvmi
+
+      - name: Run exact-artifact Azure acceptance
+        env:
+          ZVMI: ${{ github.workspace }}/zig-out/bin/zvmi
+          RUN_ID_VALUE: ${{ github.run_id }}
+          RUN_ATTEMPT_VALUE: ${{ github.run_attempt }}
+        run: |
+          export GITHUB_RUN_ID=$RUN_ID_VALUE
+          export GITHUB_RUN_ATTEMPT=$RUN_ATTEMPT_VALUE
+          scripts/azurelinux4_azure_acceptance.sh run
+
+      - name: Refresh Azure OIDC token for unconditional cleanup
+        if: always()
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Delete only owned temporary Azure resources
+        if: always()
+        env:
+          RUN_ID_VALUE: ${{ github.run_id }}
+          RUN_ATTEMPT_VALUE: ${{ github.run_attempt }}
+        run: |
+          export GITHUB_RUN_ID=$RUN_ID_VALUE
+          export GITHUB_RUN_ATTEMPT=$RUN_ATTEMPT_VALUE
+          if [[ -x scripts/azurelinux4_azure_acceptance.sh ]]; then
+            scripts/azurelinux4_azure_acceptance.sh cleanup
+          elif [[ -s "$STATE_FILE" ]]; then
+            echo "::error::Cleanup script is absent while Azure state exists"
             exit 1
           fi
 
-          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
-          Generalized x86_64 Azure Linux 4.0 Gen2 image built with zvmi from current \`main\`. The QCOW2 uses maximum-level zstd cluster compression and boots directly from a Unified Kernel Image (UKI) under UEFI.
+      - name: Upload exact Azure acceptance result
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: azurelinux4-azure-${{ matrix.key }}-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ env.RESULT_DIR }}/azure-result.json
+          if-no-files-found: error
+          retention-days: 2
 
-          - Asset: \`$ASSET_NAME\`
-          - Boot path: \`UEFI -> EFI/BOOT/BOOTX64.EFI (UKI) -> kernel/initramfs -> zvminit\`
-          - Secure Boot: disabled; UKI signing and trust are tracked in issue #168
-          - Virtual disk size: 1184 MiB
-          - EFI System Partition: 512 MiB
-          - Root partition: 670 MiB
-          - File size: $asset_bytes bytes
-          - SHA-256: \`$asset_sha256\`
-          - Source commit: \`$source_commit\`
-          - Azure deployment username convention: \`g\`
+      - name: Remove derived VHD and local credentials
+        if: always()
+        run: rm -rf -- ".release/azure/$CANDIDATE_KEY" "$RESULT_DIR"
 
-          Provenance:
+  publish:
+    name: verify four-by-four gate and publish
+    needs: [prepare, build, azure_acceptance]
+    if: >-
+      ${{
+        always() &&
+        needs.prepare.result == 'success' &&
+        needs.build.result == 'success' &&
+        needs.azure_acceptance.result == 'success'
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment: azurelinux4-release
+    permissions:
+      contents: write
+    env:
+      SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+      CANDIDATES_DIR: .release/publication/candidates
+      AZURE_RESULTS_DIR: .release/publication/azure
+      STAGING_ROOT: .release/publication/staging
+      REPOSITORY: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+      PREPARE_RESULT: ${{ needs.prepare.result }}
+      BUILD_RESULT: ${{ needs.build.result }}
+      AZURE_RESULT: ${{ needs.azure_acceptance.result }}
+    steps:
+      - name: Check out accepted source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
+          persist-credentials: false
 
-          - Source ISO: \`AzureLinux-4.0-x86_64.iso\`
-          - ISO SHA-256: \`$iso_sha256\`
-          - Base OCI manifest: \`$base_digest\`
-          - UKI stub package: \`systemd-boot-unsigned-258.4-4.azl4.x86_64.rpm\`
-          - UKI stub package SHA-256: \`85dd3ac0c532bceb09fc0a85c6568c51fc4ee84e0c478d1302b7a2d84e1bea5c\`
+      - name: Download all local-accepted candidates
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: azurelinux4-candidate-*-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ env.CANDIDATES_DIR }}
+          merge-multiple: false
 
-          The builder validates the finalized QCOW2's GPT, ESP, UKI sections, and embedded command line. The release workflow then boots that exact compressed artifact with QEMU/OVMF and ephemeral marked OVF media, proves key-only SSH, verifies \`zvminit\` is PID 1 and directly owns foreground sshd, kills sshd and reconnects after supervisor restart, powers off through PID 1, and re-hashes the unchanged source QCOW2. The base image identifies itself as Azure Linux 4.0 Container Image Beta with \`RELEASE_TYPE=development\`.
-          EOF
+      - name: Download all Azure acceptance results
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: azurelinux4-azure-*-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ env.AZURE_RESULTS_DIR }}
+          merge-multiple: false
 
-          gh release upload "$RELEASE_TAG" "dist/$ASSET_NAME" --clobber --repo "$GITHUB_REPOSITORY"
-          gh release edit "$RELEASE_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "$RELEASE_TITLE" \
-            --notes-file "$RUNNER_TEMP/release-notes.md"
-
-          {
-            echo "### Release asset replaced"
-            echo
-            echo "- Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$RELEASE_TAG"
-            echo "- Asset: https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$ASSET_NAME"
-            echo "- SHA-256: \`$asset_sha256\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Publish only after explicit complete matrix validation
+        run: |
+          set -euo pipefail
+          test "$PREPARE_RESULT" = success
+          test "$BUILD_RESULT" = success
+          test "$AZURE_RESULT" = success
+          scripts/azurelinux4_publish.sh

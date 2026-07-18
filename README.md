@@ -632,12 +632,81 @@ machine-ID and SSH-host-key stability, and distinct identities across the two
 instances. Core additionally verifies `zvminit` PID 1 and its supervised
 foreground-sshd restart behavior; full verifies systemd PID 1 plus cloud-init,
 WALinuxAgent, sshd, and networkd active/enabled contracts. Both instances must
-power off cleanly. This adds only local/build wiring: release publication and
-Azure OIDC deployment remain outside this slice of issue #178.
+power off cleanly.
 
-The future four-entry workflow matrix, Azure deployment, and release
-publication remain separate issue #178 work. This builder slice does not
-publish or deploy an image.
+### Azure Linux 4 release images
+
+Release `AzureLinux-4.0-20260717` contains exactly four Gen2 QCOW2 assets:
+
+```text
+AzureLinux-4.0-x86_64.qcow2
+AzureLinux-4.0-aarch64.qcow2
+AzureLinux-4.0-x86_64.core.qcow2
+AzureLinux-4.0-aarch64.core.qcow2
+```
+
+The unsuffixed **full** images use systemd, cloud-init for the provisioned
+account and SSH key, WALinuxAgent for Azure Ready/extensions, and
+`sshd.service`. The **core** images use `zvminit` as PID 1, `azagent` for
+provisioning/Ready, and directly supervised OpenSSH. Both flavors have no
+baked credentials and require a public SSH key at provisioning time; core
+cannot expose SSH until that key has been supplied through the Azure OVF
+profile. The UKIs are unsigned, so Secure Boot remains disabled pending issue
+#168.
+
+`zvmi qemu` defaults to the full x86_64 asset pinned as
+`AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260717`. Select an AArch64 or
+core file explicitly when needed.
+
+The manual release workflow builds all four candidates on native ephemeral
+self-hosted Ubuntu runners with the standard `self-hosted`, `Linux`, and
+`X64`/`ARM64` labels. Each runner must provide passwordless sudo, native KVM,
+and enough workspace for a 5 GiB candidate. The workflow installs the
+remaining image/QEMU packages and never substitutes TCG for acceptance.
+
+Real-Azure validation and publication use the protected
+`azurelinux4-release` GitHub environment. Configure it with required
+reviewers, allow deployments only from `main`, and create this OIDC federated
+subject:
+
+```text
+repo:cataggar/zvmi:environment:azurelinux4-release
+```
+
+The environment must define these secrets:
+
+```text
+AZURE_CLIENT_ID
+AZURE_TENANT_ID
+AZURE_SUBSCRIPTION_ID
+```
+
+and these variables:
+
+```text
+AZURE_LOCATION_X64=eastus2
+AZURE_VM_SIZE_X64=Standard_D2ds_v5
+AZURE_LOCATION_ARM64=eastus2
+AZURE_VM_SIZE_ARM64=Standard_D2pds_v5
+```
+
+Equivalent regions/SKUs are allowed, but each configured SKU must be
+available, expose the requested x64/Arm64 architecture and Gen2, and have a
+temporary resource disk. Missing credentials, tools, capacity, or
+configuration fail the workflow. The OIDC identity needs permission to
+create/delete the uniquely tagged temporary resource groups and their
+Compute, Network, and Compute Gallery resources; use a dedicated validation
+subscription or an equivalent least-privilege custom role.
+
+Every candidate is rebound to its SHA-256 after artifact download. A complete
+four-entry protected Azure matrix validates key-only SSH, agent Ready, root
+growth, resource/data disks, reboot/reconnect, and flavor/runtime identity.
+Only then can the single publisher stage the release as a draft, clobber the
+four QCOW2s, remove stale assets, verify downloaded remote bytes, and publish.
+Existing tags are peeled and must resolve to the accepted source commit.
+Derived VHDs and Azure resources are temporary and are never retained.
+SHA-256 values appear in release notes and job summaries only: **checksum
+sidecar assets are not published**.
 
 ### Generalized FreeBSD 15.1 AArch64 QCOW2
 
@@ -694,7 +763,7 @@ zvmi qemu
 
 If `AzureLinux-4.0-x86_64.qcow2` is absent, `zvmi` runs the verified ghr
 download for
-`cataggar/zvmi/AzureLinux-4.0-x86_64.qcow2@AzureLinux4.0-20260714`.
+`cataggar/zvmi/AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260717`.
 Existing images are never refreshed or overwritten. QEMU and its matching
 EDK2 firmware are resolved from the `cataggar/qemu` ghr installation first,
 then from a system QEMU/OVMF installation.
@@ -734,13 +803,13 @@ Use `--qemu`, `--firmware-code`, and `--firmware-vars` (or the compatible
 after `--` are appended directly to QEMU. The terminal is attached to
 QEMU's `-nographic` serial console; use QEMU's `Ctrl+A`, then `X`, escape to
 exit. With the default secure command line, a successful local boot reaches
-the PID 1 readiness marker without exposing a root shell:
+the full image's systemd startup and login prompt. It does not emit
+`zvminit` readiness markers.
 
-```text
-[zvminit] non-Azure environment detected; skipping azagent
-[zvminit] diagnostic root shell disabled
-[zvminit] ZVMINIT_PID1_READY supervisor loop active
-```
+Those markers apply only when an explicit `*.core.qcow2` image is selected.
+A successful core boot reports that non-Azure `azagent` provisioning was
+skipped, the diagnostic root shell is disabled, and the
+`ZVMINIT_PID1_READY supervisor loop active` marker.
 
 To provision an administrator at launch, supply
 `--admin-username <name> --ssh-public-key <path>` together. `--ssh-port`
