@@ -636,6 +636,43 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_builder_tests.step);
         test_step.dependOn(generalized_check_step);
 
+        // Opt-in native-QEMU acceptance for a completed, finalized release
+        // candidate. The image itself is intentionally supplied at runtime:
+        // four native matrix entries select their architecture/flavor here and
+        // set ZVMI_AZURELINUX4_IMAGE to the exact candidate under test.
+        const azurelinux_acceptance_options = b.addOptions();
+        azurelinux_acceptance_options.addOption(
+            []const u8,
+            "azurelinux_architecture",
+            @tagName(azurelinux_architecture),
+        );
+        azurelinux_acceptance_options.addOption(
+            []const u8,
+            "azurelinux_flavor",
+            @tagName(azurelinux_flavor),
+        );
+        const azurelinux_acceptance_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/azurelinux4_acceptance.zig"),
+                .target = b.graph.host,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "build_options", .module = azurelinux_acceptance_options.createModule() },
+                    .{ .name = "qemu_host", .module = host_qemu_host_mod },
+                    .{ .name = "qmp", .module = host_qmp_mod },
+                    .{ .name = "zvmi", .module = host_zvmi_mod },
+                },
+            }),
+        });
+        const run_azurelinux_acceptance_tests = b.addRunArtifact(
+            azurelinux_acceptance_tests,
+        );
+        const azurelinux_acceptance_step = b.step(
+            "test-azurelinux4-acceptance",
+            "Run native-QEMU acceptance for one finalized Azure Linux 4 core or full QCOW2",
+        );
+        azurelinux_acceptance_step.dependOn(&run_azurelinux_acceptance_tests.step);
+
         const freebsd_builder_mod = b.createModule(.{
             .root_source_file = b.path("scripts/build_generalized_freebsd15_aarch64.zig"),
             .target = b.graph.host,

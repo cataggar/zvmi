@@ -597,9 +597,47 @@ architecture, flavor, native zvmi, and preload library, plus the guest
 zvminit/azagent binaries for core only; no separate `zig build` invocation is
 needed.
 
-The final four-image workflow, four-image boot acceptance, Azure deployment,
-and release publication remain separate issue #178 work. This builder slice
-does not publish or deploy an image.
+#### Finalized-image native QEMU acceptance
+
+`test-azurelinux4-acceptance` is the reusable, opt-in release-candidate
+acceptance step. It receives the completed artifact through
+`ZVMI_AZURELINUX4_IMAGE` and refuses a mismatched basename, so it never tests
+an intermediate builder file. The selected build options map exactly to these
+four candidates:
+
+```text
+x86_64 full:    AzureLinux-4.0-x86_64.qcow2
+aarch64 full:   AzureLinux-4.0-aarch64.qcow2
+x86_64 core:    AzureLinux-4.0-x86_64.core.qcow2
+aarch64 core:   AzureLinux-4.0-aarch64.core.qcow2
+```
+
+For example, run the native x86_64 core entry as:
+
+```text
+ZVMI_AZURELINUX4_IMAGE=/path/to/AzureLinux-4.0-x86_64.core.qcow2 \
+zig build -Dazurelinux-arch=x86_64 -Dazurelinux-flavor=core \
+  test-azurelinux4-acceptance
+```
+
+When `ZVMI_AZURELINUX4_IMAGE` is absent, the opt-in test skips cleanly. Once it
+is set, the invocation fails closed: native Linux/KVM, matching host
+architecture, QEMU and support tools, readable image, and matching UEFI
+firmware are all mandatory. The step explicitly refuses TCG. It validates the
+supplied standalone zstd QCOW2, GPT root GUID, UKI
+architecture and flavor command line, then boots two concurrent disposable
+overlays with independent UEFI variables and hybrid NoCloud/OVF seed media.
+It proves key-only SSH as `zvmitest`, first boot, reboot/reconnect, per-guest
+machine-ID and SSH-host-key stability, and distinct identities across the two
+instances. Core additionally verifies `zvminit` PID 1 and its supervised
+foreground-sshd restart behavior; full verifies systemd PID 1 plus cloud-init,
+WALinuxAgent, sshd, and networkd active/enabled contracts. Both instances must
+power off cleanly. This adds only local/build wiring: release publication and
+Azure OIDC deployment remain outside this slice of issue #178.
+
+The future four-entry workflow matrix, Azure deployment, and release
+publication remain separate issue #178 work. This builder slice does not
+publish or deploy an image.
 
 ### Generalized FreeBSD 15.1 AArch64 QCOW2
 
