@@ -108,6 +108,7 @@ zvmi/
   qmp/                      # native Zig QEMU Machine Protocol (QMP) client,
                               #   MIT licensed (see qmp/README.md)
   qemu/
+    bzip2.zig               # embedded bzip2 streaming decoder binding
     host.zig                # shared host QEMU executable + OVMF discovery
   nbd/                      # native Zig NBD client + reference server, MIT
                               #   licensed (see nbd/README.md)
@@ -182,8 +183,10 @@ zvmi/
 
 - Zig **0.16.0** or later.
 - `zvmi qemu` additionally requires [ghr](https://github.com/cataggar/ghr)
-  for automatic image download. Install the packaged QEMU build with
-  `ghr install cataggar/qemu`, or provide a system QEMU/OVMF installation.
+  for automatic known-image download. Install the packaged QEMU build with
+  `ghr install cataggar/qemu`, or provide a system QEMU/UEFI installation.
+  The released `zvmi` binary includes bzip2 support for packaged compressed
+  firmware and does not require a system decompression tool.
 
 ## Build
 
@@ -431,8 +434,8 @@ zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 384M --skip-iso-rootfs -o output-minimal.raw -O raw
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G --verity -o output.vhd
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G --boot-mode uki --esp-size 512M -o output-uki.vhd
-zvmi qemu
-zvmi qemu --snapshot
+zvmi qemu AzureLinux
+zvmi qemu AzureLinux --snapshot
 ```
 
 `--skip-iso-rootfs` is useful with genuinely minimal base containers: it keeps
@@ -773,7 +776,8 @@ ghr install cataggar/qemu
 Then run the command from the directory where the VM disk should live:
 
 ```text
-zvmi qemu
+zvmi qemu AzureLinux
+zvmi qemu AzureLinux-4.0-x86_64
 ```
 
 If `AzureLinux-4.0-x86_64.qcow2` is absent, `zvmi` runs the verified ghr
@@ -781,37 +785,71 @@ download for
 `cataggar/zvmi/AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260717`.
 Existing images are never refreshed or overwritten. QEMU and its matching
 EDK2 firmware are resolved from the `cataggar/qemu` ghr installation first,
-then from a system QEMU/OVMF installation.
+then from a system QEMU/UEFI installation. Directory-prefixed aliases such as
+`zvmi qemu images/AzureLinux-4.0-x86_64` place the downloaded disk and
+firmware under that directory.
 
 The published images use the direct UKI boot path described above. Local QEMU
 launches must keep Secure Boot disabled until the UKI signing work in issue
 #168 is complete. `--architecture x86_64|aarch64` selects q35/OVMF or
 virt/AAVMF respectively; `--architecture auto` requires an unambiguous
-architecture-bearing GPT root/USR GUID or UKI PE header.
+architecture-bearing GPT root/USR GUID or UKI PE header. `AzureLinux` remains
+the short alias for the x86_64 Azure Linux image, while exact catalog aliases
+select their corresponding architecture.
 
-The default boot is persistent: QEMU writes directly to the image, and a
-matching `AzureLinux-4.0-x86_64.vars.fd` UEFI variables file is created once
-beside it and reused. Use snapshot mode when guest changes should be discarded:
+Before launch, the command creates or reuses a complete image-adjacent bundle:
 
 ```text
-zvmi qemu --snapshot
+AzureLinux-4.0-x86_64.qcow2
+AzureLinux-4.0-x86_64.code.fd
+AzureLinux-4.0-x86_64.vars.fd
+```
+
+QEMU and matching EDK2 firmware are resolved from the `cataggar/qemu` ghr
+installation first, then from a system QEMU/UEFI installation. Missing bundle
+firmware is copied from raw sources or decompressed from `.fd.bz2` sources.
+The installed QEMU package is never changed.
+
+The default boot is persistent: QEMU writes directly to the image and its
+`.vars.fd` guest UEFI state. Use snapshot mode when guest changes should be
+discarded:
+
+```text
+zvmi qemu AzureLinux --snapshot
 ```
 
 Snapshot mode uses the sibling `qemu-img` binary to create a temporary qcow2
-overlay plus a temporary UEFI variables copy; `zvmi` removes both when QEMU
-exits. The automatic accelerator uses WHPX/HVF/KVM only when host and guest
-architectures match, and TCG otherwise. Override it when needed:
+overlay and creates temporary UEFI variables directly from the pristine
+firmware source, not from the persistent `.vars.fd`. `zvmi` removes both when
+QEMU exits. The automatic accelerator is WHPX for x86_64 Windows, HVF for
+same-architecture macOS guests, KVM for same-architecture Linux guests when
+`/dev/kvm` is available, and TCG otherwise. Override it when needed:
 
 ```text
-zvmi qemu --accel tcg
+zvmi qemu AzureLinux --accel tcg
 ```
 
 An explicit image path must already exist. Without an architecture option it
-keeps the x86_64 default; use `aarch64` or `auto` for Arm64 images:
+keeps the x86_64 default; exact Azure Linux catalog filenames select their
+corresponding architecture, and `aarch64` or `auto` can be used for other
+Arm64 images:
 
 ```text
+zvmi qemu ./AzureLinux-4.0-x86_64.qcow2
 zvmi qemu custom.qcow2
 ```
+
+The AArch64 profile is already wired for `qemu-system-aarch64`, `virt`, and
+AArch64 EDK2 firmware:
+
+```text
+zvmi qemu AzureLinux-4.0-aarch64
+```
+
+It becomes downloadable when the exact asset
+`AzureLinux-4.0-aarch64.qcow2` is published to release
+`AzureLinux-4.0-20260717`; until then, ghr reports the missing asset and the
+command exits without creating a partial bundle.
 
 Use `--qemu`, `--firmware-code`, and `--firmware-vars` (or the compatible
 `--ovmf-code`/`--ovmf-vars` names) for non-standard installations. Arguments
@@ -833,8 +871,9 @@ short-lived hybrid `cidata` ISO containing NoCloud metadata/user-data, Azure
 `ovf-env.xml`, and the explicit `zvmi-local-provisioning` marker, then removes
 the seed and temporary launch state when QEMU exits.
 
-This command is intentionally a focused launcher for the published x86_64
-Gen2 Azure Linux image, not a general VM configuration manager.
+This command is intentionally a focused launcher for the cataloged Azure Linux
+Gen2 images plus compatible explicit disks, not a general VM configuration
+manager.
 
 `convert` skips all-zero chunks (aligned to the destination's block size for
 sparse block formats such as dynamic vhd and vhdx), so converting a

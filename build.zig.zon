@@ -4,7 +4,12 @@
     .fingerprint = 0x918747103382f4de,
     .minimum_zig_version = "0.16.0",
 
-    .dependencies = .{},
+    .dependencies = .{
+        .bzip2 = .{
+            .url = "https://github.com/silver-signal/zig-bzip2/archive/refs/tags/1.0.8.tar.gz",
+            .hash = "bzip2-1.0.8-U45n218UAAD7Ic57yiQVR6us3Q0A-VgMmwiMXZUUGMke",
+        },
+    },
 
     .paths = .{
         "build.zig",
@@ -12,6 +17,7 @@
         "build",
         "packages",
         "cli",
+        "qemu",
         "qmp",
         "nbd",
         "qcow2",
@@ -22,5 +28,6 @@
         "tests",
         "README.md",
         "LICENSE",
+        "THIRD_PARTY_NOTICES.md",
     },
 }
