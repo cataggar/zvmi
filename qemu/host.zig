@@ -1259,7 +1259,9 @@ test "concurrent pair materialization publishes one complete bundle" {
     try std.testing.expectEqualStrings(source_bytes, vars);
 
     var entries: usize = 0;
-    var iterator = tmp.dir.iterate();
+    var iterable_dir = try Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
+    defer iterable_dir.close(io);
+    var iterator = iterable_dir.iterate();
     while (try iterator.next(io)) |_| entries += 1;
     try std.testing.expectEqual(@as(usize, 4), entries);
 }
