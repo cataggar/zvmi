@@ -2,6 +2,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import types
 import unittest
 from pathlib import Path
@@ -220,6 +221,24 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         )
         for action, _ in actions:
             self.assertRegex(action, r"@[0-9a-f]{40}$")
+
+    def test_release_workflow_uses_fail_closed_runner_probe(self):
+        workflow = (ROOT / ".github/workflows/azurelinux4-release.yml").read_text()
+        invocation = 'scripts/check_azurelinux4_release_runner.sh "$ARCHITECTURE"'
+        self.assertEqual(workflow.count(invocation), 1)
+        self.assertNotIn("test -r /dev/kvm", workflow)
+
+    def test_runner_probe_help_and_invalid_architecture(self):
+        script = ROOT / "scripts/check_azurelinux4_release_runner.sh"
+        subprocess.run(["bash", script, "--help"], check=True, capture_output=True)
+        result = subprocess.run(
+            ["bash", script, "riscv64"], check=False, capture_output=True
+        )
+        self.assertEqual(result.returncode, 2)
+        text = script.read_text()
+        self.assertIn("timeout --signal=TERM --kill-after=2s 2s", text)
+        self.assertNotIn("-daemonize", text)
+        self.assertNotIn("-pidfile", text)
 
     def test_resource_group_state_precedes_create_and_cleanup_is_guarded(self):
         script = (ROOT / "scripts/azurelinux4_azure_acceptance.sh").read_text()

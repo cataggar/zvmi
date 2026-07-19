@@ -664,6 +664,21 @@ self-hosted Ubuntu runners with the standard `self-hosted`, `Linux`, and
 and enough workspace for a 5 GiB candidate. The workflow installs the
 remaining image/QEMU packages and never substitutes TCG for acceptance.
 
+Before registering a runner, install the architecture-specific QEMU package
+and run the same fail-closed readiness probe used by the workflow:
+
+```sh
+# AArch64
+sudo apt-get update
+sudo apt-get install -y qemu-system-arm
+scripts/check_azurelinux4_release_runner.sh aarch64
+```
+
+It must print `architecture=aarch64 accelerator=kvm`. A native Arm64 machine
+without a readable and writable `/dev/kvm` is not release-capable; a
+GitHub-hosted Arm64 runner or an Azure Arm64 VM does not satisfy this gate.
+Use `x86_64` and install `qemu-system-x86` for the x86_64 runner.
+
 Real-Azure validation and publication use the protected
 `azurelinux4-release` GitHub environment. Configure it with required
 reviewers, allow deployments only from `main`, and create this OIDC federated
