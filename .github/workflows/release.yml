@@ -128,7 +128,7 @@ jobs:
 
           mkdir -p "$package/bin"
           cp "$source_executable" "$package/bin/"
-          cp LICENSE README.md "$package/"
+          cp LICENSE README.md THIRD_PARTY_NOTICES.md "$package/"
 
           executable_count=$(find "$package/bin" -maxdepth 1 -type f | wc -l | tr -d ' ')
           test "$executable_count" = 1

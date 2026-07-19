@@ -45,6 +45,22 @@ pub fn build(b: *std.Build) void {
         "azurelinux-flavor",
         "Azure Linux guest flavor: core (default, zvminit) or full (official vm-base/systemd)",
     ) orelse .core;
+    const bzip2 = b.dependency("bzip2", .{
+        .target = target,
+        .optimize = optimize,
+        .linkage = .static,
+        .bz2 = true,
+        .bzip2 = false,
+        .bzip2recover = false,
+    });
+    const host_bzip2 = b.dependency("bzip2", .{
+        .target = b.graph.host,
+        .optimize = optimize,
+        .linkage = .static,
+        .bz2 = true,
+        .bzip2 = false,
+        .bzip2recover = false,
+    });
 
     // ---- packages/zvmi: the core disk-image library ----
     const zvmi_mod = b.addModule("zvmi", .{
@@ -74,7 +90,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("qemu/host.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
+    qemu_host_mod.linkLibrary(bzip2.artifact("bz2"));
     const guest_validation_mod = b.addModule("guest_validation", .{
         .root_source_file = b.path("azagent/validation.zig"),
         .target = target,
@@ -335,7 +353,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("qemu/host.zig"),
         .target = b.graph.host,
         .optimize = optimize,
+        .link_libc = true,
     });
+    host_qemu_host_mod.linkLibrary(host_bzip2.artifact("bz2"));
     const freebsd_boot_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/freebsd15_aarch64_boot.zig"),
