@@ -445,9 +445,10 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         self.assertIn("tests/efi_signing_probe.zig", workflow)
         self.assertIn('"$UKI_SIGN_COMMAND" sign', workflow)
         self.assertIn(
-            'sbverify --cert "$UKI_SIGNING_CERTIFICATE" "$signed"',
+            'sbverify --verbose --cert "$UKI_SIGNING_CERTIFICATE" "$signed"',
             workflow,
         )
+        self.assertIn("Upload failed signing probe", workflow)
         self.assertIn("--uki-sign-command \"$UKI_SIGN_COMMAND\"", workflow)
         self.assertIn("--uki-sign-command-arg sign", workflow)
         self.assertIn("ZVMI_AZURE_TENANT_ID", workflow)
