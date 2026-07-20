@@ -539,7 +539,22 @@ fn runSanitizedWithEnvironment(
         .exited => |code| if (code == 0) return,
         else => {},
     }
+    if (signerErrorName(result.stderr)) |error_name| {
+        std.debug.print("signing command failed: {s}\n", .{error_name});
+    }
     return error.SigningCommandFailed;
+}
+
+fn signerErrorName(stderr: []const u8) ?[]const u8 {
+    const prefix = "zvmi sign: failed: ";
+    var line = std.mem.trimEnd(u8, stderr, "\r\n");
+    if (!std.mem.startsWith(u8, line, prefix)) return null;
+    line = line[prefix.len..];
+    if (line.len == 0 or line.len > 128) return null;
+    for (line) |byte| {
+        if (!(std.ascii.isAlphanumeric(byte) or byte == '_')) return null;
+    }
+    return line;
 }
 
 test "signing mode names are stable provenance values" {
@@ -550,6 +565,19 @@ test "signing mode names are stable provenance values" {
         .executable_path = "/test/signer",
         .argument = "sign",
     } }).name());
+}
+
+test "only safe built-in signer error names are reported" {
+    try std.testing.expectEqualStrings(
+        "ArtifactSigningSubmitFailed",
+        signerErrorName(
+            "zvmi sign: failed: ArtifactSigningSubmitFailed\n",
+        ).?,
+    );
+    try std.testing.expect(signerErrorName("secret output") == null);
+    try std.testing.expect(
+        signerErrorName("zvmi sign: failed: Bad\nInjected") == null,
+    );
 }
 
 test "certificate fingerprints accept canonical SHA-256 forms" {
