@@ -17,7 +17,7 @@ const max_response_bytes = 1024 * 1024;
 const artifact_signing_api_version = "2024-06-15";
 const artifact_signing_scope = "https://codesigning.azure.net/.default";
 const artifact_signing_provider = "azure-artifact-signing";
-const github_oidc_prefix = "https://vstoken.actions.githubusercontent.com/";
+const github_oidc_host_suffix = ".actions.githubusercontent.com";
 const oidc_audience = "api%3A%2F%2FAzureADTokenExchange";
 
 const OidcResponse = struct {
@@ -953,11 +953,32 @@ fn encodePemCertificateAlloc(
 }
 
 fn validateOidcRequestUrl(url: []const u8) !void {
-    if (!std.mem.startsWith(u8, url, github_oidc_prefix) or
+    const https_prefix = "https://";
+    if (!std.mem.startsWith(u8, url, https_prefix) or
         std.mem.indexOfScalar(u8, url, '#') != null or
         std.mem.indexOfAny(u8, url, " \t\r\n") != null)
     {
         return error.InvalidGithubOidcUrl;
+    }
+    const authority_and_path = url[https_prefix.len..];
+    const path_start = std.mem.indexOfScalar(u8, authority_and_path, '/') orelse
+        return error.InvalidGithubOidcUrl;
+    const host = authority_and_path[0..path_start];
+    if (!std.mem.endsWith(u8, host, github_oidc_host_suffix))
+        return error.InvalidGithubOidcUrl;
+    const service = host[0 .. host.len - github_oidc_host_suffix.len];
+    if (service.len == 0 or service[0] == '-' or
+        service[service.len - 1] == '-' or
+        std.mem.indexOfScalar(u8, service, '.') != null)
+    {
+        return error.InvalidGithubOidcUrl;
+    }
+    for (service) |byte| {
+        if (!(std.ascii.isLower(byte) or std.ascii.isDigit(byte) or
+            byte == '-'))
+        {
+            return error.InvalidGithubOidcUrl;
+        }
     }
 }
 
@@ -1101,6 +1122,31 @@ test "OIDC audience is appended without replacing protected query data" {
             "https://vstoken.actions.githubusercontent.com/token?audience=wrong",
         ),
     );
+}
+
+test "GitHub OIDC request URLs allow official service host rotation" {
+    try validateOidcRequestUrl(
+        "https://vstoken.actions.githubusercontent.com/token?api-version=2.0",
+    );
+    try validateOidcRequestUrl(
+        "https://oidc.actions.githubusercontent.com/token?api-version=2.0",
+    );
+    const invalid_urls = [_][]const u8{
+        "http://vstoken.actions.githubusercontent.com/token",
+        "https://actions.githubusercontent.com/token",
+        "https://nested.vstoken.actions.githubusercontent.com/token",
+        "https://vstoken.actions.githubusercontent.com.evil.example/token",
+        "https://vstoken.actions.githubusercontent.com:443/token",
+        "https://user@vstoken.actions.githubusercontent.com/token",
+        "https://vstoken.actions.githubusercontent.com/token#fragment",
+        "https://vstoken.actions.githubusercontent.com/token\n",
+    };
+    for (invalid_urls) |url| {
+        try std.testing.expectError(
+            error.InvalidGithubOidcUrl,
+            validateOidcRequestUrl(url),
+        );
+    }
 }
 
 test "Artifact Signing endpoints and resource names are constrained" {
