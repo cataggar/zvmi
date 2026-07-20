@@ -226,7 +226,8 @@ pub fn finishRsaSha256Alloc(
     return finishRsaSha256WithChainAlloc(allocator, prepared, certificate_der, &.{}, rsa_signature);
 }
 
-/// Embeds an RSA/SHA-256 signature and complete X.509 certificate chain.
+/// Embeds an RSA/SHA-256 signature and X.509 certificate chain, omitting
+/// self-issued roots that verifiers must obtain from their trust store.
 /// Ownership of `prepared` stays with caller.
 pub fn finishRsaSha256WithChainAlloc(
     allocator: std.mem.Allocator,
@@ -398,6 +399,7 @@ fn makeAttribute(allocator: std.mem.Allocator, oid: []const u8, value_set: []con
 
 const IssuerAndSerial = struct {
     issuer: []const u8,
+    subject: []const u8,
     serial: []const u8,
 };
 
@@ -414,7 +416,12 @@ fn makeCertificateSet(
 
     var unique_count: usize = 0;
     for (all_certificates) |certificate| {
-        _ = try extractIssuerAndSerial(certificate);
+        const identity = try extractIssuerAndSerial(certificate);
+        if (!std.mem.eql(u8, certificate, signing_certificate) and
+            std.mem.eql(u8, identity.issuer, identity.subject))
+        {
+            continue;
+        }
         var duplicate = false;
         for (all_certificates[0..unique_count]) |existing| {
             if (std.mem.eql(u8, certificate, existing)) {
@@ -471,6 +478,14 @@ fn extractIssuerAndSerial(certificate: []const u8) Error!IssuerAndSerial {
     const issuer = certificate[issuer_field.start..issuer_field.end];
 
     index = issuer_field.end;
+    const validity_field = try parseCertificateElement(certificate, index);
+    if (validity_field.tag != 0x30) return error.InvalidCertificate;
+    index = validity_field.end;
+    const subject_field = try parseCertificateElement(certificate, index);
+    if (subject_field.tag != 0x30) return error.InvalidCertificate;
+    const subject = certificate[subject_field.start..subject_field.end];
+
+    index = subject_field.end;
     while (index < tbs.end) index = (try parseCertificateElement(certificate, index)).end;
     if (index != tbs.end) return error.InvalidCertificate;
     index = tbs.end;
@@ -478,7 +493,7 @@ fn extractIssuerAndSerial(certificate: []const u8) Error!IssuerAndSerial {
     if (outer_signature.tag != 0x30) return error.InvalidCertificate;
     const signature_value = try parseCertificateElement(certificate, outer_signature.end);
     if (signature_value.tag != 0x03 or signature_value.end != outer.end) return error.InvalidCertificate;
-    return .{ .issuer = issuer, .serial = serial };
+    return .{ .issuer = issuer, .subject = subject, .serial = serial };
 }
 
 fn makeCms(
@@ -800,7 +815,7 @@ test "finish rejects malformed certificates and unsupported signatures" {
     );
 }
 
-test "chain-aware finish embeds a sorted deduplicated certificate set" {
+test "chain-aware finish omits self-issued roots and deduplicates certificates" {
     const allocator = std.testing.allocator;
     const image = try makeTestPe(allocator, 512);
     defer allocator.free(image);
@@ -808,7 +823,8 @@ test "chain-aware finish embeds a sorted deduplicated certificate set" {
     defer prepared.deinit(allocator);
     const leaf = testCertificate();
     const intermediate = testCertificateTwo();
-    const chain = [_][]const u8{ intermediate, leaf, intermediate };
+    const root = testCertificateThree();
+    const chain = [_][]const u8{ root, intermediate, leaf, root, intermediate };
     const signature = [_]u8{0} ** 256;
     const signed = try finishRsaSha256WithChainAlloc(allocator, prepared, leaf, &chain, &signature);
     defer allocator.free(signed);
@@ -948,8 +964,14 @@ fn testCertificate() []const u8 {
 }
 
 fn testCertificateTwo() []const u8 {
+    return "\x30\x1c" ++
+        "\x30\x15\xa0\x03\x02\x01\x02\x02\x02\x00\x02\x30\x00\x30\x02\x05\x00\x30\x00\x30\x00\x30\x00" ++
+        "\x30\x00\x03\x01\x00";
+}
+
+fn testCertificateThree() []const u8 {
     return "\x30\x1a" ++
-        "\x30\x13\xa0\x03\x02\x01\x02\x02\x02\x00\x02\x30\x00\x30\x00\x30\x00\x30\x00\x30\x00" ++
+        "\x30\x13\xa0\x03\x02\x01\x02\x02\x02\x00\x03\x30\x00\x30\x00\x30\x00\x30\x00\x30\x00" ++
         "\x30\x00\x03\x01\x00";
 }
 
