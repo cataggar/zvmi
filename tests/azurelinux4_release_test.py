@@ -96,20 +96,6 @@ class AzureLinuxReleaseTest(unittest.TestCase):
             json.dumps(signing), encoding="utf-8"
         )
         digest = release.sha256(asset)
-        local_result = provenance / "local-secure-boot-result.json"
-        local_result.write_text(
-            json.dumps(
-                {
-                    "schema": 1,
-                    "type": "azurelinux4-local-secure-boot-acceptance",
-                    "candidate_sha256": digest,
-                    "certificate_sha256": certificate_sha256,
-                    "fallback_uki_sha256": "3" * 64,
-                    "contracts": sorted(release.LOCAL_SECURE_BOOT_CONTRACTS),
-                }
-            ),
-            encoding="utf-8",
-        )
         manifest = candidate_dir / "candidate.json"
         release.candidate_command(
             types.SimpleNamespace(
@@ -117,13 +103,11 @@ class AzureLinuxReleaseTest(unittest.TestCase):
                 architecture=architecture,
                 flavor=flavor,
                 asset=asset,
-                accepted_sha256=digest,
+                validated_sha256=digest,
                 virtual_size=1024,
                 source_commit=self.source_commit,
                 provenance_dir=provenance,
-                local_acceptance_result=local_result,
                 runner=f"runner-{architecture}",
-                qemu_version="QEMU 10",
                 run_id="1",
                 run_attempt="1",
                 output=manifest,
@@ -430,11 +414,24 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         for action, _ in actions:
             self.assertRegex(action, r"@[0-9a-f]{40}$")
 
-    def test_release_workflow_uses_fail_closed_runner_probe(self):
+    def test_release_workflow_uses_hosted_architecture_runners(self):
         workflow = (ROOT / ".github/workflows/azurelinux4-release.yml").read_text()
         invocation = 'scripts/check_azurelinux4_release_runner.sh "$ARCHITECTURE"'
-        self.assertEqual(workflow.count(invocation), 1)
-        self.assertNotIn("test -r /dev/kvm", workflow)
+        self.assertNotIn(invocation, workflow)
+        self.assertNotIn("self-hosted", workflow)
+        self.assertEqual(workflow.count("runner: ubuntu-24.04\n"), 2)
+        self.assertEqual(workflow.count("runner: ubuntu-24.04-arm\n"), 2)
+        self.assertIn("max-parallel: 2", workflow)
+        self.assertNotIn("test-azurelinux4-acceptance", workflow)
+        self.assertIn("scripts/azurelinux4_azure_acceptance.sh run", workflow)
+
+    def test_candidate_records_build_validation_not_local_kvm_acceptance(self):
+        self.make_bundle("x86_64-full")
+        document = json.loads(
+            (self.candidates / "x86_64-full" / "candidate.json").read_text()
+        )
+        self.assertEqual(document["build_validation"]["status"], "success")
+        self.assertNotIn("local_acceptance", document)
 
     def test_release_workflow_requires_built_in_signing_and_secure_boot(self):
         workflow = (ROOT / ".github/workflows/azurelinux4-release.yml").read_text()

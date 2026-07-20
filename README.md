@@ -540,7 +540,9 @@ the ISO LiveOS/Anaconda rootfs. A pinned core OCI is used only to extract and
 checksum/fingerprint-validate the RPM signing key before its filesystem is
 discarded. Full verifies ISO kernel/initramfs releases against installed
 kernel-core/kernel-modules rather than emitting an incoherent userspace/module
-mix.
+mix. Its kernel and kernel-modules package requests are pinned to the release
+inside the checksum-pinned ISO's nested `LiveOS` rootfs, and the builder mounts
+that nested rootfs to verify the exact release before image assembly.
 
 The recipe creates bounded flavor-specific OCI layers, validates rootfs
 identity cleanup, GPT/root GUIDs, fallback EFI, UKI PE sections/cmdline,
@@ -559,11 +561,14 @@ builder verifies the live metadata, populates an isolated per-build DNF
 cache/persist directory, verifies DNF's cached `repomd.xml`, and performs the
 transaction with metadata expiration disabled globally and for
 `azurelinux-base`. That prevents metadata refresh while allowing DNF to
-download uncached RPM payloads. DNF then verifies RPM signatures and package
-payload checksums from that pinned metadata. The cached and live metadata are
-verified again after the transaction; a repository change fails the build. The
-newly installed, sorted NEVRA closure is emitted and recorded under the builder
-work directory's `provenance/` directory.
+download uncached RPM payloads. Payload downloads use a one-byte-per-second
+minimum rate, a five-minute timeout, and twenty retries so a slow Microsoft
+package endpoint does not discard an otherwise valid pinned transaction. DNF
+then verifies RPM signatures and package payload checksums from that pinned
+metadata. The cached and live metadata are verified again after the
+transaction; a repository change fails the build. The newly installed, sorted
+NEVRA closure is emitted and recorded under the builder work directory's
+`provenance/` directory.
 
 The image boots directly through `UEFI -> EFI/BOOT/BOOTX64.EFI` (x86_64) or
 `EFI/BOOT/BOOTAA64.EFI` (AArch64) `-> UKI -> kernel/initramfs -> zvminit`; it
@@ -682,14 +687,15 @@ profile. Release UKIs are trusted through the exact Artifact Signing leaf enroll
 `AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260717`. Select an AArch64 or
 core file explicitly when needed.
 
-The manual release workflow builds and externally signs all four candidates on native ephemeral
-self-hosted Ubuntu runners with the standard `self-hosted`, `Linux`, and
-`X64`/`ARM64` labels. Each runner must provide passwordless sudo, native KVM,
-and enough workspace for a 5 GiB candidate. The workflow installs the
-remaining image/QEMU packages and never substitutes TCG for acceptance.
+The manual release workflow builds and externally signs all four candidates on
+GitHub-hosted `ubuntu-24.04` and `ubuntu-24.04-arm` runners. Hosted jobs perform
+structural QCOW2, GPT, UKI, provenance, and digest validation. They do not
+require local KVM or claim a local native boot result; the exact candidate
+bytes must pass the protected Azure acceptance matrix on matching x86_64 and
+AArch64 VMs before publication.
 
-Before registering a runner, install the architecture-specific QEMU package
-and run the same fail-closed readiness probe used by the workflow:
+The fail-closed native KVM test remains available for optional validation on a
+suitable machine:
 
 ```sh
 # AArch64
@@ -698,10 +704,9 @@ sudo apt-get install -y qemu-system-arm
 scripts/check_azurelinux4_release_runner.sh aarch64
 ```
 
-It must print `architecture=aarch64 accelerator=kvm`. A native Arm64 machine
-without a readable and writable `/dev/kvm` is not release-capable; a
-GitHub-hosted Arm64 runner or an Azure Arm64 VM does not satisfy this gate.
-Use `x86_64` and install `qemu-system-x86` for the x86_64 runner.
+It must print `architecture=aarch64 accelerator=kvm`. Use `x86_64` and install
+`qemu-system-x86` for optional x86_64 validation. This probe is not part of
+the hosted release gate.
 
 Build/sign/local acceptance use the separate protected `azurelinux4-signing` GitHub environment, restricted to `main` with required reviewers. It defines these variables:
 

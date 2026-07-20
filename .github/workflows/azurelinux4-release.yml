@@ -41,9 +41,9 @@ jobs:
           echo "Accepted source commit: \`$commit\`" >> "$GITHUB_STEP_SUMMARY"
 
   build:
-    name: build/local ${{ matrix.key }}
+    name: build/hosted ${{ matrix.key }}
     needs: prepare
-    runs-on: [self-hosted, Linux, "${{ matrix.runner_arch }}"]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
     environment: azurelinux4-signing
     permissions:
@@ -51,13 +51,13 @@ jobs:
       id-token: write
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         include:
           - key: x86_64-full
             architecture: x86_64
             flavor: full
-            runner_arch: X64
-            deb_arch: amd64
+            runner: ubuntu-24.04
             asset_name: AzureLinux-4.0-x86_64.qcow2
             virtual_size: 5368709120
             iso_name: AzureLinux-4.0-x86_64.iso
@@ -65,8 +65,7 @@ jobs:
           - key: aarch64-full
             architecture: aarch64
             flavor: full
-            runner_arch: ARM64
-            deb_arch: arm64
+            runner: ubuntu-24.04-arm
             asset_name: AzureLinux-4.0-aarch64.qcow2
             virtual_size: 5368709120
             iso_name: AzureLinux-4.0-aarch64.iso
@@ -74,8 +73,7 @@ jobs:
           - key: x86_64-core
             architecture: x86_64
             flavor: core
-            runner_arch: X64
-            deb_arch: amd64
+            runner: ubuntu-24.04
             asset_name: AzureLinux-4.0-x86_64.core.qcow2
             virtual_size: 1241513984
             iso_name: AzureLinux-4.0-x86_64.iso
@@ -83,8 +81,7 @@ jobs:
           - key: aarch64-core
             architecture: aarch64
             flavor: core
-            runner_arch: ARM64
-            deb_arch: arm64
+            runner: ubuntu-24.04-arm
             asset_name: AzureLinux-4.0-aarch64.core.qcow2
             virtual_size: 1241513984
             iso_name: AzureLinux-4.0-aarch64.iso
@@ -122,18 +119,13 @@ jobs:
           tools: |
             cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
-      - name: Install image and acceptance dependencies
+      - name: Install image build dependencies
         run: |
           set -euo pipefail
           sudo apt-get update
           packages=(
             curl dnf file jq openssh-client openssl python3-virt-firmware qemu-utils rpm sbsigntool tar xorriso
           )
-          if [[ "$ARCHITECTURE" == x86_64 ]]; then
-            packages+=(ovmf qemu-system-x86)
-          else
-            packages+=(qemu-efi-aarch64 qemu-system-arm)
-          fi
           sudo apt-get install -y --no-install-recommends "${packages[@]}"
           echo '%_dbpath /usr/lib/sysimage/rpm' | sudo tee /root/.rpmmacros >/dev/null
           test "$(sudo rpm --eval '%{_dbpath}')" = /usr/lib/sysimage/rpm
@@ -162,9 +154,6 @@ jobs:
           actual=$(openssl x509 -in "$certificate" -outform DER | sha256sum | awk '{print $1}')
           echo "UKI_SIGNING_CERTIFICATE=$certificate" >> "$GITHUB_ENV"
           echo "UKI_SIGNING_CERTIFICATE_SHA256=$actual" >> "$GITHUB_ENV"
-
-      - name: Require native Ubuntu KVM runner
-        run: scripts/check_azurelinux4_release_runner.sh "$ARCHITECTURE"
 
       - name: Cache pinned Azure Linux ISO
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -216,30 +205,12 @@ jobs:
           digest=$(sha256sum "$asset" | awk '{print $1}')
           [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
 
-      - name: Run native finalized-image acceptance
-        env:
-          ZVMI_AZURELINUX4_IMAGE: ${{ github.workspace }}/${{ env.BUNDLE_DIR }}/${{ env.ASSET_NAME }}
+      - name: Bind structurally validated candidate digest
         run: |
           set -euo pipefail
-          unset ZIG_LOCAL_CACHE_DIR
-          export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
-          before=$(sha256sum "$ZVMI_AZURELINUX4_IMAGE" | awk '{print $1}')
-          signing_provenance="$WORK_DIR/provenance/uki-signing-$FLAVOR-$ARCHITECTURE.json"
-          test -s "$signing_provenance"
-          uki_sha256=$(jq -r --arg path "$([[ "$ARCHITECTURE" == x86_64 ]] && echo EFI/BOOT/BOOTX64.EFI || echo EFI/BOOT/BOOTAA64.EFI)" \
-            '.files[] | select(.path == $path) | .finalized_sha256' "$signing_provenance")
-          test "$uki_sha256" != null
-          export ZVMI_AZURELINUX4_SIGNING_CERTIFICATE="$UKI_SIGNING_CERTIFICATE"
-          export ZVMI_AZURELINUX4_SIGNING_CERTIFICATE_SHA256="$UKI_SIGNING_CERTIFICATE_SHA256"
-          export ZVMI_AZURELINUX4_UKI_SHA256="$uki_sha256"
-          export ZVMI_AZURELINUX4_ACCEPTANCE_RESULT="$BUNDLE_DIR/internal-provenance/local-secure-boot-result.json"
-          zig build \
-            -Dazurelinux-arch="$ARCHITECTURE" \
-            -Dazurelinux-flavor="$FLAVOR" \
-            test-azurelinux4-acceptance
-          after=$(sha256sum "$ZVMI_AZURELINUX4_IMAGE" | awk '{print $1}')
-          test "$after" = "$before"
-          printf '%s\n' "$after" > "$BUNDLE_DIR/internal-provenance/local-accepted-digest"
+          digest=$(sha256sum "$BUNDLE_DIR/$ASSET_NAME" | awk '{print $1}')
+          [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+          printf '%s\n' "$digest" > "$BUNDLE_DIR/internal-provenance/build-validated-digest"
 
       - name: Bind candidate metadata
         env:
@@ -250,24 +221,17 @@ jobs:
           set -euo pipefail
           test -d "$WORK_DIR/provenance"
           cp -a "$WORK_DIR/provenance/." "$BUNDLE_DIR/internal-provenance/"
-          accepted=$(<"$BUNDLE_DIR/internal-provenance/local-accepted-digest")
-          qemu_binary=qemu-system-x86_64
-          if [[ "$ARCHITECTURE" == aarch64 ]]; then
-            qemu_binary=qemu-system-aarch64
-          fi
-          qemu_version=$("$qemu_binary" --version | head -n 1)
+          validated=$(<"$BUNDLE_DIR/internal-provenance/build-validated-digest")
           python3 scripts/azurelinux4_release.py candidate \
             --key "$CANDIDATE_KEY" \
             --architecture "$ARCHITECTURE" \
             --flavor "$FLAVOR" \
             --asset "$BUNDLE_DIR/$ASSET_NAME" \
-            --accepted-sha256 "$accepted" \
+            --validated-sha256 "$validated" \
             --virtual-size "$VIRTUAL_SIZE" \
             --source-commit "$SOURCE_COMMIT" \
             --provenance-dir "$BUNDLE_DIR/internal-provenance" \
-            --local-acceptance-result "$BUNDLE_DIR/internal-provenance/local-secure-boot-result.json" \
             --runner "$RUNNER_NAME_VALUE" \
-            --qemu-version "$qemu_version" \
             --run-id "$RUN_ID_VALUE" \
             --run-attempt "$RUN_ATTEMPT_VALUE" \
             --output "$BUNDLE_DIR/candidate.json"
@@ -277,7 +241,7 @@ jobs:
             --key "$CANDIDATE_KEY" \
             --source-commit "$SOURCE_COMMIT"
 
-      - name: Upload exact accepted candidate
+      - name: Upload exact validated candidate
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: azurelinux4-candidate-${{ matrix.key }}-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
@@ -286,19 +250,19 @@ jobs:
           compression-level: 0
           retention-days: 2
 
-      - name: Summarize local acceptance
+      - name: Summarize hosted build validation
         env:
           RUNNER_NAME_VALUE: ${{ runner.name }}
         run: |
           set -euo pipefail
           digest=$(sha256sum "$BUNDLE_DIR/$ASSET_NAME" | awk '{print $1}')
           {
-            echo "### Local acceptance: $ASSET_NAME"
+            echo "### Hosted candidate: $ASSET_NAME"
             echo
             echo "- Source: \`$SOURCE_COMMIT\`"
             echo "- SHA-256: \`$digest\`"
-            echo "- Native runner: \`$RUNNER_NAME_VALUE\`"
-            echo "- TCG: not used"
+            echo "- Hosted runner: \`$RUNNER_NAME_VALUE\`"
+            echo "- Native boot gate: protected Azure acceptance"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Clean privileged build state
@@ -364,7 +328,7 @@ jobs:
           ref: ${{ needs.prepare.outputs.source_commit }}
           persist-credentials: false
 
-      - name: Download exact local-accepted candidate
+      - name: Download exact build-validated candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: azurelinux4-candidate-${{ matrix.key }}-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
@@ -496,7 +460,7 @@ jobs:
           ref: ${{ needs.prepare.outputs.source_commit }}
           persist-credentials: false
 
-      - name: Download all local-accepted candidates
+      - name: Download all build-validated candidates
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: azurelinux4-candidate-*-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}

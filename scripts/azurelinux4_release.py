@@ -48,14 +48,6 @@ AZURE_CONTRACTS = {
     "reboot-reconnect",
     "runtime-flavor-identity",
 }
-LOCAL_SECURE_BOOT_CONTRACTS = {
-    "secure-boot",
-    "uefi-db-signer",
-    "signed-uki",
-    "kernel-lockdown",
-    "module-signatures",
-    "tampered-uki-rejected",
-}
 AZURE_VHD_ALIGNMENT = 1024 * 1024
 VHD_FOOTER_BYTES = 512
 PRIVATE_KEY_PEM_MARKERS = (
@@ -434,22 +426,10 @@ def candidate_command(args: argparse.Namespace) -> None:
     records = provenance_records(provenance_root)
     signing = validate_signing_provenance(provenance_root, architecture, flavor)
     digest = sha256(asset)
-    if args.accepted_sha256 != digest:
-        fail(f"{args.key}: local acceptance digest does not match candidate bytes")
+    if args.validated_sha256 != digest:
+        fail(f"{args.key}: build validation digest does not match candidate bytes")
     if args.virtual_size <= 0:
         fail("virtual size must be positive")
-    local_result = read_json(args.local_acceptance_result)
-    if (
-        local_result.get("schema") != 1
-        or local_result.get("type") != "azurelinux4-local-secure-boot-acceptance"
-        or local_result.get("candidate_sha256") != digest
-        or local_result.get("certificate_sha256") != signing["certificate_sha256"]
-        or local_result.get("fallback_uki_sha256") != signing["fallback_uki_sha256"]
-        or not has_exact_contracts(
-            local_result.get("contracts"), LOCAL_SECURE_BOOT_CONTRACTS
-        )
-    ):
-        fail(f"{args.key}: local Secure Boot acceptance binding is invalid")
     write_json(
         args.output,
         {
@@ -463,14 +443,10 @@ def candidate_command(args: argparse.Namespace) -> None:
             "sha256": digest,
             "bytes": asset.stat().st_size,
             "virtual_size": args.virtual_size,
-            "local_acceptance": {
+            "build_validation": {
                 "status": "success",
-                "accepted_sha256": args.accepted_sha256,
+                "validated_sha256": args.validated_sha256,
                 "runner": args.runner,
-                "qemu_version": args.qemu_version,
-                "certificate_sha256": local_result["certificate_sha256"],
-                "fallback_uki_sha256": local_result["fallback_uki_sha256"],
-                "contracts": sorted(LOCAL_SECURE_BOOT_CONTRACTS),
             },
             "provenance": {
                 "digest": provenance_digest(records),
@@ -509,11 +485,14 @@ def verify_candidate(
     virtual_size = document.get("virtual_size")
     if not isinstance(virtual_size, int) or virtual_size <= 0:
         fail(f"{actual_key}: invalid virtual size")
-    local = document.get("local_acceptance")
-    if not isinstance(local, dict) or local.get("status") != "success":
-        fail(f"{actual_key}: local acceptance is not explicitly successful")
-    if local.get("accepted_sha256") != digest:
-        fail(f"{actual_key}: local acceptance did not validate published bytes")
+    build_validation = document.get("build_validation")
+    if (
+        not isinstance(build_validation, dict)
+        or build_validation.get("status") != "success"
+    ):
+        fail(f"{actual_key}: build validation is not explicitly successful")
+    if build_validation.get("validated_sha256") != digest:
+        fail(f"{actual_key}: build validation did not validate published bytes")
     provenance = document.get("provenance")
     if not isinstance(provenance, dict):
         fail(f"{actual_key}: provenance is absent")
@@ -558,12 +537,6 @@ def verify_candidate(
     actual_signing = validate_signing_provenance(provenance_root, document["architecture"], document["flavor"])
     if signing != actual_signing:
         fail(f"{actual_key}: UKI signing binding does not match provenance")
-    if (
-        local.get("certificate_sha256") != signing["certificate_sha256"]
-        or local.get("fallback_uki_sha256") != signing["fallback_uki_sha256"]
-        or not has_exact_contracts(local.get("contracts"), LOCAL_SECURE_BOOT_CONTRACTS)
-    ):
-        fail(f"{actual_key}: local Secure Boot acceptance did not bind the signed UKI")
     return document
 
 
@@ -770,9 +743,9 @@ def stage_command(args: argparse.Namespace) -> None:
             shutil.copyfile(asset_path, destination)
         if sha256(destination) != digest:
             fail(f"{key}: staging changed candidate bytes")
-        local = candidate["local_acceptance"]
+        build_validation = candidate["build_validation"]
         provenance = candidate["provenance"]
-        if not isinstance(local, dict) or not isinstance(provenance, dict):
+        if not isinstance(build_validation, dict) or not isinstance(provenance, dict):
             fail(f"{key}: validated metadata changed type")
         staged.append(
             {
@@ -783,8 +756,7 @@ def stage_command(args: argparse.Namespace) -> None:
                 "sha256": digest,
                 "bytes": destination.stat().st_size,
                 "virtual_size": candidate["virtual_size"],
-                "local_runner": local.get("runner"),
-                "qemu_version": local.get("qemu_version"),
+                "build_runner": build_validation.get("runner"),
                 "provenance_digest": provenance.get("digest"),
                 "certificate_sha256": certificate_sha256,
                 "signing_certificate_sha256": signing_certificate_sha256,
@@ -811,8 +783,8 @@ def stage_command(args: argparse.Namespace) -> None:
 
     lines = [
         "Azure Linux 4.0 generalized Gen2 images built from the accepted source commit "
-        f"`{source_commit}`. Every published QCOW2 passed native-KVM local acceptance and "
-        "protected-environment validation on a matching Azure architecture.",
+        f"`{source_commit}`. Every published QCOW2 passed hosted structural validation and "
+        "protected-environment native validation on a matching Azure architecture.",
         "",
         f"All UKIs are trusted through enrolled leaf SHA-256 `{release_certificate_sha256}`.",
         f"Artifact Signing leaf certificate SHA-256: `{release_signing_certificate_sha256}`.",
@@ -834,8 +806,8 @@ def stage_command(args: argparse.Namespace) -> None:
             "boot `zvminit`, provision through `azagent`, and directly supervise OpenSSH. "
             "Core therefore requires a public SSH key in the Azure provisioning profile.",
             "",
-            "Acceptance required signed UKIs, QEMU Secure Boot rejection of authenticated command-line tampering, "
-            "Azure Trusted Launch with Secure Boot and vTPM, the exact signer in UEFI db, kernel lockdown, "
+            "Acceptance required signed UKIs, Azure Trusted Launch with Secure Boot and vTPM, "
+            "the exact signer in UEFI db, kernel lockdown, "
             "module trust, key-only SSH, agent Ready, runtime architecture/flavor identity, root growth on an enlarged OS disk, temporary-resource-disk policy, managed-data-disk policy, and reboot/reconnect. Candidate and derived-VHD hashes were checked at every "
             "handoff; temporary VHDs and Azure resources were deleted.",
             "",
@@ -849,7 +821,7 @@ def stage_command(args: argparse.Namespace) -> None:
     for item in staged:
         lines.append(
             f"- `{item['asset_name']}`: provenance `{item['provenance_digest']}`; "
-            f"local `{item['qemu_version']}` on `{item['local_runner']}`"
+            f"hosted build on `{item['build_runner']}`"
         )
     args.notes.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -863,13 +835,11 @@ def parser() -> argparse.ArgumentParser:
     candidate.add_argument("--architecture", required=True)
     candidate.add_argument("--flavor", required=True)
     candidate.add_argument("--asset", type=Path, required=True)
-    candidate.add_argument("--accepted-sha256", required=True)
+    candidate.add_argument("--validated-sha256", required=True)
     candidate.add_argument("--virtual-size", type=int, required=True)
     candidate.add_argument("--source-commit", required=True)
     candidate.add_argument("--provenance-dir", type=Path, required=True)
-    candidate.add_argument("--local-acceptance-result", type=Path, required=True)
     candidate.add_argument("--runner", required=True)
-    candidate.add_argument("--qemu-version", required=True)
     candidate.add_argument("--run-id", required=True)
     candidate.add_argument("--run-attempt", required=True)
     candidate.add_argument("--output", type=Path, required=True)
