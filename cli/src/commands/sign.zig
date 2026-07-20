@@ -699,6 +699,7 @@ fn artifactRequestAlloc(
     var request = try client.request(method, uri, .{
         .redirect_behavior = .not_allowed,
         .headers = .{
+            .accept_encoding = .{ .override = "identity" },
             .content_type = if (payload != null)
                 .{ .override = "application/json" }
             else
@@ -733,6 +734,8 @@ fn artifactRequestAlloc(
             ) catch return error.InvalidArtifactSigningRetryAfter;
         }
     }
+    if (response.head.content_encoding != .identity)
+        return error.UnexpectedArtifactSigningContentEncoding;
     var transfer_buffer: [8192]u8 = undefined;
     const body = try response.reader(&transfer_buffer).allocRemaining(
         allocator,
@@ -1350,6 +1353,17 @@ fn runMockArtifactSigningServerFallible(
     var handled: usize = 0;
     while (handled < mockArtifactSigningRequestCount(context.scenario)) : (handled += 1) {
         var request = try server.receiveHead();
+        var accepts_identity = false;
+        var request_headers = request.iterateHeaders();
+        while (request_headers.next()) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "Accept-Encoding") and
+                std.ascii.eqlIgnoreCase(header.value, "identity"))
+            {
+                accepts_identity = true;
+            }
+        }
+        if (!accepts_identity)
+            return error.UnexpectedMockArtifactSigningEncoding;
         if (handled == 0) {
             if (request.head.method != .POST)
                 return error.UnexpectedMockArtifactSigningRequest;
