@@ -97,6 +97,7 @@ jobs:
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
       WORK_DIR: .scratch/azurelinux4-release-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.key }}
       BUNDLE_DIR: artifact-staging/candidates/${{ matrix.key }}
+      SIGNING_PROBE_DIR: ${{ runner.temp }}/zvmi-signing-probe-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.key }}
       UKI_SIGN_COMMAND: ${{ github.workspace }}/zig-out/bin/zvmi
       ZVMI_AZURE_TENANT_ID: ${{ vars.ZVMI_AZURE_TENANT_ID }}
       ZVMI_AZURE_CLIENT_ID: ${{ vars.ZVMI_AZURE_CLIENT_ID }}
@@ -165,11 +166,12 @@ jobs:
             aarch64) target=aarch64-uefi ;;
             *) exit 1 ;;
           esac
-          scratch="$RUNNER_TEMP/zvmi-signing-probe-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${CANDIDATE_KEY}"
+          scratch="$SIGNING_PROBE_DIR"
           mkdir -m 0700 "$scratch"
           unsigned="$scratch/unsigned.efi"
           signed="$scratch/signed.efi"
           metadata="$scratch/metadata.json"
+          cp "$UKI_SIGNING_CERTIFICATE" "$scratch/certificate.pem"
           zig build-exe -target "$target" tests/efi_signing_probe.zig -femit-bin="$unsigned"
           export ZVMI_UKI_UNSIGNED="$unsigned"
           export ZVMI_UKI_SIGNED="$signed"
@@ -183,8 +185,17 @@ jobs:
           "$UKI_SIGN_COMMAND" sign
           test -s "$signed"
           test -s "$metadata"
-          sbverify --cert "$UKI_SIGNING_CERTIFICATE" "$signed"
+          sbverify --verbose --cert "$UKI_SIGNING_CERTIFICATE" "$signed"
           rm -rf -- "$scratch"
+
+      - name: Upload failed signing probe
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: azurelinux4-signing-probe-${{ matrix.key }}-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ env.SIGNING_PROBE_DIR }}/
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Cache pinned Azure Linux ISO
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
