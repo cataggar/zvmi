@@ -285,6 +285,8 @@ fn acquireAzureAccessTokenAlloc(
         null,
         &.{.{ .name = "Accept", .value = "application/json" }},
         &.{.{ .name = "Authorization", .value = oidc_authorization }},
+        "GitHub OIDC token request",
+        error.GithubOidcTokenRequestFailed,
     );
     defer allocator.free(oidc_body);
     const oidc = try std.json.parseFromSlice(
@@ -321,6 +323,8 @@ fn acquireAzureAccessTokenAlloc(
         token_form,
         &.{.{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" }},
         &.{},
+        "Microsoft Entra token exchange",
+        error.AzureFederatedTokenExchangeFailed,
     );
     defer allocator.free(token_body);
     const token = try std.json.parseFromSlice(
@@ -826,6 +830,8 @@ fn fetchBoundedAlloc(
     payload: ?[]const u8,
     headers: []const std.http.Header,
     privileged_headers: []const std.http.Header,
+    operation: []const u8,
+    status_error: anyerror,
 ) ![]u8 {
     const storage = try allocator.alloc(u8, max_response_bytes);
     defer allocator.free(storage);
@@ -839,7 +845,13 @@ fn fetchBoundedAlloc(
         .extra_headers = headers,
         .privileged_headers = privileged_headers,
     });
-    if (result.status != .ok) return error.UnexpectedHttpStatus;
+    if (result.status != .ok) {
+        std.debug.print(
+            "zvmi sign: {s} returned HTTP {d}\n",
+            .{ operation, @intFromEnum(result.status) },
+        );
+        return status_error;
+    }
     return allocator.dupe(u8, writer.buffered());
 }
 
