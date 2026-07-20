@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import json
 import os
 import re
@@ -11,6 +13,10 @@ from scripts import azurelinux4_release as release
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TEST_CERTIFICATE_DER = b"zvmi test certificate DER"
+TEST_CERTIFICATE_SHA256 = hashlib.sha256(TEST_CERTIFICATE_DER).hexdigest()
+TEST_SIGNING_CERTIFICATE_SHA256 = "4" * 64
+TEST_SIGNING_OPERATION_ID = "00000000-0000-4000-8000-000000000001"
 
 
 class AzureLinuxReleaseTest(unittest.TestCase):
@@ -28,7 +34,13 @@ class AzureLinuxReleaseTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.root, ignore_errors=True)
 
-    def make_bundle(self, key):
+    def make_bundle(
+        self,
+        key,
+        certificate_der=TEST_CERTIFICATE_DER,
+        signing_certificate_sha256=TEST_SIGNING_CERTIFICATE_SHA256,
+    ):
+        certificate_sha256 = hashlib.sha256(certificate_der).hexdigest()
         architecture, flavor, asset_name = release.EXPECTED[key]
         candidate_dir = self.candidates / key
         candidate_dir.mkdir(parents=True)
@@ -37,6 +49,52 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         provenance = candidate_dir / "internal-provenance"
         provenance.mkdir()
         (provenance / "inputs.txt").write_text(f"{key}\n", encoding="utf-8")
+        fallback_path = (
+            "EFI/BOOT/BOOTX64.EFI"
+            if architecture == "x86_64"
+            else "EFI/BOOT/BOOTAA64.EFI"
+        )
+        signing = {
+            "schema": 1,
+            "type": "zvmi-uki-signing",
+            "architecture": architecture,
+            "flavor": flavor,
+            "signer_mode": "external-command",
+            "certificate_sha256": certificate_sha256,
+            "certificate_der_base64": base64.b64encode(certificate_der).decode(),
+            "certificate_details": "subject=CN=zvmi test signer",
+            "provider": {
+                "name": "azure-artifact-signing",
+                "endpoint": "https://wus.codesigning.azure.net",
+                "account": "cataggar",
+                "profile": "zvmi-uki",
+                "signing_certificate_sha256": signing_certificate_sha256,
+            },
+            "signature_verification": "success",
+            "files": [
+                {
+                    "path": f"EFI/Linux/zvmi-{key}.efi",
+                    "unsigned_sha256": "2" * 64,
+                    "signed_sha256": "3" * 64,
+                    "finalized_sha256": "3" * 64,
+                    "signed_bytes": 4096,
+                    "signing_operation_id": TEST_SIGNING_OPERATION_ID,
+                    "signing_certificate_sha256": signing_certificate_sha256,
+                },
+                {
+                    "path": fallback_path,
+                    "unsigned_sha256": "2" * 64,
+                    "signed_sha256": "3" * 64,
+                    "finalized_sha256": "3" * 64,
+                    "signed_bytes": 4096,
+                    "signing_operation_id": TEST_SIGNING_OPERATION_ID,
+                    "signing_certificate_sha256": signing_certificate_sha256,
+                },
+            ],
+        }
+        (provenance / f"uki-signing-{flavor}-{architecture}.json").write_text(
+            json.dumps(signing), encoding="utf-8"
+        )
         digest = release.sha256(asset)
         manifest = candidate_dir / "candidate.json"
         release.candidate_command(
@@ -60,6 +118,24 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         azure_dir.mkdir(parents=True)
         vhd = azure_dir / "temporary.vhd"
         vhd.write_bytes((key + "-vhd\n").encode())
+        uefi_settings = {
+            "signatureTemplateNames": [
+                "MicrosoftUefiCertificateAuthorityTemplate"
+            ],
+            "additionalSignatures": {
+                "db": [
+                    {
+                        "type": "x509",
+                        "value": [base64.b64encode(certificate_der).decode()],
+                    }
+                ]
+            },
+        }
+        uefi_request = azure_dir / "uefi-request.json"
+        uefi_response = azure_dir / "uefi-response.json"
+        payload = {"properties": {"securityProfile": {"uefiSettings": uefi_settings}}}
+        uefi_request.write_text(json.dumps(payload), encoding="utf-8")
+        uefi_response.write_text(json.dumps(payload), encoding="utf-8")
         release.azure_result_command(
             types.SimpleNamespace(
                 manifest=manifest,
@@ -70,6 +146,9 @@ class AzureLinuxReleaseTest(unittest.TestCase):
                 location="eastus2",
                 vm_size="Standard_D2ds_v5",
                 resource_group=f"rg-{key}",
+                image_version_id=f"/subscriptions/test/gallery/{key}/versions/1.0.0",
+                uefi_request=uefi_request,
+                uefi_response=uefi_response,
                 run_id="1",
                 run_attempt="1",
                 output=azure_dir / "azure-result.json",
@@ -108,6 +187,14 @@ class AzureLinuxReleaseTest(unittest.TestCase):
             sorted(path.name for path in output.glob("*.qcow2")),
             sorted(item[2] for item in release.EXPECTED.values()),
         )
+        self.assertEqual(manifest["certificate_sha256"], TEST_CERTIFICATE_SHA256)
+        self.assertEqual(
+            manifest["signing_certificate_sha256"],
+            TEST_SIGNING_CERTIFICATE_SHA256,
+        )
+        self.assertTrue(
+            all(item["fallback_uki_sha256"] == "3" * 64 for item in manifest["assets"])
+        )
         self.assertIn("No checksum sidecar assets are published", notes.read_text())
 
     def test_stage_rejects_absent_azure_matrix_entry(self):
@@ -137,6 +224,112 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         path.write_text("tampered\n", encoding="utf-8")
         with self.assertRaises(SystemExit):
             self.stage()
+
+    def test_stage_rejects_missing_signing_provenance(self):
+        self.make_all_bundles()
+        path = (
+            self.candidates
+            / "x86_64-full"
+            / "internal-provenance"
+            / "uki-signing-full-x86_64.json"
+        )
+        path.unlink()
+        with self.assertRaises(SystemExit):
+            self.stage()
+
+    def test_stage_rejects_pem_private_key_in_provenance(self):
+        self.make_all_bundles()
+        path = self.candidates / "x86_64-full" / "internal-provenance" / "inputs.txt"
+        path.write_bytes(b"-----BEGIN PRIVATE KEY-----\nsecret\n")
+        with self.assertRaises(SystemExit):
+            self.stage()
+
+    def test_stage_rejects_der_private_key_in_provenance(self):
+        self.make_all_bundles()
+        path = self.candidates / "x86_64-full" / "internal-provenance" / "inputs.txt"
+        path.write_bytes(b"\x30\x82\x00\x08\x02\x01\x00\x30\x00\x00\x00\x00")
+        with self.assertRaises(SystemExit):
+            self.stage()
+
+    def test_stage_rejects_encrypted_der_private_key_in_provenance(self):
+        self.make_all_bundles()
+        path = self.candidates / "x86_64-full" / "internal-provenance" / "inputs.txt"
+        path.write_bytes(
+            b"\x30\x0c\x30\x07\x06\x03\x2a\x03\x04\x05\x00\x04\x01\x00"
+        )
+        with self.assertRaises(SystemExit):
+            self.stage()
+
+    def test_stage_rejects_embedded_der_private_key_in_provenance(self):
+        self.make_all_bundles()
+        path = self.candidates / "x86_64-full" / "internal-provenance" / "build.log"
+        path.write_bytes(
+            b"diagnostic output\n"
+            b"\x30\x0c\x30\x07\x06\x03\x2a\x03\x04\x05\x00\x04\x01\x00"
+        )
+        with self.assertRaises(SystemExit):
+            self.stage()
+
+    def test_stage_rejects_pkcs12_private_key_container_in_provenance(self):
+        self.make_all_bundles()
+        path = self.candidates / "x86_64-full" / "internal-provenance" / "inputs.txt"
+        path.write_bytes(b"\x30\x08\x02\x01\x03\x30\x03\x06\x01\x2a")
+        with self.assertRaises(SystemExit):
+            self.stage()
+
+    def test_stage_rejects_mixed_signing_certificates(self):
+        for key in release.EXPECTED:
+            self.make_bundle(
+                key,
+                b"different certificate"
+                if key == "aarch64-core"
+                else TEST_CERTIFICATE_DER,
+            )
+        with self.assertRaises(SystemExit):
+            self.stage()
+
+    def test_stage_rejects_mixed_artifact_signing_leaves(self):
+        for key in release.EXPECTED:
+            self.make_bundle(
+                key,
+                signing_certificate_sha256=(
+                    "5" * 64
+                    if key == "aarch64-core"
+                    else TEST_SIGNING_CERTIFICATE_SHA256
+                ),
+            )
+        with self.assertRaises(SystemExit):
+            self.stage()
+
+    def test_azure_uefi_settings_bind_canonical_der_certificate(self):
+        settings = {
+            "signatureTemplateNames": [
+                "MicrosoftUefiCertificateAuthorityTemplate"
+            ],
+            "additionalSignatures": {
+                "db": [
+                    {
+                        "type": "x509",
+                        "value": [
+                            base64.b64encode(TEST_CERTIFICATE_DER).decode()
+                        ],
+                    }
+                ]
+            },
+        }
+        self.assertEqual(
+            release.validate_azure_uefi_settings(
+                settings, TEST_CERTIFICATE_SHA256
+            ),
+            settings,
+        )
+        settings["additionalSignatures"]["db"][0]["value"] = [
+            base64.b64encode(b"different").decode()
+        ]
+        with self.assertRaises(SystemExit):
+            release.validate_azure_uefi_settings(
+                settings, TEST_CERTIFICATE_SHA256
+            )
 
     def test_fixed_vhd_alignment_applies_to_virtual_size_not_footer(self):
         virtual_size = 2 * release.AZURE_VHD_ALIGNMENT
@@ -239,6 +432,34 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         )
         self.assertEqual(document["build_validation"]["status"], "success")
         self.assertNotIn("local_acceptance", document)
+
+    def test_release_workflow_requires_built_in_signing_and_secure_boot(self):
+        workflow = (ROOT / ".github/workflows/azurelinux4-release.yml").read_text()
+        self.assertIn("environment: azurelinux4-signing", workflow)
+        self.assertNotIn("AZURELINUX4_UKI_SIGN_COMMAND", workflow)
+        self.assertIn(
+            "UKI_SIGN_COMMAND: ${{ github.workspace }}/zig-out/bin/zvmi",
+            workflow,
+        )
+        self.assertIn("zig build install-zvmi", workflow)
+        self.assertIn("--uki-sign-command \"$UKI_SIGN_COMMAND\"", workflow)
+        self.assertIn("--uki-sign-command-arg sign", workflow)
+        self.assertIn("ZVMI_AZURE_TENANT_ID", workflow)
+        self.assertIn("ZVMI_AZURE_CLIENT_ID", workflow)
+        self.assertIn("ZVMI_ARTIFACT_SIGNING_ENDPOINT", workflow)
+        self.assertIn("ZVMI_ARTIFACT_SIGNING_ACCOUNT", workflow)
+        self.assertIn("ZVMI_ARTIFACT_SIGNING_PROFILE", workflow)
+        self.assertNotIn("ZVMI_AZURE_KEY_ID", workflow)
+        self.assertNotIn("--uki-signing-key", workflow)
+        self.assertIn("python3-virt-firmware", workflow)
+        self.assertIn("sbsigntool", workflow)
+
+        azure = (ROOT / "scripts/azurelinux4_azure_acceptance.sh").read_text()
+        self.assertIn("api-version=2025-03-03", azure)
+        self.assertIn("MicrosoftUefiCertificateAuthorityTemplate", azure)
+        self.assertIn("--security-type TrustedLaunch", azure)
+        self.assertIn("--enable-secure-boot true", azure)
+        self.assertIn("--enable-vtpm true", azure)
 
     def test_runner_probe_help_and_invalid_architecture(self):
         script = ROOT / "scripts/check_azurelinux4_release_runner.sh"

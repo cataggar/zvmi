@@ -112,6 +112,23 @@ virtual_size=${candidate[2]}
 [[ "$qcow_sha256" =~ ^[0-9a-f]{64}$ ]]
 [[ "$qcow_bytes" =~ ^[0-9]+$ ]]
 [[ "$virtual_size" =~ ^[0-9]+$ ]]
+readarray -t signing_identity < <(
+  python3 - "$manifest" <<'PY'
+import json
+import sys
+
+signing = json.load(open(sys.argv[1], encoding="utf-8"))["uki_signing"]
+print(signing["certificate_sha256"])
+print(signing["fallback_uki_sha256"])
+print(signing["certificate_der_base64"])
+PY
+)
+test "${#signing_identity[@]}" -eq 3
+certificate_sha256=${signing_identity[0]}
+fallback_uki_sha256=${signing_identity[1]}
+certificate_der_base64=${signing_identity[2]}
+[[ "$certificate_sha256" =~ ^[0-9a-f]{64}$ ]]
+[[ "$fallback_uki_sha256" =~ ^[0-9a-f]{64}$ ]]
 
 suffix=${CANDIDATE_KEY//_/-}
 resource_group="zvmi-al4-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${suffix}"
@@ -127,8 +144,23 @@ vhd="$RESULT_DIR/${CANDIDATE_KEY}.vhd"
 private_key="$RESULT_DIR/id_ed25519"
 boot_log="$RESULT_DIR/boot.log"
 sku_json="$RESULT_DIR/sku.json"
+certificate_der="$RESULT_DIR/signing-certificate.der"
+uefi_request="$RESULT_DIR/gallery-version-request.json"
+uefi_response="$RESULT_DIR/gallery-version-response.json"
+vm_security_json="$RESULT_DIR/vm-security.json"
+instance_security_json="$RESULT_DIR/instance-security.json"
 mkdir -p "$(dirname -- "$STATE_FILE")"
 rm -f -- "$STATE_FILE" "${STATE_FILE}.group.json" "$vhd" "$private_key" "$private_key.pub"
+python3 - "$certificate_der" "$certificate_sha256" "$certificate_der_base64" <<'PY'
+import base64
+import hashlib
+import sys
+
+certificate = base64.b64decode(sys.argv[3], validate=True)
+if not certificate or hashlib.sha256(certificate).hexdigest() != sys.argv[2]:
+    raise SystemExit("candidate signing certificate binding is invalid")
+open(sys.argv[1], "wb").write(certificate)
+PY
 
 cleanup_on_exit() {
   status=$?
@@ -278,18 +310,95 @@ az sig image-definition create \
   --os-state Generalized \
   --hyper-v-generation V2 \
   --architecture "$azure_image_architecture" \
+  --features SecurityType=TrustedLaunchSupported \
   --location "$AZURE_LOCATION"
-image_version_id=$(az sig image-version create \
+image_definition_id=$(az sig image-definition show \
   --resource-group "$resource_group" \
   --gallery-name "$gallery_name" \
   --gallery-image-definition "$image_name" \
-  --gallery-image-version 1.0.0 \
-  --os-snapshot "$disk_id" \
-  --replication-mode Shallow \
-  --storage-account-type Standard_LRS \
-  --location "$AZURE_LOCATION" \
   --query id \
   --output tsv)
+[[ "$image_definition_id" == /subscriptions/* ]]
+image_version_id="$image_definition_id/versions/1.0.0"
+python3 - "$uefi_request" "$AZURE_LOCATION" "$disk_id" "$certificate_der" <<'PY'
+import base64
+import json
+import sys
+
+output, location, disk_id, certificate_path = sys.argv[1:]
+certificate = base64.b64encode(open(certificate_path, "rb").read()).decode("ascii")
+payload = {
+    "location": location,
+    "properties": {
+        "publishingProfile": {
+            "replicationMode": "Shallow",
+            "targetRegions": [
+                {
+                    "name": location,
+                    "regionalReplicaCount": 1,
+                    "storageAccountType": "Standard_LRS",
+                }
+            ],
+        },
+        "storageProfile": {"osDiskImage": {"source": {"id": disk_id}}},
+        "securityProfile": {
+            "uefiSettings": {
+                "signatureTemplateNames": [
+                    "MicrosoftUefiCertificateAuthorityTemplate"
+                ],
+                "additionalSignatures": {
+                    "db": [{"type": "x509", "value": [certificate]}]
+                },
+            }
+        },
+    },
+}
+open(output, "w", encoding="utf-8").write(
+    json.dumps(payload, indent=2, sort_keys=True) + "\n"
+)
+PY
+az rest \
+  --method put \
+  --uri "https://management.azure.com${image_version_id}?api-version=2025-03-03" \
+  --body "@$uefi_request" \
+  --output json >"$uefi_response"
+for _ in {1..120}; do
+  provisioning_state=$(python3 - "$uefi_response" <<'PY'
+import json
+import sys
+print(json.load(open(sys.argv[1], encoding="utf-8")).get("properties", {}).get("provisioningState", ""))
+PY
+)
+  case "$provisioning_state" in
+    Succeeded) break ;;
+    Failed|Canceled)
+      echo "::error::Gallery image-version provisioning ended in $provisioning_state"
+      exit 1
+      ;;
+  esac
+  sleep 10
+  az rest \
+    --method get \
+    --uri "https://management.azure.com${image_version_id}?api-version=2025-03-03" \
+    --output json >"$uefi_response"
+done
+test "$provisioning_state" = Succeeded
+python3 - "$uefi_request" "$uefi_response" "$image_version_id" <<'PY'
+import json
+import sys
+
+request = json.load(open(sys.argv[1], encoding="utf-8"))
+response = json.load(open(sys.argv[2], encoding="utf-8"))
+if response.get("id", "").lower() != sys.argv[3].lower():
+    raise SystemExit("Azure returned a different gallery image-version identity")
+expected = request["properties"]["securityProfile"]["uefiSettings"]
+actual = response.get("properties", {}).get("securityProfile", {}).get("uefiSettings")
+if actual != expected:
+    raise SystemExit("Azure did not preserve the exact custom UEFI settings")
+state = response.get("properties", {}).get("provisioningState")
+if state != "Succeeded":
+    raise SystemExit(f"gallery image-version provisioning did not succeed: {state!r}")
+PY
 [[ "$image_version_id" == /subscriptions/* ]]
 
 ssh-keygen -q -t ed25519 -N '' -C zvmi-azure-acceptance -f "$private_key"
@@ -304,10 +413,36 @@ az vm create \
   --ssh-key-values "$private_key.pub" \
   --enable-agent true \
   --enable-auto-update false \
-  --security-type Standard \
+  --security-type TrustedLaunch \
+  --enable-secure-boot true \
+  --enable-vtpm true \
   --public-ip-sku Standard \
   --nsg-rule SSH \
   --boot-diagnostics-storage ""
+az vm show \
+  --resource-group "$resource_group" \
+  --name "$vm_name" \
+  --query securityProfile \
+  --output json >"$vm_security_json"
+az vm get-instance-view \
+  --resource-group "$resource_group" \
+  --name "$vm_name" \
+  --query securityProfile \
+  --output json >"$instance_security_json"
+python3 - "$vm_security_json" "$instance_security_json" <<'PY'
+import json
+import sys
+
+for path in sys.argv[1:]:
+    profile = json.load(open(path, encoding="utf-8"))
+    if profile.get("securityType") != "TrustedLaunch":
+        raise SystemExit(f"{path}: VM is not Trusted Launch")
+    settings = profile.get("uefiSettings") or {}
+    if settings.get("secureBootEnabled") is not True:
+        raise SystemExit(f"{path}: Secure Boot is not enabled")
+    if settings.get("vTpmEnabled") is not True:
+        raise SystemExit(f"{path}: vTPM is not enabled")
+PY
 public_ip=$(az vm show \
   --resource-group "$resource_group" \
   --name "$vm_name" \
@@ -406,16 +541,76 @@ test -s /etc/machine-id
 test -s /etc/ssh/ssh_host_ed25519_key.pub
 GUEST
 
+uefi_db="$RESULT_DIR/uefi-db.bin"
+ssh "${ssh_options[@]}" "$ssh_target" \
+  "sudo -n /usr/bin/cat /sys/firmware/efi/efivars/db-*" >"$uefi_db"
+python3 - "$uefi_db" "$certificate_sha256" <<'PY'
+import hashlib
+import struct
+import sys
+
+data = open(sys.argv[1], "rb").read()
+expected = sys.argv[2]
+efi_cert_x509_guid = bytes.fromhex("a159c0a5e494a74a87b5ab155c2bf072")
+offset = 4
+found = False
+while offset < len(data):
+    if len(data) - offset < 28:
+        raise SystemExit("truncated EFI signature list")
+    list_size, header_size, signature_size = struct.unpack_from("<III", data, offset + 16)
+    is_x509 = data[offset : offset + 16] == efi_cert_x509_guid
+    if list_size < 28 or signature_size <= 16:
+        raise SystemExit("invalid EFI signature list")
+    end = offset + list_size
+    signatures = offset + 28 + header_size
+    if end > len(data) or signatures > end or (end - signatures) % signature_size:
+        raise SystemExit("invalid EFI signature-list bounds")
+    while signatures < end:
+        certificate = data[signatures + 16 : signatures + signature_size]
+        found |= is_x509 and hashlib.sha256(certificate).hexdigest() == expected
+        signatures += signature_size
+    offset = end
+if not found:
+    raise SystemExit("release signing certificate is absent from UEFI db")
+PY
+ssh "${ssh_options[@]}" "$ssh_target" \
+  "/usr/bin/bash -s -- '$FLAVOR'" <<'GUEST'
+set -euo pipefail
+flavor=$1
+secure_boot=$(od -An -t u1 -j 4 -N 1 /sys/firmware/efi/efivars/SecureBoot-* | tr -d ' ')
+test "$secure_boot" = 1
+if ! test -r /sys/kernel/security/lockdown; then
+  sudo -n /usr/bin/mount -t securityfs securityfs /sys/kernel/security
+fi
+grep -Eq '\[(integrity|confidentiality)\]' /sys/kernel/security/lockdown
+for module in hv_netvsc crc_itu_t udf isofs; do
+  if ! test -d "/sys/module/$module" && [[ "$flavor" == full ]]; then
+    sudo -n /usr/sbin/modprobe "$module"
+  fi
+  test -d "/sys/module/$module"
+done
+dmesg_output=$(sudo -n /usr/bin/dmesg) || exit 1
+if printf '%s\n' "$dmesg_output" | grep -Eiq 'module verification failed|Loading of unsigned module|Lockdown:.*unsigned'; then
+  exit 1
+fi
+GUEST
+
 if [[ "$FLAVOR" == core ]]; then
   ssh "${ssh_options[@]}" "$ssh_target" '/usr/bin/bash -s' <<'GUEST'
 set -euo pipefail
-test /proc/1/exe -ef /sbin/zvminit
+sudo -n /usr/bin/test /proc/1/exe -ef /sbin/zvminit
 test -f /var/lib/azagent/provisioned
 master=
 for proc in /proc/[0-9]*; do
   test -r "$proc/status" || continue
-  test "$(awk '/^Name:/{print $2}' "$proc/status")" = sshd || continue
-  test "$(awk '/^PPid:/{print $2}' "$proc/status")" = 1 || continue
+  name= ppid=
+  while read -r key value _; do
+    case "$key" in
+      Name:) name=$value ;;
+      PPid:) ppid=$value ;;
+    esac
+  done <"$proc/status"
+  test "$name" = sshd && test "$ppid" = 1 || continue
   case "$(tr '\000' ' ' <"$proc/cmdline")" in
     *"/usr/sbin/sshd -D -e"*) master=${proc##*/}; break ;;
   esac
@@ -424,12 +619,17 @@ test -n "$master"
 mountpoint -q /d
 test "$(findmnt -n -o FSTYPE /d)" = ext4
 test -f /d/DATALOSS_WARNING_README.txt
-! awk 'NR > 1 {print $1}' /proc/swaps | grep -Fq /d
+while read -r swap_path _; do
+  test "$swap_path" = Filename && continue
+  case "$swap_path" in
+    /d|/d/*) exit 1 ;;
+  esac
+done </proc/swaps
 GUEST
 else
   ssh "${ssh_options[@]}" "$ssh_target" '/usr/bin/bash -s' <<'GUEST'
 set -euo pipefail
-test /proc/1/exe -ef /usr/lib/systemd/systemd
+sudo -n /usr/bin/test /proc/1/exe -ef /usr/lib/systemd/systemd
 test ! -e /sbin/zvminit
 test ! -e /usr/bin/zvminit
 for unit in cloud-final.service waagent.service sshd.service systemd-networkd.service; do
@@ -544,6 +744,7 @@ fi
 if [[ "$ARCHITECTURE" == aarch64 ]]; then
   grep -Fq 'ttyAMA0' "$boot_log"
 fi
+! grep -Eiq 'security violation|module verification failed|Loading of unsigned module' "$boot_log"
 
 python3 scripts/azurelinux4_release.py azure-result \
   --manifest "$manifest" \
@@ -554,6 +755,9 @@ python3 scripts/azurelinux4_release.py azure-result \
   --location "$AZURE_LOCATION" \
   --vm-size "$AZURE_VM_SIZE" \
   --resource-group "$resource_group" \
+  --image-version-id "$image_version_id" \
+  --uefi-request "$uefi_request" \
+  --uefi-response "$uefi_response" \
   --run-id "$GITHUB_RUN_ID" \
   --run-attempt "$GITHUB_RUN_ATTEMPT" \
   --output "$RESULT_DIR/azure-result.json"
@@ -564,6 +768,8 @@ test "$(sha256sum "$asset" | awk '{print $1}')" = "$qcow_sha256"
   echo
   echo "- QCOW2 SHA-256: \`$qcow_sha256\`"
   echo "- Temporary VHD SHA-256: \`$vhd_sha256\` (not retained or published)"
+  echo "- UKI SHA-256: \`$fallback_uki_sha256\`"
+  echo "- Signing certificate SHA-256: \`$certificate_sha256\`"
   echo "- Azure: \`$AZURE_LOCATION\` / \`$AZURE_VM_SIZE\`"
-  echo "- Contracts: key-only SSH, Ready, root growth, resource/data disks, reboot, runtime identity"
+  echo "- Contracts: Trusted Launch, Secure Boot, vTPM, UEFI db signer, signed UKI, lockdown, modules, key-only SSH, Ready, root growth, resource/data disks, reboot, runtime identity"
 } >>"$GITHUB_STEP_SUMMARY"

@@ -45,6 +45,10 @@ jobs:
     needs: prepare
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
+    environment: azurelinux4-signing
+    permissions:
+      contents: read
+      id-token: write
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -93,6 +97,12 @@ jobs:
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
       WORK_DIR: .scratch/azurelinux4-release-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.key }}
       BUNDLE_DIR: artifact-staging/candidates/${{ matrix.key }}
+      UKI_SIGN_COMMAND: ${{ github.workspace }}/zig-out/bin/zvmi
+      ZVMI_AZURE_TENANT_ID: ${{ vars.ZVMI_AZURE_TENANT_ID }}
+      ZVMI_AZURE_CLIENT_ID: ${{ vars.ZVMI_AZURE_CLIENT_ID }}
+      ZVMI_ARTIFACT_SIGNING_ENDPOINT: ${{ vars.ZVMI_ARTIFACT_SIGNING_ENDPOINT }}
+      ZVMI_ARTIFACT_SIGNING_ACCOUNT: ${{ vars.ZVMI_ARTIFACT_SIGNING_ACCOUNT }}
+      ZVMI_ARTIFACT_SIGNING_PROFILE: ${{ vars.ZVMI_ARTIFACT_SIGNING_PROFILE }}
     steps:
       - name: Check out accepted source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -114,11 +124,36 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           packages=(
-            curl dnf file jq openssh-client qemu-utils rpm tar xorriso
+            curl dnf file jq openssh-client openssl python3-virt-firmware qemu-utils rpm sbsigntool tar xorriso
           )
           sudo apt-get install -y --no-install-recommends "${packages[@]}"
           echo '%_dbpath /usr/lib/sysimage/rpm' | sudo tee /root/.rpmmacros >/dev/null
           test "$(sudo rpm --eval '%{_dbpath}')" = /usr/lib/sysimage/rpm
+
+      - name: Build built-in signer
+        run: |
+          set -euo pipefail
+          unset ZIG_LOCAL_CACHE_DIR
+          export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
+          zig build install-zvmi
+          test -x "$UKI_SIGN_COMMAND"
+
+      - name: Resolve protected signing certificate
+        run: |
+          set -euo pipefail
+          uuid='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+          [[ "$ZVMI_AZURE_TENANT_ID" =~ $uuid ]]
+          [[ "$ZVMI_AZURE_CLIENT_ID" =~ $uuid ]]
+          [[ "$ZVMI_ARTIFACT_SIGNING_ENDPOINT" =~ ^https://[a-z0-9.-]+\.codesigning\.azure\.net/?$ ]]
+          [[ "$ZVMI_ARTIFACT_SIGNING_ACCOUNT" =~ ^[A-Za-z0-9._-]+$ ]]
+          [[ "$ZVMI_ARTIFACT_SIGNING_PROFILE" =~ ^[A-Za-z0-9._-]+$ ]]
+          certificate="$RUNNER_TEMP/zvmi-uki-signing-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${CANDIDATE_KEY}.pem"
+          umask 077
+          "$UKI_SIGN_COMMAND" sign certificate "$certificate"
+          openssl x509 -in "$certificate" -noout
+          actual=$(openssl x509 -in "$certificate" -outform DER | sha256sum | awk '{print $1}')
+          echo "UKI_SIGNING_CERTIFICATE=$certificate" >> "$GITHUB_ENV"
+          echo "UKI_SIGNING_CERTIFICATE_SHA256=$actual" >> "$GITHUB_ENV"
 
       - name: Cache pinned Azure Linux ISO
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -140,6 +175,10 @@ jobs:
             generalized-azurelinux4 -- \
             --work-dir "$GITHUB_WORKSPACE/$WORK_DIR" \
             --output "$GITHUB_WORKSPACE/$BUNDLE_DIR/$ASSET_NAME" \
+            --uki-signing-certificate "$UKI_SIGNING_CERTIFICATE" \
+            --uki-signing-certificate-sha256 "$UKI_SIGNING_CERTIFICATE_SHA256" \
+            --uki-sign-command "$UKI_SIGN_COMMAND" \
+            --uki-sign-command-arg sign \
             2>&1 | tee "$BUNDLE_DIR/internal-provenance/build.log"
 
       - name: Validate exact finalized QCOW2
@@ -231,6 +270,7 @@ jobs:
         run: |
           sudo rm -rf -- "$WORK_DIR"
           rm -rf -- "$BUNDLE_DIR"
+          rm -f -- "${UKI_SIGNING_CERTIFICATE:-}"
 
   azure_acceptance:
     name: Azure ${{ matrix.key }}
