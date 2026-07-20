@@ -289,8 +289,10 @@ fn acquireAzureAccessTokenAlloc(
         .GET,
         audience_url,
         null,
-        &.{.{ .name = "Accept", .value = "application/json" }},
-        &.{.{ .name = "Authorization", .value = oidc_authorization }},
+        &.{
+            .{ .name = "Accept", .value = "application/json" },
+            .{ .name = "Authorization", .value = oidc_authorization },
+        },
     );
     defer allocator.free(oidc_body);
     const oidc = try std.json.parseFromSlice(
@@ -327,7 +329,6 @@ fn acquireAzureAccessTokenAlloc(
         token_url,
         token_form,
         &.{.{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" }},
-        &.{},
     );
     defer allocator.free(token_body);
     const token = try std.json.parseFromSlice(
@@ -691,10 +692,10 @@ fn artifactRequestAlloc(
     const extra_headers = [_]std.http.Header{
         .{ .name = "Accept", .value = accept },
         .{ .name = "client-version", .value = "zvmi/1" },
-    };
-    const privileged_headers = [_]std.http.Header{
         .{ .name = "Authorization", .value = authorization },
     };
+    // Zig 0.16 does not emit privileged_headers on the initial request.
+    // Redirects are forbidden, so Authorization cannot cross origins here.
     var request = try client.request(method, uri, .{
         .redirect_behavior = .not_allowed,
         .headers = .{
@@ -704,7 +705,6 @@ fn artifactRequestAlloc(
                 .default,
         },
         .extra_headers = &extra_headers,
-        .privileged_headers = &privileged_headers,
     });
     defer request.deinit();
     if (payload) |body| {
@@ -833,11 +833,12 @@ fn fetchBoundedAlloc(
     url: []const u8,
     payload: ?[]const u8,
     headers: []const std.http.Header,
-    privileged_headers: []const std.http.Header,
 ) ![]u8 {
     const storage = try allocator.alloc(u8, max_response_bytes);
     defer allocator.free(storage);
     var writer: std.Io.Writer = .fixed(storage);
+    // See artifactRequestAlloc: redirects are forbidden, so authentication
+    // headers must use extra_headers to work around Zig 0.16.
     const result = try client.fetch(.{
         .location = .{ .url = url },
         .method = method,
@@ -845,7 +846,6 @@ fn fetchBoundedAlloc(
         .response_writer = &writer,
         .redirect_behavior = .not_allowed,
         .extra_headers = headers,
-        .privileged_headers = privileged_headers,
     });
     if (result.status != .ok)
         return tokenHttpStatusError(request_kind, result.status);
