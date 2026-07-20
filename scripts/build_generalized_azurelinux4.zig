@@ -2844,11 +2844,11 @@ fn validateFullIsoKernelCompatibility(
     defer sudo(gpa, io, &.{ "umount", mount_path }) catch {};
 
     const iso_kernels = try capture(gpa, io, &.{
-        "find", mount_path, "-type", "f", "-name", "vmlinuz-*", "-printf", "%f\n",
+        "sudo", "find", mount_path, "-type", "f", "-name", "vmlinuz-*", "-printf", "%f\n",
     });
     defer gpa.free(iso_kernels);
     const iso_initrds = try capture(gpa, io, &.{
-        "find", mount_path, "-type", "f", "(", "-name", "initramfs-*", "-o", "-name", "initrd-*", ")", "-printf", "%f\n",
+        "sudo", "find", mount_path, "-type", "f", "(", "-name", "initramfs-*", "-o", "-name", "initrd-*", ")", "-printf", "%f\n",
     });
     defer gpa.free(iso_initrds);
     const installed = try capture(gpa, io, &.{
