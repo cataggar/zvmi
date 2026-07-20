@@ -4,13 +4,18 @@ const std = @import("std");
 const zvmi = @import("zvmi");
 
 const help_text =
-    \\usage: zvmi build-image --iso <file.iso> --container <oci-layout> --generation 1|2 --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}> [-O raw|vhd|vhdx|qcow2] [--rootfs-path <path>] [--skip-iso-rootfs] [--esp-size <size>] [--ext4-label <label>] [--stub-source-path <path>] [--os-release-source-path <path>] [--splash-source-path <path>] [--uki-output-directory <path>] [--verity] [--extra-kernel-options <opts>] [--boot-mode bls|uki|both] [--dry-run] [-v]
+    \\usage: zvmi build-image --iso <file.iso> --container <oci-layout> --generation 1|2 --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}> [-O raw|vhd|vhdx|qcow2] [--rootfs-path <path>] [--skip-iso-rootfs] [--max-oci-blob-size <size>] [--max-oci-layer-size <size>] [--max-oci-archive-size <size>] [--esp-size <size>] [--ext4-label <label>] [--stub-source-path <path>] [--os-release-source-path <path>] [--splash-source-path <path>] [--uki-output-directory <path>] [--verity] [--extra-kernel-options <opts>] [--boot-mode bls|uki|both] [--dry-run] [-v]
     \\
     \\Options:
     \\  --boot-mode bls|uki|both   Gen2 boot files: GRUB+BLS only (default), UKI only, or both.
     \\  --esp-size <size>          ESP size (default 96M). UKI/both commonly need 512M or larger.
     \\  --ext4-label <label>       Root ext4 filesystem label (default rootfs).
     \\  --skip-iso-rootfs          Use the container as the root filesystem; keep only boot-critical files from the ISO/squashfs.
+    \\  --max-oci-blob-size <size> Maximum compressed OCI blob size (default 64M).
+    \\  --max-oci-layer-size <size>
+    \\                              Maximum decompressed OCI layer size (default 128M).
+    \\  --max-oci-archive-size <size>
+    \\                              Maximum docker/podman save archive size (default 512M).
     \\  --stub-source-path <path>  UKI/both only: use this systemd EFI stub path from the merged source tree.
     \\  --os-release-source-path <path>
     \\                              UKI/both only: use this os-release path from the merged source tree.
@@ -49,6 +54,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     var output_format: ?zvmi.Format = null;
     var rootfs_path: ?[]const u8 = null;
     var skip_iso_rootfs = false;
+    var oci_load_options = zvmi.oci.LoadOptions{};
     var generation: zvmi.azure.Generation = .gen2;
     var size: ?u64 = null;
     var esp_size: ?u64 = null;
@@ -129,6 +135,21 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
             rootfs_path = args[i];
         } else if (std.mem.eql(u8, arg, "--skip-iso-rootfs")) {
             skip_iso_rootfs = true;
+        } else if (std.mem.eql(u8, arg, "--max-oci-blob-size")) {
+            i += 1;
+            if (i >= args.len) return fail("build-image: --max-oci-blob-size requires a value", .{});
+            oci_load_options.max_blob_size = parseOciLimit(args[i]) catch |err|
+                return fail("build-image: invalid --max-oci-blob-size '{s}': {s}", .{ args[i], @errorName(err) });
+        } else if (std.mem.eql(u8, arg, "--max-oci-layer-size")) {
+            i += 1;
+            if (i >= args.len) return fail("build-image: --max-oci-layer-size requires a value", .{});
+            oci_load_options.max_layer_size = parseOciLimit(args[i]) catch |err|
+                return fail("build-image: invalid --max-oci-layer-size '{s}': {s}", .{ args[i], @errorName(err) });
+        } else if (std.mem.eql(u8, arg, "--max-oci-archive-size")) {
+            i += 1;
+            if (i >= args.len) return fail("build-image: --max-oci-archive-size requires a value", .{});
+            oci_load_options.max_archive_size = parseOciLimit(args[i]) catch |err|
+                return fail("build-image: invalid --max-oci-archive-size '{s}': {s}", .{ args[i], @errorName(err) });
         } else if (std.mem.eql(u8, arg, "--verity")) {
             enable_verity = true;
         } else if (std.mem.eql(u8, arg, "--extra-kernel-options")) {
@@ -162,6 +183,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
         const built = zvmi.build_image.build(gpa, io, .{
             .iso_path = iso_path orelse return fail("build-image: --iso is required", .{}),
             .container_path = container_path orelse return fail("build-image: --container is required", .{}),
+            .oci_load_options = oci_load_options,
             .output_path = output_path orelse return fail("build-image: -o/--output is required", .{}),
             .size = size orelse return fail("build-image: --size is required", .{}),
             .generation = generation,
@@ -195,6 +217,12 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
 
     printReport(report, dry_run);
     return 0;
+}
+
+fn parseOciLimit(value: []const u8) !usize {
+    const size = try zvmi.parseSize(value);
+    if (size == 0) return error.ZeroOciLimit;
+    return std.math.cast(usize, size) orelse error.OciLimitTooLarge;
 }
 
 fn printReport(report: zvmi.build_image.BuildImageReport, dry_run: bool) void {
@@ -313,4 +341,9 @@ test "describeBuildImageFailure explains missing initramfs verity tooling" {
     try std.testing.expect(std.mem.indexOf(u8, message, "systemd-veritysetup-generator") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "dracut --add veritysetup") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "issues/77") != null);
+}
+
+test "OCI limit parsing accepts bounded sizes" {
+    try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), try parseOciLimit("512M"));
+    try std.testing.expectError(error.ZeroOciLimit, parseOciLimit("0"));
 }

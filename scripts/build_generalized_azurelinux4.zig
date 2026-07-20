@@ -263,6 +263,14 @@ fn ociLayerPlanCount(flavor: *const FlavorDescriptor) usize {
     };
 }
 
+fn ociLoadOptionsForFlavor(flavor: *const FlavorDescriptor) oci.LoadOptions {
+    return .{
+        .max_blob_size = @intCast(flavor.max_oci_layer_bytes),
+        .max_layer_size = @intCast(flavor.max_oci_layer_bytes),
+        .max_archive_size = @intCast(flavor.max_oci_layer_bytes * 8),
+    };
+}
+
 /// All target-dependent Azure Linux core-image inputs and output conventions.
 /// Keeping them together prevents a guest architecture from being selected in
 /// one stage while another stage silently retains x86_64 defaults.
@@ -2459,11 +2467,7 @@ fn validateGeneralizedOciLayout(
     architecture: *const ArchitectureDescriptor,
     flavor: *const FlavorDescriptor,
 ) !void {
-    var image = try oci.loadLayout(io, gpa, layout_dir, .{
-        .max_blob_size = @intCast(flavor.max_oci_layer_bytes),
-        .max_layer_size = @intCast(flavor.max_oci_layer_bytes),
-        .max_archive_size = @intCast(flavor.max_oci_layer_bytes * 8),
-    });
+    var image = try oci.loadLayout(io, gpa, layout_dir, ociLoadOptionsForFlavor(flavor));
     defer image.deinit();
 
     const config_architecture = image.config.architecture orelse return error.MissingOciArchitecture;
@@ -3273,6 +3277,13 @@ pub fn main(init: std.process.Init) !void {
     const raw_qcow2 = try std.fmt.allocPrint(gpa, "{s}.raw.qcow2", .{output_path});
     defer gpa.free(raw_qcow2);
     Dir.cwd().deleteFile(io, raw_qcow2) catch {};
+    const oci_load_options = ociLoadOptionsForFlavor(flavor);
+    const max_oci_blob_size_arg = try std.fmt.allocPrint(gpa, "{d}", .{oci_load_options.max_blob_size});
+    defer gpa.free(max_oci_blob_size_arg);
+    const max_oci_layer_size_arg = try std.fmt.allocPrint(gpa, "{d}", .{oci_load_options.max_layer_size});
+    defer gpa.free(max_oci_layer_size_arg);
+    const max_oci_archive_size_arg = try std.fmt.allocPrint(gpa, "{d}", .{oci_load_options.max_archive_size});
+    defer gpa.free(max_oci_archive_size_arg);
 
     std.debug.print("Building disk image...\n", .{});
     try run(gpa, io, &.{
@@ -3282,6 +3293,12 @@ pub fn main(init: std.process.Init) !void {
         iso_path,
         "--container",
         layout_dir,
+        "--max-oci-blob-size",
+        max_oci_blob_size_arg,
+        "--max-oci-layer-size",
+        max_oci_layer_size_arg,
+        "--max-oci-archive-size",
+        max_oci_archive_size_arg,
         "--generation",
         "2",
         "--size",
@@ -3641,6 +3658,13 @@ test "flavor contracts keep full systemd-only and core zvminit-only" {
     try std.testing.expect(argvContains(&full_required_systemd_units, "cloud-init-network.service"));
     try std.testing.expectEqualSlices([]const u8, &full_required_systemd_units, &full_enabled_systemd_units);
     try std.testing.expect(full.max_oci_layer_bytes > core.max_oci_layer_bytes);
+    const core_oci_limits = ociLoadOptionsForFlavor(&core);
+    try std.testing.expectEqual(@as(usize, 128 * 1024 * 1024), core_oci_limits.max_blob_size);
+    try std.testing.expectEqual(@as(usize, 128 * 1024 * 1024), core_oci_limits.max_layer_size);
+    const full_oci_limits = ociLoadOptionsForFlavor(&full);
+    try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), full_oci_limits.max_blob_size);
+    try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), full_oci_limits.max_layer_size);
+    try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024 * 1024), full_oci_limits.max_archive_size);
     try std.testing.expectEqual(@as(usize, 3), ociLayerPlanCount(&core));
     try std.testing.expectEqual(@as(usize, 7), ociLayerPlanCount(&full));
 }
