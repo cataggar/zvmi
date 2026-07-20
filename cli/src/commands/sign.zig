@@ -623,8 +623,12 @@ fn signDigestWithArtifactSigningAlloc(
         if (std.mem.eql(u8, operation.value.status, "Canceled"))
             return error.ArtifactSigningOperationCanceled;
         if (!std.mem.eql(u8, operation.value.status, "NotStarted") and
-            !std.mem.eql(u8, operation.value.status, "Running"))
+            !std.mem.eql(u8, operation.value.status, "Running") and
+            !std.mem.eql(u8, operation.value.status, "InProgress"))
         {
+            reportUnknownArtifactSigningOperationStatus(
+                operation.value.status,
+            );
             return error.InvalidArtifactSigningOperationStatus;
         }
         if (attempt + 1 == poll_options.max_attempts)
@@ -637,6 +641,31 @@ fn signDigestWithArtifactSigningAlloc(
         delay_seconds = @min(delay_seconds * 2, 5);
     }
     return error.ArtifactSigningTimedOut;
+}
+
+fn reportUnknownArtifactSigningOperationStatus(status: []const u8) void {
+    if (status.len == 0 or status.len > 64) {
+        std.debug.print(
+            "zvmi sign: Artifact Signing returned a redacted operation status\n",
+            .{},
+        );
+        return;
+    }
+    for (status) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '-' and
+            byte != '_' and byte != '.')
+        {
+            std.debug.print(
+                "zvmi sign: Artifact Signing returned a redacted operation status\n",
+                .{},
+            );
+            return;
+        }
+    }
+    std.debug.print(
+        "zvmi sign: Artifact Signing returned operation status: {s}\n",
+        .{status},
+    );
 }
 
 fn fetchSigningCertificateAlloc(
@@ -1443,6 +1472,9 @@ fn runMockArtifactSigningServerFallible(
 
     const operation_id = "00000000-0000-4000-8000-000000000000";
     const accepted_body = "";
+    const in_progress_body =
+        "{\"id\":\"" ++ operation_id ++ "\",\"status\":\"InProgress\"," ++
+        "\"result\":{\"signature\":null,\"signingCertificate\":null}}";
     const running_body =
         "{\"id\":\"" ++ operation_id ++ "\",\"status\":\"Running\"," ++
         "\"result\":{\"signature\":null,\"signingCertificate\":null}}";
@@ -1505,7 +1537,7 @@ fn runMockArtifactSigningServerFallible(
             return error.UnexpectedMockArtifactSigningRequest;
         const body = switch (context.scenario) {
             .success => if (handled == 1)
-                running_body
+                in_progress_body
             else
                 context.success_body,
             .failed => failed_body,
