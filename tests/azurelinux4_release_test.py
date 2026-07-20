@@ -449,6 +449,11 @@ class AzureLinuxReleaseTest(unittest.TestCase):
             workflow,
         )
         self.assertIn("Upload failed signing probe", workflow)
+        self.assertIn(
+            "SIGNING_PROBE_DIR: ${{ github.workspace }}/signing-probe-",
+            workflow,
+        )
+        self.assertNotIn("/.signing-probe-", workflow)
         self.assertIn("--uki-sign-command \"$UKI_SIGN_COMMAND\"", workflow)
         self.assertIn("--uki-sign-command-arg sign", workflow)
         self.assertIn("ZVMI_AZURE_TENANT_ID", workflow)
