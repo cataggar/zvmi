@@ -97,7 +97,7 @@ jobs:
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
       WORK_DIR: .scratch/azurelinux4-release-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.key }}
       BUNDLE_DIR: artifact-staging/candidates/${{ matrix.key }}
-      SIGNING_PROBE_DIR: ${{ runner.temp }}/zvmi-signing-probe-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.key }}
+      SIGNING_PROBE_DIR: ${{ github.workspace }}/.signing-probe-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.key }}
       UKI_SIGN_COMMAND: ${{ github.workspace }}/zig-out/bin/zvmi
       ZVMI_AZURE_TENANT_ID: ${{ vars.ZVMI_AZURE_TENANT_ID }}
       ZVMI_AZURE_CLIENT_ID: ${{ vars.ZVMI_AZURE_CLIENT_ID }}
