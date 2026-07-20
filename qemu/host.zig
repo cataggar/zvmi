@@ -58,10 +58,12 @@ pub const FirmwarePair = struct {
 
 pub const FirmwareSearchOptions = struct {
     architecture: GuestArchitecture = .x86_64,
+    secure_boot: bool = false,
     explicit_code_path: ?[]const u8 = null,
     explicit_vars_path: ?[]const u8 = null,
     qemu_path: ?[]const u8 = null,
     data_dirs: []const []const u8 = &.{},
+    include_system_candidates: bool = true,
 };
 
 pub const MaterializeOptions = struct {
@@ -79,6 +81,12 @@ const x86_data_candidates = [_]FirmwareCandidate{
     .{ .code = "OVMF_CODE_4M.fd", .vars = "OVMF_VARS_4M.fd" },
 };
 
+const x86_secure_boot_data_candidates = [_]FirmwareCandidate{
+    .{ .code = "OVMF_CODE_4M.secboot.fd", .vars = "OVMF_VARS_4M.ms.fd" },
+    .{ .code = "OVMF_CODE_4M.ms.fd", .vars = "OVMF_VARS_4M.ms.fd" },
+    .{ .code = "OVMF_CODE.secboot.fd", .vars = "OVMF_VARS.secboot.fd" },
+};
+
 const aarch64_data_candidates = [_]FirmwareCandidate{
     .{ .code = "edk2-aarch64-code.fd", .vars = "edk2-arm-vars.fd" },
     .{ .code = "AAVMF_CODE.no-secboot.fd", .vars = "AAVMF_VARS.fd" },
@@ -90,12 +98,23 @@ const aarch64_data_candidates = [_]FirmwareCandidate{
     .{ .code = "code.fd", .vars = "vars.fd" },
 };
 
+const aarch64_secure_boot_data_candidates = [_]FirmwareCandidate{
+    .{ .code = "AAVMF_CODE.secboot.fd", .vars = "AAVMF_VARS.ms.fd" },
+    .{ .code = "AAVMF_CODE.ms.fd", .vars = "AAVMF_VARS.ms.fd" },
+};
+
 const linux_x86_candidates = [_]FirmwareCandidate{
     .{ .code = "/usr/share/OVMF/OVMF_CODE.fd", .vars = "/usr/share/OVMF/OVMF_VARS.fd" },
     .{ .code = "/usr/share/OVMF/OVMF_CODE_4M.fd", .vars = "/usr/share/OVMF/OVMF_VARS_4M.fd" },
     .{ .code = "/usr/share/edk2/ovmf/OVMF_CODE.fd", .vars = "/usr/share/edk2/ovmf/OVMF_VARS.fd" },
     .{ .code = "/usr/share/edk2/x64/OVMF_CODE.fd", .vars = "/usr/share/edk2/x64/OVMF_VARS.fd" },
     .{ .code = "/usr/share/qemu/edk2-x86_64-code.fd", .vars = "/usr/share/qemu/edk2-i386-vars.fd" },
+};
+
+const linux_x86_secure_boot_candidates = [_]FirmwareCandidate{
+    .{ .code = "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd", .vars = "/usr/share/OVMF/OVMF_VARS_4M.ms.fd" },
+    .{ .code = "/usr/share/OVMF/OVMF_CODE_4M.ms.fd", .vars = "/usr/share/OVMF/OVMF_VARS_4M.ms.fd" },
+    .{ .code = "/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd", .vars = "/usr/share/edk2/ovmf/OVMF_VARS.secboot.fd" },
 };
 
 const macos_x86_candidates = [_]FirmwareCandidate{
@@ -114,6 +133,11 @@ const linux_aarch64_candidates = [_]FirmwareCandidate{
     .{ .code = "/usr/share/edk2/aarch64/edk2-aarch64-code.fd", .vars = "/usr/share/edk2/aarch64/edk2-arm-vars.fd" },
     .{ .code = "/usr/share/edk2/aarch64/code.fd", .vars = "/usr/share/edk2/aarch64/vars.fd" },
     .{ .code = "/usr/share/qemu/edk2-aarch64-code.fd", .vars = "/usr/share/qemu/edk2-arm-vars.fd" },
+};
+
+const linux_aarch64_secure_boot_candidates = [_]FirmwareCandidate{
+    .{ .code = "/usr/share/AAVMF/AAVMF_CODE.secboot.fd", .vars = "/usr/share/AAVMF/AAVMF_VARS.ms.fd" },
+    .{ .code = "/usr/share/AAVMF/AAVMF_CODE.ms.fd", .vars = "/usr/share/AAVMF/AAVMF_VARS.ms.fd" },
 };
 
 const macos_aarch64_candidates = [_]FirmwareCandidate{
@@ -200,6 +224,11 @@ pub fn findFirmwareSourcePairAlloc(
         {
             return error.FirmwareNotReadable;
         }
+        if (options.secure_boot and
+            !firmwareCodeNameIndicatesSecureBoot(options.explicit_code_path.?))
+        {
+            return error.FirmwareNotSecureBootCapable;
+        }
 
         return @as(?FirmwareSourcePair, try ownedSourcePairAlloc(
             allocator,
@@ -245,6 +274,7 @@ fn findAutomaticFirmwareSourceAlloc(
             io,
             data_dir,
             options.architecture,
+            options.secure_boot,
             encoding,
         )) |pair| return pair;
     }
@@ -258,6 +288,7 @@ fn findAutomaticFirmwareSourceAlloc(
                 io,
                 adjacent_share,
                 options.architecture,
+                options.secure_boot,
                 encoding,
             )) |pair| return pair;
 
@@ -269,25 +300,46 @@ fn findAutomaticFirmwareSourceAlloc(
                     io,
                     prefix_share,
                     options.architecture,
+                    options.secure_boot,
                     encoding,
                 )) |pair| return pair;
             }
         }
     }
 
-    for (systemFirmwareCandidates(options.architecture)) |candidate| {
-        if (try readableEncodedPairAlloc(
-            allocator,
-            io,
-            candidate.code,
-            candidate.vars,
-            encoding,
-        )) |pair| return pair;
+    if (options.include_system_candidates) {
+        for (systemFirmwareCandidates(
+            options.architecture,
+            options.secure_boot,
+        )) |candidate| {
+            if (try readableEncodedPairAlloc(
+                allocator,
+                io,
+                candidate.code,
+                candidate.vars,
+                encoding,
+            )) |pair| return pair;
+        }
     }
     return null;
 }
 
-fn systemFirmwareCandidates(architecture: GuestArchitecture) []const FirmwareCandidate {
+fn systemFirmwareCandidates(
+    architecture: GuestArchitecture,
+    secure_boot: bool,
+) []const FirmwareCandidate {
+    if (secure_boot) {
+        return switch (architecture) {
+            .x86_64 => switch (builtin.os.tag) {
+                .linux => &linux_x86_secure_boot_candidates,
+                else => &.{},
+            },
+            .aarch64 => switch (builtin.os.tag) {
+                .linux => &linux_aarch64_secure_boot_candidates,
+                else => &.{},
+            },
+        };
+    }
     return switch (architecture) {
         .x86_64 => switch (builtin.os.tag) {
             .linux => &linux_x86_candidates,
@@ -302,7 +354,16 @@ fn systemFirmwareCandidates(architecture: GuestArchitecture) []const FirmwareCan
     };
 }
 
-fn dataFirmwareCandidates(architecture: GuestArchitecture) []const FirmwareCandidate {
+fn dataFirmwareCandidates(
+    architecture: GuestArchitecture,
+    secure_boot: bool,
+) []const FirmwareCandidate {
+    if (secure_boot) {
+        return switch (architecture) {
+            .x86_64 => &x86_secure_boot_data_candidates,
+            .aarch64 => &aarch64_secure_boot_data_candidates,
+        };
+    }
     return switch (architecture) {
         .x86_64 => &x86_data_candidates,
         .aarch64 => &aarch64_data_candidates,
@@ -314,9 +375,10 @@ fn findFirmwareInDataDirAlloc(
     io: Io,
     data_dir: []const u8,
     architecture: GuestArchitecture,
+    secure_boot: bool,
     encoding: FirmwareEncoding,
 ) !?FirmwareSourcePair {
-    for (dataFirmwareCandidates(architecture)) |candidate| {
+    for (dataFirmwareCandidates(architecture, secure_boot)) |candidate| {
         const code_base = try std.fs.path.join(allocator, &.{ data_dir, candidate.code });
         defer allocator.free(code_base);
         const vars_base = try std.fs.path.join(allocator, &.{ data_dir, candidate.vars });
@@ -330,7 +392,14 @@ fn findFirmwareInDataDirAlloc(
             encoding,
         )) |pair| return pair;
     }
+
     return null;
+}
+
+fn firmwareCodeNameIndicatesSecureBoot(path: []const u8) bool {
+    const name = std.fs.path.basename(path);
+    return std.ascii.indexOfIgnoreCase(name, "secboot") != null or
+        std.ascii.indexOfIgnoreCase(name, ".ms.") != null;
 }
 
 fn readableEncodedPairAlloc(
@@ -681,12 +750,76 @@ test "find packaged raw x86 firmware in a data directory" {
 
     var pair = (try findFirmwareSourcePairAlloc(allocator, io, .{
         .data_dirs = &.{data_dir},
+        .include_system_candidates = false,
     })).?;
     defer pair.deinit(allocator);
     try std.testing.expectEqual(FirmwareEncoding.raw, pair.code.encoding);
     try std.testing.expectEqualStrings(
         "edk2-x86_64-code.fd",
         std.fs.path.basename(pair.code.path),
+    );
+}
+
+test "secure boot firmware search never falls back to ordinary OVMF" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "OVMF_CODE_4M.fd", .data = "ordinary" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "OVMF_VARS_4M.fd", .data = "ordinary-vars" });
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+    try std.testing.expect((try findFirmwareInDataDirAlloc(
+        allocator,
+        io,
+        data_dir,
+        .x86_64,
+        true,
+        .raw,
+    )) == null);
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "OVMF_CODE_4M.secboot.fd",
+        .data = "secure",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "OVMF_VARS_4M.ms.fd",
+        .data = "microsoft-vars",
+    });
+    var pair = (try findFirmwareInDataDirAlloc(
+        allocator,
+        io,
+        data_dir,
+        .x86_64,
+        true,
+        .raw,
+    )).?;
+    defer pair.deinit(allocator);
+    try std.testing.expectEqualStrings(
+        "OVMF_CODE_4M.secboot.fd",
+        std.fs.path.basename(pair.code.path),
+    );
+}
+
+test "secure boot explicit firmware rejects an ordinary code image" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "OVMF_CODE_4M.fd", .data = "ordinary" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "OVMF_VARS_4M.fd", .data = "vars" });
+    const code = try tmp.dir.realPathFileAlloc(io, "OVMF_CODE_4M.fd", allocator);
+    defer allocator.free(code);
+    const vars = try tmp.dir.realPathFileAlloc(io, "OVMF_VARS_4M.fd", allocator);
+    defer allocator.free(vars);
+    try std.testing.expectError(
+        error.FirmwareNotSecureBootCapable,
+        findFirmwareSourcePairAlloc(allocator, io, .{
+            .secure_boot = true,
+            .explicit_code_path = code,
+            .explicit_vars_path = vars,
+        }),
     );
 }
 
@@ -717,6 +850,7 @@ test "find Ubuntu AAVMF regular firmware in a data directory" {
     var pair = (try findFirmwareSourcePairAlloc(allocator, io, .{
         .architecture = .aarch64,
         .data_dirs = &.{data_dir},
+        .include_system_candidates = false,
     })).?;
     defer pair.deinit(allocator);
     try std.testing.expectEqual(FirmwareEncoding.raw, pair.code.encoding);
@@ -744,6 +878,7 @@ test "find packaged AAVMF and pflash firmware in a data directory" {
     var aavmf = (try findFirmwareSourcePairAlloc(allocator, io, .{
         .architecture = .aarch64,
         .data_dirs = &.{aavmf_dir},
+        .include_system_candidates = false,
     })).?;
     defer aavmf.deinit(allocator);
     try std.testing.expectEqualStrings("AAVMF_CODE.fd", std.fs.path.basename(aavmf.code.path));
@@ -753,6 +888,7 @@ test "find packaged AAVMF and pflash firmware in a data directory" {
     var pflash = (try findFirmwareSourcePairAlloc(allocator, io, .{
         .architecture = .aarch64,
         .data_dirs = &.{pflash_dir},
+        .include_system_candidates = false,
     })).?;
     defer pflash.deinit(allocator);
     try std.testing.expectEqualStrings(
@@ -784,6 +920,7 @@ test "compressed firmware is discovered for both architectures" {
 
     var x86 = (try findFirmwareSourcePairAlloc(allocator, io, .{
         .data_dirs = &.{data_dir},
+        .include_system_candidates = false,
     })).?;
     defer x86.deinit(allocator);
     try std.testing.expectEqual(FirmwareEncoding.bzip2, x86.code.encoding);
@@ -791,6 +928,7 @@ test "compressed firmware is discovered for both architectures" {
     var arm = (try findFirmwareSourcePairAlloc(allocator, io, .{
         .architecture = .aarch64,
         .data_dirs = &.{data_dir},
+        .include_system_candidates = false,
     })).?;
     defer arm.deinit(allocator);
     try std.testing.expectEqualStrings(
@@ -829,6 +967,7 @@ test "raw firmware wins over compressed firmware in an earlier directory" {
     defer allocator.free(raw);
     var pair = (try findFirmwareSourcePairAlloc(allocator, io, .{
         .data_dirs = &.{ compressed, raw },
+        .include_system_candidates = false,
     })).?;
     defer pair.deinit(allocator);
     try std.testing.expectEqual(FirmwareEncoding.raw, pair.code.encoding);
@@ -1289,7 +1428,10 @@ test "firmware search returns null when no candidate is readable" {
     const pair = try findFirmwareSourcePairAlloc(
         std.testing.allocator,
         std.testing.io,
-        .{ .data_dirs = &.{"definitely-missing-qemu-data-dir"} },
+        .{
+            .data_dirs = &.{"definitely-missing-qemu-data-dir"},
+            .include_system_candidates = false,
+        },
     );
     try std.testing.expect(pair == null);
 }

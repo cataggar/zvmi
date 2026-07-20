@@ -45,6 +45,10 @@ jobs:
     needs: prepare
     runs-on: [self-hosted, Linux, "${{ matrix.runner_arch }}"]
     timeout-minutes: 240
+    environment: azurelinux4-signing
+    permissions:
+      contents: read
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -96,6 +100,9 @@ jobs:
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
       WORK_DIR: .scratch/azurelinux4-release-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.key }}
       BUNDLE_DIR: artifact-staging/candidates/${{ matrix.key }}
+      UKI_SIGN_COMMAND: ${{ vars.AZURELINUX4_UKI_SIGN_COMMAND }}
+      UKI_SIGNING_CERTIFICATE_SHA256: ${{ vars.AZURELINUX4_UKI_SIGNING_CERTIFICATE_SHA256 }}
+      ZVMI_UKI_SIGNING_KEY_VERSION: ${{ vars.AZURELINUX4_UKI_SIGNING_KEY_VERSION }}
     steps:
       - name: Check out accepted source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -117,7 +124,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           packages=(
-            curl dnf file jq openssh-client qemu-utils rpm tar xorriso
+            curl dnf file jq openssh-client openssl python3-virt-firmware qemu-utils rpm sbsigntool tar xorriso
           )
           if [[ "$ARCHITECTURE" == x86_64 ]]; then
             packages+=(ovmf qemu-system-x86)
@@ -127,6 +134,23 @@ jobs:
           sudo apt-get install -y --no-install-recommends "${packages[@]}"
           echo '%_dbpath /usr/lib/sysimage/rpm' | sudo tee /root/.rpmmacros >/dev/null
           test "$(sudo rpm --eval '%{_dbpath}')" = /usr/lib/sysimage/rpm
+
+      - name: Require protected external signing configuration
+        env:
+          CERTIFICATE_PEM_VALUE: ${{ secrets.AZURELINUX4_UKI_SIGNING_CERTIFICATE_PEM }}
+        run: |
+          set -euo pipefail
+          [[ "$UKI_SIGN_COMMAND" == /* ]]
+          test -x "$UKI_SIGN_COMMAND"
+          [[ "$UKI_SIGNING_CERTIFICATE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$ZVMI_UKI_SIGNING_KEY_VERSION" =~ ^[A-Za-z0-9._:/-]+$ ]]
+          certificate="$RUNNER_TEMP/zvmi-uki-signing-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${CANDIDATE_KEY}.pem"
+          umask 077
+          printf '%s\n' "$CERTIFICATE_PEM_VALUE" > "$certificate"
+          openssl x509 -in "$certificate" -noout
+          actual=$(openssl x509 -in "$certificate" -outform DER | sha256sum | awk '{print $1}')
+          test "$actual" = "$UKI_SIGNING_CERTIFICATE_SHA256"
+          echo "UKI_SIGNING_CERTIFICATE=$certificate" >> "$GITHUB_ENV"
 
       - name: Require native Ubuntu KVM runner
         run: scripts/check_azurelinux4_release_runner.sh "$ARCHITECTURE"
@@ -151,6 +175,9 @@ jobs:
             generalized-azurelinux4 -- \
             --work-dir "$GITHUB_WORKSPACE/$WORK_DIR" \
             --output "$GITHUB_WORKSPACE/$BUNDLE_DIR/$ASSET_NAME" \
+            --uki-signing-certificate "$UKI_SIGNING_CERTIFICATE" \
+            --uki-signing-certificate-sha256 "$UKI_SIGNING_CERTIFICATE_SHA256" \
+            --uki-sign-command "$UKI_SIGN_COMMAND" \
             2>&1 | tee "$BUNDLE_DIR/internal-provenance/build.log"
 
       - name: Validate exact finalized QCOW2
@@ -185,6 +212,15 @@ jobs:
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
           before=$(sha256sum "$ZVMI_AZURELINUX4_IMAGE" | awk '{print $1}')
+          signing_provenance="$WORK_DIR/provenance/uki-signing-$FLAVOR-$ARCHITECTURE.json"
+          test -s "$signing_provenance"
+          uki_sha256=$(jq -r --arg path "$([[ "$ARCHITECTURE" == x86_64 ]] && echo EFI/BOOT/BOOTX64.EFI || echo EFI/BOOT/BOOTAA64.EFI)" \
+            '.files[] | select(.path == $path) | .finalized_sha256' "$signing_provenance")
+          test "$uki_sha256" != null
+          export ZVMI_AZURELINUX4_SIGNING_CERTIFICATE="$UKI_SIGNING_CERTIFICATE"
+          export ZVMI_AZURELINUX4_SIGNING_CERTIFICATE_SHA256="$UKI_SIGNING_CERTIFICATE_SHA256"
+          export ZVMI_AZURELINUX4_UKI_SHA256="$uki_sha256"
+          export ZVMI_AZURELINUX4_ACCEPTANCE_RESULT="$BUNDLE_DIR/internal-provenance/local-secure-boot-result.json"
           zig build \
             -Dazurelinux-arch="$ARCHITECTURE" \
             -Dazurelinux-flavor="$FLAVOR" \
@@ -217,6 +253,7 @@ jobs:
             --virtual-size "$VIRTUAL_SIZE" \
             --source-commit "$SOURCE_COMMIT" \
             --provenance-dir "$BUNDLE_DIR/internal-provenance" \
+            --local-acceptance-result "$BUNDLE_DIR/internal-provenance/local-secure-boot-result.json" \
             --runner "$RUNNER_NAME_VALUE" \
             --qemu-version "$qemu_version" \
             --run-id "$RUN_ID_VALUE" \
@@ -257,6 +294,7 @@ jobs:
         run: |
           sudo rm -rf -- "$WORK_DIR"
           rm -rf -- "$BUNDLE_DIR"
+          rm -f -- "${UKI_SIGNING_CERTIFICATE:-}"
 
   azure_acceptance:
     name: Azure ${{ matrix.key }}

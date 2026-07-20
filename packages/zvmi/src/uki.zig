@@ -26,6 +26,7 @@ pub const GenerateError = std.mem.Allocator.Error || error{
     BadPeSignature,
     InvalidAlignment,
     InvalidOptionalHeader,
+    InvalidSecurityDirectory,
     InvalidSectionTable,
     SectionNameTooLong,
     TooManySections,
@@ -88,6 +89,12 @@ const ParsedStub = struct {
     optional_header_size: usize,
     section_count: usize,
     sections: []const PeSection,
+    security_directory: ?FileRange,
+};
+
+pub const FileRange = struct {
+    offset: u32,
+    size: u32,
 };
 
 const SectionSpec = struct {
@@ -279,6 +286,28 @@ fn parseStub(allocator: std.mem.Allocator, stub: []const u8) GenerateError!Parse
         };
     }
 
+    const number_of_rva_and_sizes = std.mem.readInt(
+        u32,
+        stub[optional_header_offset + optional_header_number_of_rva_and_sizes_offset ..][0..4],
+        .little,
+    );
+    const security_directory = if (number_of_rva_and_sizes > security_directory_index and
+        optional_header_size >= optional_header_data_directories_offset +
+            (security_directory_index + 1) * data_directory_entry_size)
+    blk: {
+        const entry_offset = optional_header_offset + optional_header_data_directories_offset +
+            security_directory_index * data_directory_entry_size;
+        const file_offset = std.mem.readInt(u32, stub[entry_offset..][0..4], .little);
+        const size = std.mem.readInt(u32, stub[entry_offset + 4 ..][0..4], .little);
+        if (file_offset == 0 and size == 0) break :blk null;
+        if (file_offset == 0 or size == 0 or file_offset % 8 != 0)
+            return error.InvalidSecurityDirectory;
+        const end = std.math.add(u32, file_offset, size) catch
+            return error.InvalidSecurityDirectory;
+        if (end > stub.len) return error.InvalidSecurityDirectory;
+        break :blk FileRange{ .offset = file_offset, .size = size };
+    } else null;
+
     return .{
         .pe_offset = pe_offset,
         .file_header_offset = file_header_offset,
@@ -291,6 +320,7 @@ fn parseStub(allocator: std.mem.Allocator, stub: []const u8) GenerateError!Parse
         .optional_header_size = optional_header_size,
         .section_count = section_count,
         .sections = sections,
+        .security_directory = security_directory,
     };
 }
 
@@ -345,9 +375,21 @@ fn sumUninitializedDataSize(sections: []const PeSection) u32 {
 pub const SectionView = struct {
     name: [8]u8,
     contents: []const u8,
+    raw_offset: u32,
+    raw_size: u32,
+    virtual_size: u32,
 
     pub fn nameSlice(self: *const SectionView) []const u8 {
         return trimSectionName(&self.name);
+    }
+
+    /// File padding covered by Authenticode but ignored by the PE loader.
+    pub fn paddingRange(self: *const SectionView) ?FileRange {
+        if (self.raw_size <= self.virtual_size) return null;
+        return .{
+            .offset = self.raw_offset + self.virtual_size,
+            .size = self.raw_size - self.virtual_size,
+        };
     }
 };
 
@@ -358,6 +400,7 @@ pub const Inspection = struct {
     machine: u16,
     subsystem: u16,
     sections: []SectionView,
+    security_directory: ?FileRange,
 
     pub fn deinit(self: *Inspection, allocator: std.mem.Allocator) void {
         allocator.free(self.sections);
@@ -382,12 +425,16 @@ pub fn inspect(allocator: std.mem.Allocator, image: []const u8) GenerateError!In
         sections[index] = .{
             .name = section.name,
             .contents = section.source[0..@min(section.source.len, section.virtual_size)],
+            .raw_offset = section.raw_offset,
+            .raw_size = section.raw_size,
+            .virtual_size = section.virtual_size,
         };
     }
     return .{
         .machine = parsed.machine,
         .subsystem = parsed.subsystem,
         .sections = sections,
+        .security_directory = parsed.security_directory,
     };
 }
 
@@ -428,6 +475,7 @@ test "generate builds a structurally valid UKI with systemd-stub sections" {
 
     try std.testing.expectEqual(@as(u16, 0x8664), inspection.machine);
     try std.testing.expectEqual(efi_subsystem_application, inspection.subsystem);
+    try std.testing.expect(inspection.security_directory == null);
     try expectSectionContents(&inspection, ".text", "\xC3");
     try expectSectionContents(&inspection, ".linux", linux);
     try expectSectionContents(&inspection, ".initrd", initrd);
@@ -435,6 +483,10 @@ test "generate builds a structurally valid UKI with systemd-stub sections" {
     try expectSectionContents(&inspection, ".osrel", os_release);
     try expectSectionContents(&inspection, ".uname", uname);
     try expectSectionContents(&inspection, ".splash", splash);
+    const cmdline_section = inspection.findSection(".cmdline").?;
+    const cmdline_padding = cmdline_section.paddingRange().?;
+    try std.testing.expect(cmdline_padding.size > 0);
+    try std.testing.expect(cmdline_padding.offset >= cmdline_section.raw_offset + cmdline.len);
 
     const parsed = try parseStub(std.testing.allocator, image);
     defer std.testing.allocator.free(parsed.sections);

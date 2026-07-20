@@ -22,6 +22,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const zvmi = @import("zvmi");
+const uki_signing = @import("uki_signing.zig");
 const oci = zvmi.oci;
 const artifact_pipeline = zvmi.artifact_pipeline;
 
@@ -1373,7 +1374,9 @@ fn canonicalTrustedSigningKeyPath(
 ) ![]u8 {
     const path = try trustedSigningKeyPath(gpa, work_dir, architecture);
     defer gpa.free(path);
-    return Dir.cwd().realPathFileAlloc(io, path, gpa);
+    var buffer: [Dir.max_path_bytes]u8 = undefined;
+    const length = try Dir.cwd().realPathFile(io, path, &buffer);
+    return gpa.dupe(u8, buffer[0..length]);
 }
 
 fn fileUriFromAbsolutePath(gpa: Allocator, path: []const u8) ![]u8 {
@@ -1711,9 +1714,9 @@ fn validateGeneralizedRootfs(
     const machine_id_stat = try Dir.cwd().statFile(io, machine_id, .{});
     if (machine_id_stat.size != 0) return error.GeneratedMachineId;
     const generated = try capture(gpa, io, &.{
-        "find",  rootfs_path,       "-type", "f",     "(",
-        "-name", "authorized_keys", "-o",    "-name", "ssh_host_*",
-        ")",     "-print",
+        "sudo",       "find",  rootfs_path,       "-type", "f",
+        "(",          "-name", "authorized_keys", "-o",    "-name",
+        "ssh_host_*", ")",     "-print",
     });
     defer gpa.free(generated);
     if (std.mem.trim(u8, generated, " \t\r\n").len != 0) return error.BakedIdentityState;
@@ -2474,6 +2477,246 @@ const GeneralizedImageValidationReport = struct {
     uki_size: usize,
 };
 
+const UkiSigningRecord = struct {
+    path: []u8,
+    unsigned_sha256: artifact_pipeline.Digest,
+    signed_sha256: artifact_pipeline.Digest,
+    signed_size: usize,
+};
+
+const UkiSigningReport = struct {
+    records: []UkiSigningRecord,
+
+    fn deinit(self: *UkiSigningReport, allocator: Allocator) void {
+        for (self.records) |record| allocator.free(record.path);
+        allocator.free(self.records);
+        self.* = undefined;
+    }
+};
+
+fn isEfiFile(name: []const u8) bool {
+    return name.len > 4 and std.ascii.eqlIgnoreCase(name[name.len - 4 ..], ".efi");
+}
+
+fn signGeneralizedImage(
+    gpa: Allocator,
+    io: Io,
+    image_path: []const u8,
+    architecture: *const ArchitectureDescriptor,
+    flavor: *const FlavorDescriptor,
+    config: uki_signing.Config,
+    scratch_path: []const u8,
+    environ_map: *const std.process.Environ.Map,
+) !UkiSigningReport {
+    var image = try zvmi.Image.openPath(io, image_path);
+    defer image.close(io);
+    const parsed = try zvmi.gpt.readGpt(image, io, gpa);
+    defer gpa.free(parsed.partitions);
+    if (parsed.partitions.len < 1 or
+        !std.mem.eql(u8, &parsed.partitions[0].partition_type_guid, &zvmi.guid.esp))
+    {
+        return error.MissingEspPartition;
+    }
+    const esp_partition = parsed.partitions[0];
+    var esp = try zvmi.fat32.open(&image, io, .{
+        .offset = esp_partition.first_lba * zvmi.gpt.sector_size,
+        .length = (esp_partition.last_lba - esp_partition.first_lba + 1) *
+            zvmi.gpt.sector_size,
+    });
+
+    const fallback_unsigned = try esp.readFileAlloc(
+        io,
+        gpa,
+        architecture.fallback_efi_path,
+    );
+    defer gpa.free(fallback_unsigned);
+    const linux_entries = try esp.listDirAlloc(io, gpa, "EFI/Linux");
+    defer zvmi.fat32.freeDirEntries(gpa, linux_entries);
+
+    var records: std.ArrayListUnmanaged(UkiSigningRecord) = .empty;
+    errdefer {
+        for (records.items) |record| gpa.free(record.path);
+        records.deinit(gpa);
+    }
+    var fallback_signed: ?[]u8 = null;
+    defer if (fallback_signed) |bytes| gpa.free(bytes);
+    var signer_index: usize = 0;
+
+    for (linux_entries) |entry| {
+        if (entry.kind != .file or !isEfiFile(entry.name)) continue;
+        const path = try std.fmt.allocPrint(gpa, "EFI/Linux/{s}", .{entry.name});
+        errdefer gpa.free(path);
+        const unsigned = try esp.readFileAlloc(io, gpa, path);
+        defer gpa.free(unsigned);
+
+        var signed = try uki_signing.signUkiAlloc(
+            gpa,
+            io,
+            config,
+            scratch_path,
+            environ_map,
+            signer_index,
+            @tagName(architecture.architecture),
+            @tagName(flavor.flavor),
+            unsigned,
+        );
+        defer signed.deinit(gpa);
+        signer_index += 1;
+
+        if (std.mem.eql(u8, fallback_unsigned, unsigned)) {
+            if (fallback_signed == null) {
+                fallback_signed = try gpa.dupe(u8, signed.bytes);
+            }
+        }
+        try esp.deletePath(io, path);
+        try esp.writeFile(io, path, signed.bytes);
+        try records.append(gpa, .{
+            .path = path,
+            .unsigned_sha256 = signed.unsigned_sha256,
+            .signed_sha256 = signed.signed_sha256,
+            .signed_size = signed.bytes.len,
+        });
+    }
+
+    const signed_fallback = fallback_signed orelse return error.FallbackUkiMismatch;
+    try esp.deletePath(io, architecture.fallback_efi_path);
+    try esp.writeFile(io, architecture.fallback_efi_path, signed_fallback);
+    try records.append(gpa, .{
+        .path = try gpa.dupe(u8, architecture.fallback_efi_path),
+        .unsigned_sha256 = artifact_pipeline.sha256Bytes(fallback_unsigned),
+        .signed_sha256 = artifact_pipeline.sha256Bytes(signed_fallback),
+        .signed_size = signed_fallback.len,
+    });
+
+    if (records.items.len < 2) return error.MissingNamedUki;
+    return .{ .records = try records.toOwnedSlice(gpa) };
+}
+
+fn verifySignedGeneralizedImage(
+    gpa: Allocator,
+    io: Io,
+    image_path: []const u8,
+    config: uki_signing.Config,
+    scratch_path: []const u8,
+    report: *const UkiSigningReport,
+) !void {
+    var image = try zvmi.Image.openPathReadOnly(io, image_path);
+    defer image.close(io);
+    const parsed = try zvmi.gpt.readGpt(image, io, gpa);
+    defer gpa.free(parsed.partitions);
+    if (parsed.partitions.len < 1 or
+        !std.mem.eql(u8, &parsed.partitions[0].partition_type_guid, &zvmi.guid.esp))
+    {
+        return error.MissingEspPartition;
+    }
+    const esp_partition = parsed.partitions[0];
+    var esp = try zvmi.fat32.open(&image, io, .{
+        .offset = esp_partition.first_lba * zvmi.gpt.sector_size,
+        .length = (esp_partition.last_lba - esp_partition.first_lba + 1) *
+            zvmi.gpt.sector_size,
+    });
+
+    for (report.records, 0..) |record, index| {
+        const bytes = try esp.readFileAlloc(io, gpa, record.path);
+        defer gpa.free(bytes);
+        if (bytes.len != record.signed_size or
+            !std.mem.eql(
+                u8,
+                &artifact_pipeline.sha256Bytes(bytes),
+                &record.signed_sha256,
+            ))
+        {
+            return error.FinalizedUkiDigestMismatch;
+        }
+        try uki_signing.verifyBytes(gpa, io, config, scratch_path, index, bytes);
+    }
+}
+
+fn writeSigningProvenance(
+    gpa: Allocator,
+    io: Io,
+    work_dir: []const u8,
+    architecture: *const ArchitectureDescriptor,
+    flavor: *const FlavorDescriptor,
+    config: uki_signing.Config,
+    certificate: *const uki_signing.Certificate,
+    report: *const UkiSigningReport,
+) !void {
+    const JsonRecord = struct {
+        path: []const u8,
+        unsigned_sha256: []const u8,
+        signed_sha256: []const u8,
+        finalized_sha256: []const u8,
+        signed_bytes: usize,
+    };
+    const json_records = try gpa.alloc(JsonRecord, report.records.len);
+    defer gpa.free(json_records);
+    const unsigned_hex = try gpa.alloc([64]u8, report.records.len);
+    defer gpa.free(unsigned_hex);
+    const signed_hex = try gpa.alloc([64]u8, report.records.len);
+    defer gpa.free(signed_hex);
+    for (report.records, 0..) |record, index| {
+        unsigned_hex[index] = artifact_pipeline.formatSha256(record.unsigned_sha256);
+        signed_hex[index] = artifact_pipeline.formatSha256(record.signed_sha256);
+        json_records[index] = .{
+            .path = record.path,
+            .unsigned_sha256 = &unsigned_hex[index],
+            .signed_sha256 = &signed_hex[index],
+            .finalized_sha256 = &signed_hex[index],
+            .signed_bytes = record.signed_size,
+        };
+    }
+    const certificate_hex = artifact_pipeline.formatSha256(certificate.sha256);
+    const certificate_base64 = try gpa.alloc(
+        u8,
+        std.base64.standard.Encoder.calcSize(certificate.der.len),
+    );
+    defer gpa.free(certificate_base64);
+    _ = std.base64.standard.Encoder.encode(certificate_base64, certificate.der);
+    const document = .{
+        .schema = 1,
+        .type = "zvmi-uki-signing",
+        .architecture = @tagName(architecture.architecture),
+        .flavor = @tagName(flavor.flavor),
+        .signer_mode = config.mode.name(),
+        .certificate_sha256 = &certificate_hex,
+        .certificate_der_base64 = certificate_base64,
+        .certificate_details = certificate.details,
+        .signature_verification = "success",
+        .files = json_records,
+    };
+    const json = try std.json.Stringify.valueAlloc(
+        gpa,
+        document,
+        .{ .whitespace = .indent_2 },
+    );
+    defer gpa.free(json);
+
+    const provenance_dir = try std.fmt.allocPrint(gpa, "{s}/provenance", .{work_dir});
+    defer gpa.free(provenance_dir);
+    try Dir.cwd().createDirPath(io, provenance_dir);
+    const path = try signingProvenancePath(gpa, work_dir, architecture, flavor);
+    defer gpa.free(path);
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = path,
+        .data = json,
+        .flags = .{ .truncate = true },
+    });
+}
+
+fn signingProvenancePath(
+    allocator: Allocator,
+    work_dir: []const u8,
+    architecture: *const ArchitectureDescriptor,
+    flavor: *const FlavorDescriptor,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}/provenance/uki-signing-{s}-{s}.json",
+        .{ work_dir, @tagName(flavor.flavor), architecture.dnf_architecture },
+    );
+}
+
 fn planGeneralizedGen2Layout(
     gpa: Allocator,
     virtual_size: u64,
@@ -2944,6 +3187,13 @@ const Args = struct {
     zvminit_path: ?[]const u8 = null,
     azagent_path: ?[]const u8 = null,
     preload_path: ?[]const u8 = null,
+    uki_signing_certificate: ?[]const u8 = null,
+    uki_signing_certificate_sha256: ?[]const u8 = null,
+    uki_signing_key: ?[]const u8 = null,
+    uki_sign_command: ?[]const u8 = null,
+    sbsign: []const u8 = "sbsign",
+    sbverify: []const u8 = "sbverify",
+    openssl: []const u8 = "openssl",
 };
 
 const help_text =
@@ -2959,6 +3209,17 @@ const help_text =
     \\  --zvminit <path>    guest zvminit binary (injected by build.zig)
     \\  --azagent <path>    guest azagent binary (injected by build.zig)
     \\  --preload <path>    zstd_max_preload.so (injected by build.zig)
+    \\  --uki-signing-certificate <path>
+    \\                      Public certificate used to verify signed UKIs
+    \\  --uki-signing-certificate-sha256 <hex>
+    \\                      Expected SHA-256 of the canonical DER certificate
+    \\  --uki-signing-key <path>
+    \\                      Local development private key
+    \\  --uki-sign-command <absolute-path>
+    \\                      External production signer executable
+    \\  --sbsign <path>     sbsign executable for local-key mode
+    \\  --sbverify <path>   sbverify executable (default: sbverify)
+    \\  --openssl <path>    OpenSSL executable (default: openssl)
     \\
     \\Preferred invocation: zig build generalized-azurelinux4 -- [user options]
     \\
@@ -3021,6 +3282,34 @@ fn parseArgs(argv: []const []const u8) !Args {
             i += 1;
             if (i >= argv.len) return error.MissingValue;
             a.preload_path = argv[i];
+        } else if (std.mem.eql(u8, arg, "--uki-signing-certificate")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            a.uki_signing_certificate = argv[i];
+        } else if (std.mem.eql(u8, arg, "--uki-signing-certificate-sha256")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            a.uki_signing_certificate_sha256 = argv[i];
+        } else if (std.mem.eql(u8, arg, "--uki-signing-key")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            a.uki_signing_key = argv[i];
+        } else if (std.mem.eql(u8, arg, "--uki-sign-command")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            a.uki_sign_command = argv[i];
+        } else if (std.mem.eql(u8, arg, "--sbsign")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            a.sbsign = argv[i];
+        } else if (std.mem.eql(u8, arg, "--sbverify")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            a.sbverify = argv[i];
+        } else if (std.mem.eql(u8, arg, "--openssl")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            a.openssl = argv[i];
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             std.debug.print("{s}", .{help_text});
             std.process.exit(0);
@@ -3030,6 +3319,43 @@ fn parseArgs(argv: []const []const u8) !Args {
         }
     }
     return a;
+}
+
+fn signingConfig(args: Args) !?uki_signing.Config {
+    const has_any_signing_option = args.uki_signing_certificate != null or
+        args.uki_signing_certificate_sha256 != null or
+        args.uki_signing_key != null or
+        args.uki_sign_command != null;
+    if (!has_any_signing_option) return null;
+
+    const certificate_path = args.uki_signing_certificate orelse
+        return error.MissingUkiSigningCertificate;
+    const expected_sha256 = try uki_signing.parseFingerprint(
+        args.uki_signing_certificate_sha256 orelse
+            return error.MissingUkiSigningCertificateSha256,
+    );
+    if ((args.uki_signing_key == null) == (args.uki_sign_command == null)) {
+        return error.InvalidUkiSignerSelection;
+    }
+    const mode: uki_signing.Mode = if (args.uki_signing_key) |key_path|
+        .{ .local_key = .{
+            .private_key_path = key_path,
+            .sbsign_path = args.sbsign,
+        } }
+    else blk: {
+        const command_path = args.uki_sign_command.?;
+        if (!std.fs.path.isAbsolute(command_path)) {
+            return error.UkiSignCommandMustBeAbsolute;
+        }
+        break :blk .{ .external_command = .{ .executable_path = command_path } };
+    };
+    return .{
+        .certificate_path = certificate_path,
+        .expected_certificate_sha256 = expected_sha256,
+        .sbverify_path = args.sbverify,
+        .openssl_path = args.openssl,
+        .mode = mode,
+    };
 }
 
 // ─── main ─────────────────────────────────────────────────────────────────────
@@ -3042,6 +3368,10 @@ pub fn main(init: std.process.Init) !void {
 
     const args = parseArgs(argv[1..]) catch |err| {
         std.debug.print("error: {s}\n{s}", .{ @errorName(err), help_text });
+        std.process.exit(1);
+    };
+    const signing_config = signingConfig(args) catch |err| {
+        std.debug.print("error: invalid UKI signing options ({s})\n", .{@errorName(err)});
         std.process.exit(1);
     };
     const architecture = requireArchitecture(args.architecture) catch {
@@ -3084,6 +3414,57 @@ pub fn main(init: std.process.Init) !void {
             tools_ok = false;
         }
     }
+    if (signing_config) |config| {
+        const certificate_stat = Dir.cwd().statFile(io, config.certificate_path, .{}) catch |err| {
+            std.debug.print(
+                "error: cannot read UKI signing certificate '{s}' ({s})\n",
+                .{ config.certificate_path, @errorName(err) },
+            );
+            std.process.exit(1);
+        };
+        if (!isRegularNonemptyFile(certificate_stat.kind, certificate_stat.size)) {
+            std.debug.print(
+                "error: UKI signing certificate is not a nonempty regular file: {s}\n",
+                .{config.certificate_path},
+            );
+            std.process.exit(1);
+        }
+        if (config.mode == .local_key) {
+            const key_path = config.mode.local_key.private_key_path;
+            const key_stat = Dir.cwd().statFile(io, key_path, .{}) catch |err| {
+                std.debug.print(
+                    "error: cannot read local UKI signing key '{s}' ({s})\n",
+                    .{ key_path, @errorName(err) },
+                );
+                std.process.exit(1);
+            };
+            if (!isRegularNonemptyFile(key_stat.kind, key_stat.size)) {
+                std.debug.print(
+                    "error: local UKI signing key is not a nonempty regular file: {s}\n",
+                    .{key_path},
+                );
+                std.process.exit(1);
+            }
+        }
+        const signing_tools = switch (config.mode) {
+            .local_key => |local| [_][]const u8{
+                config.openssl_path,
+                config.sbverify_path,
+                local.sbsign_path,
+            },
+            .external_command => |external| [_][]const u8{
+                config.openssl_path,
+                config.sbverify_path,
+                external.executable_path,
+            },
+        };
+        for (signing_tools) |tool| {
+            if (!requireTool(gpa, io, tool)) {
+                std.debug.print("error: required signing tool '{s}' not found\n", .{tool});
+                tools_ok = false;
+            }
+        }
+    }
     if (!tools_ok) std.process.exit(1);
     if (flavor.pid1 == .zvminit) {
         try validateGuestArtifact(gpa, io, zvminit_path orelse return error.MissingZvminitArtifact, architecture);
@@ -3091,6 +3472,31 @@ pub fn main(init: std.process.Init) !void {
     }
 
     try Dir.cwd().createDirPath(io, work_dir);
+    const signing_provenance_path = try signingProvenancePath(
+        gpa,
+        work_dir,
+        architecture,
+        flavor,
+    );
+    defer gpa.free(signing_provenance_path);
+    Dir.cwd().deleteFile(io, signing_provenance_path) catch {};
+    const signing_scratch = if (signing_config != null)
+        try std.fmt.allocPrint(gpa, "{s}/uki-signing-scratch", .{work_dir})
+    else
+        null;
+    defer if (signing_scratch) |path| gpa.free(path);
+    defer if (signing_scratch) |path| Dir.cwd().deleteTree(io, path) catch {};
+    var signing_certificate: ?uki_signing.Certificate = null;
+    defer if (signing_certificate) |*certificate| certificate.deinit(gpa);
+    if (signing_config) |config| {
+        try uki_signing.prepareScratchDirectory(io, signing_scratch.?);
+        signing_certificate = try uki_signing.prepareCertificate(
+            gpa,
+            io,
+            config,
+            signing_scratch.?,
+        );
+    }
 
     const downloaded_iso_path = if (args.iso == null) try downloadIso(gpa, io, work_dir, architecture) else null;
     defer if (downloaded_iso_path) |path| gpa.free(path);
@@ -3193,6 +3599,22 @@ pub fn main(init: std.process.Init) !void {
         "-v",
     });
 
+    var signing_report: ?UkiSigningReport = null;
+    defer if (signing_report) |*report| report.deinit(gpa);
+    if (signing_config) |config| {
+        std.debug.print("Signing UKIs...\n", .{});
+        signing_report = try signGeneralizedImage(
+            gpa,
+            io,
+            raw_qcow2,
+            architecture,
+            flavor,
+            config,
+            signing_scratch.?,
+            init.environ_map,
+        );
+    }
+
     // Compress to maximum-zstd QCOW2 via the LD_PRELOAD intercept library.
     std.debug.print("Compressing to maximum-zstd QCOW2...\n", .{});
     var env_map = try init.environ_map.clone(gpa);
@@ -3237,6 +3659,33 @@ pub fn main(init: std.process.Init) !void {
         "Validated generalized QCOW2: virtual {d} bytes, ESP {d} bytes, root {d} bytes, UKI {d} bytes\n",
         .{ validation.virtual_size, validation.esp_size, validation.root_size, validation.uki_size },
     );
+    if (signing_config) |config| {
+        verifySignedGeneralizedImage(
+            gpa,
+            io,
+            staged_qcow2,
+            config,
+            signing_scratch.?,
+            &signing_report.?,
+        ) catch |err| {
+            std.debug.print(
+                "error: finalized UKI signature verification failed ({s}); keeping {s} and {s}\n",
+                .{ @errorName(err), raw_qcow2, staged_qcow2 },
+            );
+            return err;
+        };
+        try writeSigningProvenance(
+            gpa,
+            io,
+            work_dir,
+            architecture,
+            flavor,
+            config,
+            &signing_certificate.?,
+            &signing_report.?,
+        );
+        std.debug.print("Verified signed UKIs in finalized QCOW2.\n", .{});
+    }
 
     Dir.cwd().rename(staged_qcow2, Dir.cwd(), output_path, io) catch |err| {
         std.debug.print(
@@ -3696,6 +4145,73 @@ test "architecture and argument parsing accepts only supported values" {
         "zig-out/bin/zvminit",
         (try parseArgs(&.{ "--zvminit", "zig-out/bin/zvminit" })).zvminit_path.?,
     );
+    try std.testing.expectEqualStrings(
+        "/usr/local/bin/sign-uki",
+        (try parseArgs(&.{
+            "--uki-signing-certificate",
+            "release.crt",
+            "--uki-signing-certificate-sha256",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "--uki-sign-command",
+            "/usr/local/bin/sign-uki",
+        })).uki_sign_command.?,
+    );
+}
+
+test "UKI signer configuration is complete and mutually exclusive" {
+    try std.testing.expect((try signingConfig(.{})) == null);
+    try std.testing.expectError(
+        error.MissingUkiSigningCertificate,
+        signingConfig(.{
+            .uki_signing_key = "release.key",
+        }),
+    );
+    try std.testing.expectError(
+        error.MissingUkiSigningCertificateSha256,
+        signingConfig(.{
+            .uki_signing_certificate = "release.crt",
+            .uki_signing_key = "release.key",
+        }),
+    );
+    try std.testing.expectError(
+        error.InvalidUkiSignerSelection,
+        signingConfig(.{
+            .uki_signing_certificate = "release.crt",
+            .uki_signing_certificate_sha256 = "1111111111111111111111111111111111111111111111111111111111111111",
+        }),
+    );
+    try std.testing.expectError(
+        error.InvalidUkiSignerSelection,
+        signingConfig(.{
+            .uki_signing_certificate = "release.crt",
+            .uki_signing_certificate_sha256 = "1111111111111111111111111111111111111111111111111111111111111111",
+            .uki_signing_key = "release.key",
+            .uki_sign_command = "/usr/local/bin/sign-uki",
+        }),
+    );
+    try std.testing.expectError(
+        error.UkiSignCommandMustBeAbsolute,
+        signingConfig(.{
+            .uki_signing_certificate = "release.crt",
+            .uki_signing_certificate_sha256 = "1111111111111111111111111111111111111111111111111111111111111111",
+            .uki_sign_command = "sign-uki",
+        }),
+    );
+
+    const local = (try signingConfig(.{
+        .uki_signing_certificate = "release.crt",
+        .uki_signing_certificate_sha256 = "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        .uki_signing_key = "release.key",
+    })).?;
+    try std.testing.expectEqualStrings("local-key", local.mode.name());
+    try std.testing.expectEqualStrings("release.key", local.mode.local_key.private_key_path);
+
+    const external = (try signingConfig(.{
+        .uki_signing_certificate = "release.crt",
+        .uki_signing_certificate_sha256 = "1111111111111111111111111111111111111111111111111111111111111111",
+        .uki_sign_command = "/usr/local/bin/sign-uki",
+    })).?;
+    try std.testing.expectEqualStrings("external-command", external.mode.name());
 }
 
 test "guest artifact architecture validation rejects mismatches" {

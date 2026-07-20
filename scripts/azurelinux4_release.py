@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -23,6 +25,13 @@ EXPECTED = {
 RELEASE_ORDER = tuple(EXPECTED)
 AZURE_CONTRACTS = {
     "matching-architecture-gen2",
+    "trusted-launch",
+    "secure-boot",
+    "vtpm",
+    "uefi-db-signer",
+    "signed-uki",
+    "kernel-lockdown",
+    "module-signatures",
     "key-only-ssh",
     "agent-ready",
     "root-growth",
@@ -31,8 +40,23 @@ AZURE_CONTRACTS = {
     "reboot-reconnect",
     "runtime-flavor-identity",
 }
+LOCAL_SECURE_BOOT_CONTRACTS = {
+    "secure-boot",
+    "uefi-db-signer",
+    "signed-uki",
+    "kernel-lockdown",
+    "module-signatures",
+    "tampered-uki-rejected",
+}
 AZURE_VHD_ALIGNMENT = 1024 * 1024
 VHD_FOOTER_BYTES = 512
+PRIVATE_KEY_PEM_MARKERS = (
+    b"-----BEGIN PRIVATE KEY-----",
+    b"-----BEGIN ENCRYPTED PRIVATE KEY-----",
+    b"-----BEGIN RSA PRIVATE KEY-----",
+    b"-----BEGIN EC PRIVATE KEY-----",
+    b"-----BEGIN OPENSSH PRIVATE KEY-----",
+)
 
 
 def fail(message: str) -> None:
@@ -57,6 +81,62 @@ def require_commit(value: object, label: str = "source_commit") -> str:
     if not isinstance(value, str) or COMMIT_RE.fullmatch(value) is None:
         fail(f"{label} is not a full lowercase commit SHA")
     return value
+
+
+def has_exact_contracts(value: object, expected: set[str]) -> bool:
+    return (
+        isinstance(value, list)
+        and len(value) == len(expected)
+        and all(isinstance(item, str) for item in value)
+        and set(value) == expected
+    )
+
+
+def validate_azure_uefi_settings(
+    settings: object,
+    certificate_sha256: str,
+) -> dict[str, object]:
+    if not isinstance(settings, dict) or set(settings) != {
+        "signatureTemplateNames",
+        "additionalSignatures",
+    }:
+        fail("Azure custom UEFI settings have an unexpected shape")
+    if settings.get("signatureTemplateNames") != [
+        "MicrosoftUefiCertificateAuthorityTemplate"
+    ]:
+        fail("Azure custom UEFI settings do not retain the Microsoft template")
+    additional = settings.get("additionalSignatures")
+    if not isinstance(additional, dict) or set(additional) != {"db"}:
+        fail("Azure custom UEFI additional signatures are invalid")
+    db = additional.get("db")
+    if (
+        not isinstance(db, list)
+        or len(db) != 1
+        or not isinstance(db[0], dict)
+        or db[0].get("type") != "x509"
+        or set(db[0]) != {"type", "value"}
+        or not isinstance(db[0].get("value"), list)
+        or len(db[0]["value"]) != 1
+        or not isinstance(db[0]["value"][0], str)
+    ):
+        fail("Azure custom UEFI db signature is invalid")
+    try:
+        certificate = base64.b64decode(db[0]["value"][0], validate=True)
+    except (ValueError, binascii.Error):
+        fail("Azure custom UEFI certificate is not canonical base64")
+    if hashlib.sha256(certificate).hexdigest() != certificate_sha256:
+        fail("Azure custom UEFI certificate fingerprint mismatch")
+    return settings
+
+
+def gallery_uefi_settings(document: dict[str, object]) -> object:
+    properties = document.get("properties")
+    if not isinstance(properties, dict):
+        return None
+    security_profile = properties.get("securityProfile")
+    if not isinstance(security_profile, dict):
+        return None
+    return security_profile.get("uefiSettings")
 
 
 def validate_azure_vhd_info(info: dict[str, object], file_size: int) -> int:
@@ -93,6 +173,63 @@ def write_json(path: Path, value: dict[str, object]) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def contains_private_key(data: bytes) -> bool:
+    if any(marker in data for marker in PRIVATE_KEY_PEM_MARKERS):
+        return True
+
+    def read_tlv(
+        offset: int, limit: int
+    ) -> tuple[int, int, int] | None:
+        if offset + 2 > limit:
+            return None
+        tag = data[offset]
+        length = data[offset + 1]
+        cursor = offset + 2
+        if length & 0x80:
+            length_bytes = length & 0x7F
+            if (
+                length_bytes == 0
+                or length_bytes > 4
+                or cursor + length_bytes > limit
+            ):
+                return None
+            length = int.from_bytes(data[cursor : cursor + length_bytes], "big")
+            cursor += length_bytes
+        end = cursor + length
+        if end > limit:
+            return None
+        return tag, cursor, end
+
+    def der_private_key_at(offset: int) -> bool:
+        root = read_tlv(offset, len(data))
+        if root is None or root[0] != 0x30:
+            return False
+        first = read_tlv(root[1], root[2])
+        if first is None:
+            return False
+        if first[0] == 0x02:
+            version = data[first[1] : first[2]]
+            return version in (b"\x00", b"\x01", b"\x03")
+
+        second = read_tlv(first[2], root[2])
+        if (
+            first[0] != 0x30
+            or second is None
+            or second[0] != 0x04
+            or second[2] != root[2]
+        ):
+            return False
+        algorithm_oid = read_tlv(first[1], first[2])
+        return algorithm_oid is not None and algorithm_oid[0] == 0x06
+
+    cursor = 0
+    while (candidate := data.find(b"\x30", cursor)) >= 0:
+        if der_private_key_at(candidate):
+            return True
+        cursor = candidate + 1
+    return False
+
+
 def validate_identity(
     document: dict[str, object],
     *,
@@ -125,6 +262,8 @@ def provenance_records(root: Path) -> list[dict[str, object]]:
         fail(f"provenance directory is missing: {root}")
     records: list[dict[str, object]] = []
     for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        if contains_private_key(path.read_bytes()):
+            fail(f"private key material is forbidden in provenance: {path}")
         records.append(
             {
                 "path": path.relative_to(root).as_posix(),
@@ -135,6 +274,89 @@ def provenance_records(root: Path) -> list[dict[str, object]]:
     if not records:
         fail(f"provenance directory is empty: {root}")
     return records
+
+
+def validate_signing_provenance(
+    root: Path,
+    architecture: str,
+    flavor: str,
+) -> dict[str, object]:
+    path = root / f"uki-signing-{flavor}-{architecture}.json"
+    document = read_json(path)
+    if document.get("schema") != 1 or document.get("type") != "zvmi-uki-signing":
+        fail("invalid UKI signing provenance schema")
+    if document.get("architecture") != architecture or document.get("flavor") != flavor:
+        fail("UKI signing provenance architecture/flavor mismatch")
+    if document.get("signer_mode") != "external-command":
+        fail("release UKIs were not signed by the external provider")
+    certificate_sha256 = require_sha256(
+        document.get("certificate_sha256"), "UKI signing certificate fingerprint"
+    )
+    certificate_der_base64 = document.get("certificate_der_base64")
+    if not isinstance(certificate_der_base64, str):
+        fail("canonical DER UKI signing certificate is absent")
+    try:
+        certificate_der = base64.b64decode(certificate_der_base64, validate=True)
+    except (ValueError, binascii.Error):
+        fail("canonical DER UKI signing certificate is not valid base64")
+    if (
+        not certificate_der
+        or hashlib.sha256(certificate_der).hexdigest() != certificate_sha256
+    ):
+        fail("canonical DER UKI signing certificate fingerprint mismatch")
+    if document.get("signature_verification") != "success":
+        fail("UKI signature verification did not explicitly succeed")
+    if not isinstance(document.get("certificate_details"), str) or not document[
+        "certificate_details"
+    ]:
+        fail("UKI signing certificate details are absent")
+
+    files = document.get("files")
+    if not isinstance(files, list) or len(files) < 2:
+        fail("UKI signing provenance file bindings are absent")
+    fallback_path = (
+        "EFI/BOOT/BOOTX64.EFI"
+        if architecture == "x86_64"
+        else "EFI/BOOT/BOOTAA64.EFI"
+    )
+    seen: set[str] = set()
+    named_digests: set[str] = set()
+    fallback_digest: str | None = None
+    for record in files:
+        if not isinstance(record, dict):
+            fail("invalid UKI signing file record")
+        uki_path = record.get("path")
+        if not isinstance(uki_path, str) or uki_path in seen:
+            fail("invalid or duplicate UKI signing path")
+        if uki_path != fallback_path and not (
+            uki_path.startswith("EFI/Linux/") and uki_path.lower().endswith(".efi")
+        ):
+            fail(f"unexpected UKI signing path: {uki_path}")
+        seen.add(uki_path)
+        unsigned = require_sha256(
+            record.get("unsigned_sha256"), f"{uki_path} unsigned UKI digest"
+        )
+        signed = require_sha256(record.get("signed_sha256"), f"{uki_path} signed UKI digest")
+        finalized = require_sha256(
+            record.get("finalized_sha256"), f"{uki_path} finalized UKI digest"
+        )
+        if unsigned == signed or signed != finalized:
+            fail(f"{uki_path}: invalid signed/finalized UKI digest binding")
+        if type(record.get("signed_bytes")) is not int or record["signed_bytes"] <= 0:
+            fail(f"{uki_path}: invalid signed UKI size")
+        if uki_path == fallback_path:
+            fallback_digest = signed
+        else:
+            named_digests.add(signed)
+    if fallback_digest is None or fallback_digest not in named_digests:
+        fail("fallback UKI is not byte-identical to a named signed UKI")
+    return {
+        "certificate_sha256": certificate_sha256,
+        "certificate_der_base64": certificate_der_base64,
+        "fallback_uki_sha256": fallback_digest,
+        "signer_mode": document["signer_mode"],
+        "provenance_path": path.relative_to(root).as_posix(),
+    }
 
 
 def provenance_digest(records: list[dict[str, object]]) -> str:
@@ -154,12 +376,26 @@ def candidate_command(args: argparse.Namespace) -> None:
     if asset.name != asset_name:
         fail(f"{args.key}: expected asset {asset_name}, got {asset.name}")
     source_commit = require_commit(args.source_commit)
-    records = provenance_records(args.provenance_dir.resolve())
+    provenance_root = args.provenance_dir.resolve()
+    records = provenance_records(provenance_root)
+    signing = validate_signing_provenance(provenance_root, architecture, flavor)
     digest = sha256(asset)
     if args.accepted_sha256 != digest:
         fail(f"{args.key}: local acceptance digest does not match candidate bytes")
     if args.virtual_size <= 0:
         fail("virtual size must be positive")
+    local_result = read_json(args.local_acceptance_result)
+    if (
+        local_result.get("schema") != 1
+        or local_result.get("type") != "azurelinux4-local-secure-boot-acceptance"
+        or local_result.get("candidate_sha256") != digest
+        or local_result.get("certificate_sha256") != signing["certificate_sha256"]
+        or local_result.get("fallback_uki_sha256") != signing["fallback_uki_sha256"]
+        or not has_exact_contracts(
+            local_result.get("contracts"), LOCAL_SECURE_BOOT_CONTRACTS
+        )
+    ):
+        fail(f"{args.key}: local Secure Boot acceptance binding is invalid")
     write_json(
         args.output,
         {
@@ -178,11 +414,15 @@ def candidate_command(args: argparse.Namespace) -> None:
                 "accepted_sha256": args.accepted_sha256,
                 "runner": args.runner,
                 "qemu_version": args.qemu_version,
+                "certificate_sha256": local_result["certificate_sha256"],
+                "fallback_uki_sha256": local_result["fallback_uki_sha256"],
+                "contracts": sorted(LOCAL_SECURE_BOOT_CONTRACTS),
             },
             "provenance": {
                 "digest": provenance_digest(records),
                 "files": records,
             },
+            "uki_signing": signing,
             "workflow": {
                 "run_id": args.run_id,
                 "run_attempt": args.run_attempt,
@@ -247,6 +487,8 @@ def verify_candidate(
         ):
             fail(f"{actual_key}: invalid provenance path")
         path = provenance_root / relative
+        if path.is_file() and contains_private_key(path.read_bytes()):
+            fail(f"{actual_key}: private key material is forbidden in provenance")
         if not path.is_file() or record.get("bytes") != path.stat().st_size:
             fail(f"{actual_key}: provenance file/size mismatch for {relative}")
         if record.get("sha256") != sha256(path):
@@ -256,6 +498,18 @@ def verify_candidate(
         fail(f"{actual_key}: provenance file allowlist mismatch")
     if provenance.get("digest") != provenance_digest(files):
         fail(f"{actual_key}: aggregate provenance digest mismatch")
+    signing = document.get("uki_signing")
+    if not isinstance(signing, dict):
+        fail(f"{actual_key}: UKI signing binding is absent")
+    actual_signing = validate_signing_provenance(provenance_root, document["architecture"], document["flavor"])
+    if signing != actual_signing:
+        fail(f"{actual_key}: UKI signing binding does not match provenance")
+    if (
+        local.get("certificate_sha256") != signing["certificate_sha256"]
+        or local.get("fallback_uki_sha256") != signing["fallback_uki_sha256"]
+        or not has_exact_contracts(local.get("contracts"), LOCAL_SECURE_BOOT_CONTRACTS)
+    ):
+        fail(f"{actual_key}: local Secure Boot acceptance did not bind the signed UKI")
     return document
 
 
@@ -291,6 +545,15 @@ def azure_result_command(args: argparse.Namespace) -> None:
     vhd = args.vhd.resolve()
     if not vhd.is_file():
         fail(f"derived VHD is missing: {vhd}")
+    request = read_json(args.uefi_request)
+    response = read_json(args.uefi_response)
+    request_uefi = gallery_uefi_settings(request)
+    response_uefi = gallery_uefi_settings(response)
+    if not isinstance(request_uefi, dict) or request_uefi != response_uefi:
+        fail("Azure gallery version did not preserve the exact custom UEFI settings")
+    validate_azure_uefi_settings(
+        request_uefi, candidate["uki_signing"]["certificate_sha256"]
+    )
     write_json(
         args.output,
         {
@@ -305,6 +568,10 @@ def azure_result_command(args: argparse.Namespace) -> None:
             "azure_accepted_sha256": sha256(args.asset),
             "derived_vhd_sha256": sha256(vhd),
             "derived_vhd_bytes": vhd.stat().st_size,
+            "certificate_sha256": candidate["uki_signing"]["certificate_sha256"],
+            "fallback_uki_sha256": candidate["uki_signing"]["fallback_uki_sha256"],
+            "image_version_id": args.image_version_id,
+            "uefi_settings": request_uefi,
             "status": "success",
             "location": args.location,
             "vm_size": args.vm_size,
@@ -356,6 +623,7 @@ def stage_command(args: argparse.Namespace) -> None:
         output.mkdir(parents=True)
 
     staged: list[dict[str, object]] = []
+    release_certificate_sha256: str | None = None
     for key in RELEASE_ORDER:
         manifest_path, candidate = candidates[key]
         _, architecture, flavor, asset_name = validate_identity(
@@ -384,9 +652,33 @@ def stage_command(args: argparse.Namespace) -> None:
             fail(f"{key}: Azure acceptance is not explicitly successful")
         if azure.get("qcow_sha256") != digest or azure.get("azure_accepted_sha256") != digest:
             fail(f"{key}: Azure acceptance did not validate published bytes")
+        signing = candidate.get("uki_signing")
+        if not isinstance(signing, dict):
+            fail(f"{key}: UKI signing binding is absent")
+        certificate_sha256 = require_sha256(
+            signing.get("certificate_sha256"), f"{key} signing certificate fingerprint"
+        )
+        fallback_uki_sha256 = require_sha256(
+            signing.get("fallback_uki_sha256"), f"{key} fallback UKI digest"
+        )
+        if (
+            azure.get("certificate_sha256") != certificate_sha256
+            or azure.get("fallback_uki_sha256") != fallback_uki_sha256
+        ):
+            fail(f"{key}: Azure acceptance did not bind the signed UKI identity")
+        validate_azure_uefi_settings(azure.get("uefi_settings"), certificate_sha256)
+        if (
+            not isinstance(azure.get("image_version_id"), str)
+            or not azure["image_version_id"].startswith("/subscriptions/")
+        ):
+            fail(f"{key}: Azure gallery image-version identity is absent")
+        if release_certificate_sha256 is None:
+            release_certificate_sha256 = certificate_sha256
+        elif release_certificate_sha256 != certificate_sha256:
+            fail("release candidates do not share one UKI signing certificate")
         require_sha256(azure.get("derived_vhd_sha256"), f"{key} VHD digest")
         contracts = azure.get("contracts")
-        if not isinstance(contracts, list) or set(contracts) != AZURE_CONTRACTS:
+        if not has_exact_contracts(contracts, AZURE_CONTRACTS):
             fail(f"{key}: Azure contract results are absent")
         if not isinstance(azure.get("derived_vhd_bytes"), int) or azure["derived_vhd_bytes"] <= 0:
             fail(f"{key}: derived VHD size binding is absent")
@@ -418,9 +710,12 @@ def stage_command(args: argparse.Namespace) -> None:
                 "local_runner": local.get("runner"),
                 "qemu_version": local.get("qemu_version"),
                 "provenance_digest": provenance.get("digest"),
+                "certificate_sha256": certificate_sha256,
+                "fallback_uki_sha256": fallback_uki_sha256,
                 "azure_location": azure.get("location"),
                 "azure_vm_size": azure.get("vm_size"),
                 "derived_vhd_sha256": azure.get("derived_vhd_sha256"),
+                "azure_image_version_id": azure.get("image_version_id"),
             }
         )
 
@@ -430,6 +725,7 @@ def stage_command(args: argparse.Namespace) -> None:
             "schema": 1,
             "release_tag": args.release_tag,
             "source_commit": source_commit,
+            "certificate_sha256": release_certificate_sha256,
             "assets": staged,
         },
     )
@@ -439,12 +735,14 @@ def stage_command(args: argparse.Namespace) -> None:
         f"`{source_commit}`. Every published QCOW2 passed native-KVM local acceptance and "
         "protected-environment validation on a matching Azure architecture.",
         "",
-        "| Asset | SHA-256 | Bytes | Azure validation | Derived VHD SHA-256 (not published) |",
-        "| --- | --- | ---: | --- | --- |",
+        f"All UKIs are signed by certificate SHA-256 `{release_certificate_sha256}`.",
+        "",
+        "| Asset | SHA-256 | UKI SHA-256 | Bytes | Azure validation | Derived VHD SHA-256 (not published) |",
+        "| --- | --- | --- | ---: | --- | --- |",
     ]
     for item in staged:
         lines.append(
-            f"| `{item['asset_name']}` | `{item['sha256']}` | {item['bytes']} | "
+            f"| `{item['asset_name']}` | `{item['sha256']}` | `{item['fallback_uki_sha256']}` | {item['bytes']} | "
             f"`{item['azure_location']}` / `{item['azure_vm_size']}` | "
             f"`{item['derived_vhd_sha256']}` |"
         )
@@ -456,12 +754,11 @@ def stage_command(args: argparse.Namespace) -> None:
             "boot `zvminit`, provision through `azagent`, and directly supervise OpenSSH. "
             "Core therefore requires a public SSH key in the Azure provisioning profile.",
             "",
-            "Acceptance required key-only SSH, agent Ready, runtime architecture/flavor identity, "
-            "root growth on an enlarged OS disk, temporary-resource-disk policy, managed-data-disk "
-            "policy, and reboot/reconnect. Candidate and derived-VHD hashes were checked at every "
+            "Acceptance required signed UKIs, QEMU Secure Boot rejection of authenticated command-line tampering, "
+            "Azure Trusted Launch with Secure Boot and vTPM, the exact signer in UEFI db, kernel lockdown, "
+            "module trust, key-only SSH, agent Ready, runtime architecture/flavor identity, root growth on an enlarged OS disk, temporary-resource-disk policy, managed-data-disk policy, and reboot/reconnect. Candidate and derived-VHD hashes were checked at every "
             "handoff; temporary VHDs and Azure resources were deleted.",
             "",
-            "Secure Boot is disabled because the UKIs are currently unsigned (issue #168). "
             "**No checksum sidecar assets are published**; SHA-256 digests are recorded only "
             "in these notes and the workflow job summary.",
             "",
@@ -490,6 +787,7 @@ def parser() -> argparse.ArgumentParser:
     candidate.add_argument("--virtual-size", type=int, required=True)
     candidate.add_argument("--source-commit", required=True)
     candidate.add_argument("--provenance-dir", type=Path, required=True)
+    candidate.add_argument("--local-acceptance-result", type=Path, required=True)
     candidate.add_argument("--runner", required=True)
     candidate.add_argument("--qemu-version", required=True)
     candidate.add_argument("--run-id", required=True)
@@ -518,6 +816,9 @@ def parser() -> argparse.ArgumentParser:
     azure.add_argument("--location", required=True)
     azure.add_argument("--vm-size", required=True)
     azure.add_argument("--resource-group", required=True)
+    azure.add_argument("--image-version-id", required=True)
+    azure.add_argument("--uefi-request", type=Path, required=True)
+    azure.add_argument("--uefi-response", type=Path, required=True)
     azure.add_argument("--run-id", required=True)
     azure.add_argument("--run-attempt", required=True)
     azure.add_argument("--output", type=Path, required=True)

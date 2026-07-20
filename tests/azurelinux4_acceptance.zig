@@ -37,6 +37,13 @@ const Architecture = enum {
         };
     }
 
+    fn rootRole(self: Architecture) zvmi.layout.PartitionRole {
+        return switch (self) {
+            .x86_64 => .root_x86_64,
+            .aarch64 => .root_aarch64,
+        };
+    }
+
     fn ukiMachine(self: Architecture) u16 {
         return switch (self) {
             .x86_64 => 0x8664,
@@ -58,9 +65,12 @@ const Architecture = enum {
         };
     }
 
-    fn machineArg(self: Architecture) []const u8 {
+    fn machineArg(self: Architecture, secure_boot: bool) []const u8 {
         return switch (self) {
-            .x86_64 => "q35,accel=kvm,smm=off",
+            .x86_64 => if (secure_boot)
+                "q35,accel=kvm,smm=on"
+            else
+                "q35,accel=kvm,smm=off",
             .aarch64 => "virt,accel=kvm",
         };
     }
@@ -363,19 +373,21 @@ fn requireFirmwareAlloc(
     io: Io,
     qemu_path: []const u8,
     architecture: Architecture,
+    secure_boot: bool,
 ) !Firmware {
-    const explicit_code = try optionalEnvAlloc(
+    const explicit_code = if (secure_boot) try optionalEnvAlloc(
         allocator,
         "ZVMI_AZURELINUX4_UEFI_CODE",
-    );
+    ) else null;
     defer if (explicit_code) |path| allocator.free(path);
-    const explicit_vars = try optionalEnvAlloc(
+    const explicit_vars = if (secure_boot) try optionalEnvAlloc(
         allocator,
         "ZVMI_AZURELINUX4_UEFI_VARS",
-    );
+    ) else null;
     defer if (explicit_vars) |path| allocator.free(path);
 
     return requireFoundFirmware(try qemu_host.findFirmwarePairAlloc(allocator, io, .{
+        .secure_boot = secure_boot,
         .explicit_code_path = explicit_code,
         .explicit_vars_path = explicit_vars,
         .qemu_path = qemu_path,
@@ -430,6 +442,293 @@ fn commandOutputAlloc(
     }
     allocator.free(result.stdout);
     return error.CommandFailed;
+}
+
+fn requireEnvAlloc(
+    allocator: Allocator,
+    comptime name: []const u8,
+) ![]u8 {
+    return (try optionalEnvAlloc(allocator, name)) orelse {
+        std.debug.print("Azure Linux 4 Secure Boot acceptance requires {s}\n", .{name});
+        return error.RequiredEnvironmentMissing;
+    };
+}
+
+fn canonicalCertificateSha256(
+    allocator: Allocator,
+    io: Io,
+    openssl_path: []const u8,
+    certificate_path: []const u8,
+    output_path: []const u8,
+) !zvmi.artifact_pipeline.Digest {
+    try runCommand(allocator, io, &.{
+        openssl_path,
+        "x509",
+        "-in",
+        certificate_path,
+        "-outform",
+        "DER",
+        "-out",
+        output_path,
+    });
+    const certificate = try Dir.cwd().readFileAlloc(
+        io,
+        output_path,
+        allocator,
+        .limited(1024 * 1024),
+    );
+    defer allocator.free(certificate);
+    if (certificate.len == 0) return error.EmptySigningCertificate;
+    return zvmi.artifact_pipeline.sha256Bytes(certificate);
+}
+
+fn prepareEnrolledVars(
+    allocator: Allocator,
+    io: Io,
+    virt_fw_vars_path: []const u8,
+    source_vars_path: []const u8,
+    certificate_path: []const u8,
+    output_path: []const u8,
+) !void {
+    Dir.cwd().deleteFile(io, output_path) catch {};
+    try runCommand(allocator, io, &.{
+        virt_fw_vars_path,
+        "--input",
+        source_vars_path,
+        "--output",
+        output_path,
+        "--add-db",
+        "7f32d4a1-7c10-4e6d-8a89-15ba3f4db734",
+        certificate_path,
+        "--secure-boot",
+    });
+    const stat = try Dir.cwd().statFile(io, output_path, .{});
+    if (stat.kind != .file or stat.size == 0) return error.InvalidEnrolledVars;
+}
+
+fn verifyUkiSignatures(
+    allocator: Allocator,
+    io: Io,
+    image_path: []const u8,
+    candidate: Candidate,
+    certificate_path: []const u8,
+    sbverify_path: []const u8,
+    scratch_path: []const u8,
+) !void {
+    var file = try Dir.cwd().openFile(io, image_path, .{ .mode = .read_only });
+    var image = try zvmi.Image.openStandaloneQcow2File(io, file);
+    defer image.close(io);
+    file = undefined;
+    const parsed = try zvmi.gpt.readGpt(image, io, allocator);
+    defer allocator.free(parsed.partitions);
+    if (parsed.partitions.len < 1 or
+        !std.mem.eql(u8, &parsed.partitions[0].partition_type_guid, &zvmi.guid.esp))
+    {
+        return error.MissingEspPartition;
+    }
+    const partition = parsed.partitions[0];
+    var esp = try zvmi.fat32.open(&image, io, .{
+        .offset = partition.first_lba * zvmi.gpt.sector_size,
+        .length = (partition.last_lba - partition.first_lba + 1) *
+            zvmi.gpt.sector_size,
+    });
+    const entries = try esp.listDirAlloc(io, allocator, "EFI/Linux");
+    defer zvmi.fat32.freeDirEntries(allocator, entries);
+    var index: usize = 0;
+    for (entries) |entry| {
+        if (entry.kind != .file or entry.name.len <= 4 or
+            !std.ascii.eqlIgnoreCase(entry.name[entry.name.len - 4 ..], ".efi"))
+        {
+            continue;
+        }
+        const path = try std.fmt.allocPrint(allocator, "EFI/Linux/{s}", .{entry.name});
+        defer allocator.free(path);
+        const bytes = try esp.readFileAlloc(io, allocator, path);
+        defer allocator.free(bytes);
+        const extracted = try std.fmt.allocPrint(
+            allocator,
+            "{s}/uki-{d}.efi",
+            .{ scratch_path, index },
+        );
+        defer allocator.free(extracted);
+        try Dir.cwd().writeFile(io, .{
+            .sub_path = extracted,
+            .data = bytes,
+            .flags = .{ .truncate = true, .permissions = .fromMode(0o600) },
+        });
+        defer Dir.cwd().deleteFile(io, extracted) catch {};
+        try runCommand(allocator, io, &.{
+            sbverify_path,
+            "--cert",
+            certificate_path,
+            extracted,
+        });
+        index += 1;
+    }
+    if (index == 0) return error.MissingNamedUki;
+
+    const fallback = try esp.readFileAlloc(
+        io,
+        allocator,
+        candidate.architecture.fallbackUkiPath(),
+    );
+    defer allocator.free(fallback);
+    const fallback_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/uki-fallback.efi",
+        .{scratch_path},
+    );
+    defer allocator.free(fallback_path);
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = fallback_path,
+        .data = fallback,
+        .flags = .{ .truncate = true, .permissions = .fromMode(0o600) },
+    });
+    defer Dir.cwd().deleteFile(io, fallback_path) catch {};
+    try runCommand(allocator, io, &.{
+        sbverify_path,
+        "--cert",
+        certificate_path,
+        fallback_path,
+    });
+}
+
+fn tamperUkiCmdlineAlloc(
+    allocator: Allocator,
+    signed: []const u8,
+) ![]u8 {
+    var inspection = try zvmi.uki.inspect(allocator, signed);
+    defer inspection.deinit(allocator);
+    const cmdline = inspection.findSection(".cmdline") orelse
+        return error.MissingUkiCmdline;
+    const whitespace_offset = std.mem.indexOfScalar(u8, cmdline.contents, ' ') orelse
+        return error.MissingUkiCmdlineWhitespace;
+    const file_offset = std.math.add(
+        usize,
+        @as(usize, cmdline.raw_offset),
+        whitespace_offset,
+    ) catch return error.InvalidUkiCmdlineOffset;
+    if (file_offset >= signed.len) return error.InvalidUkiCmdlineOffset;
+    const tampered = try allocator.dupe(u8, signed);
+    tampered[file_offset] = '\t';
+    return tampered;
+}
+
+fn requireRejectedUkiSignature(
+    allocator: Allocator,
+    io: Io,
+    sbverify_path: []const u8,
+    certificate_path: []const u8,
+    scratch_path: []const u8,
+    index: usize,
+    bytes: []const u8,
+) !void {
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/tampered-{d}.efi",
+        .{ scratch_path, index },
+    );
+    defer allocator.free(path);
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = path,
+        .data = bytes,
+        .flags = .{ .truncate = true, .permissions = .fromMode(0o600) },
+    });
+    defer Dir.cwd().deleteFile(io, path) catch {};
+    if (try commandSucceeded(allocator, io, &.{
+        sbverify_path,
+        "--cert",
+        certificate_path,
+        path,
+    })) {
+        return error.TamperedUkiSignatureAccepted;
+    }
+}
+
+fn createTamperedOverlay(
+    allocator: Allocator,
+    io: Io,
+    qemu_img_path: []const u8,
+    source_image: []const u8,
+    overlay_path: []const u8,
+    candidate: Candidate,
+    certificate_path: []const u8,
+    sbverify_path: []const u8,
+    scratch_path: []const u8,
+) !void {
+    try runCommand(allocator, io, &.{
+        qemu_img_path,
+        "create",
+        "-q",
+        "-f",
+        "qcow2",
+        "-F",
+        "qcow2",
+        "-b",
+        source_image,
+        overlay_path,
+    });
+    var image = try zvmi.Image.openPath(io, overlay_path);
+    defer image.close(io);
+    const parsed = try zvmi.gpt.readGpt(image, io, allocator);
+    defer allocator.free(parsed.partitions);
+    if (parsed.partitions.len < 1 or
+        !std.mem.eql(u8, &parsed.partitions[0].partition_type_guid, &zvmi.guid.esp))
+    {
+        return error.MissingEspPartition;
+    }
+    const partition = parsed.partitions[0];
+    var esp = try zvmi.fat32.open(&image, io, .{
+        .offset = partition.first_lba * zvmi.gpt.sector_size,
+        .length = (partition.last_lba - partition.first_lba + 1) *
+            zvmi.gpt.sector_size,
+    });
+    const entries = try esp.listDirAlloc(io, allocator, "EFI/Linux");
+    defer zvmi.fat32.freeDirEntries(allocator, entries);
+    var index: usize = 0;
+    for (entries) |entry| {
+        if (entry.kind != .file or entry.name.len <= 4 or
+            !std.ascii.eqlIgnoreCase(entry.name[entry.name.len - 4 ..], ".efi"))
+        {
+            continue;
+        }
+        const path = try std.fmt.allocPrint(allocator, "EFI/Linux/{s}", .{entry.name});
+        defer allocator.free(path);
+        const signed = try esp.readFileAlloc(io, allocator, path);
+        defer allocator.free(signed);
+        const tampered = try tamperUkiCmdlineAlloc(allocator, signed);
+        defer allocator.free(tampered);
+        try requireRejectedUkiSignature(
+            allocator,
+            io,
+            sbverify_path,
+            certificate_path,
+            scratch_path,
+            index,
+            tampered,
+        );
+        try esp.deletePath(io, path);
+        try esp.writeFile(io, path, tampered);
+        index += 1;
+    }
+    if (index == 0) return error.MissingNamedUki;
+
+    const fallback_path = candidate.architecture.fallbackUkiPath();
+    const signed_fallback = try esp.readFileAlloc(io, allocator, fallback_path);
+    defer allocator.free(signed_fallback);
+    const tampered_fallback = try tamperUkiCmdlineAlloc(allocator, signed_fallback);
+    defer allocator.free(tampered_fallback);
+    try requireRejectedUkiSignature(
+        allocator,
+        io,
+        sbverify_path,
+        certificate_path,
+        scratch_path,
+        index,
+        tampered_fallback,
+    );
+    try esp.deletePath(io, fallback_path);
+    try esp.writeFile(io, fallback_path, tampered_fallback);
 }
 
 fn validateQemuImgInfo(
@@ -489,7 +788,7 @@ fn validateFinalizedImage(
     io: Io,
     image_path: []const u8,
     candidate: Candidate,
-) !void {
+) !zvmi.artifact_pipeline.Digest {
     var file = try Dir.cwd().openFile(io, image_path, .{ .mode = .read_only });
     var image = try zvmi.Image.openStandaloneQcow2File(io, file);
     defer image.close(io);
@@ -519,9 +818,30 @@ fn validateFinalizedImage(
     if (esp_partition.first_lba % (1024 * 1024 / zvmi.gpt.sector_size) != 0)
         return error.UnexpectedEspAlignment;
     if (root_partition.first_lba != esp_partition.last_lba + 1 or
-        root_partition.last_lba != parsed.header.last_usable_lba or
         root_partition.last_lba < root_partition.first_lba)
         return error.InvalidRootPartition;
+    const requests = [_]zvmi.layout.PartitionRequest{
+        .{ .name = "ESP", .role = .esp, .size = .{ .fixed = 512 * 1024 * 1024 } },
+        .{
+            .name = "root",
+            .role = candidate.architecture.rootRole(),
+            .size = .{ .percent = 100.0 },
+        },
+    };
+    const expected_layout = try zvmi.layout.planLayout(
+        allocator,
+        image.virtual_size,
+        &requests,
+        null,
+    );
+    defer allocator.free(expected_layout);
+    if (esp_partition.first_lba != expected_layout[0].firstLba() or
+        esp_partition.last_lba != expected_layout[0].lastLba() or
+        root_partition.first_lba != expected_layout[1].firstLba() or
+        root_partition.last_lba != expected_layout[1].lastLba())
+    {
+        return error.InvalidRootPartition;
+    }
     if (std.mem.eql(u8, &root_partition.unique_partition_guid, &zvmi.guid.nil))
         return error.InvalidRootPartitionGuid;
 
@@ -542,6 +862,7 @@ fn validateFinalizedImage(
     if (inspection.machine != candidate.architecture.ukiMachine())
         return error.UnexpectedUkiArchitecture;
     if (inspection.subsystem != 10) return error.UnexpectedUkiSubsystem;
+    if (inspection.security_directory == null) return error.UnsignedUki;
     _ = try requireNonemptyUkiSection(&inspection, ".linux");
     _ = try requireNonemptyUkiSection(&inspection, ".initrd");
     _ = try requireNonemptyUkiSection(&inspection, ".osrel");
@@ -586,6 +907,34 @@ fn validateFinalizedImage(
                 return error.FullImageContainsZvminitBootContract;
         },
     }
+
+    const entries = try esp.listDirAlloc(io, allocator, "EFI/Linux");
+    defer zvmi.fat32.freeDirEntries(allocator, entries);
+    var named_count: usize = 0;
+    var fallback_matches_named = false;
+    for (entries) |entry| {
+        if (entry.kind != .file or entry.name.len <= 4 or
+            !std.ascii.eqlIgnoreCase(entry.name[entry.name.len - 4 ..], ".efi"))
+        {
+            continue;
+        }
+        named_count += 1;
+        const named_path = try std.fmt.allocPrint(
+            allocator,
+            "EFI/Linux/{s}",
+            .{entry.name},
+        );
+        defer allocator.free(named_path);
+        const named = try esp.readFileAlloc(io, allocator, named_path);
+        defer allocator.free(named);
+        var named_inspection = try zvmi.uki.inspect(allocator, named);
+        defer named_inspection.deinit(allocator);
+        if (named_inspection.security_directory == null) return error.UnsignedUki;
+        if (std.mem.eql(u8, named, uki)) fallback_matches_named = true;
+    }
+    if (named_count == 0) return error.MissingNamedUki;
+    if (!fallback_matches_named) return error.FallbackUkiMismatch;
+    return zvmi.artifact_pipeline.sha256Bytes(uki);
 }
 
 fn createSeed(
@@ -702,8 +1051,10 @@ fn startInstance(
     xorriso_path: []const u8,
     ssh_keygen_path: []const u8,
     firmware: *const Firmware,
+    vars_template_path: []const u8,
     source_image: []const u8,
     candidate: Candidate,
+    secure_boot: bool,
     instance: *Instance,
 ) !void {
     try runCommand(allocator, io, &.{
@@ -718,7 +1069,7 @@ fn startInstance(
         source_image,
         instance.overlay_path,
     });
-    try Dir.copyFileAbsolute(firmware.vars_path, instance.vars_path, io, .{
+    try Dir.copyFileAbsolute(vars_template_path, instance.vars_path, io, .{
         .replace = false,
     });
     try createSeed(allocator, io, xorriso_path, ssh_keygen_path, instance);
@@ -756,45 +1107,55 @@ fn startInstance(
     );
     defer allocator.free(seed_drive);
 
+    var qemu_args: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer qemu_args.deinit(allocator);
+    try qemu_args.appendSlice(allocator, &.{
+        "-machine",
+        candidate.architecture.machineArg(secure_boot),
+        "-cpu",
+        "host",
+        "-smp",
+        "2",
+        "-m",
+        "2048",
+        "-display",
+        "none",
+        "-monitor",
+        "none",
+        "-serial",
+        serial_arg,
+        "-no-shutdown",
+        "-drive",
+        code_drive,
+        "-drive",
+        vars_drive,
+        "-drive",
+        image_drive,
+        "-device",
+        "virtio-scsi-pci,id=scsi0",
+        "-drive",
+        seed_drive,
+        "-device",
+        "scsi-cd,drive=seed,bus=scsi0.0",
+        "-netdev",
+        hostfwd,
+        "-device",
+        "virtio-net-pci,netdev=net0,romfile=",
+        "-device",
+        "virtio-rng-pci",
+    });
+    if (secure_boot and candidate.architecture == .x86_64) {
+        try qemu_args.appendSlice(allocator, &.{
+            "-global",
+            "driver=cfi.pflash01,property=secure,value=on",
+        });
+    }
+
     instance.spawned = try qmp.spawnAndConnect(allocator, io, .{
         .binary = qemu_path,
         .qmp_socket_path = instance.qmp_socket_path,
         .connect_timeout = .fromSeconds(30),
-        .extra_args = &.{
-            "-machine",
-            candidate.architecture.machineArg(),
-            "-cpu",
-            "host",
-            "-smp",
-            "2",
-            "-m",
-            "2048",
-            "-display",
-            "none",
-            "-monitor",
-            "none",
-            "-serial",
-            serial_arg,
-            "-no-shutdown",
-            "-drive",
-            code_drive,
-            "-drive",
-            vars_drive,
-            "-drive",
-            image_drive,
-            "-device",
-            "virtio-scsi-pci,id=scsi0",
-            "-drive",
-            seed_drive,
-            "-device",
-            "scsi-cd,drive=seed,bus=scsi0.0",
-            "-netdev",
-            hostfwd,
-            "-device",
-            "virtio-net-pci,netdev=net0,romfile=",
-            "-device",
-            "virtio-rng-pci",
-        },
+        .extra_args = qemu_args.items,
         .stdout = .ignore,
         .stderr = .inherit,
     });
@@ -807,7 +1168,7 @@ fn commandSucceeded(
 ) !bool {
     const result = std.process.run(allocator, io, .{
         .argv = argv,
-        .stdout_limit = .limited(16 * 1024),
+        .stdout_limit = .limited(512 * 1024),
         .stderr_limit = .limited(16 * 1024),
         .timeout = .{ .duration = .{
             .raw = .fromSeconds(20),
@@ -901,25 +1262,212 @@ fn sshOutputAlloc(
             admin_username ++ "@127.0.0.1",
             command,
         },
-        .stdout_limit = .limited(16 * 1024),
+        .stdout_limit = .limited(512 * 1024),
         .stderr_limit = .limited(16 * 1024),
         .timeout = .{ .duration = .{
             .raw = .fromSeconds(20),
             .clock = .awake,
         } },
     });
-    allocator.free(result.stderr);
     switch (result.term) {
-        .exited => |code| if (code == 0) return result.stdout,
+        .exited => |code| if (code == 0) {
+            allocator.free(result.stderr);
+            return result.stdout;
+        },
         else => {},
     }
+    if (result.stderr.len != 0) {
+        std.debug.print("SSH command failed for {s}:\n{s}\n", .{
+            instance.label,
+            result.stderr,
+        });
+    }
+    allocator.free(result.stderr);
     allocator.free(result.stdout);
     return error.SshCommandFailed;
+}
+
+fn efiDbContainsCertificate(
+    variable: []const u8,
+    certificate_sha256: zvmi.artifact_pipeline.Digest,
+) bool {
+    const efi_cert_x509_guid = [_]u8{
+        0xa1, 0x59, 0xc0, 0xa5, 0xe4, 0x94, 0xa7, 0x4a,
+        0x87, 0xb5, 0xab, 0x15, 0x5c, 0x2b, 0xf0, 0x72,
+    };
+    if (variable.len < 4) return false;
+    var list_offset: usize = 4;
+    while (list_offset < variable.len) {
+        if (variable.len - list_offset < 28) return false;
+        const is_x509 = std.mem.eql(
+            u8,
+            variable[list_offset..][0..efi_cert_x509_guid.len],
+            &efi_cert_x509_guid,
+        );
+        const list_size = std.mem.readInt(
+            u32,
+            variable[list_offset + 16 ..][0..4],
+            .little,
+        );
+        const header_size = std.mem.readInt(
+            u32,
+            variable[list_offset + 20 ..][0..4],
+            .little,
+        );
+        const signature_size = std.mem.readInt(
+            u32,
+            variable[list_offset + 24 ..][0..4],
+            .little,
+        );
+        if (list_size < 28 or signature_size <= 16) return false;
+        const list_end = std.math.add(usize, list_offset, list_size) catch return false;
+        const signatures_start = std.math.add(
+            usize,
+            list_offset + 28,
+            header_size,
+        ) catch return false;
+        if (list_end > variable.len or signatures_start > list_end) return false;
+        const signatures_bytes = list_end - signatures_start;
+        if (signatures_bytes == 0 or signatures_bytes % signature_size != 0)
+            return false;
+        var signature_offset = signatures_start;
+        while (signature_offset < list_end) : (signature_offset += signature_size) {
+            const certificate = variable[signature_offset + 16 .. signature_offset + signature_size];
+            const digest = zvmi.artifact_pipeline.sha256Bytes(certificate);
+            if (is_x509 and std.mem.eql(u8, &digest, &certificate_sha256)) return true;
+        }
+        list_offset = list_end;
+    }
+    return false;
+}
+
+fn verifyGuestSecureBoot(
+    allocator: Allocator,
+    io: Io,
+    ssh_path: []const u8,
+    candidate: Candidate,
+    instance: *const Instance,
+    certificate_sha256: zvmi.artifact_pipeline.Digest,
+) !void {
+    const db = try sshOutputAlloc(
+        allocator,
+        io,
+        ssh_path,
+        instance,
+        "sudo -n /bin/sh -c 'cat /sys/firmware/efi/efivars/db-*'",
+    );
+    defer allocator.free(db);
+    if (!efiDbContainsCertificate(db, certificate_sha256)) {
+        return error.SigningCertificateMissingFromDb;
+    }
+
+    const module_checks = switch (candidate.flavor) {
+        .core =>
+        \\for module in crc_itu_t udf isofs; do
+        \\  test -d "/sys/module/$module"
+        \\done
+        ,
+        .full =>
+        \\for module in crc_itu_t udf isofs; do
+        \\  test -d "/sys/module/$module" || sudo -n /usr/sbin/modprobe "$module"
+        \\  test -d "/sys/module/$module"
+        \\done
+        ,
+    };
+    const command = try std.fmt.allocPrint(
+        allocator,
+        \\set -eu
+        \\secure_boot=$(od -An -t u1 -j 4 -N 1 /sys/firmware/efi/efivars/SecureBoot-* | tr -d ' ')
+        \\test "$secure_boot" = 1
+        \\if ! test -r /sys/kernel/security/lockdown; then
+        \\  sudo -n /usr/bin/mount -t securityfs securityfs /sys/kernel/security
+        \\fi
+        \\grep -Eq '\[(integrity|confidentiality)\]' /sys/kernel/security/lockdown
+        \\{s}
+        \\dmesg_output=$(sudo -n /usr/bin/dmesg) || exit 1
+        \\if printf '%s\n' "$dmesg_output" | grep -Eiq 'module verification failed|Loading of unsigned module|Lockdown:.*unsigned'; then
+        \\  exit 1
+        \\fi
+        \\
+    ,
+        .{module_checks},
+    );
+    defer allocator.free(command);
+    const output = sshOutputAlloc(
+        allocator,
+        io,
+        ssh_path,
+        instance,
+        command,
+    ) catch {
+        return error.GuestSecureBootContractFailed;
+    };
+    allocator.free(output);
 }
 
 fn qemuRunning(instance: *const Instance, deadline: Io.Timestamp) !bool {
     const spawned = &(instance.spawned orelse return error.QemuNotStarted);
     return spawned.client.queryRunningUntil(deadline);
+}
+
+fn serialContains(
+    allocator: Allocator,
+    io: Io,
+    instance: *const Instance,
+    marker: []const u8,
+) !bool {
+    const serial = Dir.cwd().readFileAlloc(
+        io,
+        instance.serial_path,
+        allocator,
+        .limited(serial_limit),
+    ) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer allocator.free(serial);
+    return std.ascii.indexOfIgnoreCase(serial, marker) != null;
+}
+
+fn waitForSerialMarker(
+    allocator: Allocator,
+    io: Io,
+    instance: *const Instance,
+    marker: []const u8,
+    timeout_seconds: i64,
+) !void {
+    const deadline = Io.Clock.awake.now(io).addDuration(.fromSeconds(timeout_seconds));
+    while (Io.Clock.awake.now(io).nanoseconds < deadline.nanoseconds) {
+        if (try serialContains(allocator, io, instance, marker)) return;
+        if (!try qemuRunning(instance, deadline)) return error.QemuExitedEarly;
+        try Io.sleep(io, .fromMilliseconds(500), .awake);
+    }
+    return error.SerialMarkerTimedOut;
+}
+
+fn waitForFirmwareRefusal(
+    allocator: Allocator,
+    io: Io,
+    instance: *const Instance,
+    timeout_seconds: i64,
+) !void {
+    const deadline = Io.Clock.awake.now(io).addDuration(.fromSeconds(timeout_seconds));
+    while (Io.Clock.awake.now(io).nanoseconds < deadline.nanoseconds) {
+        if (try serialContains(allocator, io, instance, "Security Violation") or
+            try serialContains(allocator, io, instance, ": Access Denied"))
+        {
+            return;
+        }
+        if (!try qemuRunning(instance, deadline)) return error.QemuExitedEarly;
+        try Io.sleep(io, .fromMilliseconds(500), .awake);
+    }
+    return error.FirmwareRefusalTimedOut;
+}
+
+fn terminateInstance(instance: *Instance) !void {
+    const spawned = &(instance.spawned orelse return error.QemuNotStarted);
+    spawned.kill();
+    instance.child_waited = true;
 }
 
 fn waitForSsh(
@@ -942,7 +1490,8 @@ const identity_command =
     \\test -s /etc/machine-id
     \\test -s /etc/ssh/ssh_host_ed25519_key.pub
     \\cat /etc/machine-id
-    \\/usr/bin/ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub -E sha256 | /usr/bin/awk '{ print $2 }'
+    \\set -- $(/usr/bin/ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub -E sha256)
+    \\printf '%s\n' "$2"
     \\cat /proc/sys/kernel/random/boot_id
 ;
 
@@ -990,13 +1539,18 @@ fn verifyAdminLogin(
 
 const core_checks =
     \\set -eu
-    \\test /proc/1/exe -ef /sbin/zvminit
+    \\sudo -n /usr/bin/test /proc/1/exe -ef /sbin/zvminit
     \\test -f /var/lib/azagent/provisioned
     \\find_sshd_master() {
     \\  for proc in /proc/[0-9]*; do
     \\    test -r "$proc/status" || continue
-    \\    name=$(awk '/^Name:/{print $2}' "$proc/status")
-    \\    ppid=$(awk '/^PPid:/{print $2}' "$proc/status")
+    \\    name= ppid=
+    \\    while read -r key value _; do
+    \\      case "$key" in
+    \\        Name:) name=$value ;;
+    \\        PPid:) ppid=$value ;;
+    \\      esac
+    \\    done < "$proc/status"
     \\    test "$name" = sshd && test "$ppid" = 1 || continue
     \\    cmdline=$(tr '\000' ' ' < "$proc/cmdline")
     \\    case "$cmdline" in
@@ -1022,7 +1576,7 @@ fn readCoreSshdPid(
 
 const full_checks =
     \\set -eu
-    \\test /proc/1/exe -ef /usr/lib/systemd/systemd
+    \\sudo -n /usr/bin/test /proc/1/exe -ef /usr/lib/systemd/systemd
     \\test ! -e /sbin/zvminit
     \\test ! -e /usr/bin/zvminit
     \\for unit in cloud-init-local.service cloud-init-main.service cloud-init-network.service cloud-config.service cloud-final.service waagent.service sshd.service systemd-networkd.service; do
@@ -1190,6 +1744,40 @@ test "Azure Linux 4 configured acceptance prerequisites fail closed" {
     );
 }
 
+test "EFI db parser finds the exact enrolled DER certificate" {
+    const efi_cert_x509_guid = [_]u8{
+        0xa1, 0x59, 0xc0, 0xa5, 0xe4, 0x94, 0xa7, 0x4a,
+        0x87, 0xb5, 0xab, 0x15, 0x5c, 0x2b, 0xf0, 0x72,
+    };
+    const certificate = "DER certificate";
+    var variable = [_]u8{0} ** (4 + 28 + 16 + certificate.len);
+    const list_offset = 4;
+    @memcpy(variable[list_offset..][0..efi_cert_x509_guid.len], &efi_cert_x509_guid);
+    std.mem.writeInt(
+        u32,
+        variable[list_offset + 16 ..][0..4],
+        28 + 16 + certificate.len,
+        .little,
+    );
+    std.mem.writeInt(u32, variable[list_offset + 20 ..][0..4], 0, .little);
+    std.mem.writeInt(
+        u32,
+        variable[list_offset + 24 ..][0..4],
+        16 + certificate.len,
+        .little,
+    );
+    @memcpy(variable[list_offset + 28 + 16 ..], certificate);
+    const digest = zvmi.artifact_pipeline.sha256Bytes(certificate);
+    try std.testing.expect(efiDbContainsCertificate(&variable, digest));
+    try std.testing.expect(!efiDbContainsCertificate(
+        &variable,
+        [_]u8{0xff} ** 32,
+    ));
+    try std.testing.expect(!efiDbContainsCertificate(variable[0 .. variable.len - 1], digest));
+    variable[list_offset] = 0;
+    try std.testing.expect(!efiDbContainsCertificate(&variable, digest));
+}
+
 test "Azure Linux 4 finalized QCOW2 boots, provisions, restarts, and powers off" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1218,16 +1806,58 @@ test "Azure Linux 4 finalized QCOW2 boots, provisions, restarts, and powers off"
     defer allocator.free(ssh_keygen_path);
     const ssh_path = try requireToolAlloc(allocator, io, "ssh");
     defer allocator.free(ssh_path);
+    const openssl_path = try requireToolAlloc(allocator, io, "openssl");
+    defer allocator.free(openssl_path);
+    const sbverify_path = try requireToolOverrideAlloc(
+        allocator,
+        io,
+        "ZVMI_AZURELINUX4_SBVERIFY",
+        "sbverify",
+    );
+    defer allocator.free(sbverify_path);
+    const virt_fw_vars_path = try requireToolOverrideAlloc(
+        allocator,
+        io,
+        "ZVMI_AZURELINUX4_VIRT_FW_VARS",
+        "virt-fw-vars",
+    );
+    defer allocator.free(virt_fw_vars_path);
+    const certificate_path = try requireEnvAlloc(
+        allocator,
+        "ZVMI_AZURELINUX4_SIGNING_CERTIFICATE",
+    );
+    defer allocator.free(certificate_path);
+    const expected_certificate_text = try requireEnvAlloc(
+        allocator,
+        "ZVMI_AZURELINUX4_SIGNING_CERTIFICATE_SHA256",
+    );
+    defer allocator.free(expected_certificate_text);
+    const expected_certificate_sha256 = zvmi.artifact_pipeline.parseSha256(
+        expected_certificate_text,
+    ) catch return error.InvalidSigningCertificateSha256;
+    const expected_uki_text = try requireEnvAlloc(
+        allocator,
+        "ZVMI_AZURELINUX4_UKI_SHA256",
+    );
+    defer allocator.free(expected_uki_text);
+    const expected_uki_sha256 = zvmi.artifact_pipeline.parseSha256(
+        expected_uki_text,
+    ) catch return error.InvalidExpectedUkiSha256;
+    const result_path = try requireEnvAlloc(
+        allocator,
+        "ZVMI_AZURELINUX4_ACCEPTANCE_RESULT",
+    );
+    defer allocator.free(result_path);
     var firmware = try requireFirmwareAlloc(
         allocator,
         io,
         qemu_path,
         candidate.architecture,
+        true,
     );
     defer firmware.deinit(allocator);
 
     try validateQemuImgInfo(allocator, io, qemu_img_path, absolute_image);
-    try validateFinalizedImage(allocator, io, absolute_image, candidate);
     const source_sha256 = (try zvmi.artifact_pipeline.hashFile(
         io,
         absolute_image,
@@ -1238,6 +1868,52 @@ test "Azure Linux 4 finalized QCOW2 boots, provisions, restarts, and powers off"
     var temporary_path_buffer: [Dir.max_path_bytes]u8 = undefined;
     const temporary_path_length = try temporary.dir.realPath(io, &temporary_path_buffer);
     const temporary_path = temporary_path_buffer[0..temporary_path_length];
+    const certificate_der_path = try std.fs.path.join(
+        allocator,
+        &.{ temporary_path, "signing-certificate.der" },
+    );
+    defer allocator.free(certificate_der_path);
+    const certificate_sha256 = try canonicalCertificateSha256(
+        allocator,
+        io,
+        openssl_path,
+        certificate_path,
+        certificate_der_path,
+    );
+    if (!std.mem.eql(u8, &certificate_sha256, &expected_certificate_sha256)) {
+        return error.SigningCertificateFingerprintMismatch;
+    }
+    const uki_sha256 = try validateFinalizedImage(
+        allocator,
+        io,
+        absolute_image,
+        candidate,
+    );
+    if (!std.mem.eql(u8, &uki_sha256, &expected_uki_sha256)) {
+        return error.SignedUkiDigestMismatch;
+    }
+    try verifyUkiSignatures(
+        allocator,
+        io,
+        absolute_image,
+        candidate,
+        certificate_path,
+        sbverify_path,
+        temporary_path,
+    );
+    const enrolled_vars_path = try std.fs.path.join(
+        allocator,
+        &.{ temporary_path, "enrolled-vars.fd" },
+    );
+    defer allocator.free(enrolled_vars_path);
+    try prepareEnrolledVars(
+        allocator,
+        io,
+        virt_fw_vars_path,
+        firmware.vars_path,
+        certificate_path,
+        enrolled_vars_path,
+    );
 
     var first: Instance = undefined;
     try first.init(allocator, io, temporary_path, "first", 22220);
@@ -1259,8 +1935,10 @@ test "Azure Linux 4 finalized QCOW2 boots, provisions, restarts, and powers off"
         xorriso_path,
         ssh_keygen_path,
         &firmware,
+        enrolled_vars_path,
         absolute_image,
         candidate,
+        true,
         &first,
     );
     try startInstance(
@@ -1271,8 +1949,10 @@ test "Azure Linux 4 finalized QCOW2 boots, provisions, restarts, and powers off"
         xorriso_path,
         ssh_keygen_path,
         &firmware,
+        enrolled_vars_path,
         absolute_image,
         candidate,
+        true,
         &second,
     );
 
@@ -1282,6 +1962,22 @@ test "Azure Linux 4 finalized QCOW2 boots, provisions, restarts, and powers off"
     try verifyAdminLogin(allocator, io, ssh_path, &second);
     try verifyFlavorRuntime(allocator, io, ssh_path, candidate, &first);
     try verifyFlavorRuntime(allocator, io, ssh_path, candidate, &second);
+    try verifyGuestSecureBoot(
+        allocator,
+        io,
+        ssh_path,
+        candidate,
+        &first,
+        certificate_sha256,
+    );
+    try verifyGuestSecureBoot(
+        allocator,
+        io,
+        ssh_path,
+        candidate,
+        &second,
+        certificate_sha256,
+    );
 
     var first_before = try readGuestIdentityAlloc(allocator, io, ssh_path, &first);
     defer first_before.deinit(allocator);
@@ -1338,11 +2034,135 @@ test "Azure Linux 4 finalized QCOW2 boots, provisions, restarts, and powers off"
     );
     try verifyFlavorRuntime(allocator, io, ssh_path, candidate, &first);
     try verifyFlavorRuntime(allocator, io, ssh_path, candidate, &second);
+    try verifyGuestSecureBoot(
+        allocator,
+        io,
+        ssh_path,
+        candidate,
+        &first,
+        certificate_sha256,
+    );
 
     try poweroff(allocator, io, ssh_path, &first);
     try poweroff(allocator, io, ssh_path, &second);
+
+    const tampered_image = try std.fs.path.join(
+        allocator,
+        &.{ temporary_path, "tampered.qcow2" },
+    );
+    defer allocator.free(tampered_image);
+    try createTamperedOverlay(
+        allocator,
+        io,
+        qemu_img_path,
+        absolute_image,
+        tampered_image,
+        candidate,
+        certificate_path,
+        sbverify_path,
+        temporary_path,
+    );
+    var ordinary_firmware = try requireFirmwareAlloc(
+        allocator,
+        io,
+        qemu_path,
+        candidate.architecture,
+        false,
+    );
+    defer ordinary_firmware.deinit(allocator);
+
+    var control: Instance = undefined;
+    try control.init(allocator, io, temporary_path, "tamper-control", 22222);
+    defer control.deinit(allocator);
+    errdefer control.dumpSerial(allocator, io);
+    try startInstance(
+        allocator,
+        io,
+        qemu_img_path,
+        qemu_path,
+        xorriso_path,
+        ssh_keygen_path,
+        &ordinary_firmware,
+        ordinary_firmware.vars_path,
+        tampered_image,
+        candidate,
+        false,
+        &control,
+    );
+    try waitForSerialMarker(
+        allocator,
+        io,
+        &control,
+        "Linux version",
+        90,
+    );
+    try terminateInstance(&control);
+
+    var rejected: Instance = undefined;
+    try rejected.init(allocator, io, temporary_path, "tamper-rejected", 22223);
+    defer rejected.deinit(allocator);
+    errdefer rejected.dumpSerial(allocator, io);
+    try startInstance(
+        allocator,
+        io,
+        qemu_img_path,
+        qemu_path,
+        xorriso_path,
+        ssh_keygen_path,
+        &firmware,
+        enrolled_vars_path,
+        tampered_image,
+        candidate,
+        true,
+        &rejected,
+    );
+    try waitForFirmwareRefusal(
+        allocator,
+        io,
+        &rejected,
+        60,
+    );
+    try Io.sleep(io, .fromSeconds(5), .awake);
+    if (try serialContains(allocator, io, &rejected, "Linux version") or
+        try serialContains(allocator, io, &rejected, "ZVMINIT_PID1_READY") or
+        try sshSucceeded(allocator, io, ssh_path, &rejected, "true"))
+    {
+        return error.TamperedUkiBootedWithSecureBoot;
+    }
+    try terminateInstance(&rejected);
+
     try std.testing.expectEqual(
         source_sha256,
         (try zvmi.artifact_pipeline.hashFile(io, absolute_image)).sha256,
     );
+    const source_sha256_hex = zvmi.artifact_pipeline.formatSha256(source_sha256);
+    const certificate_sha256_hex = zvmi.artifact_pipeline.formatSha256(
+        certificate_sha256,
+    );
+    const uki_sha256_hex = zvmi.artifact_pipeline.formatSha256(uki_sha256);
+    const result = try std.json.Stringify.valueAlloc(
+        allocator,
+        .{
+            .schema = 1,
+            .type = "azurelinux4-local-secure-boot-acceptance",
+            .candidate_sha256 = &source_sha256_hex,
+            .certificate_sha256 = &certificate_sha256_hex,
+            .fallback_uki_sha256 = &uki_sha256_hex,
+            .contracts = &.{
+                "secure-boot",
+                "uefi-db-signer",
+                "signed-uki",
+                "kernel-lockdown",
+                "module-signatures",
+                "tampered-uki-rejected",
+            },
+        },
+        .{ .whitespace = .indent_2 },
+    );
+    defer allocator.free(result);
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = result_path,
+        .data = result,
+        .flags = .{ .truncate = true },
+    });
 }

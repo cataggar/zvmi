@@ -164,6 +164,8 @@ pub const FileSystem = struct {
     info: VolumeInfo,
     free_cluster_count: u32,
     next_free_cluster: u32,
+    fat_cache_sector: ?u32 = null,
+    fat_cache: [max_bytes_per_sector]u8 = undefined,
 
     /// Ensures every component of `path` exists, creating missing
     /// directories along the way (`mkdir -p` semantics).
@@ -682,15 +684,27 @@ pub const FileSystem = struct {
     }
 
     fn readFatEntry(self: *FileSystem, io: Io, cluster: u32) MutationError!u32 {
-        var buf: [4]u8 = undefined;
-        const rel = @as(u64, self.info.reserved_sector_count) * self.info.bytes_per_sector + @as(u64, cluster) * 4;
-        try self.readRegion(io, &buf, rel);
-        return std.mem.readInt(u32, &buf, .little) & fat_entry_mask;
+        const sector_size: usize = self.info.bytes_per_sector;
+        const fat_offset = @as(u64, cluster) * 4;
+        const sector: u32 = @intCast(fat_offset / @as(u64, sector_size));
+        const entry_offset: usize = @intCast(fat_offset % @as(u64, sector_size));
+        if (self.fat_cache_sector != sector) {
+            const rel = (@as(u64, self.info.reserved_sector_count) + sector) *
+                self.info.bytes_per_sector;
+            try self.readRegion(io, self.fat_cache[0..sector_size], rel);
+            self.fat_cache_sector = sector;
+        }
+        return std.mem.readInt(
+            u32,
+            self.fat_cache[entry_offset..][0..4],
+            .little,
+        ) & fat_entry_mask;
     }
 
     fn writeFatEntry(self: *FileSystem, io: Io, cluster: u32, value: u32) MutationError!void {
         var buf: [4]u8 = undefined;
         std.mem.writeInt(u32, &buf, value, .little);
+        self.fat_cache_sector = null;
         var fat_index: u8 = 0;
         while (fat_index < self.info.fat_count) : (fat_index += 1) {
             const rel = (@as(u64, self.info.reserved_sector_count) + @as(u64, fat_index) * self.info.fat_size_sectors) * self.info.bytes_per_sector + @as(u64, cluster) * 4;
@@ -855,6 +869,7 @@ pub fn open(image: *Image, io: Io, region: Region) OpenError!FileSystem {
 }
 
 const default_bytes_per_sector: usize = 512;
+const max_bytes_per_sector: usize = 4096;
 const max_cluster_size: usize = 32 * 1024;
 const min_fat32_clusters: u32 = 65_525;
 const max_long_name_units: usize = 255;
