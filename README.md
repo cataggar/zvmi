@@ -540,7 +540,9 @@ the ISO LiveOS/Anaconda rootfs. A pinned core OCI is used only to extract and
 checksum/fingerprint-validate the RPM signing key before its filesystem is
 discarded. Full verifies ISO kernel/initramfs releases against installed
 kernel-core/kernel-modules rather than emitting an incoherent userspace/module
-mix.
+mix. Its kernel and kernel-modules package requests are pinned to the release
+inside the checksum-pinned ISO's nested `LiveOS` rootfs, and the builder mounts
+that nested rootfs to verify the exact release before image assembly.
 
 The recipe creates bounded flavor-specific OCI layers, validates rootfs
 identity cleanup, GPT/root GUIDs, fallback EFI, UKI PE sections/cmdline,
@@ -559,11 +561,14 @@ builder verifies the live metadata, populates an isolated per-build DNF
 cache/persist directory, verifies DNF's cached `repomd.xml`, and performs the
 transaction with metadata expiration disabled globally and for
 `azurelinux-base`. That prevents metadata refresh while allowing DNF to
-download uncached RPM payloads. DNF then verifies RPM signatures and package
-payload checksums from that pinned metadata. The cached and live metadata are
-verified again after the transaction; a repository change fails the build. The
-newly installed, sorted NEVRA closure is emitted and recorded under the builder
-work directory's `provenance/` directory.
+download uncached RPM payloads. Payload downloads use a one-byte-per-second
+minimum rate, a five-minute timeout, and twenty retries so a slow Microsoft
+package endpoint does not discard an otherwise valid pinned transaction. DNF
+then verifies RPM signatures and package payload checksums from that pinned
+metadata. The cached and live metadata are verified again after the
+transaction; a repository change fails the build. The newly installed, sorted
+NEVRA closure is emitted and recorded under the builder work directory's
+`provenance/` directory.
 
 The image boots directly through `UEFI -> EFI/BOOT/BOOTX64.EFI` (x86_64) or
 `EFI/BOOT/BOOTAA64.EFI` (AArch64) `-> UKI -> kernel/initramfs -> zvminit`; it
