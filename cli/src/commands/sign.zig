@@ -1,7 +1,7 @@
 //! `zvmi sign` implements the external UKI signer protocol used by the
-//! Azure Linux release builder. The private key remains in Azure Key Vault
-//! or Managed HSM; this command exchanges GitHub OIDC for a short-lived token
-//! and submits only the Authenticode signed-attributes digest.
+//! Azure Linux release builder. The private key remains in Azure Artifact
+//! Signing; this command exchanges GitHub OIDC for a short-lived token and
+//! submits only the Authenticode signed-attributes digest.
 
 const std = @import("std");
 const zvmi = @import("zvmi");
@@ -14,7 +14,9 @@ const Io = std.Io;
 const max_unsigned_bytes = 512 * 1024 * 1024;
 const max_certificate_bytes = 1024 * 1024;
 const max_response_bytes = 1024 * 1024;
-const key_vault_api_version = "2025-07-01";
+const artifact_signing_api_version = "2024-06-15";
+const artifact_signing_scope = "https://codesigning.azure.net/.default";
+const artifact_signing_provider = "azure-artifact-signing";
 const github_oidc_prefix = "https://vstoken.actions.githubusercontent.com/";
 const oidc_audience = "api%3A%2F%2FAzureADTokenExchange";
 
@@ -27,22 +29,24 @@ const TokenResponse = struct {
     token_type: []const u8,
 };
 
-const SignResponse = struct {
-    kid: []const u8,
-    value: []const u8,
-};
-
 pub fn run(
     allocator: Allocator,
     io: Io,
     environ: Environ,
     args: []const []const u8,
 ) u8 {
-    if (args.len != 0) {
-        std.debug.print("usage: zvmi sign\n", .{});
+    const result = if (args.len == 0)
+        runFallible(allocator, io, environ)
+    else if (args.len == 2 and std.mem.eql(u8, args[0], "certificate"))
+        exportCertificateFallible(allocator, io, environ, args[1])
+    else {
+        std.debug.print(
+            "usage: zvmi sign [certificate <absolute-output.pem>]\n",
+            .{},
+        );
         return 1;
-    }
-    runFallible(allocator, io, environ) catch |err| {
+    };
+    result catch |err| {
         std.debug.print("zvmi sign: failed: {s}\n", .{@errorName(err)});
         return 1;
     };
@@ -80,46 +84,11 @@ fn runFallible(allocator: Allocator, io: Io, environ: Environ) !void {
         "ZVMI_UKI_CERTIFICATE_SHA256",
     );
     defer allocator.free(expected_certificate_text);
-    const tenant_id = try requiredEnvAlloc(
+    var provider = try ArtifactSigningEnvironment.init(
         allocator,
         environ,
-        "ZVMI_AZURE_TENANT_ID",
     );
-    defer allocator.free(tenant_id);
-    const client_id = try requiredEnvAlloc(
-        allocator,
-        environ,
-        "ZVMI_AZURE_CLIENT_ID",
-    );
-    defer allocator.free(client_id);
-    const key_id = try requiredEnvAlloc(
-        allocator,
-        environ,
-        "ZVMI_AZURE_KEY_ID",
-    );
-    defer allocator.free(key_id);
-    const key_version = try requiredEnvAlloc(
-        allocator,
-        environ,
-        "ZVMI_UKI_SIGNING_KEY_VERSION",
-    );
-    defer allocator.free(key_version);
-    const oidc_request_url = try requiredEnvAlloc(
-        allocator,
-        environ,
-        "ACTIONS_ID_TOKEN_REQUEST_URL",
-    );
-    defer allocator.free(oidc_request_url);
-    const oidc_request_token = try requiredEnvAlloc(
-        allocator,
-        environ,
-        "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
-    );
-    defer allocator.free(oidc_request_token);
-
-    if (!isUuid(tenant_id) or !isUuid(client_id)) return error.InvalidAzureIdentity;
-    try validateKeyId(key_id, key_version);
-    try validateOidcRequestUrl(oidc_request_url);
+    defer provider.deinit(allocator);
 
     const unsigned = try Dir.cwd().readFileAlloc(
         io,
@@ -164,26 +133,118 @@ fn runFallible(allocator: Allocator, io: Io, environ: Environ) !void {
 
     var http_client: std.http.Client = .{ .allocator = allocator, .io = io };
     defer http_client.deinit();
-    const signature = try signDigestWithAzureKeyVaultAlloc(
+    const access_token = try acquireAzureAccessTokenAlloc(
         allocator,
         &http_client,
-        oidc_request_url,
-        oidc_request_token,
-        tenant_id,
-        client_id,
-        key_id,
-        prepared.signing_digest,
+        provider.oidc_request_url,
+        provider.oidc_request_token,
+        provider.tenant_id,
+        provider.client_id,
     );
-    defer allocator.free(signature);
+    defer allocator.free(access_token);
+    var signing_result = try signDigestWithArtifactSigningAlloc(
+        io,
+        allocator,
+        &http_client,
+        provider.config(),
+        access_token,
+        prepared.signing_digest,
+        .{},
+    );
+    defer signing_result.deinit(allocator);
 
-    const signed = try zvmi.authenticode.finishRsaSha256Alloc(
+    var certificate_chain = try zvmi.authenticode
+        .parseArtifactSigningCertificateChainAlloc(
+        allocator,
+        signing_result.certificate_bundle,
+    );
+    defer certificate_chain.deinit(allocator);
+    const signing_certificate = try zvmi.authenticode
+        .artifactSigningCertificateDer(signing_result.certificate_bundle);
+    if (!std.mem.eql(u8, signing_certificate, certificate_der))
+        return error.ArtifactSigningCertificateMismatch;
+
+    const signed = try zvmi.authenticode.finishRsaSha256WithChainAlloc(
         allocator,
         prepared,
-        certificate_der,
-        signature,
+        signing_certificate,
+        certificate_chain.certificates,
+        signing_result.signature,
     );
     defer allocator.free(signed);
     try writeAtomic(io, allocator, signed_path, signed);
+
+    const metadata_path_optional = environ.getAlloc(
+        allocator,
+        "ZVMI_UKI_SIGNING_METADATA",
+    ) catch |err| switch (err) {
+        error.EnvironmentVariableMissing => null,
+        else => return err,
+    };
+    if (metadata_path_optional) |metadata_path| {
+        defer allocator.free(metadata_path);
+        if (metadata_path.len == 0 or !Dir.path.isAbsolute(metadata_path))
+            return error.SigningMetadataPathMustBeAbsolute;
+        const leaf_sha256 = zvmi.artifact_pipeline.sha256Bytes(
+            signing_certificate,
+        );
+        const leaf_sha256_hex = zvmi.artifact_pipeline.formatSha256(leaf_sha256);
+        const enrolled_certificate_sha256_hex = zvmi.artifact_pipeline.formatSha256(
+            actual_certificate,
+        );
+        const metadata = try std.json.Stringify.valueAlloc(
+            allocator,
+            .{
+                .schema = @as(u32, 1),
+                .provider = artifact_signing_provider,
+                .endpoint = provider.endpoint,
+                .account = provider.account,
+                .profile = provider.profile,
+                .operation_id = signing_result.operation_id,
+                .signing_certificate_sha256 = &leaf_sha256_hex,
+                .enrolled_certificate_sha256 = &enrolled_certificate_sha256_hex,
+            },
+            .{ .whitespace = .indent_2 },
+        );
+        defer allocator.free(metadata);
+        try writeAtomic(io, allocator, metadata_path, metadata);
+    }
+}
+
+fn exportCertificateFallible(
+    allocator: Allocator,
+    io: Io,
+    environ: Environ,
+    output_path: []const u8,
+) !void {
+    if (!Dir.path.isAbsolute(output_path))
+        return error.SigningCertificatePathMustBeAbsolute;
+    var provider = try ArtifactSigningEnvironment.init(allocator, environ);
+    defer provider.deinit(allocator);
+    var http_client: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer http_client.deinit();
+    const access_token = try acquireAzureAccessTokenAlloc(
+        allocator,
+        &http_client,
+        provider.oidc_request_url,
+        provider.oidc_request_token,
+        provider.tenant_id,
+        provider.client_id,
+    );
+    defer allocator.free(access_token);
+    const certificate_der = try fetchSigningCertificateAlloc(
+        allocator,
+        &http_client,
+        provider.config(),
+        access_token,
+    );
+    defer allocator.free(certificate_der);
+    const certificate_pem = try encodePemCertificateAlloc(
+        allocator,
+        certificate_der,
+    );
+    defer allocator.free(certificate_pem);
+    try writeAtomic(io, allocator, output_path, certificate_pem);
 }
 
 fn requiredEnvAlloc(
@@ -197,15 +258,13 @@ fn requiredEnvAlloc(
     return value;
 }
 
-fn signDigestWithAzureKeyVaultAlloc(
+fn acquireAzureAccessTokenAlloc(
     allocator: Allocator,
     client: *std.http.Client,
     oidc_request_url: []const u8,
     oidc_request_token: []const u8,
     tenant_id: []const u8,
     client_id: []const u8,
-    key_id: []const u8,
-    digest: [32]u8,
 ) ![]u8 {
     const audience_url = try appendOidcAudienceAlloc(
         allocator,
@@ -245,7 +304,7 @@ fn signDigestWithAzureKeyVaultAlloc(
     defer allocator.free(token_url);
     const token_form = try formEncodeAlloc(allocator, &.{
         .{ "client_id", client_id },
-        .{ "scope", azureTokenScope(key_id) },
+        .{ "scope", artifact_signing_scope },
         .{
             "client_assertion_type",
             "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
@@ -276,68 +335,487 @@ fn signDigestWithAzureKeyVaultAlloc(
     {
         return error.InvalidAzureAccessToken;
     }
+    return allocator.dupe(u8, token.value.access_token);
+}
 
-    var digest_text_buf: [
-        std.base64.url_safe_no_pad.Encoder.calcSize(
-            digest.len,
-        )
+const ArtifactSigningConfig = struct {
+    endpoint: []const u8,
+    account: []const u8,
+    profile: []const u8,
+};
+
+const ArtifactSigningEnvironment = struct {
+    tenant_id: []u8,
+    client_id: []u8,
+    endpoint: []u8,
+    account: []u8,
+    profile: []u8,
+    oidc_request_url: []u8,
+    oidc_request_token: []u8,
+
+    fn init(allocator: Allocator, environ: Environ) !ArtifactSigningEnvironment {
+        const tenant_id = try requiredEnvAlloc(
+            allocator,
+            environ,
+            "ZVMI_AZURE_TENANT_ID",
+        );
+        errdefer allocator.free(tenant_id);
+        const client_id = try requiredEnvAlloc(
+            allocator,
+            environ,
+            "ZVMI_AZURE_CLIENT_ID",
+        );
+        errdefer allocator.free(client_id);
+        const endpoint_env = try requiredEnvAlloc(
+            allocator,
+            environ,
+            "ZVMI_ARTIFACT_SIGNING_ENDPOINT",
+        );
+        defer allocator.free(endpoint_env);
+        const endpoint = try normalizeArtifactSigningEndpointAlloc(
+            allocator,
+            endpoint_env,
+        );
+        errdefer allocator.free(endpoint);
+        const account = try requiredEnvAlloc(
+            allocator,
+            environ,
+            "ZVMI_ARTIFACT_SIGNING_ACCOUNT",
+        );
+        errdefer allocator.free(account);
+        const profile = try requiredEnvAlloc(
+            allocator,
+            environ,
+            "ZVMI_ARTIFACT_SIGNING_PROFILE",
+        );
+        errdefer allocator.free(profile);
+        const oidc_request_url = try requiredEnvAlloc(
+            allocator,
+            environ,
+            "ACTIONS_ID_TOKEN_REQUEST_URL",
+        );
+        errdefer allocator.free(oidc_request_url);
+        const oidc_request_token = try requiredEnvAlloc(
+            allocator,
+            environ,
+            "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+        );
+        errdefer allocator.free(oidc_request_token);
+
+        if (!isUuid(tenant_id) or !isUuid(client_id))
+            return error.InvalidAzureIdentity;
+        try validatePathSegment(account);
+        try validatePathSegment(profile);
+        try validateOidcRequestUrl(oidc_request_url);
+        return .{
+            .tenant_id = tenant_id,
+            .client_id = client_id,
+            .endpoint = endpoint,
+            .account = account,
+            .profile = profile,
+            .oidc_request_url = oidc_request_url,
+            .oidc_request_token = oidc_request_token,
+        };
+    }
+
+    fn deinit(self: *ArtifactSigningEnvironment, allocator: Allocator) void {
+        allocator.free(self.tenant_id);
+        allocator.free(self.client_id);
+        allocator.free(self.endpoint);
+        allocator.free(self.account);
+        allocator.free(self.profile);
+        allocator.free(self.oidc_request_url);
+        allocator.free(self.oidc_request_token);
+        self.* = undefined;
+    }
+
+    fn config(self: ArtifactSigningEnvironment) ArtifactSigningConfig {
+        return .{
+            .endpoint = self.endpoint,
+            .account = self.account,
+            .profile = self.profile,
+        };
+    }
+};
+
+const ArtifactSigningPollOptions = struct {
+    max_attempts: usize = 60,
+    sleep: bool = true,
+};
+
+const ArtifactSigningResult = struct {
+    signature: []u8,
+    certificate_bundle: []u8,
+    operation_id: []u8,
+
+    fn deinit(self: *ArtifactSigningResult, allocator: Allocator) void {
+        allocator.free(self.signature);
+        allocator.free(self.certificate_bundle);
+        allocator.free(self.operation_id);
+        self.* = undefined;
+    }
+};
+
+const ArtifactOperation = struct {
+    id: []const u8,
+    status: []const u8,
+    result: ?struct {
+        signature: []const u8,
+        signingCertificate: []const u8,
+    } = null,
+    @"error": ?struct {
+        code: ?[]const u8 = null,
+        message: ?[]const u8 = null,
+    } = null,
+};
+
+const ArtifactHttpResponse = struct {
+    status: std.http.Status,
+    body: []u8,
+    operation_location: ?[]u8,
+    retry_after_seconds: ?u32,
+
+    fn deinit(self: *ArtifactHttpResponse, allocator: Allocator) void {
+        allocator.free(self.body);
+        if (self.operation_location) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
+fn signDigestWithArtifactSigningAlloc(
+    io: Io,
+    allocator: Allocator,
+    client: *std.http.Client,
+    config: ArtifactSigningConfig,
+    access_token: []const u8,
+    digest: [32]u8,
+    poll_options: ArtifactSigningPollOptions,
+) !ArtifactSigningResult {
+    if (poll_options.max_attempts == 0)
+        return error.InvalidArtifactSigningPollConfiguration;
+
+    var digest_text_buffer: [
+        std.base64.standard.Encoder.calcSize(digest.len)
     ]u8 = undefined;
-    const digest_text = std.base64.url_safe_no_pad.Encoder.encode(
-        &digest_text_buf,
+    const digest_text = std.base64.standard.Encoder.encode(
+        &digest_text_buffer,
         &digest,
     );
     const request_body = try std.json.Stringify.valueAlloc(
         allocator,
-        .{ .alg = "RS256", .value = digest_text },
+        .{
+            .signatureAlgorithm = "RS256",
+            .digest = digest_text,
+        },
         .{},
     );
     defer allocator.free(request_body);
-    const sign_url = try std.fmt.allocPrint(
+    const submit_url = try artifactSigningUrlAlloc(
         allocator,
-        "{s}/sign?api-version={s}",
-        .{ key_id, key_vault_api_version },
+        config,
+        ":sign",
     );
-    defer allocator.free(sign_url);
-    const key_authorization = try std.fmt.allocPrint(
-        allocator,
-        "Bearer {s}",
-        .{token.value.access_token},
-    );
-    defer allocator.free(key_authorization);
-    const sign_body = try fetchBoundedAlloc(
+    defer allocator.free(submit_url);
+    var submit = try artifactRequestAlloc(
         allocator,
         client,
         .POST,
-        sign_url,
+        submit_url,
+        access_token,
+        "application/json",
         request_body,
-        &.{.{ .name = "Content-Type", .value = "application/json" }},
-        &.{.{ .name = "Authorization", .value = key_authorization }},
     );
-    defer allocator.free(sign_body);
-    const response = try std.json.parseFromSlice(
-        SignResponse,
+    defer submit.deinit(allocator);
+    if (submit.status != .accepted)
+        return error.ArtifactSigningSubmitFailed;
+    const operation_location = submit.operation_location orelse
+        return error.ArtifactSigningOperationLocationMissing;
+    const initial = try parseArtifactOperation(
         allocator,
-        sign_body,
+        submit.body,
+    );
+    defer initial.deinit();
+    if (!isUuid(initial.value.id))
+        return error.InvalidArtifactSigningOperationId;
+    const poll_url = try expectedArtifactSigningPollUrlAlloc(
+        allocator,
+        config,
+        initial.value.id,
+    );
+    defer allocator.free(poll_url);
+    if (!std.mem.eql(u8, poll_url, operation_location))
+        return error.InvalidArtifactSigningOperationLocation;
+
+    var attempt: usize = 0;
+    var delay_seconds: u32 = 1;
+    while (attempt < poll_options.max_attempts) : (attempt += 1) {
+        var response = try artifactRequestAlloc(
+            allocator,
+            client,
+            .GET,
+            poll_url,
+            access_token,
+            "application/json",
+            null,
+        );
+        defer response.deinit(allocator);
+
+        if (response.status == .request_timeout or
+            response.status == .too_many_requests or
+            response.status.class() == .server_error)
+        {
+            if (attempt + 1 == poll_options.max_attempts)
+                return error.ArtifactSigningTimedOut;
+            if (poll_options.sleep) {
+                const retry_after = response.retry_after_seconds orelse
+                    delay_seconds;
+                try Io.sleep(io, .fromSeconds(@min(retry_after, 30)), .awake);
+            }
+            delay_seconds = @min(delay_seconds * 2, 5);
+            continue;
+        }
+        if (response.status != .ok)
+            return error.ArtifactSigningPollFailed;
+
+        const operation = try parseArtifactOperation(
+            allocator,
+            response.body,
+        );
+        defer operation.deinit();
+        if (!std.mem.eql(u8, operation.value.id, initial.value.id))
+            return error.ArtifactSigningOperationIdMismatch;
+        if (std.mem.eql(u8, operation.value.status, "Succeeded")) {
+            const result = operation.value.result orelse
+                return error.ArtifactSigningResultMissing;
+            const signature = try decodeStandardBase64Alloc(
+                allocator,
+                result.signature,
+                max_certificate_bytes,
+            );
+            errdefer allocator.free(signature);
+            if (signature.len != 128 and signature.len != 256 and
+                signature.len != 384 and signature.len != 512)
+            {
+                return error.InvalidRsaSignatureSize;
+            }
+            const encoded_certificate_bundle = try decodeStandardBase64Alloc(
+                allocator,
+                result.signingCertificate,
+                max_certificate_bytes,
+            );
+            defer allocator.free(encoded_certificate_bundle);
+            const certificate_bundle = try decodeMimeBase64Alloc(
+                allocator,
+                encoded_certificate_bundle,
+                max_certificate_bytes,
+            );
+            errdefer allocator.free(certificate_bundle);
+            return .{
+                .signature = signature,
+                .certificate_bundle = certificate_bundle,
+                .operation_id = try allocator.dupe(u8, operation.value.id),
+            };
+        }
+        if (std.mem.eql(u8, operation.value.status, "Failed"))
+            return error.ArtifactSigningOperationFailed;
+        if (std.mem.eql(u8, operation.value.status, "Canceled"))
+            return error.ArtifactSigningOperationCanceled;
+        if (!std.mem.eql(u8, operation.value.status, "NotStarted") and
+            !std.mem.eql(u8, operation.value.status, "Running"))
+        {
+            return error.InvalidArtifactSigningOperationStatus;
+        }
+        if (attempt + 1 == poll_options.max_attempts)
+            return error.ArtifactSigningTimedOut;
+        if (poll_options.sleep) {
+            const retry_after = response.retry_after_seconds orelse
+                delay_seconds;
+            try Io.sleep(io, .fromSeconds(@min(retry_after, 30)), .awake);
+        }
+        delay_seconds = @min(delay_seconds * 2, 5);
+    }
+    return error.ArtifactSigningTimedOut;
+}
+
+fn fetchSigningCertificateAlloc(
+    allocator: Allocator,
+    client: *std.http.Client,
+    config: ArtifactSigningConfig,
+    access_token: []const u8,
+) ![]u8 {
+    const url = try artifactSigningUrlAlloc(
+        allocator,
+        config,
+        "/sign/certchain",
+    );
+    defer allocator.free(url);
+    var response = try artifactRequestAlloc(
+        allocator,
+        client,
+        .GET,
+        url,
+        access_token,
+        "application/x-x509-ca-cert",
+        null,
+    );
+    defer response.deinit(allocator);
+    if (response.status != .ok)
+        return error.ArtifactSigningCertificateFetchFailed;
+    try zvmi.authenticode.validateX509CertificateDer(response.body);
+    return allocator.dupe(u8, response.body);
+}
+
+fn artifactRequestAlloc(
+    allocator: Allocator,
+    client: *std.http.Client,
+    method: std.http.Method,
+    url: []const u8,
+    access_token: []const u8,
+    accept: []const u8,
+    payload: ?[]u8,
+) !ArtifactHttpResponse {
+    const authorization = try std.fmt.allocPrint(
+        allocator,
+        "Bearer {s}",
+        .{access_token},
+    );
+    defer allocator.free(authorization);
+    const uri = try std.Uri.parse(url);
+    const extra_headers = [_]std.http.Header{
+        .{ .name = "Accept", .value = accept },
+        .{ .name = "client-version", .value = "zvmi/1" },
+    };
+    const privileged_headers = [_]std.http.Header{
+        .{ .name = "Authorization", .value = authorization },
+    };
+    var request = try client.request(method, uri, .{
+        .redirect_behavior = .not_allowed,
+        .headers = .{
+            .content_type = if (payload != null)
+                .{ .override = "application/json" }
+            else
+                .default,
+        },
+        .extra_headers = &extra_headers,
+        .privileged_headers = &privileged_headers,
+    });
+    defer request.deinit();
+    if (payload) |body| {
+        try request.sendBodyComplete(body);
+    } else {
+        try request.sendBodiless();
+    }
+    var response = try request.receiveHead(&.{});
+
+    var operation_location: ?[]u8 = null;
+    errdefer if (operation_location) |value| allocator.free(value);
+    var retry_after_seconds: ?u32 = null;
+    var headers = response.head.iterateHeaders();
+    while (headers.next()) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "Operation-Location")) {
+            if (operation_location != null)
+                return error.DuplicateArtifactSigningOperationLocation;
+            operation_location = try allocator.dupe(u8, header.value);
+        } else if (std.ascii.eqlIgnoreCase(header.name, "Retry-After")) {
+            if (retry_after_seconds != null)
+                return error.DuplicateArtifactSigningRetryAfter;
+            retry_after_seconds = std.fmt.parseInt(
+                u32,
+                header.value,
+                10,
+            ) catch return error.InvalidArtifactSigningRetryAfter;
+        }
+    }
+    var transfer_buffer: [8192]u8 = undefined;
+    const body = try response.reader(&transfer_buffer).allocRemaining(
+        allocator,
+        .limited(max_response_bytes),
+    );
+    return .{
+        .status = response.head.status,
+        .body = body,
+        .operation_location = operation_location,
+        .retry_after_seconds = retry_after_seconds,
+    };
+}
+
+fn parseArtifactOperation(
+    allocator: Allocator,
+    body: []const u8,
+) !std.json.Parsed(ArtifactOperation) {
+    return std.json.parseFromSlice(
+        ArtifactOperation,
+        allocator,
+        body,
         .{ .ignore_unknown_fields = true },
     );
-    defer response.deinit();
-    if (!std.mem.eql(u8, response.value.kid, key_id))
-        return error.AzureKeyIdMismatch;
+}
 
-    const signature_size = try std.base64.url_safe_no_pad.Decoder
-        .calcSizeForSlice(response.value.value);
-    if (signature_size != 128 and signature_size != 256 and
-        signature_size != 384 and signature_size != 512)
-    {
-        return error.InvalidRsaSignatureSize;
-    }
-    const signature = try allocator.alloc(u8, signature_size);
-    errdefer allocator.free(signature);
-    try std.base64.url_safe_no_pad.Decoder.decode(
-        signature,
-        response.value.value,
+fn artifactSigningUrlAlloc(
+    allocator: Allocator,
+    config: ArtifactSigningConfig,
+    suffix: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}/codesigningaccounts/{s}/certificateprofiles/{s}{s}?api-version={s}",
+        .{
+            config.endpoint,
+            config.account,
+            config.profile,
+            suffix,
+            artifact_signing_api_version,
+        },
     );
-    return signature;
+}
+
+fn expectedArtifactSigningPollUrlAlloc(
+    allocator: Allocator,
+    config: ArtifactSigningConfig,
+    operation_id: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}/codesigningaccounts/{s}/certificateprofiles/{s}/sign/{s}?api-version={s}",
+        .{
+            config.endpoint,
+            config.account,
+            config.profile,
+            operation_id,
+            artifact_signing_api_version,
+        },
+    );
+}
+
+fn decodeStandardBase64Alloc(
+    allocator: Allocator,
+    encoded: []const u8,
+    max_size: usize,
+) ![]u8 {
+    if (encoded.len == 0) return error.EmptyBase64Value;
+    const decoded_size = try std.base64.standard.Decoder.calcSizeForSlice(
+        encoded,
+    );
+    if (decoded_size == 0 or decoded_size > max_size)
+        return error.InvalidBase64ValueSize;
+    const decoded = try allocator.alloc(u8, decoded_size);
+    errdefer allocator.free(decoded);
+    try std.base64.standard.Decoder.decode(decoded, encoded);
+    return decoded;
+}
+
+fn decodeMimeBase64Alloc(
+    allocator: Allocator,
+    encoded: []const u8,
+    max_size: usize,
+) ![]u8 {
+    var compact: std.Io.Writer.Allocating = .init(allocator);
+    defer compact.deinit();
+    for (encoded) |byte| {
+        if (std.ascii.isWhitespace(byte)) continue;
+        try compact.writer.writeByte(byte);
+    }
+    return decodeStandardBase64Alloc(allocator, compact.written(), max_size);
 }
 
 fn fetchBoundedAlloc(
@@ -447,6 +925,33 @@ fn decodePemCertificateAlloc(
     return certificate;
 }
 
+fn encodePemCertificateAlloc(
+    allocator: Allocator,
+    certificate_der: []const u8,
+) ![]u8 {
+    if (certificate_der.len == 0 or certificate_der.len > max_certificate_bytes)
+        return error.InvalidCertificate;
+    const encoded = try allocator.alloc(
+        u8,
+        std.base64.standard.Encoder.calcSize(certificate_der.len),
+    );
+    defer allocator.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, certificate_der);
+
+    var pem: std.Io.Writer.Allocating = .init(allocator);
+    errdefer pem.deinit();
+    try pem.writer.writeAll("-----BEGIN CERTIFICATE-----\n");
+    var offset: usize = 0;
+    while (offset < encoded.len) {
+        const end = @min(offset + 64, encoded.len);
+        try pem.writer.writeAll(encoded[offset..end]);
+        try pem.writer.writeByte('\n');
+        offset = end;
+    }
+    try pem.writer.writeAll("-----END CERTIFICATE-----\n");
+    return pem.toOwnedSlice();
+}
+
 fn validateOidcRequestUrl(url: []const u8) !void {
     if (!std.mem.startsWith(u8, url, github_oidc_prefix) or
         std.mem.indexOfScalar(u8, url, '#') != null or
@@ -456,55 +961,48 @@ fn validateOidcRequestUrl(url: []const u8) !void {
     }
 }
 
-fn validateKeyId(key_id: []const u8, expected_version: []const u8) !void {
+fn normalizeArtifactSigningEndpointAlloc(
+    allocator: Allocator,
+    endpoint: []const u8,
+) ![]u8 {
     const prefix = "https://";
-    if (!std.mem.startsWith(u8, key_id, prefix) or
-        std.mem.indexOfAny(u8, key_id, "?#% \t\r\n") != null)
+    if (!std.mem.startsWith(u8, endpoint, prefix) or
+        std.mem.indexOfAny(u8, endpoint, "?#% \t\r\n") != null)
     {
-        return error.InvalidAzureKeyId;
+        return error.InvalidArtifactSigningEndpoint;
     }
-    const remainder = key_id[prefix.len..];
-    const slash = std.mem.indexOfScalar(u8, remainder, '/') orelse
-        return error.InvalidAzureKeyId;
-    const host = remainder[0..slash];
-    if ((!std.mem.endsWith(u8, host, ".vault.azure.net") and
-        !std.mem.endsWith(u8, host, ".managedhsm.azure.net")) or
-        host.len == 0)
+    var normalized = endpoint;
+    if (std.mem.endsWith(u8, normalized, "/"))
+        normalized = normalized[0 .. normalized.len - 1];
+    const host = normalized[prefix.len..];
+    if (host.len == 0 or std.mem.indexOfScalar(u8, host, '/') != null or
+        !std.mem.endsWith(u8, host, ".codesigning.azure.net"))
     {
-        return error.InvalidAzureKeyId;
+        return error.InvalidArtifactSigningEndpoint;
     }
+    const regional_name = host[0 .. host.len - ".codesigning.azure.net".len];
+    if (regional_name.len == 0 or std.mem.endsWith(u8, regional_name, "."))
+        return error.InvalidArtifactSigningEndpoint;
     for (host) |byte| {
         if (!(std.ascii.isLower(byte) or std.ascii.isDigit(byte) or
             byte == '-' or byte == '.'))
         {
-            return error.InvalidAzureKeyId;
+            return error.InvalidArtifactSigningEndpoint;
         }
     }
-
-    var segments = std.mem.splitScalar(u8, remainder[slash + 1 ..], '/');
-    if (!std.mem.eql(u8, segments.next() orelse "", "keys"))
-        return error.InvalidAzureKeyId;
-    const key_name = segments.next() orelse return error.InvalidAzureKeyId;
-    const key_version = segments.next() orelse return error.InvalidAzureKeyId;
-    if (segments.next() != null or key_name.len == 0 or key_version.len == 0 or
-        !std.mem.eql(u8, key_version, expected_version))
-    {
-        return error.InvalidAzureKeyId;
-    }
-    for (key_name) |byte| {
-        if (!(std.ascii.isAlphanumeric(byte) or byte == '-'))
-            return error.InvalidAzureKeyId;
-    }
-    for (key_version) |byte| {
-        if (!std.ascii.isHex(byte)) return error.InvalidAzureKeyId;
-    }
+    return allocator.dupe(u8, normalized);
 }
 
-fn azureTokenScope(key_id: []const u8) []const u8 {
-    return if (std.mem.indexOf(u8, key_id, ".managedhsm.azure.net/") != null)
-        "https://managedhsm.azure.net/.default"
-    else
-        "https://vault.azure.net/.default";
+fn validatePathSegment(value: []const u8) !void {
+    if (value.len == 0 or value.len > 128)
+        return error.InvalidArtifactSigningResourceName;
+    for (value) |byte| {
+        if (!(std.ascii.isAlphanumeric(byte) or byte == '-' or
+            byte == '_' or byte == '.'))
+        {
+            return error.InvalidArtifactSigningResourceName;
+        }
+    }
 }
 
 fn isUuid(value: []const u8) bool {
@@ -547,14 +1045,41 @@ fn writeAtomic(
     try Dir.cwd().renamePreserve(temporary, Dir.cwd(), destination, io);
 }
 
+test "Artifact Signing certificate payload uses nested MIME base64" {
+    const decoded = try decodeMimeBase64Alloc(
+        std.testing.allocator,
+        "MAMC\r\nAQE=\r\n",
+        1024,
+    );
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 0x30, 0x03, 0x02, 0x01, 0x01 },
+        decoded,
+    );
+}
+
+test "certificate PEM encoding round trips canonical DER" {
+    const certificate_der = "\x30\x03\x02\x01\x01";
+    const pem = try encodePemCertificateAlloc(
+        std.testing.allocator,
+        certificate_der,
+    );
+    defer std.testing.allocator.free(pem);
+    const decoded = try decodePemCertificateAlloc(std.testing.allocator, pem);
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualSlices(u8, certificate_der, decoded);
+}
+
 test "form encoding protects assertion delimiters" {
     const encoded = try formEncodeAlloc(std.testing.allocator, &.{
-        .{ "scope", "https://vault.azure.net/.default" },
+        .{ "scope", artifact_signing_scope },
         .{ "assertion", "a+b/c=d" },
     });
     defer std.testing.allocator.free(encoded);
     try std.testing.expectEqualStrings(
-        "scope=https%3A%2F%2Fvault.azure.net%2F.default&assertion=a%2Bb%2Fc%3Dd",
+        "scope=https%3A%2F%2Fcodesigning.azure.net%2F.default&" ++
+            "assertion=a%2Bb%2Fc%3Dd",
         encoded,
     );
 }
@@ -578,41 +1103,66 @@ test "OIDC audience is appended without replacing protected query data" {
     );
 }
 
-test "Azure key IDs require an immutable matching version" {
-    const version = "0123456789abcdef0123456789abcdef";
-    try validateKeyId(
-        "https://zvmi.vault.azure.net/keys/uki-release/" ++ version,
-        version,
+test "Artifact Signing endpoints and resource names are constrained" {
+    const endpoint = try normalizeArtifactSigningEndpointAlloc(
+        std.testing.allocator,
+        "https://wus.codesigning.azure.net/",
     );
-    try validateKeyId(
-        "https://zvmi.managedhsm.azure.net/keys/uki-release/" ++ version,
-        version,
-    );
+    defer std.testing.allocator.free(endpoint);
     try std.testing.expectEqualStrings(
-        "https://vault.azure.net/.default",
-        azureTokenScope(
-            "https://zvmi.vault.azure.net/keys/uki-release/" ++ version,
-        ),
+        "https://wus.codesigning.azure.net",
+        endpoint,
     );
-    try std.testing.expectEqualStrings(
-        "https://managedhsm.azure.net/.default",
-        azureTokenScope(
-            "https://zvmi.managedhsm.azure.net/keys/uki-release/" ++ version,
+    try validatePathSegment("cataggar");
+    try validatePathSegment("zvmi-uki");
+    try std.testing.expectError(
+        error.InvalidArtifactSigningEndpoint,
+        normalizeArtifactSigningEndpointAlloc(
+            std.testing.allocator,
+            "https://codesigning.azure.net.evil.example/",
         ),
     );
     try std.testing.expectError(
-        error.InvalidAzureKeyId,
-        validateKeyId(
-            "https://zvmi.vault.azure.net/keys/uki-release/latest",
-            "latest",
+        error.InvalidArtifactSigningEndpoint,
+        normalizeArtifactSigningEndpointAlloc(
+            std.testing.allocator,
+            "http://wus.codesigning.azure.net/",
         ),
     );
     try std.testing.expectError(
-        error.InvalidAzureKeyId,
-        validateKeyId(
-            "https://evil.example/keys/uki-release/" ++ version,
-            version,
-        ),
+        error.InvalidArtifactSigningResourceName,
+        validatePathSegment("../zvmi"),
+    );
+}
+
+test "Artifact Signing uses padded standard base64 and exact operation URLs" {
+    const decoded = try decodeStandardBase64Alloc(
+        std.testing.allocator,
+        "AAECAwQ=",
+        8,
+    );
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 0, 1, 2, 3, 4 },
+        decoded,
+    );
+    const poll_url = try expectedArtifactSigningPollUrlAlloc(
+        std.testing.allocator,
+        .{
+            .endpoint = "https://wus.codesigning.azure.net",
+            .account = "cataggar",
+            .profile = "zvmi-uki",
+        },
+        "00000000-0000-4000-8000-000000000000",
+    );
+    defer std.testing.allocator.free(poll_url);
+    try std.testing.expectEqualStrings(
+        "https://wus.codesigning.azure.net/codesigningaccounts/cataggar/" ++
+            "certificateprofiles/zvmi-uki/sign/" ++
+            "00000000-0000-4000-8000-000000000000?" ++
+            "api-version=2024-06-15",
+        poll_url,
     );
 }
 
@@ -628,6 +1178,281 @@ test "PEM certificate decoder accepts one canonical certificate block" {
         decodePemCertificateAlloc(
             std.testing.allocator,
             "prefix\n-----BEGIN CERTIFICATE-----\nMAMCAQE=\n-----END CERTIFICATE-----",
+        ),
+    );
+}
+
+const MockArtifactSigningScenario = enum {
+    success,
+    failed,
+    canceled,
+    timeout,
+    malformed_base64,
+    wrong_operation_location,
+    redirect,
+};
+
+const MockArtifactSigningServer = struct {
+    scenario: MockArtifactSigningScenario,
+    poll_url: []const u8,
+    success_body: []const u8,
+    err: ?anyerror = null,
+};
+
+fn mockArtifactSigningRequestCount(
+    scenario: MockArtifactSigningScenario,
+) usize {
+    return switch (scenario) {
+        .success, .timeout => 3,
+        .failed, .canceled, .malformed_base64 => 2,
+        .wrong_operation_location, .redirect => 1,
+    };
+}
+
+fn runMockArtifactSigningServer(
+    io: Io,
+    listener: *std.Io.net.Server,
+    context: *MockArtifactSigningServer,
+) void {
+    runMockArtifactSigningServerFallible(io, listener, context) catch |err| {
+        context.err = err;
+    };
+}
+
+fn runMockArtifactSigningServerFallible(
+    io: Io,
+    listener: *std.Io.net.Server,
+    context: *MockArtifactSigningServer,
+) !void {
+    var stream = try listener.accept(io);
+    defer stream.close(io);
+    var input_buffer: [4096]u8 = undefined;
+    var output_buffer: [4096]u8 = undefined;
+    var stream_reader = stream.reader(io, &input_buffer);
+    var stream_writer = stream.writer(io, &output_buffer);
+    var server: std.http.Server = .init(
+        &stream_reader.interface,
+        &stream_writer.interface,
+    );
+
+    const operation_id = "00000000-0000-4000-8000-000000000000";
+    const accepted_body =
+        "{\"id\":\"" ++ operation_id ++ "\",\"status\":\"Running\"}";
+    const running_body =
+        "{\"id\":\"" ++ operation_id ++ "\",\"status\":\"Running\"}";
+    const failed_body =
+        "{\"id\":\"" ++ operation_id ++ "\",\"status\":\"Failed\"," ++
+        "\"error\":{\"code\":\"MockFailure\",\"message\":\"redacted\"}}";
+    const canceled_body =
+        "{\"id\":\"" ++ operation_id ++ "\",\"status\":\"Canceled\"}";
+    const malformed_body =
+        "{\"id\":\"" ++ operation_id ++ "\",\"status\":\"Succeeded\"," ++
+        "\"result\":{\"signature\":\"not-base64\",\"signingCertificate\":" ++
+        "\"MAMCAQE=\"}}";
+
+    var handled: usize = 0;
+    while (handled < mockArtifactSigningRequestCount(context.scenario)) : (handled += 1) {
+        var request = try server.receiveHead();
+        if (handled == 0) {
+            if (request.head.method != .POST)
+                return error.UnexpectedMockArtifactSigningRequest;
+            if (context.scenario == .redirect) {
+                try request.respond("", .{
+                    .status = .temporary_redirect,
+                    .extra_headers = &.{
+                        .{ .name = "Location", .value = "https://evil.example/" },
+                    },
+                });
+                continue;
+            }
+            const operation_location = if (context.scenario ==
+                .wrong_operation_location)
+                "https://evil.example/operation"
+            else
+                context.poll_url;
+            try request.respond(accepted_body, .{
+                .status = .accepted,
+                .extra_headers = &.{
+                    .{
+                        .name = "Operation-Location",
+                        .value = operation_location,
+                    },
+                },
+            });
+            continue;
+        }
+        if (request.head.method != .GET)
+            return error.UnexpectedMockArtifactSigningRequest;
+        const body = switch (context.scenario) {
+            .success => if (handled == 1)
+                running_body
+            else
+                context.success_body,
+            .failed => failed_body,
+            .canceled => canceled_body,
+            .timeout => running_body,
+            .malformed_base64 => malformed_body,
+            .wrong_operation_location, .redirect => unreachable,
+        };
+        try request.respond(body, .{});
+    }
+}
+
+fn runMockArtifactSigningScenario(
+    allocator: Allocator,
+    io: Io,
+    scenario: MockArtifactSigningScenario,
+) !ArtifactSigningResult {
+    const port: u16 = 28910 + @as(u16, @intFromEnum(scenario));
+    var listen_address: std.Io.net.IpAddress = .{
+        .ip4 = .{
+            .bytes = .{ 127, 0, 0, 1 },
+            .port = port,
+        },
+    };
+    var listener = try listen_address.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const endpoint = try std.fmt.allocPrint(
+        allocator,
+        "http://127.0.0.1:{d}",
+        .{port},
+    );
+    defer allocator.free(endpoint);
+    const config: ArtifactSigningConfig = .{
+        .endpoint = endpoint,
+        .account = "cataggar",
+        .profile = "zvmi-uki",
+    };
+    const poll_url = try expectedArtifactSigningPollUrlAlloc(
+        allocator,
+        config,
+        "00000000-0000-4000-8000-000000000000",
+    );
+    defer allocator.free(poll_url);
+    const signature = [_]u8{0x5a} ** 256;
+    const signature_text = try allocator.alloc(
+        u8,
+        std.base64.standard.Encoder.calcSize(signature.len),
+    );
+    defer allocator.free(signature_text);
+    _ = std.base64.standard.Encoder.encode(signature_text, &signature);
+    const success_body = try std.json.Stringify.valueAlloc(
+        allocator,
+        .{
+            .id = "00000000-0000-4000-8000-000000000000",
+            .status = "Succeeded",
+            .result = .{
+                .signature = signature_text,
+                .signingCertificate = "TUFNQ0FRRT0=",
+            },
+        },
+        .{},
+    );
+    defer allocator.free(success_body);
+    var context: MockArtifactSigningServer = .{
+        .scenario = scenario,
+        .poll_url = poll_url,
+        .success_body = success_body,
+    };
+    const thread = try std.Thread.spawn(
+        .{},
+        runMockArtifactSigningServer,
+        .{ io, &listener, &context },
+    );
+
+    var client: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer client.deinit();
+    const result = signDigestWithArtifactSigningAlloc(
+        io,
+        allocator,
+        &client,
+        config,
+        "test-token",
+        [_]u8{0xa5} ** 32,
+        .{ .max_attempts = 2, .sleep = false },
+    ) catch |err| {
+        thread.join();
+        if (context.err) |server_err| return server_err;
+        return err;
+    };
+    thread.join();
+    if (context.err) |err| {
+        var mutable_result = result;
+        mutable_result.deinit(allocator);
+        return err;
+    }
+    return result;
+}
+
+test "Artifact Signing submit and polling decode the returned bundle and signature" {
+    var result = try runMockArtifactSigningScenario(
+        std.testing.allocator,
+        std.testing.io,
+        .success,
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 256), result.signature.len);
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 0x30, 0x03, 0x02, 0x01, 0x01 },
+        result.certificate_bundle,
+    );
+    try std.testing.expectEqualStrings(
+        "00000000-0000-4000-8000-000000000000",
+        result.operation_id,
+    );
+}
+
+test "Artifact Signing rejects terminal failures, timeouts, and malformed results" {
+    try std.testing.expectError(
+        error.ArtifactSigningOperationFailed,
+        runMockArtifactSigningScenario(
+            std.testing.allocator,
+            std.testing.io,
+            .failed,
+        ),
+    );
+    try std.testing.expectError(
+        error.ArtifactSigningOperationCanceled,
+        runMockArtifactSigningScenario(
+            std.testing.allocator,
+            std.testing.io,
+            .canceled,
+        ),
+    );
+    try std.testing.expectError(
+        error.ArtifactSigningTimedOut,
+        runMockArtifactSigningScenario(
+            std.testing.allocator,
+            std.testing.io,
+            .timeout,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidPadding,
+        runMockArtifactSigningScenario(
+            std.testing.allocator,
+            std.testing.io,
+            .malformed_base64,
+        ),
+    );
+}
+
+test "Artifact Signing rejects untrusted operation URLs and redirects" {
+    try std.testing.expectError(
+        error.InvalidArtifactSigningOperationLocation,
+        runMockArtifactSigningScenario(
+            std.testing.allocator,
+            std.testing.io,
+            .wrong_operation_location,
+        ),
+    );
+    try std.testing.expectError(
+        error.TooManyHttpRedirects,
+        runMockArtifactSigningScenario(
+            std.testing.allocator,
+            std.testing.io,
+            .redirect,
         ),
     );
 }

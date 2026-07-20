@@ -588,22 +588,23 @@ zig build -Dazurelinux-arch=x86_64 -Dazurelinux-flavor=core generalized-azurelin
   --uki-signing-certificate-sha256 <canonical-DER-SHA-256> \
   --uki-signing-key test.key
 
-# Production Azure Key Vault or Managed HSM signing
+# Production Azure Artifact Signing
 zig build install-zvmi
 export ZVMI_AZURE_TENANT_ID=<Microsoft-Entra-tenant-UUID>
 export ZVMI_AZURE_CLIENT_ID=<federated-application-client-UUID>
-export ZVMI_AZURE_KEY_ID=https://<vault>.vault.azure.net/keys/<name>/<immutable-version>
-export ZVMI_UKI_SIGNING_KEY_VERSION=<immutable-version>
+export ZVMI_ARTIFACT_SIGNING_ENDPOINT=https://wus.codesigning.azure.net/
+export ZVMI_ARTIFACT_SIGNING_ACCOUNT=cataggar
+export ZVMI_ARTIFACT_SIGNING_PROFILE=zvmi-uki
 zig build -Dazurelinux-arch=x86_64 -Dazurelinux-flavor=core generalized-azurelinux4 -- \
-  --uki-signing-certificate release.crt \
+  --uki-signing-certificate zvmi-uki-current-leaf.crt \
   --uki-signing-certificate-sha256 <canonical-DER-SHA-256> \
   --uki-sign-command "$PWD/zig-out/bin/zvmi" \
   --uki-sign-command-arg sign
 ```
 
-`zvmi sign` is the built-in production provider adapter. It validates the unsigned UKI and certificate fingerprints, constructs the Authenticode signed attributes locally, obtains a GitHub OIDC token for `api://AzureADTokenExchange`, exchanges it with Microsoft Entra, and asks the immutable Key Vault or Managed HSM key version to sign only the SHA-256 digest with `RS256`. It then creates the Authenticode CMS and atomically publishes `ZVMI_UKI_SIGNED`; the private key never leaves Azure. The external-provider protocol supplies `ZVMI_UKI_UNSIGNED`, `ZVMI_UKI_SIGNED`, `ZVMI_UKI_CERTIFICATE`, `ZVMI_UKI_ARCHITECTURE`, `ZVMI_UKI_FLAVOR`, `ZVMI_UKI_UNSIGNED_SHA256`, and `ZVMI_UKI_CERTIFICATE_SHA256`.
+`zvmi sign` is the built-in production provider adapter. It validates the unsigned UKI and exact signing-leaf fingerprint, constructs the Authenticode signed attributes locally, obtains a GitHub OIDC token for `api://AzureADTokenExchange`, exchanges it with Microsoft Entra for the `https://codesigning.azure.net/.default` scope, and submits only the SHA-256 digest to Artifact Signing's stable `2024-06-15` `RS256` API. It polls the returned operation without following redirects, decodes the operation's nested Base64 PKCS#7 certificate bundle, requires its encapsulated signing leaf to exactly match the configured certificate, embeds the complete deduplicated chain in Authenticode CMS, and atomically publishes the signed UKI and non-secret provider metadata. `zvmi sign certificate <absolute-output.pem>` fetches the profile's current leaf from the authenticated certificate-bundle endpoint. The private key never leaves Azure. The external-provider protocol supplies `ZVMI_UKI_UNSIGNED`, `ZVMI_UKI_SIGNED`, `ZVMI_UKI_CERTIFICATE`, `ZVMI_UKI_ARCHITECTURE`, `ZVMI_UKI_FLAVOR`, `ZVMI_UKI_UNSIGNED_SHA256`, `ZVMI_UKI_CERTIFICATE_SHA256`, and `ZVMI_UKI_SIGNING_METADATA`.
 
-The Azure key must be an RSA key whose public key matches `release.crt`, and the federated identity needs only the data-plane `sign` operation for that exact key. Configure its federated credential for audience `api://AzureADTokenExchange`, issuer `https://token.actions.githubusercontent.com`, and subject `repo:cataggar/zvmi:environment:azurelinux4-signing`. Pin the complete HTTPS key ID, including its hexadecimal version; aliases such as `latest` and versionless key IDs are rejected. Key Vault hosts must end in `.vault.azure.net`; Managed HSM hosts must end in `.managedhsm.azure.net`.
+Create a dedicated Private Trust certificate profile named `zvmi-uki` in the existing `cataggar` Artifact Signing account. Configure the Entra federated credential for audience `api://AzureADTokenExchange`, issuer `https://token.actions.githubusercontent.com`, and subject `repo:cataggar/zvmi:environment:azurelinux4-signing`, then grant `Artifact Signing Certificate Profile Signer` at the `zvmi-uki` profile scope. The observed Private Trust chain terminates at a shared Microsoft Enterprise identity hierarchy, and UEFI cannot restrict trust with Artifact Signing's subscriber-unique EKU. Secure Boot therefore enrolls the exact short-lived signing leaf for each release, never the broad AOC intermediate or Microsoft root. The workflow fetches the current leaf immediately before signing and fails if the operation returns another leaf; release validation also fails if the leaf or provider identity changes across candidates. Artifact Signing leaves rotate daily and are valid for about three days. The raw digest API does not add an RFC 3161 timestamp; firmware and `sbverify` do not enforce signing-certificate wall-clock validity, but general long-term Authenticode validation requires a separately implemented timestamp policy.
 
 The builder requires Zig 0.16, `curl`, `dnf`, GNU tar, `qemu-img`, and
 passwordless or interactive `sudo`. On a host that differs from the selected
@@ -675,7 +676,7 @@ account and SSH key, WALinuxAgent for Azure Ready/extensions, and
 provisioning/Ready, and directly supervised OpenSSH. Both flavors have no
 baked credentials and require a public SSH key at provisioning time; core
 cannot expose SSH until that key has been supplied through the Azure OVF
-profile. Release UKIs are signed by the immutable certificate fingerprint recorded in `candidate.json`, `publish-manifest.json`, release notes, local Secure Boot acceptance, and Azure acceptance.
+profile. Release UKIs are trusted through the exact Artifact Signing leaf enrolled in UEFI `db`; its fingerprint is recorded in `candidate.json`, `publish-manifest.json`, release notes, local Secure Boot acceptance, and Azure acceptance together with every signing operation ID.
 
 `zvmi qemu` defaults to the full x86_64 asset pinned as
 `AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260717`. Select an AArch64 or
@@ -702,17 +703,17 @@ without a readable and writable `/dev/kvm` is not release-capable; a
 GitHub-hosted Arm64 runner or an Azure Arm64 VM does not satisfy this gate.
 Use `x86_64` and install `qemu-system-x86` for the x86_64 runner.
 
-Build/sign/local acceptance use the separate protected `azurelinux4-signing` GitHub environment, restricted to `main` with required reviewers. It defines the public certificate secret `AZURELINUX4_UKI_SIGNING_CERTIFICATE_PEM` and these variables:
+Build/sign/local acceptance use the separate protected `azurelinux4-signing` GitHub environment, restricted to `main` with required reviewers. It defines these variables:
 
 ```text
-AZURELINUX4_UKI_SIGNING_CERTIFICATE_SHA256=<canonical-DER-SHA-256>
-AZURELINUX4_UKI_SIGNING_KEY_VERSION=<immutable-provider-key-version>
 ZVMI_AZURE_TENANT_ID=<Microsoft-Entra-tenant-UUID>
 ZVMI_AZURE_CLIENT_ID=<federated-application-client-UUID>
-ZVMI_AZURE_KEY_ID=https://<vault>.vault.azure.net/keys/<name>/<immutable-version>
+ZVMI_ARTIFACT_SIGNING_ENDPOINT=https://wus.codesigning.azure.net/
+ZVMI_ARTIFACT_SIGNING_ACCOUNT=cataggar
+ZVMI_ARTIFACT_SIGNING_PROFILE=zvmi-uki
 ```
 
-The workflow builds `zvmi` from the accepted source commit and uses its absolute `zig-out/bin/zvmi sign` path; no separately installed adapter is trusted. The signer receives `id-token: write`; all other build permissions remain read-only. Grant the federated application `Key Vault Crypto User` (or an equivalent custom role limited to `keys/sign/action`) at the exact key scope, not the vault scope when key-scoped RBAC is available. No production private key is stored in the repository, image, provenance, logs, workflow artifacts, or release assets.
+The workflow builds `zvmi` from the accepted source commit, uses `zvmi sign certificate` to fetch the current public leaf, and uses the absolute `zig-out/bin/zvmi sign` path; no separately installed adapter or static certificate secret is trusted. The signer receives `id-token: write`; all other build permissions remain read-only. Grant the federated application `Artifact Signing Certificate Profile Signer` only at the `zvmi-uki` profile scope. No production private key, access token, OIDC token, or raw provider response is stored in the repository, image, provenance, logs, workflow artifacts, or release assets.
 
 Real-Azure validation and publication use the protected
 `azurelinux4-release` GitHub environment. Configure it with required
@@ -757,7 +758,7 @@ Derived VHDs and Azure resources are temporary and are never retained.
 SHA-256 values appear in release notes and job summaries only: **checksum
 sidecar assets are not published**.
 
-For routine rotation, add the new provider certificate alongside the old certificate in a transition gallery version, pin the new key version for new UKIs, retain both public fingerprints through the rollback window, then remove the old `db` entry from later versions. On compromise, stop publication, rotate immediately, add the compromised certificate or hash to `dbx` in future gallery versions, and require reimage/redeployment; existing image versions and VM firmware state are not assumed to inherit later `db`/`dbx` changes. `NoSignatureTemplate` is not used because it would replace Microsoft/Azure trust anchors.
+Artifact Signing leaf rotation is release-scoped: each gallery version enrolls the exact leaf used for that version, and all four candidates must finish under one leaf. Retain old public leaf certificates and release-to-fingerprint mappings through the rollback window. On compromise, stop publication, revoke or rotate immediately, add the compromised leaf or hash to `dbx` in future gallery versions, and require reimage/redeployment; existing image versions and VM firmware state are not assumed to inherit later `db`/`dbx` changes. `NoSignatureTemplate` is not used because it would replace Microsoft/Azure trust anchors.
 
 ### Generalized FreeBSD 15.1 AArch64 QCOW2
 

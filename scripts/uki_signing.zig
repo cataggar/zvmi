@@ -49,16 +49,63 @@ pub const SignedUki = struct {
     bytes: []u8,
     unsigned_sha256: Digest,
     signed_sha256: Digest,
+    provider_metadata: ?ProviderMetadata = null,
 
     pub fn deinit(self: *SignedUki, allocator: Allocator) void {
         allocator.free(self.bytes);
+        if (self.provider_metadata) |*metadata| metadata.deinit(allocator);
         self.* = undefined;
+    }
+};
+
+pub const ProviderMetadata = struct {
+    provider: []u8,
+    endpoint: []u8,
+    account: []u8,
+    profile: []u8,
+    operation_id: []u8,
+    signing_certificate_sha256: Digest,
+    enrolled_certificate_sha256: Digest,
+
+    pub fn deinit(self: *ProviderMetadata, allocator: Allocator) void {
+        allocator.free(self.provider);
+        allocator.free(self.endpoint);
+        allocator.free(self.account);
+        allocator.free(self.profile);
+        allocator.free(self.operation_id);
+        self.* = undefined;
+    }
+
+    pub fn clone(
+        self: ProviderMetadata,
+        allocator: Allocator,
+    ) !ProviderMetadata {
+        const provider = try allocator.dupe(u8, self.provider);
+        errdefer allocator.free(provider);
+        const endpoint = try allocator.dupe(u8, self.endpoint);
+        errdefer allocator.free(endpoint);
+        const account = try allocator.dupe(u8, self.account);
+        errdefer allocator.free(account);
+        const profile = try allocator.dupe(u8, self.profile);
+        errdefer allocator.free(profile);
+        const operation_id = try allocator.dupe(u8, self.operation_id);
+        errdefer allocator.free(operation_id);
+        return .{
+            .provider = provider,
+            .endpoint = endpoint,
+            .account = account,
+            .profile = profile,
+            .operation_id = operation_id,
+            .signing_certificate_sha256 = self.signing_certificate_sha256,
+            .enrolled_certificate_sha256 = self.enrolled_certificate_sha256,
+        };
     }
 };
 
 const max_certificate_bytes = 1024 * 1024;
 const max_command_output_bytes = 64 * 1024;
 const max_signature_overhead = 4 * 1024 * 1024;
+const max_provider_metadata_bytes = 16 * 1024;
 
 pub fn parseFingerprint(value: []const u8) error{InvalidCertificateFingerprint}!Digest {
     return zvmi.artifact_pipeline.parseSha256(value) catch
@@ -148,8 +195,15 @@ pub fn signUkiAlloc(
         .{ scratch_path, index },
     );
     defer allocator.free(signed_path);
+    const metadata_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/metadata-{d}.json",
+        .{ scratch_path, index },
+    );
+    defer allocator.free(metadata_path);
     Dir.cwd().deleteFile(io, unsigned_path) catch {};
     Dir.cwd().deleteFile(io, signed_path) catch {};
+    Dir.cwd().deleteFile(io, metadata_path) catch {};
     try Dir.cwd().writeFile(io, .{
         .sub_path = unsigned_path,
         .data = unsigned_bytes,
@@ -183,6 +237,7 @@ pub fn signUkiAlloc(
             try environment.put("ZVMI_UKI_CERTIFICATE", config.certificate_path);
             try environment.put("ZVMI_UKI_ARCHITECTURE", architecture);
             try environment.put("ZVMI_UKI_FLAVOR", flavor);
+            try environment.put("ZVMI_UKI_SIGNING_METADATA", metadata_path);
             try environment.put("ZVMI_UKI_UNSIGNED_SHA256", &unsigned_sha256_hex);
             try environment.put(
                 "ZVMI_UKI_CERTIFICATE_SHA256",
@@ -210,12 +265,146 @@ pub fn signUkiAlloc(
     );
     errdefer allocator.free(signed_bytes);
     try verifyPayloads(allocator, unsigned_bytes, signed_bytes);
+    var provider_metadata = try readProviderMetadataAlloc(
+        allocator,
+        io,
+        metadata_path,
+        config.expected_certificate_sha256,
+    );
+    errdefer if (provider_metadata) |*metadata| metadata.deinit(allocator);
 
     return .{
         .bytes = signed_bytes,
         .unsigned_sha256 = unsigned_sha256,
         .signed_sha256 = zvmi.artifact_pipeline.sha256Bytes(signed_bytes),
+        .provider_metadata = provider_metadata,
     };
+}
+
+fn readProviderMetadataAlloc(
+    allocator: Allocator,
+    io: Io,
+    path: []const u8,
+    expected_enrolled_certificate_sha256: Digest,
+) !?ProviderMetadata {
+    const bytes = Dir.cwd().readFileAlloc(
+        io,
+        path,
+        allocator,
+        .limited(max_provider_metadata_bytes),
+    ) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(bytes);
+    const Wire = struct {
+        schema: u32,
+        provider: []const u8,
+        endpoint: []const u8,
+        account: []const u8,
+        profile: []const u8,
+        operation_id: []const u8,
+        signing_certificate_sha256: []const u8,
+        enrolled_certificate_sha256: []const u8,
+    };
+    const parsed = try std.json.parseFromSlice(
+        Wire,
+        allocator,
+        bytes,
+        .{ .ignore_unknown_fields = false },
+    );
+    defer parsed.deinit();
+    const value = parsed.value;
+    if (value.schema != 1 or
+        !std.mem.eql(u8, value.provider, "azure-artifact-signing") or
+        !validArtifactSigningEndpoint(value.endpoint) or
+        !validProviderResourceName(value.account) or
+        !validProviderResourceName(value.profile) or
+        !isUuid(value.operation_id))
+    {
+        return error.InvalidSigningProviderMetadata;
+    }
+    const signing_certificate_sha256 = parseFingerprint(
+        value.signing_certificate_sha256,
+    ) catch return error.InvalidSigningProviderMetadata;
+    const enrolled_certificate_sha256 = parseFingerprint(
+        value.enrolled_certificate_sha256,
+    ) catch return error.InvalidSigningProviderMetadata;
+    if (!std.mem.eql(
+        u8,
+        &enrolled_certificate_sha256,
+        &expected_enrolled_certificate_sha256,
+    )) {
+        return error.SigningProviderEnrolledCertificateMismatch;
+    }
+
+    const provider = try allocator.dupe(u8, value.provider);
+    errdefer allocator.free(provider);
+    const endpoint = try allocator.dupe(u8, value.endpoint);
+    errdefer allocator.free(endpoint);
+    const account = try allocator.dupe(u8, value.account);
+    errdefer allocator.free(account);
+    const profile = try allocator.dupe(u8, value.profile);
+    errdefer allocator.free(profile);
+    const operation_id = try allocator.dupe(u8, value.operation_id);
+    errdefer allocator.free(operation_id);
+    return .{
+        .provider = provider,
+        .endpoint = endpoint,
+        .account = account,
+        .profile = profile,
+        .operation_id = operation_id,
+        .signing_certificate_sha256 = signing_certificate_sha256,
+        .enrolled_certificate_sha256 = enrolled_certificate_sha256,
+    };
+}
+
+fn validArtifactSigningEndpoint(value: []const u8) bool {
+    const prefix = "https://";
+    if (!std.mem.startsWith(u8, value, prefix) or
+        std.mem.endsWith(u8, value, "/") or
+        std.mem.indexOfAny(u8, value, "?#% \t\r\n") != null)
+    {
+        return false;
+    }
+    const host = value[prefix.len..];
+    if (host.len == 0 or std.mem.indexOfScalar(u8, host, '/') != null or
+        !std.mem.endsWith(u8, host, ".codesigning.azure.net"))
+    {
+        return false;
+    }
+    for (host) |byte| {
+        if (!(std.ascii.isLower(byte) or std.ascii.isDigit(byte) or
+            byte == '-' or byte == '.'))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn validProviderResourceName(value: []const u8) bool {
+    if (value.len == 0 or value.len > 128) return false;
+    for (value) |byte| {
+        if (!(std.ascii.isAlphanumeric(byte) or byte == '-' or
+            byte == '_' or byte == '.'))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn isUuid(value: []const u8) bool {
+    if (value.len != 36) return false;
+    for (value, 0..) |byte, index| {
+        if (index == 8 or index == 13 or index == 18 or index == 23) {
+            if (byte != '-') return false;
+        } else if (!std.ascii.isHex(byte)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 pub fn verifyBytes(

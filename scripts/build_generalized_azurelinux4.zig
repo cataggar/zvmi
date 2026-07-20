@@ -2482,17 +2482,47 @@ const UkiSigningRecord = struct {
     unsigned_sha256: artifact_pipeline.Digest,
     signed_sha256: artifact_pipeline.Digest,
     signed_size: usize,
+    provider_metadata: ?uki_signing.ProviderMetadata,
+
+    fn deinit(self: *UkiSigningRecord, allocator: Allocator) void {
+        allocator.free(self.path);
+        if (self.provider_metadata) |*metadata| metadata.deinit(allocator);
+        self.* = undefined;
+    }
 };
 
 const UkiSigningReport = struct {
     records: []UkiSigningRecord,
 
     fn deinit(self: *UkiSigningReport, allocator: Allocator) void {
-        for (self.records) |record| allocator.free(record.path);
+        for (self.records) |*record| record.deinit(allocator);
         allocator.free(self.records);
         self.* = undefined;
     }
 };
+
+fn sameProviderIdentity(
+    first: ?uki_signing.ProviderMetadata,
+    next: ?uki_signing.ProviderMetadata,
+) bool {
+    if (first == null or next == null) return first == null and next == null;
+    const a = first.?;
+    const b = next.?;
+    return std.mem.eql(u8, a.provider, b.provider) and
+        std.mem.eql(u8, a.endpoint, b.endpoint) and
+        std.mem.eql(u8, a.account, b.account) and
+        std.mem.eql(u8, a.profile, b.profile) and
+        std.mem.eql(
+            u8,
+            &a.signing_certificate_sha256,
+            &b.signing_certificate_sha256,
+        ) and
+        std.mem.eql(
+            u8,
+            &a.enrolled_certificate_sha256,
+            &b.enrolled_certificate_sha256,
+        );
+}
 
 fn isEfiFile(name: []const u8) bool {
     return name.len > 4 and std.ascii.eqlIgnoreCase(name[name.len - 4 ..], ".efi");
@@ -2535,11 +2565,13 @@ fn signGeneralizedImage(
 
     var records: std.ArrayListUnmanaged(UkiSigningRecord) = .empty;
     errdefer {
-        for (records.items) |record| gpa.free(record.path);
+        for (records.items) |*record| record.deinit(gpa);
         records.deinit(gpa);
     }
     var fallback_signed: ?[]u8 = null;
     defer if (fallback_signed) |bytes| gpa.free(bytes);
+    var fallback_provider_metadata: ?uki_signing.ProviderMetadata = null;
+    defer if (fallback_provider_metadata) |*metadata| metadata.deinit(gpa);
     var signer_index: usize = 0;
 
     for (linux_entries) |entry| {
@@ -2562,10 +2594,19 @@ fn signGeneralizedImage(
         );
         defer signed.deinit(gpa);
         signer_index += 1;
+        if (records.items.len > 0 and !sameProviderIdentity(
+            records.items[0].provider_metadata,
+            signed.provider_metadata,
+        )) {
+            return error.SigningProviderIdentityChanged;
+        }
 
         if (std.mem.eql(u8, fallback_unsigned, unsigned)) {
             if (fallback_signed == null) {
                 fallback_signed = try gpa.dupe(u8, signed.bytes);
+                if (signed.provider_metadata) |metadata| {
+                    fallback_provider_metadata = try metadata.clone(gpa);
+                }
             }
         }
         try esp.deletePath(io, path);
@@ -2575,7 +2616,9 @@ fn signGeneralizedImage(
             .unsigned_sha256 = signed.unsigned_sha256,
             .signed_sha256 = signed.signed_sha256,
             .signed_size = signed.bytes.len,
+            .provider_metadata = signed.provider_metadata,
         });
+        signed.provider_metadata = null;
     }
 
     const signed_fallback = fallback_signed orelse return error.FallbackUkiMismatch;
@@ -2586,7 +2629,9 @@ fn signGeneralizedImage(
         .unsigned_sha256 = artifact_pipeline.sha256Bytes(fallback_unsigned),
         .signed_sha256 = artifact_pipeline.sha256Bytes(signed_fallback),
         .signed_size = signed_fallback.len,
+        .provider_metadata = fallback_provider_metadata,
     });
+    fallback_provider_metadata = null;
 
     if (records.items.len < 2) return error.MissingNamedUki;
     return .{ .records = try records.toOwnedSlice(gpa) };
@@ -2648,6 +2693,15 @@ fn writeSigningProvenance(
         signed_sha256: []const u8,
         finalized_sha256: []const u8,
         signed_bytes: usize,
+        signing_operation_id: ?[]const u8,
+        signing_certificate_sha256: ?[]const u8,
+    };
+    const JsonProvider = struct {
+        name: []const u8,
+        endpoint: []const u8,
+        account: []const u8,
+        profile: []const u8,
+        signing_certificate_sha256: []const u8,
     };
     const json_records = try gpa.alloc(JsonRecord, report.records.len);
     defer gpa.free(json_records);
@@ -2655,15 +2709,29 @@ fn writeSigningProvenance(
     defer gpa.free(unsigned_hex);
     const signed_hex = try gpa.alloc([64]u8, report.records.len);
     defer gpa.free(signed_hex);
+    const provider_certificate_hex = try gpa.alloc([64]u8, report.records.len);
+    defer gpa.free(provider_certificate_hex);
     for (report.records, 0..) |record, index| {
         unsigned_hex[index] = artifact_pipeline.formatSha256(record.unsigned_sha256);
         signed_hex[index] = artifact_pipeline.formatSha256(record.signed_sha256);
+        const operation_id: ?[]const u8 = if (record.provider_metadata) |metadata|
+            metadata.operation_id
+        else
+            null;
+        const provider_fingerprint: ?[]const u8 = if (record.provider_metadata) |metadata| p: {
+            provider_certificate_hex[index] = artifact_pipeline.formatSha256(
+                metadata.signing_certificate_sha256,
+            );
+            break :p &provider_certificate_hex[index];
+        } else null;
         json_records[index] = .{
             .path = record.path,
             .unsigned_sha256 = &unsigned_hex[index],
             .signed_sha256 = &signed_hex[index],
             .finalized_sha256 = &signed_hex[index],
             .signed_bytes = record.signed_size,
+            .signing_operation_id = operation_id,
+            .signing_certificate_sha256 = provider_fingerprint,
         };
     }
     const certificate_hex = artifact_pipeline.formatSha256(certificate.sha256);
@@ -2673,6 +2741,19 @@ fn writeSigningProvenance(
     );
     defer gpa.free(certificate_base64);
     _ = std.base64.standard.Encoder.encode(certificate_base64, certificate.der);
+    var provider_hex: [64]u8 = undefined;
+    const provider: ?JsonProvider = if (report.records[0].provider_metadata) |metadata| p: {
+        provider_hex = artifact_pipeline.formatSha256(
+            metadata.signing_certificate_sha256,
+        );
+        break :p .{
+            .name = metadata.provider,
+            .endpoint = metadata.endpoint,
+            .account = metadata.account,
+            .profile = metadata.profile,
+            .signing_certificate_sha256 = &provider_hex,
+        };
+    } else null;
     const document = .{
         .schema = 1,
         .type = "zvmi-uki-signing",
@@ -2682,6 +2763,7 @@ fn writeSigningProvenance(
         .certificate_sha256 = &certificate_hex,
         .certificate_der_base64 = certificate_base64,
         .certificate_details = certificate.details,
+        .provider = provider,
         .signature_verification = "success",
         .files = json_records,
     };

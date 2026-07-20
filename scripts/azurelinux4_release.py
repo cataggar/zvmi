@@ -16,6 +16,14 @@ from pathlib import Path
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+ARTIFACT_SIGNING_ENDPOINT_RE = re.compile(
+    r"^https://[a-z0-9.-]+\.codesigning\.azure\.net$"
+)
+ARTIFACT_SIGNING_RESOURCE_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 EXPECTED = {
     "x86_64-full": ("x86_64", "full", "AzureLinux-4.0-x86_64.qcow2"),
     "aarch64-full": ("aarch64", "full", "AzureLinux-4.0-aarch64.qcow2"),
@@ -311,6 +319,34 @@ def validate_signing_provenance(
     ]:
         fail("UKI signing certificate details are absent")
 
+    provider = document.get("provider")
+    if not isinstance(provider, dict) or set(provider) != {
+        "name",
+        "endpoint",
+        "account",
+        "profile",
+        "signing_certificate_sha256",
+    }:
+        fail("Artifact Signing provider identity is absent")
+    if provider.get("name") != "azure-artifact-signing":
+        fail("unexpected UKI signing provider")
+    endpoint = provider.get("endpoint")
+    account = provider.get("account")
+    profile = provider.get("profile")
+    if (
+        not isinstance(endpoint, str)
+        or ARTIFACT_SIGNING_ENDPOINT_RE.fullmatch(endpoint) is None
+        or not isinstance(account, str)
+        or ARTIFACT_SIGNING_RESOURCE_RE.fullmatch(account) is None
+        or not isinstance(profile, str)
+        or ARTIFACT_SIGNING_RESOURCE_RE.fullmatch(profile) is None
+    ):
+        fail("invalid Artifact Signing provider identity")
+    signing_certificate_sha256 = require_sha256(
+        provider.get("signing_certificate_sha256"),
+        "Artifact Signing leaf certificate fingerprint",
+    )
+
     files = document.get("files")
     if not isinstance(files, list) or len(files) < 2:
         fail("UKI signing provenance file bindings are absent")
@@ -321,7 +357,9 @@ def validate_signing_provenance(
     )
     seen: set[str] = set()
     named_digests: set[str] = set()
+    named_operations: dict[str, set[str]] = {}
     fallback_digest: str | None = None
+    fallback_operation: str | None = None
     for record in files:
         if not isinstance(record, dict):
             fail("invalid UKI signing file record")
@@ -344,16 +382,32 @@ def validate_signing_provenance(
             fail(f"{uki_path}: invalid signed/finalized UKI digest binding")
         if type(record.get("signed_bytes")) is not int or record["signed_bytes"] <= 0:
             fail(f"{uki_path}: invalid signed UKI size")
+        operation_id = record.get("signing_operation_id")
+        if not isinstance(operation_id, str) or UUID_RE.fullmatch(operation_id) is None:
+            fail(f"{uki_path}: invalid Artifact Signing operation ID")
+        if record.get("signing_certificate_sha256") != signing_certificate_sha256:
+            fail(f"{uki_path}: Artifact Signing leaf fingerprint mismatch")
         if uki_path == fallback_path:
             fallback_digest = signed
+            fallback_operation = operation_id
         else:
             named_digests.add(signed)
+            named_operations.setdefault(signed, set()).add(operation_id)
     if fallback_digest is None or fallback_digest not in named_digests:
         fail("fallback UKI is not byte-identical to a named signed UKI")
+    if fallback_operation not in named_operations[fallback_digest]:
+        fail("fallback UKI does not retain its named UKI signing operation")
     return {
         "certificate_sha256": certificate_sha256,
         "certificate_der_base64": certificate_der_base64,
         "fallback_uki_sha256": fallback_digest,
+        "provider": {
+            "name": provider["name"],
+            "endpoint": endpoint,
+            "account": account,
+            "profile": profile,
+        },
+        "signing_certificate_sha256": signing_certificate_sha256,
         "signer_mode": document["signer_mode"],
         "provenance_path": path.relative_to(root).as_posix(),
     }
@@ -569,6 +623,9 @@ def azure_result_command(args: argparse.Namespace) -> None:
             "derived_vhd_sha256": sha256(vhd),
             "derived_vhd_bytes": vhd.stat().st_size,
             "certificate_sha256": candidate["uki_signing"]["certificate_sha256"],
+            "signing_certificate_sha256": candidate["uki_signing"][
+                "signing_certificate_sha256"
+            ],
             "fallback_uki_sha256": candidate["uki_signing"]["fallback_uki_sha256"],
             "image_version_id": args.image_version_id,
             "uefi_settings": request_uefi,
@@ -624,6 +681,8 @@ def stage_command(args: argparse.Namespace) -> None:
 
     staged: list[dict[str, object]] = []
     release_certificate_sha256: str | None = None
+    release_signing_certificate_sha256: str | None = None
+    release_signing_provider: dict[str, object] | None = None
     for key in RELEASE_ORDER:
         manifest_path, candidate = candidates[key]
         _, architecture, flavor, asset_name = validate_identity(
@@ -661,8 +720,17 @@ def stage_command(args: argparse.Namespace) -> None:
         fallback_uki_sha256 = require_sha256(
             signing.get("fallback_uki_sha256"), f"{key} fallback UKI digest"
         )
+        signing_certificate_sha256 = require_sha256(
+            signing.get("signing_certificate_sha256"),
+            f"{key} Artifact Signing leaf certificate fingerprint",
+        )
+        signing_provider = signing.get("provider")
+        if not isinstance(signing_provider, dict):
+            fail(f"{key}: Artifact Signing provider identity is absent")
         if (
             azure.get("certificate_sha256") != certificate_sha256
+            or azure.get("signing_certificate_sha256")
+            != signing_certificate_sha256
             or azure.get("fallback_uki_sha256") != fallback_uki_sha256
         ):
             fail(f"{key}: Azure acceptance did not bind the signed UKI identity")
@@ -676,6 +744,14 @@ def stage_command(args: argparse.Namespace) -> None:
             release_certificate_sha256 = certificate_sha256
         elif release_certificate_sha256 != certificate_sha256:
             fail("release candidates do not share one UKI signing certificate")
+        if release_signing_certificate_sha256 is None:
+            release_signing_certificate_sha256 = signing_certificate_sha256
+            release_signing_provider = signing_provider
+        elif (
+            release_signing_certificate_sha256 != signing_certificate_sha256
+            or release_signing_provider != signing_provider
+        ):
+            fail("release candidates do not share one Artifact Signing identity")
         require_sha256(azure.get("derived_vhd_sha256"), f"{key} VHD digest")
         contracts = azure.get("contracts")
         if not has_exact_contracts(contracts, AZURE_CONTRACTS):
@@ -711,6 +787,7 @@ def stage_command(args: argparse.Namespace) -> None:
                 "qemu_version": local.get("qemu_version"),
                 "provenance_digest": provenance.get("digest"),
                 "certificate_sha256": certificate_sha256,
+                "signing_certificate_sha256": signing_certificate_sha256,
                 "fallback_uki_sha256": fallback_uki_sha256,
                 "azure_location": azure.get("location"),
                 "azure_vm_size": azure.get("vm_size"),
@@ -726,6 +803,8 @@ def stage_command(args: argparse.Namespace) -> None:
             "release_tag": args.release_tag,
             "source_commit": source_commit,
             "certificate_sha256": release_certificate_sha256,
+            "signing_certificate_sha256": release_signing_certificate_sha256,
+            "signing_provider": release_signing_provider,
             "assets": staged,
         },
     )
@@ -735,7 +814,8 @@ def stage_command(args: argparse.Namespace) -> None:
         f"`{source_commit}`. Every published QCOW2 passed native-KVM local acceptance and "
         "protected-environment validation on a matching Azure architecture.",
         "",
-        f"All UKIs are signed by certificate SHA-256 `{release_certificate_sha256}`.",
+        f"All UKIs are trusted through enrolled leaf SHA-256 `{release_certificate_sha256}`.",
+        f"Artifact Signing leaf certificate SHA-256: `{release_signing_certificate_sha256}`.",
         "",
         "| Asset | SHA-256 | UKI SHA-256 | Bytes | Azure validation | Derived VHD SHA-256 (not published) |",
         "| --- | --- | --- | ---: | --- | --- |",

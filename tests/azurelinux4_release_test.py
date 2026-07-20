@@ -15,6 +15,8 @@ from scripts import azurelinux4_release as release
 ROOT = Path(__file__).resolve().parents[1]
 TEST_CERTIFICATE_DER = b"zvmi test certificate DER"
 TEST_CERTIFICATE_SHA256 = hashlib.sha256(TEST_CERTIFICATE_DER).hexdigest()
+TEST_SIGNING_CERTIFICATE_SHA256 = "4" * 64
+TEST_SIGNING_OPERATION_ID = "00000000-0000-4000-8000-000000000001"
 
 
 class AzureLinuxReleaseTest(unittest.TestCase):
@@ -36,6 +38,7 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         self,
         key,
         certificate_der=TEST_CERTIFICATE_DER,
+        signing_certificate_sha256=TEST_SIGNING_CERTIFICATE_SHA256,
     ):
         certificate_sha256 = hashlib.sha256(certificate_der).hexdigest()
         architecture, flavor, asset_name = release.EXPECTED[key]
@@ -60,6 +63,13 @@ class AzureLinuxReleaseTest(unittest.TestCase):
             "certificate_sha256": certificate_sha256,
             "certificate_der_base64": base64.b64encode(certificate_der).decode(),
             "certificate_details": "subject=CN=zvmi test signer",
+            "provider": {
+                "name": "azure-artifact-signing",
+                "endpoint": "https://wus.codesigning.azure.net",
+                "account": "cataggar",
+                "profile": "zvmi-uki",
+                "signing_certificate_sha256": signing_certificate_sha256,
+            },
             "signature_verification": "success",
             "files": [
                 {
@@ -68,6 +78,8 @@ class AzureLinuxReleaseTest(unittest.TestCase):
                     "signed_sha256": "3" * 64,
                     "finalized_sha256": "3" * 64,
                     "signed_bytes": 4096,
+                    "signing_operation_id": TEST_SIGNING_OPERATION_ID,
+                    "signing_certificate_sha256": signing_certificate_sha256,
                 },
                 {
                     "path": fallback_path,
@@ -75,6 +87,8 @@ class AzureLinuxReleaseTest(unittest.TestCase):
                     "signed_sha256": "3" * 64,
                     "finalized_sha256": "3" * 64,
                     "signed_bytes": 4096,
+                    "signing_operation_id": TEST_SIGNING_OPERATION_ID,
+                    "signing_certificate_sha256": signing_certificate_sha256,
                 },
             ],
         }
@@ -190,6 +204,10 @@ class AzureLinuxReleaseTest(unittest.TestCase):
             sorted(item[2] for item in release.EXPECTED.values()),
         )
         self.assertEqual(manifest["certificate_sha256"], TEST_CERTIFICATE_SHA256)
+        self.assertEqual(
+            manifest["signing_certificate_sha256"],
+            TEST_SIGNING_CERTIFICATE_SHA256,
+        )
         self.assertTrue(
             all(item["fallback_uki_sha256"] == "3" * 64 for item in manifest["assets"])
         )
@@ -282,6 +300,19 @@ class AzureLinuxReleaseTest(unittest.TestCase):
                 b"different certificate"
                 if key == "aarch64-core"
                 else TEST_CERTIFICATE_DER,
+            )
+        with self.assertRaises(SystemExit):
+            self.stage()
+
+    def test_stage_rejects_mixed_artifact_signing_leaves(self):
+        for key in release.EXPECTED:
+            self.make_bundle(
+                key,
+                signing_certificate_sha256=(
+                    "5" * 64
+                    if key == "aarch64-core"
+                    else TEST_SIGNING_CERTIFICATE_SHA256
+                ),
             )
         with self.assertRaises(SystemExit):
             self.stage()
@@ -418,7 +449,10 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         self.assertIn("--uki-sign-command-arg sign", workflow)
         self.assertIn("ZVMI_AZURE_TENANT_ID", workflow)
         self.assertIn("ZVMI_AZURE_CLIENT_ID", workflow)
-        self.assertIn("ZVMI_AZURE_KEY_ID", workflow)
+        self.assertIn("ZVMI_ARTIFACT_SIGNING_ENDPOINT", workflow)
+        self.assertIn("ZVMI_ARTIFACT_SIGNING_ACCOUNT", workflow)
+        self.assertIn("ZVMI_ARTIFACT_SIGNING_PROFILE", workflow)
+        self.assertNotIn("ZVMI_AZURE_KEY_ID", workflow)
         self.assertNotIn("--uki-signing-key", workflow)
         self.assertIn("python3-virt-firmware", workflow)
         self.assertIn("sbsigntool", workflow)
