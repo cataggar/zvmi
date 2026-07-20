@@ -29,6 +29,11 @@ const TokenResponse = struct {
     token_type: []const u8,
 };
 
+const TokenHttpRequest = enum {
+    github_oidc,
+    azure_token_exchange,
+};
+
 pub fn run(
     allocator: Allocator,
     io: Io,
@@ -280,6 +285,7 @@ fn acquireAzureAccessTokenAlloc(
     const oidc_body = try fetchBoundedAlloc(
         allocator,
         client,
+        .github_oidc,
         .GET,
         audience_url,
         null,
@@ -316,6 +322,7 @@ fn acquireAzureAccessTokenAlloc(
     const token_body = try fetchBoundedAlloc(
         allocator,
         client,
+        .azure_token_exchange,
         .POST,
         token_url,
         token_form,
@@ -821,6 +828,7 @@ fn decodeMimeBase64Alloc(
 fn fetchBoundedAlloc(
     allocator: Allocator,
     client: *std.http.Client,
+    request_kind: TokenHttpRequest,
     method: std.http.Method,
     url: []const u8,
     payload: ?[]const u8,
@@ -839,8 +847,34 @@ fn fetchBoundedAlloc(
         .extra_headers = headers,
         .privileged_headers = privileged_headers,
     });
-    if (result.status != .ok) return error.UnexpectedHttpStatus;
+    if (result.status != .ok)
+        return tokenHttpStatusError(request_kind, result.status);
     return allocator.dupe(u8, writer.buffered());
+}
+
+fn tokenHttpStatusError(
+    request_kind: TokenHttpRequest,
+    status: std.http.Status,
+) anyerror {
+    const status_code = @intFromEnum(status);
+    return switch (request_kind) {
+        .github_oidc => switch (status_code) {
+            400 => error.GithubOidcBadRequest,
+            401 => error.GithubOidcUnauthorized,
+            403 => error.GithubOidcForbidden,
+            429 => error.GithubOidcRateLimited,
+            500...599 => error.GithubOidcServerError,
+            else => error.GithubOidcUnexpectedHttpStatus,
+        },
+        .azure_token_exchange => switch (status_code) {
+            400 => error.AzureTokenExchangeBadRequest,
+            401 => error.AzureTokenExchangeUnauthorized,
+            403 => error.AzureTokenExchangeForbidden,
+            429 => error.AzureTokenExchangeRateLimited,
+            500...599 => error.AzureTokenExchangeServerError,
+            else => error.AzureTokenExchangeUnexpectedHttpStatus,
+        },
+    };
 }
 
 fn appendOidcAudienceAlloc(
@@ -1123,6 +1157,21 @@ test "OIDC audience is appended without replacing protected query data" {
             std.testing.allocator,
             "https://vstoken.actions.githubusercontent.com/token?audience=wrong",
         ),
+    );
+}
+
+test "token HTTP failures identify the rejected exchange" {
+    try std.testing.expectEqual(
+        error.GithubOidcUnauthorized,
+        tokenHttpStatusError(.github_oidc, .unauthorized),
+    );
+    try std.testing.expectEqual(
+        error.AzureTokenExchangeBadRequest,
+        tokenHttpStatusError(.azure_token_exchange, .bad_request),
+    );
+    try std.testing.expectEqual(
+        error.AzureTokenExchangeServerError,
+        tokenHttpStatusError(.azure_token_exchange, .service_unavailable),
     );
 }
 
