@@ -1373,7 +1373,9 @@ fn mockArtifactSigningRequestCount(
 ) usize {
     return switch (scenario) {
         .success, .timeout => 3,
-        .failed, .canceled, .malformed_base64,
+        .failed,
+        .canceled,
+        .malformed_base64,
         .wrong_poll_operation_id,
         => 2,
         .wrong_operation_location, .redirect => 1,
