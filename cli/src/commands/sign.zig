@@ -468,8 +468,8 @@ const ArtifactOperation = struct {
     id: []const u8,
     status: []const u8,
     result: ?struct {
-        signature: []const u8,
-        signingCertificate: []const u8,
+        signature: ?[]const u8 = null,
+        signingCertificate: ?[]const u8 = null,
     } = null,
     @"error": ?struct {
         code: ?[]const u8 = null,
@@ -585,9 +585,13 @@ fn signDigestWithArtifactSigningAlloc(
         if (std.mem.eql(u8, operation.value.status, "Succeeded")) {
             const result = operation.value.result orelse
                 return error.ArtifactSigningResultMissing;
+            const signature_text = result.signature orelse
+                return error.ArtifactSigningResultMissing;
+            const certificate_text = result.signingCertificate orelse
+                return error.ArtifactSigningResultMissing;
             const signature = try decodeStandardBase64Alloc(
                 allocator,
-                result.signature,
+                signature_text,
                 max_certificate_bytes,
             );
             errdefer allocator.free(signature);
@@ -598,7 +602,7 @@ fn signDigestWithArtifactSigningAlloc(
             }
             const encoded_certificate_bundle = try decodeStandardBase64Alloc(
                 allocator,
-                result.signingCertificate,
+                certificate_text,
                 max_certificate_bytes,
             );
             defer allocator.free(encoded_certificate_bundle);
@@ -748,7 +752,22 @@ fn parseArtifactOperation(
         allocator,
         body,
         .{ .ignore_unknown_fields = true },
-    );
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            const value = std.json.parseFromSlice(
+                std.json.Value,
+                allocator,
+                body,
+                .{},
+            ) catch |syntax_err| switch (syntax_err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidArtifactSigningOperationJson,
+            };
+            defer value.deinit();
+            return error.InvalidArtifactSigningOperationSchema;
+        },
+    };
 }
 
 fn artifactSigningUrlAlloc(
@@ -1334,6 +1353,20 @@ test "Artifact Signing uses padded standard base64 and exact operation URLs" {
     );
 }
 
+test "Artifact Signing distinguishes malformed JSON from invalid operation schema" {
+    try std.testing.expectError(
+        error.InvalidArtifactSigningOperationJson,
+        parseArtifactOperation(std.testing.allocator, "not-json"),
+    );
+    try std.testing.expectError(
+        error.InvalidArtifactSigningOperationSchema,
+        parseArtifactOperation(
+            std.testing.allocator,
+            "{\"id\":1,\"status\":\"Running\"}",
+        ),
+    );
+}
+
 test "PEM certificate decoder accepts one canonical certificate block" {
     const der = try decodePemCertificateAlloc(
         std.testing.allocator,
@@ -1411,7 +1444,8 @@ fn runMockArtifactSigningServerFallible(
     const operation_id = "00000000-0000-4000-8000-000000000000";
     const accepted_body = "";
     const running_body =
-        "{\"id\":\"" ++ operation_id ++ "\",\"status\":\"Running\"}";
+        "{\"id\":\"" ++ operation_id ++ "\",\"status\":\"Running\"," ++
+        "\"result\":{\"signature\":null,\"signingCertificate\":null}}";
     const failed_body =
         "{\"id\":\"" ++ operation_id ++ "\",\"status\":\"Failed\"," ++
         "\"error\":{\"code\":\"MockFailure\",\"message\":\"redacted\"}}";
