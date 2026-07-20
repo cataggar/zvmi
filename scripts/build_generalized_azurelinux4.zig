@@ -274,6 +274,8 @@ const ArchitectureDescriptor = struct {
     iso_url: []const u8,
     iso_name: []const u8,
     iso_sha256: []const u8,
+    iso_squashfs_path: []const u8,
+    iso_nested_rootfs_path: []const u8,
     base_manifest_digest: []const u8,
     repository_base_url: []const u8,
     repomd_url: []const u8,
@@ -294,6 +296,9 @@ const ArchitectureDescriptor = struct {
     binfmt_static_name: []const u8,
     elf_file_marker: []const u8,
     full_efi_packages: []const []const u8,
+    full_kernel_package: []const u8,
+    full_kernel_modules_package: []const u8,
+    full_kernel_release: []const u8,
 };
 
 const x86_64 = ArchitectureDescriptor{
@@ -306,6 +311,8 @@ const x86_64 = ArchitectureDescriptor{
     // Official Azure Linux checksum resolved from the aka.ms endpoint on
     // 2026-07-17. Pinning it prevents a moving endpoint changing the recipe.
     .iso_sha256 = "d98f7d1ffaa916de7c9f66ffdadb150c174da691509e760835709ffa7829ca48",
+    .iso_squashfs_path = "LiveOS/squashfs.img",
+    .iso_nested_rootfs_path = "LiveOS/rootfs.img",
     .base_manifest_digest = "sha256:9070b05147f01e5a4bac47723c95f2555e11b9d3324c1df1910ff3545b7ce319",
     .repository_base_url = "https://packages.microsoft.com/azurelinux/4.0/beta/base/x86_64",
     .repomd_url = "https://packages.microsoft.com/azurelinux/4.0/beta/base/x86_64/repodata/repomd.xml",
@@ -326,6 +333,10 @@ const x86_64 = ArchitectureDescriptor{
     .binfmt_static_name = "qemu-x86_64-static",
     .elf_file_marker = "x86-64",
     .full_efi_packages = &.{ "grub2-efi-x64-modules", "grub2-efi-x64", "shim" },
+    // The checksum-pinned ISO's LiveOS rootfs supplies this exact boot release.
+    .full_kernel_package = "kernel-6.18.31-1.3.azl4",
+    .full_kernel_modules_package = "kernel-modules-6.18.31-1.3.azl4",
+    .full_kernel_release = "6.18.31-1.3.azl4.x86_64",
 };
 
 const aarch64 = ArchitectureDescriptor{
@@ -338,6 +349,8 @@ const aarch64 = ArchitectureDescriptor{
     // Official Azure Linux checksum resolved from the aka.ms endpoint on
     // 2026-07-17. Pinning it prevents a moving endpoint changing the recipe.
     .iso_sha256 = "762039fde64a59806750ee86ca98132fad4f9df02e7684490017cdfda0c55157",
+    .iso_squashfs_path = "LiveOS/squashfs.img",
+    .iso_nested_rootfs_path = "LiveOS/rootfs.img",
     .base_manifest_digest = "sha256:e541db83a8511c25fa1dd989161263874b7395ddd588f5caaa25453ea4e23263",
     .repository_base_url = "https://packages.microsoft.com/azurelinux/4.0/beta/base/aarch64",
     .repomd_url = "https://packages.microsoft.com/azurelinux/4.0/beta/base/aarch64/repodata/repomd.xml",
@@ -358,6 +371,10 @@ const aarch64 = ArchitectureDescriptor{
     .binfmt_static_name = "qemu-aarch64-static",
     .elf_file_marker = "aarch64",
     .full_efi_packages = &.{ "grub2-efi-aa64-modules", "grub2-efi-aa64", "shim" },
+    // The checksum-pinned ISO's LiveOS rootfs supplies this exact boot release.
+    .full_kernel_package = "kernel-6.18.31-1.3.azl4",
+    .full_kernel_modules_package = "kernel-modules-6.18.31-1.3.azl4",
+    .full_kernel_release = "6.18.31-1.3.azl4.aarch64",
 };
 
 fn architectureDescriptor(architecture: AzureLinuxArchitecture) *const ArchitectureDescriptor {
@@ -400,6 +417,9 @@ fn defaultWorkDir(architecture: AzureLinuxArchitecture, flavor: Flavor) []const 
 }
 
 const systemd_boot_unsigned_rpm_max_bytes: u64 = 16 * 1024 * 1024;
+const dnf_minrate_opt = "--setopt=minrate=1";
+const dnf_timeout_opt = "--setopt=timeout=300";
+const dnf_retries_opt = "--setopt=retries=20";
 const oci_manifest_type = "application/vnd.oci.image.manifest.v1+json";
 const oci_index_type = "application/vnd.oci.image.index.v1+json";
 const docker_manifest_type = "application/vnd.docker.distribution.manifest.v2+json";
@@ -1192,6 +1212,9 @@ fn dnfInstallArgs(
         gpgcheck_opt,
         cache_opt,
         persist_opt,
+        dnf_minrate_opt,
+        dnf_timeout_opt,
+        dnf_retries_opt,
         "--setopt=install_weak_deps=False",
         "install",
     });
@@ -1212,7 +1235,7 @@ fn dnfSeedMakecacheArgs(
     gpgcheck_opt: []const u8,
     cache_opt: []const u8,
     persist_opt: []const u8,
-) [18][]const u8 {
+) [21][]const u8 {
     return .{
         "dnf",
         "-y",
@@ -1231,6 +1254,9 @@ fn dnfSeedMakecacheArgs(
         gpgcheck_opt,
         cache_opt,
         persist_opt,
+        dnf_minrate_opt,
+        dnf_timeout_opt,
+        dnf_retries_opt,
         "makecache",
     };
 }
@@ -1277,12 +1303,29 @@ fn packagesForFlavor(
     gpa: Allocator,
     flavor: *const FlavorDescriptor,
     architecture: *const ArchitectureDescriptor,
-) ![]const []const u8 {
+) ![][]const u8 {
     const efi_len: usize = if (flavor.flavor == .full) architecture.full_efi_packages.len else 0;
     const packages = try gpa.alloc([]const u8, flavor.required_packages.len + efi_len);
     @memcpy(packages[0..flavor.required_packages.len], flavor.required_packages);
     if (efi_len != 0) {
         @memcpy(packages[flavor.required_packages.len..], architecture.full_efi_packages);
+    }
+    return packages;
+}
+
+fn packagesForInstall(
+    gpa: Allocator,
+    flavor: *const FlavorDescriptor,
+    architecture: *const ArchitectureDescriptor,
+) ![][]const u8 {
+    const packages = try packagesForFlavor(gpa, flavor, architecture);
+    for (flavor.required_packages, 0..) |package, index| {
+        packages[index] = if (flavor.flavor == .full and std.mem.eql(u8, package, "kernel"))
+            architecture.full_kernel_package
+        else if (flavor.flavor == .full and std.mem.eql(u8, package, "kernel-modules"))
+            architecture.full_kernel_modules_package
+        else
+            package;
     }
     return packages;
 }
@@ -1879,6 +1922,8 @@ fn installGuestContent(
     defer gpa.free(installed_before);
     const flavor_packages = try packagesForFlavor(gpa, flavor, architecture);
     defer gpa.free(flavor_packages);
+    const install_packages = try packagesForInstall(gpa, flavor, architecture);
+    defer gpa.free(install_packages);
     const package_install_argv = try dnfInstallArgs(
         gpa,
         rootfs_path,
@@ -1894,7 +1939,7 @@ fn installGuestContent(
         gpgcheck_opt,
         dnf_cache.cache_opt,
         dnf_cache.persist_opt,
-        flavor_packages,
+        install_packages,
     );
     defer gpa.free(package_install_argv);
     try sudo(gpa, io, package_install_argv);
@@ -2815,14 +2860,44 @@ fn isoKernelAssetsMatchInstalledModules(
     iso_kernel_names: []const u8,
     iso_initramfs_names: []const u8,
     installed_kernel_nevras: []const u8,
+    expected_kernel_release: []const u8,
 ) bool {
+    var installed = std.mem.splitScalar(u8, installed_kernel_nevras, '\n');
+    var installed_release_found = false;
+    while (installed.next()) |raw| {
+        if (std.mem.eql(u8, std.mem.trim(u8, raw, " \r\t"), expected_kernel_release)) {
+            installed_release_found = true;
+            break;
+        }
+    }
+    if (!installed_release_found) return false;
+
+    var initramfs = std.mem.splitScalar(u8, iso_initramfs_names, '\n');
+    var initramfs_release_found = false;
+    while (initramfs.next()) |raw| {
+        const name = std.mem.trim(u8, raw, " \r\t");
+        const release = if (std.mem.startsWith(u8, name, "initramfs-"))
+            name["initramfs-".len..]
+        else if (std.mem.startsWith(u8, name, "initrd-"))
+            name["initrd-".len..]
+        else
+            continue;
+        if (std.mem.eql(u8, release, expected_kernel_release) or
+            (std.mem.startsWith(u8, release, expected_kernel_release) and
+                std.mem.eql(u8, release[expected_kernel_release.len..], ".img")))
+        {
+            initramfs_release_found = true;
+            break;
+        }
+    }
+    if (!initramfs_release_found) return false;
+
     var kernels = std.mem.splitScalar(u8, iso_kernel_names, '\n');
     while (kernels.next()) |kernel_name| {
         const release = std.mem.trim(u8, kernel_name, " \r\t");
         if (!std.mem.startsWith(u8, release, "vmlinuz-")) continue;
         const kernel_release = release["vmlinuz-".len..];
-        if (std.mem.indexOf(u8, iso_initramfs_names, kernel_release) == null) continue;
-        if (std.mem.indexOf(u8, installed_kernel_nevras, kernel_release) != null) return true;
+        if (std.mem.eql(u8, kernel_release, expected_kernel_release)) return true;
     }
     return false;
 }
@@ -2836,19 +2911,45 @@ fn validateFullIsoKernelCompatibility(
     iso_path: []const u8,
     rootfs_path: []const u8,
     work_dir: []const u8,
+    architecture: *const ArchitectureDescriptor,
 ) !void {
-    const mount_path = try std.fmt.allocPrint(gpa, "{s}/iso-boot-assets", .{work_dir});
-    defer gpa.free(mount_path);
-    try Dir.cwd().createDirPath(io, mount_path);
-    try sudo(gpa, io, &.{ "mount", "-o", "loop,ro", iso_path, mount_path });
-    defer sudo(gpa, io, &.{ "umount", mount_path }) catch {};
+    const iso_mount_path = try std.fmt.allocPrint(gpa, "{s}/iso-boot-assets", .{work_dir});
+    defer gpa.free(iso_mount_path);
+    const squashfs_mount_path = try std.fmt.allocPrint(gpa, "{s}/iso-live-squashfs", .{work_dir});
+    defer gpa.free(squashfs_mount_path);
+    const nested_rootfs_mount_path = try std.fmt.allocPrint(gpa, "{s}/iso-live-rootfs", .{work_dir});
+    defer gpa.free(nested_rootfs_mount_path);
+    try Dir.cwd().createDirPath(io, iso_mount_path);
+    try Dir.cwd().createDirPath(io, squashfs_mount_path);
+    try Dir.cwd().createDirPath(io, nested_rootfs_mount_path);
+
+    try sudo(gpa, io, &.{ "mount", "-o", "loop,ro", iso_path, iso_mount_path });
+    defer sudo(gpa, io, &.{ "umount", iso_mount_path }) catch {};
+    const squashfs_path = try std.fmt.allocPrint(
+        gpa,
+        "{s}/{s}",
+        .{ iso_mount_path, architecture.iso_squashfs_path },
+    );
+    defer gpa.free(squashfs_path);
+    try sudo(gpa, io, &.{ "mount", "-t", "squashfs", "-o", "loop,ro", squashfs_path, squashfs_mount_path });
+    defer sudo(gpa, io, &.{ "umount", squashfs_mount_path }) catch {};
+    const nested_rootfs_path = try std.fmt.allocPrint(
+        gpa,
+        "{s}/{s}",
+        .{ squashfs_mount_path, architecture.iso_nested_rootfs_path },
+    );
+    defer gpa.free(nested_rootfs_path);
+    try sudo(gpa, io, &.{ "mount", "-t", "ext4", "-o", "loop,ro", nested_rootfs_path, nested_rootfs_mount_path });
+    defer sudo(gpa, io, &.{ "umount", nested_rootfs_mount_path }) catch {};
+    const nested_boot_path = try std.fmt.allocPrint(gpa, "{s}/boot", .{nested_rootfs_mount_path});
+    defer gpa.free(nested_boot_path);
 
     const iso_kernels = try capture(gpa, io, &.{
-        "sudo", "find", mount_path, "-type", "f", "-name", "vmlinuz-*", "-printf", "%f\n",
+        "sudo", "find", nested_boot_path, "-type", "f", "-name", "vmlinuz-*", "-printf", "%f\n",
     });
     defer gpa.free(iso_kernels);
     const iso_initrds = try capture(gpa, io, &.{
-        "sudo", "find", mount_path, "-type", "f", "(", "-name", "initramfs-*", "-o", "-name", "initrd-*", ")", "-printf", "%f\n",
+        "sudo", "find", nested_boot_path, "-type", "f", "(", "-name", "initramfs-*", "-o", "-name", "initrd-*", ")", "-printf", "%f\n",
     });
     defer gpa.free(iso_initrds);
     const installed = try capture(gpa, io, &.{
@@ -2856,10 +2957,15 @@ fn validateFullIsoKernelCompatibility(
         "%{VERSION}-%{RELEASE}.%{ARCH}\n", "kernel-core", "kernel-modules",
     });
     defer gpa.free(installed);
-    if (!isoKernelAssetsMatchInstalledModules(iso_kernels, iso_initrds, installed)) {
+    if (!isoKernelAssetsMatchInstalledModules(
+        iso_kernels,
+        iso_initrds,
+        installed,
+        architecture.full_kernel_release,
+    )) {
         std.debug.print(
-            "error: ISO kernel/initramfs does not match installed kernel-core/kernel-modules; refusing incoherent full image\n",
-            .{},
+            "error: ISO kernel/initramfs does not match installed kernel-core/kernel-modules release {s}; refusing incoherent full image\n",
+            .{architecture.full_kernel_release},
         );
         return error.IncompatibleIsoKernelModules;
     }
@@ -3134,7 +3240,7 @@ pub fn main(init: std.process.Init) !void {
     );
     defer gpa.free(installed_closure);
     if (flavor.flavor == .full) {
-        try validateFullIsoKernelCompatibility(gpa, io, iso_path, rootfs_path, work_dir);
+        try validateFullIsoKernelCompatibility(gpa, io, iso_path, rootfs_path, work_dir, architecture);
     }
     try enforceMinimumRootFreeSpace(gpa, io, rootfs_path, requested_size, architecture, flavor);
 
@@ -3375,6 +3481,8 @@ test "architecture and flavor descriptors pin inputs and output namespaces" {
         _ = try artifact_pipeline.parseSha256(architecture.base_manifest_digest);
         _ = try artifact_pipeline.parseSha256(architecture.repomd_sha256);
         _ = try artifact_pipeline.parseSha256(architecture.systemd_boot_rpm_sha256);
+        try std.testing.expectEqualStrings("LiveOS/squashfs.img", architecture.iso_squashfs_path);
+        try std.testing.expectEqualStrings("LiveOS/rootfs.img", architecture.iso_nested_rootfs_path);
         try std.testing.expectEqual(architecture.root_type_guid, architecture.root_role.defaultTypeGuid());
     }
     try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024), systemd_boot_unsigned_rpm_max_bytes);
@@ -3468,6 +3576,12 @@ test "architecture descriptors select RPMs, stubs, EFI paths, and binfmt" {
     try std.testing.expectEqualStrings("qemu-aarch64-static", aarch64.binfmt_static_name);
     try std.testing.expectEqualStrings("/proc/sys/fs/binfmt_misc/qemu-x86_64", x86_64.binfmt_registration_path);
     try std.testing.expectEqualStrings("/proc/sys/fs/binfmt_misc/qemu-aarch64", aarch64.binfmt_registration_path);
+    try std.testing.expectEqualStrings("kernel-6.18.31-1.3.azl4", x86_64.full_kernel_package);
+    try std.testing.expectEqualStrings("kernel-modules-6.18.31-1.3.azl4", x86_64.full_kernel_modules_package);
+    try std.testing.expectEqualStrings("6.18.31-1.3.azl4.x86_64", x86_64.full_kernel_release);
+    try std.testing.expectEqualStrings("kernel-6.18.31-1.3.azl4", aarch64.full_kernel_package);
+    try std.testing.expectEqualStrings("kernel-modules-6.18.31-1.3.azl4", aarch64.full_kernel_modules_package);
+    try std.testing.expectEqualStrings("6.18.31-1.3.azl4.aarch64", aarch64.full_kernel_release);
 }
 
 test "full flavor encodes the pinned official vm-base package profile" {
@@ -3497,6 +3611,13 @@ test "full flavor encodes the pinned official vm-base package profile" {
     try std.testing.expect(argvContains(aarch64.full_efi_packages, "grub2-efi-aa64"));
     try std.testing.expect(argvContains(x86_64.full_efi_packages, "shim"));
     try std.testing.expect(argvContains(aarch64.full_efi_packages, "shim"));
+
+    const x86_packages = try packagesForInstall(std.testing.allocator, &full, &x86_64);
+    defer std.testing.allocator.free(x86_packages);
+    try std.testing.expect(argvContains(x86_packages, x86_64.full_kernel_package));
+    try std.testing.expect(argvContains(x86_packages, x86_64.full_kernel_modules_package));
+    try std.testing.expect(!argvContains(x86_packages, "kernel"));
+    try std.testing.expect(!argvContains(x86_packages, "kernel-modules"));
 }
 
 test "flavor contracts keep full systemd-only and core zvminit-only" {
@@ -3614,11 +3735,14 @@ test "DNF install permits payload downloads without refreshing verified metadata
     try std.testing.expect(argvContains(argv, "--setopt=cachedir=/private/cache"));
     try std.testing.expect(argvContains(argv, "--setopt=persistdir=/private/persist"));
     try std.testing.expect(argvContains(argv, "--setopt=azurelinux-base.gpgcheck=True"));
+    try std.testing.expect(argvContains(argv, dnf_minrate_opt));
+    try std.testing.expect(argvContains(argv, dnf_timeout_opt));
+    try std.testing.expect(argvContains(argv, dnf_retries_opt));
     try std.testing.expect(argvContains(argv, "--disablerepo=*"));
     try std.testing.expect(argvContains(argv, "--enablerepo=zvmi-azurelinux-base"));
-    try std.testing.expectEqualStrings("install", argv[20]);
-    try std.testing.expectEqualStrings("openssh-server", argv[21]);
-    try std.testing.expectEqualStrings("sudo", argv[22]);
+    try std.testing.expectEqualStrings("install", argv[23]);
+    try std.testing.expectEqualStrings("openssh-server", argv[24]);
+    try std.testing.expectEqualStrings("sudo", argv[25]);
 }
 
 test "fresh full installroot defines the repository before transactions" {
@@ -3817,16 +3941,25 @@ test "kernel asset compatibility requires matching ISO and installed releases" {
         "vmlinuz-6.6.87.1-1.azl4.x86_64\n",
         "initramfs-6.6.87.1-1.azl4.x86_64.img\n",
         "6.6.87.1-1.azl4.x86_64\n",
+        "6.6.87.1-1.azl4.x86_64",
     ));
     try std.testing.expect(!isoKernelAssetsMatchInstalledModules(
         "vmlinuz-6.6.87.1-1.azl4.x86_64\n",
         "initramfs-6.6.87.1-1.azl4.x86_64.img\n",
         "6.6.88.1-1.azl4.x86_64\n",
+        "6.6.87.1-1.azl4.x86_64",
     ));
     try std.testing.expect(!isoKernelAssetsMatchInstalledModules(
         "vmlinuz-6.6.87.1-1.azl4.x86_64\n",
         "initramfs-6.6.88.1-1.azl4.x86_64.img\n",
         "6.6.87.1-1.azl4.x86_64\n",
+        "6.6.87.1-1.azl4.x86_64",
+    ));
+    try std.testing.expect(!isoKernelAssetsMatchInstalledModules(
+        "vmlinuz-6.6.87.1-1.azl4.x86_64\n",
+        "initramfs-6.6.87.1-1.azl4.x86_64.img\n",
+        "6.6.87.1-1.azl4.x86_64\n",
+        "6.6.87.1-2.azl4.x86_64",
     ));
 }
 
