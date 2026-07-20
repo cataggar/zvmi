@@ -1295,7 +1295,7 @@ fn validateRequiredPackages(
 ) !void {
     var argv = std.array_list.Managed([]const u8).init(gpa);
     defer argv.deinit();
-    try argv.appendSlice(&.{ "sudo", "chroot", rootfs_path, "/usr/bin/rpm", "-q" });
+    try argv.appendSlice(&.{ "sudo", "chroot", rootfs_path, "/usr/bin/rpm", "-q", "--whatprovides" });
     try argv.appendSlice(packages);
     try run(gpa, io, argv.items);
 }
@@ -1370,7 +1370,7 @@ fn canonicalTrustedSigningKeyPath(
     io: Io,
     work_dir: []const u8,
     architecture: *const ArchitectureDescriptor,
-) ![]u8 {
+) ![:0]u8 {
     const path = try trustedSigningKeyPath(gpa, work_dir, architecture);
     defer gpa.free(path);
     return Dir.cwd().realPathFileAlloc(io, path, gpa);
@@ -1420,7 +1420,7 @@ fn extractTrustedSigningKey(
     rootfs_path: []const u8,
     work_dir: []const u8,
     architecture: *const ArchitectureDescriptor,
-) ![]u8 {
+) ![:0]u8 {
     const signing_key_guest = try std.fmt.allocPrint(
         gpa,
         "{s}/{s}",
@@ -1711,9 +1711,9 @@ fn validateGeneralizedRootfs(
     const machine_id_stat = try Dir.cwd().statFile(io, machine_id, .{});
     if (machine_id_stat.size != 0) return error.GeneratedMachineId;
     const generated = try capture(gpa, io, &.{
-        "find",  rootfs_path,       "-type", "f",     "(",
-        "-name", "authorized_keys", "-o",    "-name", "ssh_host_*",
-        ")",     "-print",
+        "sudo",   "find",            rootfs_path, "-type", "f",          "(",
+        "-name",  "authorized_keys", "-o",        "-name", "ssh_host_*", ")",
+        "-print",
     });
     defer gpa.free(generated);
     if (std.mem.trim(u8, generated, " \t\r\n").len != 0) return error.BakedIdentityState;
@@ -1727,7 +1727,9 @@ fn validateGeneralizedRootfs(
         defer gpa.free(path);
         if (Dir.cwd().statFile(io, path, .{ .follow_symlinks = false })) |stat| {
             if (stat.kind == .directory) {
-                const entries = try capture(gpa, io, &.{ "find", path, "-mindepth", "1", "-print", "-quit" });
+                const entries = try capture(gpa, io, &.{
+                    "sudo", "find", path, "-mindepth", "1", "-print", "-quit",
+                });
                 defer gpa.free(entries);
                 if (std.mem.trim(u8, entries, " \t\r\n").len == 0) continue;
             }
