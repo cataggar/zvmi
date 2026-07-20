@@ -14,6 +14,7 @@ pub const Mode = union(enum) {
     },
     external_command: struct {
         executable_path: []const u8,
+        argument: ?[]const u8 = null,
     },
 
     pub fn name(self: Mode) []const u8 {
@@ -160,6 +161,9 @@ pub fn signUkiAlloc(
 
     const unsigned_sha256 = zvmi.artifact_pipeline.sha256Bytes(unsigned_bytes);
     const unsigned_sha256_hex = zvmi.artifact_pipeline.formatSha256(unsigned_sha256);
+    const certificate_sha256_hex = zvmi.artifact_pipeline.formatSha256(
+        config.expected_certificate_sha256,
+    );
     switch (config.mode) {
         .local_key => |local| try runSanitizedNoOutput(allocator, io, &.{
             local.sbsign_path,
@@ -180,10 +184,18 @@ pub fn signUkiAlloc(
             try environment.put("ZVMI_UKI_ARCHITECTURE", architecture);
             try environment.put("ZVMI_UKI_FLAVOR", flavor);
             try environment.put("ZVMI_UKI_UNSIGNED_SHA256", &unsigned_sha256_hex);
+            try environment.put(
+                "ZVMI_UKI_CERTIFICATE_SHA256",
+                &certificate_sha256_hex,
+            );
+            var command = std.array_list.Managed([]const u8).init(allocator);
+            defer command.deinit();
+            try command.append(external.executable_path);
+            if (external.argument) |argument| try command.append(argument);
             try runSanitizedWithEnvironment(
                 allocator,
                 io,
-                &.{external.executable_path},
+                command.items,
                 &environment,
             );
         },
@@ -347,6 +359,7 @@ test "signing mode names are stable provenance values" {
     } }).name());
     try std.testing.expectEqualStrings("external-command", (Mode{ .external_command = .{
         .executable_path = "/test/signer",
+        .argument = "sign",
     } }).name());
 }
 

@@ -100,8 +100,11 @@ jobs:
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
       WORK_DIR: .scratch/azurelinux4-release-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.key }}
       BUNDLE_DIR: artifact-staging/candidates/${{ matrix.key }}
-      UKI_SIGN_COMMAND: ${{ vars.AZURELINUX4_UKI_SIGN_COMMAND }}
+      UKI_SIGN_COMMAND: ${{ github.workspace }}/zig-out/bin/zvmi
       UKI_SIGNING_CERTIFICATE_SHA256: ${{ vars.AZURELINUX4_UKI_SIGNING_CERTIFICATE_SHA256 }}
+      ZVMI_AZURE_TENANT_ID: ${{ vars.ZVMI_AZURE_TENANT_ID }}
+      ZVMI_AZURE_CLIENT_ID: ${{ vars.ZVMI_AZURE_CLIENT_ID }}
+      ZVMI_AZURE_KEY_ID: ${{ vars.ZVMI_AZURE_KEY_ID }}
       ZVMI_UKI_SIGNING_KEY_VERSION: ${{ vars.AZURELINUX4_UKI_SIGNING_KEY_VERSION }}
     steps:
       - name: Check out accepted source
@@ -135,15 +138,26 @@ jobs:
           echo '%_dbpath /usr/lib/sysimage/rpm' | sudo tee /root/.rpmmacros >/dev/null
           test "$(sudo rpm --eval '%{_dbpath}')" = /usr/lib/sysimage/rpm
 
-      - name: Require protected external signing configuration
+      - name: Build built-in signer
+        run: |
+          set -euo pipefail
+          unset ZIG_LOCAL_CACHE_DIR
+          export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
+          zig build install-zvmi
+          test -x "$UKI_SIGN_COMMAND"
+
+      - name: Require protected signing configuration
         env:
           CERTIFICATE_PEM_VALUE: ${{ secrets.AZURELINUX4_UKI_SIGNING_CERTIFICATE_PEM }}
         run: |
           set -euo pipefail
-          [[ "$UKI_SIGN_COMMAND" == /* ]]
-          test -x "$UKI_SIGN_COMMAND"
+          uuid='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+          [[ "$ZVMI_AZURE_TENANT_ID" =~ $uuid ]]
+          [[ "$ZVMI_AZURE_CLIENT_ID" =~ $uuid ]]
+          [[ "$ZVMI_AZURE_KEY_ID" =~ ^https://[a-z0-9.-]+\.(vault\.azure\.net|managedhsm\.azure\.net)/keys/[A-Za-z0-9-]+/[0-9a-fA-F]+$ ]]
           [[ "$UKI_SIGNING_CERTIFICATE_SHA256" =~ ^[0-9a-f]{64}$ ]]
-          [[ "$ZVMI_UKI_SIGNING_KEY_VERSION" =~ ^[A-Za-z0-9._:/-]+$ ]]
+          [[ "$ZVMI_UKI_SIGNING_KEY_VERSION" =~ ^[0-9a-fA-F]+$ ]]
+          [[ "$ZVMI_AZURE_KEY_ID" == */"$ZVMI_UKI_SIGNING_KEY_VERSION" ]]
           certificate="$RUNNER_TEMP/zvmi-uki-signing-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${CANDIDATE_KEY}.pem"
           umask 077
           printf '%s\n' "$CERTIFICATE_PEM_VALUE" > "$certificate"
@@ -178,6 +192,7 @@ jobs:
             --uki-signing-certificate "$UKI_SIGNING_CERTIFICATE" \
             --uki-signing-certificate-sha256 "$UKI_SIGNING_CERTIFICATE_SHA256" \
             --uki-sign-command "$UKI_SIGN_COMMAND" \
+            --uki-sign-command-arg sign \
             2>&1 | tee "$BUNDLE_DIR/internal-provenance/build.log"
 
       - name: Validate exact finalized QCOW2

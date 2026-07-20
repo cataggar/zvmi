@@ -1,5 +1,15 @@
 # Third-Party Notices
 
+## ghr Authenticode parser
+
+`packages/zvmi/src/authenticode.zig` adapts PE parsing and Authenticode
+range-hashing code from ghr.
+
+Copyright (c) 2026 Cameron Taggart.
+
+Licensed under the MIT License. See:
+https://github.com/ctaggart/ghr/blob/main/LICENSE
+
 ## zig-bzip2
 
 This project uses the `silver-signal/zig-bzip2` Zig build wrapper, version

@@ -588,14 +588,22 @@ zig build -Dazurelinux-arch=x86_64 -Dazurelinux-flavor=core generalized-azurelin
   --uki-signing-certificate-sha256 <canonical-DER-SHA-256> \
   --uki-signing-key test.key
 
-# Production external provider
+# Production Azure Key Vault or Managed HSM signing
+zig build install-zvmi
+export ZVMI_AZURE_TENANT_ID=<Microsoft-Entra-tenant-UUID>
+export ZVMI_AZURE_CLIENT_ID=<federated-application-client-UUID>
+export ZVMI_AZURE_KEY_ID=https://<vault>.vault.azure.net/keys/<name>/<immutable-version>
+export ZVMI_UKI_SIGNING_KEY_VERSION=<immutable-version>
 zig build -Dazurelinux-arch=x86_64 -Dazurelinux-flavor=core generalized-azurelinux4 -- \
   --uki-signing-certificate release.crt \
   --uki-signing-certificate-sha256 <canonical-DER-SHA-256> \
-  --uki-sign-command /absolute/path/to/provider-adapter
+  --uki-sign-command "$PWD/zig-out/bin/zvmi" \
+  --uki-sign-command-arg sign
 ```
 
-The external provider receives no secret command-line arguments. It inherits the protected workflow environment and receives `ZVMI_UKI_UNSIGNED`, `ZVMI_UKI_SIGNED`, `ZVMI_UKI_CERTIFICATE`, `ZVMI_UKI_ARCHITECTURE`, `ZVMI_UKI_FLAVOR`, and `ZVMI_UKI_UNSIGNED_SHA256`; it must atomically create `ZVMI_UKI_SIGNED`. Production policy pins `ZVMI_UKI_SIGNING_KEY_VERSION` and requires the provider to authorize the GitHub OIDC repository, source commit/ref, workflow, protected environment, audience, run/attempt, unsigned digest, and certificate fingerprint rather than exposing a generic signing oracle.
+`zvmi sign` is the built-in production provider adapter. It validates the unsigned UKI and certificate fingerprints, constructs the Authenticode signed attributes locally, obtains a GitHub OIDC token for `api://AzureADTokenExchange`, exchanges it with Microsoft Entra, and asks the immutable Key Vault or Managed HSM key version to sign only the SHA-256 digest with `RS256`. It then creates the Authenticode CMS and atomically publishes `ZVMI_UKI_SIGNED`; the private key never leaves Azure. The external-provider protocol supplies `ZVMI_UKI_UNSIGNED`, `ZVMI_UKI_SIGNED`, `ZVMI_UKI_CERTIFICATE`, `ZVMI_UKI_ARCHITECTURE`, `ZVMI_UKI_FLAVOR`, `ZVMI_UKI_UNSIGNED_SHA256`, and `ZVMI_UKI_CERTIFICATE_SHA256`.
+
+The Azure key must be an RSA key whose public key matches `release.crt`, and the federated identity needs only the data-plane `sign` operation for that exact key. Configure its federated credential for audience `api://AzureADTokenExchange`, issuer `https://token.actions.githubusercontent.com`, and subject `repo:cataggar/zvmi:environment:azurelinux4-signing`. Pin the complete HTTPS key ID, including its hexadecimal version; aliases such as `latest` and versionless key IDs are rejected. Key Vault hosts must end in `.vault.azure.net`; Managed HSM hosts must end in `.managedhsm.azure.net`.
 
 The builder requires Zig 0.16, `curl`, `dnf`, GNU tar, `qemu-img`, and
 passwordless or interactive `sudo`. On a host that differs from the selected
@@ -697,12 +705,14 @@ Use `x86_64` and install `qemu-system-x86` for the x86_64 runner.
 Build/sign/local acceptance use the separate protected `azurelinux4-signing` GitHub environment, restricted to `main` with required reviewers. It defines the public certificate secret `AZURELINUX4_UKI_SIGNING_CERTIFICATE_PEM` and these variables:
 
 ```text
-AZURELINUX4_UKI_SIGN_COMMAND=/absolute/path/to/provider-adapter
 AZURELINUX4_UKI_SIGNING_CERTIFICATE_SHA256=<canonical-DER-SHA-256>
 AZURELINUX4_UKI_SIGNING_KEY_VERSION=<immutable-provider-key-version>
+ZVMI_AZURE_TENANT_ID=<Microsoft-Entra-tenant-UUID>
+ZVMI_AZURE_CLIENT_ID=<federated-application-client-UUID>
+ZVMI_AZURE_KEY_ID=https://<vault>.vault.azure.net/keys/<name>/<immutable-version>
 ```
 
-The signer receives `id-token: write`; all other build permissions remain read-only. Configure the provider for the federated subject `repo:cataggar/zvmi:environment:azurelinux4-signing` and the exact release workflow identity. No production private key is stored in the repository, image, provenance, logs, workflow artifacts, or release assets.
+The workflow builds `zvmi` from the accepted source commit and uses its absolute `zig-out/bin/zvmi sign` path; no separately installed adapter is trusted. The signer receives `id-token: write`; all other build permissions remain read-only. Grant the federated application `Key Vault Crypto User` (or an equivalent custom role limited to `keys/sign/action`) at the exact key scope, not the vault scope when key-scoped RBAC is available. No production private key is stored in the repository, image, provenance, logs, workflow artifacts, or release assets.
 
 Real-Azure validation and publication use the protected
 `azurelinux4-release` GitHub environment. Configure it with required

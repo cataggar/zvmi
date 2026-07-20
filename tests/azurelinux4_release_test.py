@@ -405,11 +405,20 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         self.assertEqual(workflow.count(invocation), 1)
         self.assertNotIn("test -r /dev/kvm", workflow)
 
-    def test_release_workflow_requires_external_signing_and_secure_boot(self):
+    def test_release_workflow_requires_built_in_signing_and_secure_boot(self):
         workflow = (ROOT / ".github/workflows/azurelinux4-release.yml").read_text()
         self.assertIn("environment: azurelinux4-signing", workflow)
-        self.assertIn("AZURELINUX4_UKI_SIGN_COMMAND", workflow)
+        self.assertNotIn("AZURELINUX4_UKI_SIGN_COMMAND", workflow)
+        self.assertIn(
+            "UKI_SIGN_COMMAND: ${{ github.workspace }}/zig-out/bin/zvmi",
+            workflow,
+        )
+        self.assertIn("zig build install-zvmi", workflow)
         self.assertIn("--uki-sign-command \"$UKI_SIGN_COMMAND\"", workflow)
+        self.assertIn("--uki-sign-command-arg sign", workflow)
+        self.assertIn("ZVMI_AZURE_TENANT_ID", workflow)
+        self.assertIn("ZVMI_AZURE_CLIENT_ID", workflow)
+        self.assertIn("ZVMI_AZURE_KEY_ID", workflow)
         self.assertNotIn("--uki-signing-key", workflow)
         self.assertIn("python3-virt-firmware", workflow)
         self.assertIn("sbsigntool", workflow)

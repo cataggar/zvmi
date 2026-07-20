@@ -3191,6 +3191,7 @@ const Args = struct {
     uki_signing_certificate_sha256: ?[]const u8 = null,
     uki_signing_key: ?[]const u8 = null,
     uki_sign_command: ?[]const u8 = null,
+    uki_sign_command_arg: ?[]const u8 = null,
     sbsign: []const u8 = "sbsign",
     sbverify: []const u8 = "sbverify",
     openssl: []const u8 = "openssl",
@@ -3217,6 +3218,8 @@ const help_text =
     \\                      Local development private key
     \\  --uki-sign-command <absolute-path>
     \\                      External production signer executable
+    \\  --uki-sign-command-arg <argument>
+    \\                      Optional fixed signer subcommand
     \\  --sbsign <path>     sbsign executable for local-key mode
     \\  --sbverify <path>   sbverify executable (default: sbverify)
     \\  --openssl <path>    OpenSSL executable (default: openssl)
@@ -3298,6 +3301,10 @@ fn parseArgs(argv: []const []const u8) !Args {
             i += 1;
             if (i >= argv.len) return error.MissingValue;
             a.uki_sign_command = argv[i];
+        } else if (std.mem.eql(u8, arg, "--uki-sign-command-arg")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            a.uki_sign_command_arg = argv[i];
         } else if (std.mem.eql(u8, arg, "--sbsign")) {
             i += 1;
             if (i >= argv.len) return error.MissingValue;
@@ -3325,7 +3332,8 @@ fn signingConfig(args: Args) !?uki_signing.Config {
     const has_any_signing_option = args.uki_signing_certificate != null or
         args.uki_signing_certificate_sha256 != null or
         args.uki_signing_key != null or
-        args.uki_sign_command != null;
+        args.uki_sign_command != null or
+        args.uki_sign_command_arg != null;
     if (!has_any_signing_option) return null;
 
     const certificate_path = args.uki_signing_certificate orelse
@@ -3335,6 +3343,9 @@ fn signingConfig(args: Args) !?uki_signing.Config {
             return error.MissingUkiSigningCertificateSha256,
     );
     if ((args.uki_signing_key == null) == (args.uki_sign_command == null)) {
+        return error.InvalidUkiSignerSelection;
+    }
+    if (args.uki_sign_command == null and args.uki_sign_command_arg != null) {
         return error.InvalidUkiSignerSelection;
     }
     const mode: uki_signing.Mode = if (args.uki_signing_key) |key_path|
@@ -3347,7 +3358,10 @@ fn signingConfig(args: Args) !?uki_signing.Config {
         if (!std.fs.path.isAbsolute(command_path)) {
             return error.UkiSignCommandMustBeAbsolute;
         }
-        break :blk .{ .external_command = .{ .executable_path = command_path } };
+        break :blk .{ .external_command = .{
+            .executable_path = command_path,
+            .argument = args.uki_sign_command_arg,
+        } };
     };
     return .{
         .certificate_path = certificate_path,
@@ -4154,7 +4168,16 @@ test "architecture and argument parsing accepts only supported values" {
             "1111111111111111111111111111111111111111111111111111111111111111",
             "--uki-sign-command",
             "/usr/local/bin/sign-uki",
+            "--uki-sign-command-arg",
+            "sign",
         })).uki_sign_command.?,
+    );
+    try std.testing.expectEqualStrings(
+        "sign",
+        (try parseArgs(&.{
+            "--uki-sign-command-arg",
+            "sign",
+        })).uki_sign_command_arg.?,
     );
 }
 
@@ -4197,6 +4220,15 @@ test "UKI signer configuration is complete and mutually exclusive" {
             .uki_sign_command = "sign-uki",
         }),
     );
+    try std.testing.expectError(
+        error.InvalidUkiSignerSelection,
+        signingConfig(.{
+            .uki_signing_certificate = "release.crt",
+            .uki_signing_certificate_sha256 = "1111111111111111111111111111111111111111111111111111111111111111",
+            .uki_signing_key = "release.key",
+            .uki_sign_command_arg = "sign",
+        }),
+    );
 
     const local = (try signingConfig(.{
         .uki_signing_certificate = "release.crt",
@@ -4210,8 +4242,13 @@ test "UKI signer configuration is complete and mutually exclusive" {
         .uki_signing_certificate = "release.crt",
         .uki_signing_certificate_sha256 = "1111111111111111111111111111111111111111111111111111111111111111",
         .uki_sign_command = "/usr/local/bin/sign-uki",
+        .uki_sign_command_arg = "sign",
     })).?;
     try std.testing.expectEqualStrings("external-command", external.mode.name());
+    try std.testing.expectEqualStrings(
+        "sign",
+        external.mode.external_command.argument.?,
+    );
 }
 
 test "guest artifact architecture validation rejects mismatches" {
