@@ -438,6 +438,11 @@ zvmi qemu AzureLinux
 zvmi qemu AzureLinux --snapshot
 ```
 
+OCI ingestion defaults to 64 MiB compressed blobs, 128 MiB decompressed
+layers, and 512 MiB docker/podman save archives. Deliberately larger trusted
+inputs can opt into explicit bounded limits with `--max-oci-blob-size`,
+`--max-oci-layer-size`, and `--max-oci-archive-size`.
+
 `--skip-iso-rootfs` is useful with genuinely minimal base containers: it keeps
 the container as the effective root filesystem and carries over only the
 boot-critical assets from the ISO/squashfs (kernel, initramfs, EFI binaries,

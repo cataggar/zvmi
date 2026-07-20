@@ -34,6 +34,9 @@ const max_nested_filesystem_depth: u8 = 3;
 pub const BuildImageOptions = struct {
     iso_path: []const u8,
     container_path: []const u8,
+    /// Bounded OCI input limits. The defaults remain conservative; callers
+    /// that deliberately create larger layers must opt into matching limits.
+    oci_load_options: oci.LoadOptions = .{},
     output_path: []const u8,
     size: u64,
     generation: azure.Generation = .gen2,
@@ -173,7 +176,7 @@ pub fn build(
     try validateBuildPathIsolation(allocator, io, options, output_format);
 
     logStep(options, "load container image");
-    var container_image = try oci.load(io, allocator, options.container_path, .{});
+    var container_image = try oci.load(io, allocator, options.container_path, options.oci_load_options);
     var container_image_open = true;
     defer if (container_image_open) container_image.deinit();
 
@@ -2744,6 +2747,24 @@ test "customization sources cannot alias output or internal scratch paths" {
         error.SourcePathConflict,
         validateBuildPathIsolation(std.testing.allocator, std.testing.io, options, .raw),
     );
+}
+
+test "build-image honors caller OCI load limits" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const oci_root = "test-build-image-oci-limit";
+    defer Io.Dir.cwd().deleteTree(io, oci_root) catch {};
+    try createEfiOnlyBuildImageOciLayout(allocator, io, oci_root);
+
+    try std.testing.expectError(error.BlobTooLarge, build(allocator, io, .{
+        .iso_path = "unreached.iso",
+        .container_path = oci_root,
+        .oci_load_options = .{ .max_blob_size = 1 },
+        .output_path = "unreached.raw",
+        .output_format = .raw,
+        .size = 256 * mib,
+        .dry_run = true,
+    }));
 }
 
 test "build-image builds Gen2 VHD, VHDX, and qcow2 outputs from XZ squashfs + OCI layout" {
