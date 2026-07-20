@@ -538,21 +538,11 @@ fn signDigestWithArtifactSigningAlloc(
         return error.ArtifactSigningSubmitFailed;
     const operation_location = submit.operation_location orelse
         return error.ArtifactSigningOperationLocationMissing;
-    const initial = try parseArtifactOperation(
-        allocator,
-        submit.body,
-    );
-    defer initial.deinit();
-    if (!isUuid(initial.value.id))
-        return error.InvalidArtifactSigningOperationId;
-    const poll_url = try expectedArtifactSigningPollUrlAlloc(
+    const operation_id = try validateArtifactSigningOperationLocation(
         allocator,
         config,
-        initial.value.id,
+        operation_location,
     );
-    defer allocator.free(poll_url);
-    if (!std.mem.eql(u8, poll_url, operation_location))
-        return error.InvalidArtifactSigningOperationLocation;
 
     var attempt: usize = 0;
     var delay_seconds: u32 = 1;
@@ -561,7 +551,7 @@ fn signDigestWithArtifactSigningAlloc(
             allocator,
             client,
             .GET,
-            poll_url,
+            operation_location,
             access_token,
             "application/json",
             null,
@@ -590,7 +580,7 @@ fn signDigestWithArtifactSigningAlloc(
             response.body,
         );
         defer operation.deinit();
-        if (!std.mem.eql(u8, operation.value.id, initial.value.id))
+        if (!std.mem.eql(u8, operation.value.id, operation_id))
             return error.ArtifactSigningOperationIdMismatch;
         if (std.mem.eql(u8, operation.value.status, "Succeeded")) {
             const result = operation.value.result orelse
@@ -621,7 +611,7 @@ fn signDigestWithArtifactSigningAlloc(
             return .{
                 .signature = signature,
                 .certificate_bundle = certificate_bundle,
-                .operation_id = try allocator.dupe(u8, operation.value.id),
+                .operation_id = try allocator.dupe(u8, operation_id),
             };
         }
         if (std.mem.eql(u8, operation.value.status, "Failed"))
@@ -795,6 +785,37 @@ fn expectedArtifactSigningPollUrlAlloc(
             artifact_signing_api_version,
         },
     );
+}
+
+fn validateArtifactSigningOperationLocation(
+    allocator: Allocator,
+    config: ArtifactSigningConfig,
+    operation_location: []const u8,
+) ![]const u8 {
+    const marker = "/sign/";
+    const id_start = (std.mem.lastIndexOf(
+        u8,
+        operation_location,
+        marker,
+    ) orelse return error.InvalidArtifactSigningOperationLocation) + marker.len;
+    const id_end = std.mem.indexOfScalarPos(
+        u8,
+        operation_location,
+        id_start,
+        '?',
+    ) orelse return error.InvalidArtifactSigningOperationLocation;
+    const operation_id = operation_location[id_start..id_end];
+    if (!isUuid(operation_id))
+        return error.InvalidArtifactSigningOperationId;
+    const expected = try expectedArtifactSigningPollUrlAlloc(
+        allocator,
+        config,
+        operation_id,
+    );
+    defer allocator.free(expected);
+    if (!std.mem.eql(u8, expected, operation_location))
+        return error.InvalidArtifactSigningOperationLocation;
+    return operation_id;
 }
 
 fn decodeStandardBase64Alloc(
@@ -1264,6 +1285,53 @@ test "Artifact Signing uses padded standard base64 and exact operation URLs" {
             "api-version=2024-06-15",
         poll_url,
     );
+    const config: ArtifactSigningConfig = .{
+        .endpoint = "https://wus.codesigning.azure.net",
+        .account = "cataggar",
+        .profile = "zvmi-uki",
+    };
+    try std.testing.expectEqualStrings(
+        "00000000-0000-4000-8000-000000000000",
+        try validateArtifactSigningOperationLocation(
+            std.testing.allocator,
+            config,
+            poll_url,
+        ),
+    );
+    const invalid_locations = [_][]const u8{
+        "https://eus.codesigning.azure.net/codesigningaccounts/cataggar/" ++
+            "certificateprofiles/zvmi-uki/sign/" ++
+            "00000000-0000-4000-8000-000000000000?api-version=2024-06-15",
+        "https://wus.codesigning.azure.net/codesigningaccounts/other/" ++
+            "certificateprofiles/zvmi-uki/sign/" ++
+            "00000000-0000-4000-8000-000000000000?api-version=2024-06-15",
+        "https://wus.codesigning.azure.net/codesigningaccounts/cataggar/" ++
+            "certificateprofiles/other/sign/" ++
+            "00000000-0000-4000-8000-000000000000?api-version=2024-06-15",
+        "https://wus.codesigning.azure.net/codesigningaccounts/cataggar/" ++
+            "certificateprofiles/zvmi-uki/sign/" ++
+            "00000000-0000-4000-8000-000000000000?api-version=2022-06-15",
+    };
+    for (invalid_locations) |location| {
+        try std.testing.expectError(
+            error.InvalidArtifactSigningOperationLocation,
+            validateArtifactSigningOperationLocation(
+                std.testing.allocator,
+                config,
+                location,
+            ),
+        );
+    }
+    try std.testing.expectError(
+        error.InvalidArtifactSigningOperationId,
+        validateArtifactSigningOperationLocation(
+            std.testing.allocator,
+            config,
+            "https://wus.codesigning.azure.net/codesigningaccounts/cataggar/" ++
+                "certificateprofiles/zvmi-uki/sign/not-a-uuid?" ++
+                "api-version=2024-06-15",
+        ),
+    );
 }
 
 test "PEM certificate decoder accepts one canonical certificate block" {
@@ -1288,6 +1356,7 @@ const MockArtifactSigningScenario = enum {
     canceled,
     timeout,
     malformed_base64,
+    wrong_poll_operation_id,
     wrong_operation_location,
     redirect,
 };
@@ -1304,7 +1373,11 @@ fn mockArtifactSigningRequestCount(
 ) usize {
     return switch (scenario) {
         .success, .timeout => 3,
-        .failed, .canceled, .malformed_base64 => 2,
+        .failed,
+        .canceled,
+        .malformed_base64,
+        .wrong_poll_operation_id,
+        => 2,
         .wrong_operation_location, .redirect => 1,
     };
 }
@@ -1336,8 +1409,7 @@ fn runMockArtifactSigningServerFallible(
     );
 
     const operation_id = "00000000-0000-4000-8000-000000000000";
-    const accepted_body =
-        "{\"id\":\"" ++ operation_id ++ "\",\"status\":\"Running\"}";
+    const accepted_body = "";
     const running_body =
         "{\"id\":\"" ++ operation_id ++ "\",\"status\":\"Running\"}";
     const failed_body =
@@ -1349,6 +1421,9 @@ fn runMockArtifactSigningServerFallible(
         "{\"id\":\"" ++ operation_id ++ "\",\"status\":\"Succeeded\"," ++
         "\"result\":{\"signature\":\"not-base64\",\"signingCertificate\":" ++
         "\"MAMCAQE=\"}}";
+    const wrong_id_body =
+        "{\"id\":\"11111111-1111-4111-8111-111111111111\"," ++
+        "\"status\":\"Running\"}";
 
     var handled: usize = 0;
     while (handled < mockArtifactSigningRequestCount(context.scenario)) : (handled += 1) {
@@ -1403,6 +1478,7 @@ fn runMockArtifactSigningServerFallible(
             .canceled => canceled_body,
             .timeout => running_body,
             .malformed_base64 => malformed_body,
+            .wrong_poll_operation_id => wrong_id_body,
             .wrong_operation_location, .redirect => unreachable,
         };
         try request.respond(body, .{});
@@ -1545,6 +1621,14 @@ test "Artifact Signing rejects terminal failures, timeouts, and malformed result
             std.testing.allocator,
             std.testing.io,
             .malformed_base64,
+        ),
+    );
+    try std.testing.expectError(
+        error.ArtifactSigningOperationIdMismatch,
+        runMockArtifactSigningScenario(
+            std.testing.allocator,
+            std.testing.io,
+            .wrong_poll_operation_id,
         ),
     );
 }
