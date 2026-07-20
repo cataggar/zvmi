@@ -228,6 +228,7 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         self.assertNotIn("self-hosted", workflow)
         self.assertEqual(workflow.count("runner: ubuntu-24.04\n"), 2)
         self.assertEqual(workflow.count("runner: ubuntu-24.04-arm\n"), 2)
+        self.assertIn("max-parallel: 2", workflow)
         self.assertNotIn("test-azurelinux4-acceptance", workflow)
         self.assertIn("scripts/azurelinux4_azure_acceptance.sh run", workflow)
 

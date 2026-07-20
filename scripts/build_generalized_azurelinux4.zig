@@ -1610,6 +1610,7 @@ fn configureFullGuest(
         }
     }
     try writeRootFile(gpa, io, rootfs_path, work_dir, ".autorelabel", "", "0600");
+    try sudo(gpa, io, &.{ "chroot", rootfs_path, "/usr/bin/ssh-keygen", "-A" });
     try sudo(gpa, io, &.{ "chroot", rootfs_path, "/usr/bin/sshd", "-t" });
 }
 

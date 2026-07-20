@@ -47,6 +47,7 @@ jobs:
     timeout-minutes: 240
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         include:
           - key: x86_64-full
