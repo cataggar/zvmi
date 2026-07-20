@@ -156,8 +156,8 @@ def candidate_command(args: argparse.Namespace) -> None:
     source_commit = require_commit(args.source_commit)
     records = provenance_records(args.provenance_dir.resolve())
     digest = sha256(asset)
-    if args.accepted_sha256 != digest:
-        fail(f"{args.key}: local acceptance digest does not match candidate bytes")
+    if args.validated_sha256 != digest:
+        fail(f"{args.key}: build validation digest does not match candidate bytes")
     if args.virtual_size <= 0:
         fail("virtual size must be positive")
     write_json(
@@ -173,11 +173,10 @@ def candidate_command(args: argparse.Namespace) -> None:
             "sha256": digest,
             "bytes": asset.stat().st_size,
             "virtual_size": args.virtual_size,
-            "local_acceptance": {
+            "build_validation": {
                 "status": "success",
-                "accepted_sha256": args.accepted_sha256,
+                "validated_sha256": args.validated_sha256,
                 "runner": args.runner,
-                "qemu_version": args.qemu_version,
             },
             "provenance": {
                 "digest": provenance_digest(records),
@@ -215,11 +214,14 @@ def verify_candidate(
     virtual_size = document.get("virtual_size")
     if not isinstance(virtual_size, int) or virtual_size <= 0:
         fail(f"{actual_key}: invalid virtual size")
-    local = document.get("local_acceptance")
-    if not isinstance(local, dict) or local.get("status") != "success":
-        fail(f"{actual_key}: local acceptance is not explicitly successful")
-    if local.get("accepted_sha256") != digest:
-        fail(f"{actual_key}: local acceptance did not validate published bytes")
+    build_validation = document.get("build_validation")
+    if (
+        not isinstance(build_validation, dict)
+        or build_validation.get("status") != "success"
+    ):
+        fail(f"{actual_key}: build validation is not explicitly successful")
+    if build_validation.get("validated_sha256") != digest:
+        fail(f"{actual_key}: build validation did not validate published bytes")
     provenance = document.get("provenance")
     if not isinstance(provenance, dict):
         fail(f"{actual_key}: provenance is absent")
@@ -402,9 +404,9 @@ def stage_command(args: argparse.Namespace) -> None:
             shutil.copyfile(asset_path, destination)
         if sha256(destination) != digest:
             fail(f"{key}: staging changed candidate bytes")
-        local = candidate["local_acceptance"]
+        build_validation = candidate["build_validation"]
         provenance = candidate["provenance"]
-        if not isinstance(local, dict) or not isinstance(provenance, dict):
+        if not isinstance(build_validation, dict) or not isinstance(provenance, dict):
             fail(f"{key}: validated metadata changed type")
         staged.append(
             {
@@ -415,8 +417,7 @@ def stage_command(args: argparse.Namespace) -> None:
                 "sha256": digest,
                 "bytes": destination.stat().st_size,
                 "virtual_size": candidate["virtual_size"],
-                "local_runner": local.get("runner"),
-                "qemu_version": local.get("qemu_version"),
+                "build_runner": build_validation.get("runner"),
                 "provenance_digest": provenance.get("digest"),
                 "azure_location": azure.get("location"),
                 "azure_vm_size": azure.get("vm_size"),
@@ -436,8 +437,8 @@ def stage_command(args: argparse.Namespace) -> None:
 
     lines = [
         "Azure Linux 4.0 generalized Gen2 images built from the accepted source commit "
-        f"`{source_commit}`. Every published QCOW2 passed native-KVM local acceptance and "
-        "protected-environment validation on a matching Azure architecture.",
+        f"`{source_commit}`. Every published QCOW2 passed hosted structural validation and "
+        "protected-environment native validation on a matching Azure architecture.",
         "",
         "| Asset | SHA-256 | Bytes | Azure validation | Derived VHD SHA-256 (not published) |",
         "| --- | --- | ---: | --- | --- |",
@@ -472,7 +473,7 @@ def stage_command(args: argparse.Namespace) -> None:
     for item in staged:
         lines.append(
             f"- `{item['asset_name']}`: provenance `{item['provenance_digest']}`; "
-            f"local `{item['qemu_version']}` on `{item['local_runner']}`"
+            f"hosted build on `{item['build_runner']}`"
         )
     args.notes.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -486,12 +487,11 @@ def parser() -> argparse.ArgumentParser:
     candidate.add_argument("--architecture", required=True)
     candidate.add_argument("--flavor", required=True)
     candidate.add_argument("--asset", type=Path, required=True)
-    candidate.add_argument("--accepted-sha256", required=True)
+    candidate.add_argument("--validated-sha256", required=True)
     candidate.add_argument("--virtual-size", type=int, required=True)
     candidate.add_argument("--source-commit", required=True)
     candidate.add_argument("--provenance-dir", type=Path, required=True)
     candidate.add_argument("--runner", required=True)
-    candidate.add_argument("--qemu-version", required=True)
     candidate.add_argument("--run-id", required=True)
     candidate.add_argument("--run-attempt", required=True)
     candidate.add_argument("--output", type=Path, required=True)
