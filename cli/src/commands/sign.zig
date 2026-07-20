@@ -282,6 +282,10 @@ fn acquireAzureAccessTokenAlloc(
         .{oidc_request_token},
     );
     defer allocator.free(oidc_authorization);
+    const oidc_headers = [_]std.http.Header{
+        .{ .name = "Accept", .value = "application/json" },
+        .{ .name = "Authorization", .value = oidc_authorization },
+    };
     const oidc_body = try fetchBoundedAlloc(
         allocator,
         client,
@@ -289,8 +293,7 @@ fn acquireAzureAccessTokenAlloc(
         .GET,
         audience_url,
         null,
-        &.{.{ .name = "Accept", .value = "application/json" }},
-        &.{.{ .name = "Authorization", .value = oidc_authorization }},
+        &oidc_headers,
     );
     defer allocator.free(oidc_body);
     const oidc = try std.json.parseFromSlice(
@@ -327,7 +330,6 @@ fn acquireAzureAccessTokenAlloc(
         token_url,
         token_form,
         &.{.{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" }},
-        &.{},
     );
     defer allocator.free(token_body);
     const token = try std.json.parseFromSlice(
@@ -691,8 +693,6 @@ fn artifactRequestAlloc(
     const extra_headers = [_]std.http.Header{
         .{ .name = "Accept", .value = accept },
         .{ .name = "client-version", .value = "zvmi/1" },
-    };
-    const privileged_headers = [_]std.http.Header{
         .{ .name = "Authorization", .value = authorization },
     };
     var request = try client.request(method, uri, .{
@@ -704,7 +704,7 @@ fn artifactRequestAlloc(
                 .default,
         },
         .extra_headers = &extra_headers,
-        .privileged_headers = &privileged_headers,
+        .privileged_headers = &.{},
     });
     defer request.deinit();
     if (payload) |body| {
@@ -833,7 +833,6 @@ fn fetchBoundedAlloc(
     url: []const u8,
     payload: ?[]const u8,
     headers: []const std.http.Header,
-    privileged_headers: []const std.http.Header,
 ) ![]u8 {
     const storage = try allocator.alloc(u8, max_response_bytes);
     defer allocator.free(storage);
@@ -845,7 +844,9 @@ fn fetchBoundedAlloc(
         .response_writer = &writer,
         .redirect_behavior = .not_allowed,
         .extra_headers = headers,
-        .privileged_headers = privileged_headers,
+        // Zig 0.16 does not serialize privileged_headers. Redirects are
+        // disabled, so callers safely include Authorization in extra_headers.
+        .privileged_headers = &.{},
     });
     if (result.status != .ok)
         return tokenHttpStatusError(request_kind, result.status);
@@ -1350,6 +1351,11 @@ fn runMockArtifactSigningServerFallible(
     var handled: usize = 0;
     while (handled < mockArtifactSigningRequestCount(context.scenario)) : (handled += 1) {
         var request = try server.receiveHead();
+        if (std.mem.indexOf(
+            u8,
+            request.head_buffer,
+            "\r\nAuthorization: Bearer test-token\r\n",
+        ) == null) return error.MissingMockArtifactSigningAuthorization;
         if (handled == 0) {
             if (request.head.method != .POST)
                 return error.UnexpectedMockArtifactSigningRequest;
