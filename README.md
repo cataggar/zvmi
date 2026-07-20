@@ -661,14 +661,15 @@ profile. The UKIs are unsigned, so Secure Boot remains disabled pending issue
 `AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260717`. Select an AArch64 or
 core file explicitly when needed.
 
-The manual release workflow builds all four candidates on native ephemeral
-self-hosted Ubuntu runners with the standard `self-hosted`, `Linux`, and
-`X64`/`ARM64` labels. Each runner must provide passwordless sudo, native KVM,
-and enough workspace for a 5 GiB candidate. The workflow installs the
-remaining image/QEMU packages and never substitutes TCG for acceptance.
+The manual release workflow builds all four candidates on GitHub-hosted
+`ubuntu-24.04` and `ubuntu-24.04-arm` runners. Hosted jobs perform structural
+QCOW2, GPT, UKI, provenance, and digest validation. They do not require local
+KVM or claim a local native boot result; the exact candidate bytes must pass
+the protected Azure acceptance matrix on matching x86_64 and AArch64 VMs
+before publication.
 
-Before registering a runner, install the architecture-specific QEMU package
-and run the same fail-closed readiness probe used by the workflow:
+The fail-closed native KVM test remains available for optional validation on
+a suitable machine:
 
 ```sh
 # AArch64
@@ -677,10 +678,9 @@ sudo apt-get install -y qemu-system-arm
 scripts/check_azurelinux4_release_runner.sh aarch64
 ```
 
-It must print `architecture=aarch64 accelerator=kvm`. A native Arm64 machine
-without a readable and writable `/dev/kvm` is not release-capable; a
-GitHub-hosted Arm64 runner or an Azure Arm64 VM does not satisfy this gate.
-Use `x86_64` and install `qemu-system-x86` for the x86_64 runner.
+It must print `architecture=aarch64 accelerator=kvm`. Use `x86_64` and install
+`qemu-system-x86` for optional x86_64 validation. This probe is not part of
+the hosted release gate.
 
 Real-Azure validation and publication use the protected
 `azurelinux4-release` GitHub environment. Configure it with required
