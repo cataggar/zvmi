@@ -167,9 +167,9 @@ const full_required_rootfs_paths = [_][]const u8{
 
 const core_forbidden_rootfs_paths = [_][]const u8{};
 const full_forbidden_rootfs_paths = [_][]const u8{
-    "sbin/zvminit",
+    // Azure Linux uses merged-/usr aliases; validate their canonical targets
+    // because the ext4 reader deliberately does not follow symlinks.
     "usr/bin/zvminit",
-    "usr/sbin/azagent",
     "usr/bin/azagent",
     "etc/ssh/sshd_config.d/10-zvminit.conf",
     "var/lib/azagent/provisioned",
@@ -4187,9 +4187,11 @@ test "flavor contracts keep full systemd-only and core zvminit-only" {
     try std.testing.expectEqual(Provisioner.cloud_init_waagent, full.provisioner);
     try std.testing.expectEqualStrings("/sbin/zvminit", core.oci_entrypoint);
     try std.testing.expectEqualStrings("/usr/lib/systemd/systemd", full.oci_entrypoint);
-    for (&[_][]const u8{ "sbin/zvminit", "usr/sbin/azagent", "etc/ssh/sshd_config.d/10-zvminit.conf" }) |path| {
+    for (&[_][]const u8{ "usr/bin/zvminit", "usr/bin/azagent", "etc/ssh/sshd_config.d/10-zvminit.conf" }) |path| {
         try std.testing.expect(argvContains(full.forbidden_rootfs_paths, path));
     }
+    try std.testing.expect(!argvContains(full.forbidden_rootfs_paths, "sbin/zvminit"));
+    try std.testing.expect(!argvContains(full.forbidden_rootfs_paths, "usr/sbin/azagent"));
     try std.testing.expect(argvContains(full.required_rootfs_paths, "usr/lib/systemd/systemd"));
     try std.testing.expect(argvContains(full.required_rootfs_paths, "usr/bin/sshd"));
     try std.testing.expect(argvContains(full.required_rootfs_paths, "usr/bin/waagent"));
