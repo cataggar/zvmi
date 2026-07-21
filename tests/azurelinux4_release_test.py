@@ -434,6 +434,28 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         self.assertIn("AZURE_CLIENT_SECRET_VALUE", acceptance)
         self.assertNotIn("protected-environment OIDC", acceptance)
 
+    def test_azure_acceptance_uses_current_harness_with_accepted_source_tool(self):
+        workflow = (ROOT / ".github/workflows/azurelinux4-release.yml").read_text()
+        acceptance = workflow.split("  azure_acceptance:", 1)[1].split(
+            "\n  publish:", 1
+        )[0]
+        self.assertIn("name: Check out acceptance harness", acceptance)
+        self.assertIn("ref: ${{ github.sha }}", acceptance)
+        self.assertIn("path: release-source", acceptance)
+        self.assertIn("working-directory: release-source", acceptance)
+        self.assertIn(
+            "ZVMI: ${{ github.workspace }}/release-source/zig-out/bin/zvmi",
+            acceptance,
+        )
+
+    def test_azure_acceptance_allows_arm64_without_temporary_resource_disk(self):
+        script = (ROOT / "scripts/azurelinux4_azure_acceptance.sh").read_text()
+        self.assertIn('restriction.get("type") == "Location"', script)
+        self.assertIn('capabilities.get("TrustedLaunchDisabled") == "True"', script)
+        self.assertIn('if sys.argv[3] == "x64" and not has_resource_disk:', script)
+        self.assertIn('if [[ "$has_resource_disk" == true ]]; then', script)
+        self.assertIn("! mountpoint -q /d", script)
+
     def test_ci_actions_are_pinned_to_audited_commits(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         actions = re.findall(

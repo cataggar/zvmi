@@ -441,9 +441,16 @@ jobs:
       AZURE_LOCATION: ${{ vars[matrix.location_variable] }}
       AZURE_VM_SIZE: ${{ vars[matrix.size_variable] }}
     steps:
+      - name: Check out acceptance harness
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
       - name: Check out accepted source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
+          path: release-source
           ref: ${{ needs.prepare.outputs.source_commit }}
           persist-credentials: false
 
@@ -497,6 +504,7 @@ jobs:
           az version --output json > /dev/null
 
       - name: Build accepted-source zvmi
+        working-directory: release-source
         run: |
           set -euo pipefail
           unset ZIG_LOCAL_CACHE_DIR
@@ -506,7 +514,7 @@ jobs:
 
       - name: Run exact-artifact Azure acceptance
         env:
-          ZVMI: ${{ github.workspace }}/zig-out/bin/zvmi
+          ZVMI: ${{ github.workspace }}/release-source/zig-out/bin/zvmi
           RUN_ID_VALUE: ${{ github.run_id }}
           RUN_ATTEMPT_VALUE: ${{ github.run_attempt }}
         run: |
