@@ -218,7 +218,8 @@ if [[ "$ARCHITECTURE" == aarch64 ]]; then
   runtime_architecture=aarch64
   azure_image_architecture=Arm64
 fi
-python3 - "$sku_json" "$AZURE_VM_SIZE" "$expected_azure_architecture" <<'PY'
+has_resource_disk=$(
+  python3 - "$sku_json" "$AZURE_VM_SIZE" "$expected_azure_architecture" <<'PY'
 import json
 import sys
 
@@ -226,16 +227,27 @@ matches = [item for item in json.load(open(sys.argv[1], encoding="utf-8")) if it
 if len(matches) != 1:
     raise SystemExit("configured Azure VM SKU is absent or ambiguous in the configured location")
 sku = matches[0]
-if sku.get("restrictions"):
-    raise SystemExit(f"configured Azure VM SKU is restricted: {sku['restrictions']!r}")
+location_restrictions = [
+    restriction
+    for restriction in sku.get("restrictions", [])
+    if restriction.get("type") == "Location"
+]
+if location_restrictions:
+    raise SystemExit(f"configured Azure VM SKU is location-restricted: {location_restrictions!r}")
 capabilities = {item["name"]: item["value"] for item in sku.get("capabilities", [])}
 if capabilities.get("CpuArchitectureType") != sys.argv[3]:
     raise SystemExit(f"SKU architecture mismatch: {capabilities.get('CpuArchitectureType')!r}")
 if "V2" not in capabilities.get("HyperVGenerations", "").split(","):
     raise SystemExit("configured Azure VM SKU does not support Gen2")
-if int(capabilities.get("MaxResourceVolumeMB", "0")) <= 0:
+if capabilities.get("TrustedLaunchDisabled") == "True":
+    raise SystemExit("configured Azure VM SKU does not support Trusted Launch")
+has_resource_disk = int(capabilities.get("MaxResourceVolumeMB", "0")) > 0
+if sys.argv[3] == "x64" and not has_resource_disk:
     raise SystemExit("configured Azure VM SKU has no temporary resource disk")
+print("true" if has_resource_disk else "false")
 PY
+)
+[[ "$has_resource_disk" == true || "$has_resource_disk" == false ]]
 
 source_before=$(sha256sum "$asset" | awk '{print $1}')
 test "$source_before" = "$qcow_sha256"
@@ -596,8 +608,10 @@ fi
 GUEST
 
 if [[ "$FLAVOR" == core ]]; then
-  ssh "${ssh_options[@]}" "$ssh_target" '/usr/bin/bash -s' <<'GUEST'
+  ssh "${ssh_options[@]}" "$ssh_target" \
+    "/usr/bin/bash -s -- '$has_resource_disk'" <<'GUEST'
 set -euo pipefail
+has_resource_disk=$1
 sudo -n /usr/bin/test /proc/1/exe -ef /sbin/zvminit
 test -f /var/lib/azagent/provisioned
 master=
@@ -616,15 +630,19 @@ for proc in /proc/[0-9]*; do
   esac
 done
 test -n "$master"
-mountpoint -q /d
-test "$(findmnt -n -o FSTYPE /d)" = ext4
-test -f /d/DATALOSS_WARNING_README.txt
-while read -r swap_path _; do
-  test "$swap_path" = Filename && continue
-  case "$swap_path" in
-    /d|/d/*) exit 1 ;;
-  esac
-done </proc/swaps
+if [[ "$has_resource_disk" == true ]]; then
+  mountpoint -q /d
+  test "$(findmnt -n -o FSTYPE /d)" = ext4
+  test -f /d/DATALOSS_WARNING_README.txt
+  while read -r swap_path _; do
+    test "$swap_path" = Filename && continue
+    case "$swap_path" in
+      /d|/d/*) exit 1 ;;
+    esac
+  done </proc/swaps
+else
+  ! mountpoint -q /d
+fi
 GUEST
 else
   ssh "${ssh_options[@]}" "$ssh_target" '/usr/bin/bash -s' <<'GUEST'
