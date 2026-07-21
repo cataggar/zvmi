@@ -161,6 +161,8 @@ const full_required_rootfs_paths = [_][]const u8{
     "usr/bin/sshd",
     "usr/bin/waagent",
     "usr/lib/systemd/systemd",
+    "usr/lib/systemd/system/chronyd.service",
+    "usr/lib/sysusers.d/chrony.conf",
     "etc/waagent.conf",
     ".autorelabel",
 };
@@ -1537,6 +1539,28 @@ fn configValueEquals(content: []const u8, key: []const u8, expected: []const u8)
         }
     }
     return false;
+}
+
+fn sysusersDefinesHome(content: []const u8, user: []const u8, home: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0 or std.mem.startsWith(u8, trimmed, "#")) continue;
+        var fields = std.mem.tokenizeAny(u8, trimmed, " \t");
+        if (!std.mem.eql(u8, fields.next() orelse continue, "u")) continue;
+        if (!std.mem.eql(u8, fields.next() orelse continue, user)) continue;
+        while (fields.next()) |field| {
+            if (std.mem.eql(u8, field, home)) return true;
+        }
+    }
+    return false;
+}
+
+fn chronyStateContractMatches(service: []const u8, sysusers: []const u8) bool {
+    return configValueEquals(service, "User", "chrony") and
+        configValueEquals(service, "StateDirectory", "chrony") and
+        configValueEquals(service, "StateDirectoryMode", "0750") and
+        sysusersDefinesHome(sysusers, "chrony", "/var/lib/chrony");
 }
 
 fn setRootConfigValue(
@@ -3065,8 +3089,21 @@ fn validateFinalizedImageRootfs(
     if (flavor.flavor == .full) {
         const autorelabel = try rootfs.statPath(io, ".autorelabel");
         if (autorelabel.kind != .file) return error.MissingAutorelabel;
-        const chrony_state = try rootfs.statPath(io, "var/lib/chrony");
-        if (chrony_state.uid == 0 or chrony_state.gid == 0) return error.LostPackageOwnership;
+        const chrony_service = try rootfs.readFileAlloc(
+            io,
+            gpa,
+            "usr/lib/systemd/system/chronyd.service",
+        );
+        defer gpa.free(chrony_service);
+        const chrony_sysusers = try rootfs.readFileAlloc(
+            io,
+            gpa,
+            "usr/lib/sysusers.d/chrony.conf",
+        );
+        defer gpa.free(chrony_sysusers);
+        if (!chronyStateContractMatches(chrony_service, chrony_sysusers)) {
+            return error.InvalidChronyStateContract;
+        }
         const waagent_metadata = try rootfs.statPath(io, "var/lib/waagent");
         if (!waagentStateContractMatches(waagent_metadata.uid, waagent_metadata.gid, waagent_metadata.mode)) {
             return error.InvalidWALinuxAgentStateMetadata;
@@ -4196,6 +4233,8 @@ test "flavor contracts keep full systemd-only and core zvminit-only" {
     try std.testing.expect(argvContains(full.required_rootfs_paths, "usr/bin/sshd"));
     try std.testing.expect(argvContains(full.required_rootfs_paths, "usr/bin/waagent"));
     try std.testing.expect(argvContains(full.required_rootfs_paths, "usr/bin/rpm"));
+    try std.testing.expect(argvContains(full.required_rootfs_paths, "usr/lib/systemd/system/chronyd.service"));
+    try std.testing.expect(argvContains(full.required_rootfs_paths, "usr/lib/sysusers.d/chrony.conf"));
     try std.testing.expect(argvContains(full.required_rootfs_paths, ".autorelabel"));
     try std.testing.expect(!argvContains(full.required_rootfs_paths, "usr/sbin/waagent"));
     try std.testing.expect(!argvContains(&full_required_systemd_units, "cloud-init.service"));
@@ -4223,6 +4262,28 @@ test "full key URI and package-state contracts are canonical" {
     try std.testing.expect(waagentStateContractMatches(0, 0, 0o700));
     try std.testing.expect(!waagentStateContractMatches(1, 0, 0o700));
     try std.testing.expect(!waagentStateContractMatches(0, 0, 0o755));
+}
+
+test "chrony state is created at boot with the package user" {
+    const service =
+        \\[Service]
+        \\User=chrony
+        \\StateDirectory=chrony
+        \\StateDirectoryMode=0750
+    ;
+    const sysusers =
+        \\#Type Name ID GECOS Home Shell
+        \\u chrony - "chrony system user" /var/lib/chrony /sbin/nologin
+    ;
+    try std.testing.expect(chronyStateContractMatches(service, sysusers));
+    try std.testing.expect(!chronyStateContractMatches(
+        "User=root\nStateDirectory=chrony\nStateDirectoryMode=0750\n",
+        sysusers,
+    ));
+    try std.testing.expect(!chronyStateContractMatches(
+        service,
+        "u chrony - \"chrony system user\" /run/chrony /sbin/nologin\n",
+    ));
 }
 
 test "full OCI provenance records profile repomd and NEVRA closure" {
