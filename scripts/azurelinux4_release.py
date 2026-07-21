@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import struct
 from pathlib import Path
 
 
@@ -50,6 +51,7 @@ AZURE_CONTRACTS = {
 }
 AZURE_VHD_ALIGNMENT = 1024 * 1024
 VHD_FOOTER_BYTES = 512
+VHD_MAX_CHS_SECTORS = 65535 * 16 * 255
 PRIVATE_KEY_PEM_MARKERS = (
     b"-----BEGIN PRIVATE KEY-----",
     b"-----BEGIN ENCRYPTED PRIVATE KEY-----",
@@ -139,14 +141,84 @@ def gallery_uefi_settings(document: dict[str, object]) -> object:
     return security_profile.get("uefiSettings")
 
 
-def validate_azure_vhd_info(info: dict[str, object], file_size: int) -> int:
+def validate_azure_vhd_info(
+    info: dict[str, object], file_size: int, footer: bytes
+) -> int:
     if info.get("format") != "vpc":
         fail("derived upload image is not VHD/VPC")
-    virtual_size = info.get("virtual-size")
-    if type(virtual_size) is not int or virtual_size <= 0:
-        fail("derived upload VHD virtual size is invalid")
-    if virtual_size % AZURE_VHD_ALIGNMENT != 0:
+    reported_size = info.get("virtual-size")
+    if type(reported_size) is not int or reported_size <= 0:
+        fail("derived upload VHD reported virtual size is invalid")
+    if len(footer) != VHD_FOOTER_BYTES or footer[:8] != b"conectix":
+        fail("derived upload VHD footer is invalid")
+
+    stored_checksum = struct.unpack_from(">I", footer, 64)[0]
+    checked = bytearray(footer)
+    checked[64:68] = b"\0" * 4
+    expected_checksum = (~sum(checked)) & 0xFFFFFFFF
+    if stored_checksum != expected_checksum:
+        fail("derived upload VHD footer checksum is invalid")
+
+    features, version = struct.unpack_from(">II", footer, 8)
+    data_offset = struct.unpack_from(">Q", footer, 16)[0]
+    creator_version = struct.unpack_from(">I", footer, 32)[0]
+    original_size, virtual_size = struct.unpack_from(">QQ", footer, 40)
+    cylinders, heads, sectors_per_track = struct.unpack_from(">HBB", footer, 56)
+    disk_type = struct.unpack_from(">I", footer, 60)[0]
+    if features != 2 or version != 0x00010000:
+        fail("derived upload VHD footer version is invalid")
+    if (
+        footer[28:32] != b"zvmi"
+        or creator_version != 0x00010000
+        or footer[36:40] != b"\0" * 4
+    ):
+        fail("derived upload VHD creator identity is invalid")
+    if data_offset != 0xFFFFFFFFFFFFFFFF or disk_type != 2:
+        fail("derived upload VHD is not fixed")
+    if original_size != virtual_size:
+        fail("derived upload VHD original and current sizes differ")
+    if footer[84] != 0 or any(footer[85:]):
+        fail("derived upload VHD footer state or reserved bytes are invalid")
+    if virtual_size <= 0 or virtual_size % AZURE_VHD_ALIGNMENT != 0:
         fail("derived upload VHD virtual size is not 1 MiB aligned")
+
+    total_sectors = min(virtual_size // 512, VHD_MAX_CHS_SECTORS)
+    if total_sectors >= 65535 * 16 * 63:
+        expected_sectors_per_track = 255
+        expected_heads = 16
+        cylinders_times_heads = total_sectors // expected_sectors_per_track
+    else:
+        expected_sectors_per_track = 17
+        cylinders_times_heads = total_sectors // expected_sectors_per_track
+        expected_heads = (cylinders_times_heads + 1023) // 1024
+        expected_heads = max(expected_heads, 4)
+        if (
+            cylinders_times_heads >= expected_heads * 1024
+            or expected_heads > 16
+        ):
+            expected_sectors_per_track = 31
+            expected_heads = 16
+            cylinders_times_heads = total_sectors // expected_sectors_per_track
+        if cylinders_times_heads >= expected_heads * 1024:
+            expected_sectors_per_track = 63
+            expected_heads = 16
+            cylinders_times_heads = total_sectors // expected_sectors_per_track
+    expected_cylinders = cylinders_times_heads // expected_heads
+    expected_geometry = (
+        expected_cylinders,
+        expected_heads,
+        expected_sectors_per_track,
+    )
+    if (cylinders, heads, sectors_per_track) != expected_geometry:
+        fail("derived upload VHD CHS geometry is invalid")
+    geometry_sectors = cylinders * heads * sectors_per_track
+    expected_reported_size = (
+        virtual_size
+        if geometry_sectors == VHD_MAX_CHS_SECTORS
+        else geometry_sectors * 512
+    )
+    if reported_size != expected_reported_size:
+        fail("derived upload VHD reported virtual size is inconsistent")
     if file_size != virtual_size + VHD_FOOTER_BYTES:
         fail("derived upload VHD file size does not equal virtual size plus footer")
     return virtual_size
@@ -551,7 +623,13 @@ def verify_vhd_command(args: argparse.Namespace) -> None:
     if not vhd.is_file():
         fail(f"derived VHD is missing: {vhd}")
     file_size = vhd.stat().st_size
-    virtual_size = validate_azure_vhd_info(read_json(args.info), file_size)
+    try:
+        with vhd.open("rb") as stream:
+            stream.seek(-VHD_FOOTER_BYTES, os.SEEK_END)
+            footer = stream.read(VHD_FOOTER_BYTES)
+    except OSError as error:
+        fail(f"cannot read derived VHD footer: {error}")
+    virtual_size = validate_azure_vhd_info(read_json(args.info), file_size, footer)
     print(virtual_size)
     print(file_size)
 
