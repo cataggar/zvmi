@@ -336,7 +336,6 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         info = {
             "format": "vpc",
             "virtual-size": virtual_size,
-            "format-specific": {"data": {"type": "fixed"}},
         }
         file_size = virtual_size + release.VHD_FOOTER_BYTES
         self.assertNotEqual(file_size % release.AZURE_VHD_ALIGNMENT, 0)
@@ -349,7 +348,6 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         info = {
             "format": "vpc",
             "virtual-size": virtual_size,
-            "format-specific": {"data": {"type": "fixed"}},
         }
         with self.assertRaises(SystemExit):
             release.validate_azure_vhd_info(
@@ -361,10 +359,20 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         info = {
             "format": "vpc",
             "virtual-size": virtual_size,
-            "format-specific": {"data": {"type": "fixed"}},
         }
         with self.assertRaises(SystemExit):
             release.validate_azure_vhd_info(info, virtual_size)
+
+    def test_fixed_vhd_rejects_non_vpc_format(self):
+        virtual_size = 2 * release.AZURE_VHD_ALIGNMENT
+        info = {
+            "format": "raw",
+            "virtual-size": virtual_size,
+        }
+        with self.assertRaises(SystemExit):
+            release.validate_azure_vhd_info(
+                info, virtual_size + release.VHD_FOOTER_BYTES
+            )
 
     def test_release_artifacts_use_visible_attempt_bound_staging(self):
         workflow = (ROOT / ".github/workflows/azurelinux4-release.yml").read_text()

@@ -142,12 +142,6 @@ def gallery_uefi_settings(document: dict[str, object]) -> object:
 def validate_azure_vhd_info(info: dict[str, object], file_size: int) -> int:
     if info.get("format") != "vpc":
         fail("derived upload image is not VHD/VPC")
-    data = (info.get("format-specific") or {})
-    if not isinstance(data, dict):
-        fail("derived upload VHD format metadata is invalid")
-    format_data = data.get("data") or {}
-    if not isinstance(format_data, dict) or format_data.get("type") != "fixed":
-        fail("derived upload VHD is not fixed")
     virtual_size = info.get("virtual-size")
     if type(virtual_size) is not int or virtual_size <= 0:
         fail("derived upload VHD virtual size is invalid")
