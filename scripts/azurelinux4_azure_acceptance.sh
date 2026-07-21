@@ -198,7 +198,7 @@ if ! az group create \
     "zvmi-run-id=$GITHUB_RUN_ID" \
     "zvmi-run-attempt=$GITHUB_RUN_ATTEMPT" \
     "zvmi-candidate=$CANDIDATE_KEY" \
-  --output none
+  --output json >/dev/null
 then
   echo "::error::Failed to create the persisted temporary resource group"
   exit 1
@@ -280,7 +280,8 @@ az disk create \
   --upload-size-bytes "$vhd_bytes" \
   --os-type Linux \
   --hyper-v-generation V2 \
-  --architecture "$azure_image_architecture"
+  --architecture "$azure_image_architecture" \
+  --output json >/dev/null
 upload_sas=$(az disk grant-access \
   --resource-group "$resource_group" \
   --name "$disk_name" \
@@ -291,14 +292,18 @@ upload_sas=$(az disk grant-access \
 [[ "$upload_sas" == https://* ]]
 echo "::add-mask::$upload_sas"
 azcopy copy "$vhd" "$upload_sas" --blob-type PageBlob
-az disk revoke-access --resource-group "$resource_group" --name "$disk_name"
+az disk revoke-access \
+  --resource-group "$resource_group" \
+  --name "$disk_name" \
+  --output json >/dev/null
 upload_sas=
 
 expanded_size_gib=$(((virtual_size + 1073741823) / 1073741824 + 2))
 az disk update \
   --resource-group "$resource_group" \
   --name "$disk_name" \
-  --size-gb "$expanded_size_gib"
+  --size-gb "$expanded_size_gib" \
+  --output json >/dev/null
 disk_id=$(az disk show \
   --resource-group "$resource_group" \
   --name "$disk_name" \
@@ -309,7 +314,8 @@ disk_id=$(az disk show \
 az sig create \
   --resource-group "$resource_group" \
   --gallery-name "$gallery_name" \
-  --location "$AZURE_LOCATION"
+  --location "$AZURE_LOCATION" \
+  --output json >/dev/null
 az sig image-definition create \
   --resource-group "$resource_group" \
   --gallery-name "$gallery_name" \
@@ -322,7 +328,8 @@ az sig image-definition create \
   --hyper-v-generation V2 \
   --architecture "$azure_image_architecture" \
   --features SecurityType=TrustedLaunchSupported \
-  --location "$AZURE_LOCATION"
+  --location "$AZURE_LOCATION" \
+  --output json >/dev/null
 image_definition_id=$(az sig image-definition show \
   --resource-group "$resource_group" \
   --gallery-name "$gallery_name" \
@@ -429,7 +436,8 @@ az vm create \
   --enable-vtpm true \
   --public-ip-sku Standard \
   --nsg-rule SSH \
-  --boot-diagnostics-storage ""
+  --boot-diagnostics-storage "" \
+  --output json >/dev/null
 az vm show \
   --resource-group "$resource_group" \
   --name "$vm_name" \
@@ -670,12 +678,14 @@ az disk create \
   --name "$data_disk_name" \
   --location "$AZURE_LOCATION" \
   --size-gb 4 \
-  --sku Standard_LRS
+  --sku Standard_LRS \
+  --output json >/dev/null
 az vm disk attach \
   --resource-group "$resource_group" \
   --vm-name "$vm_name" \
   --name "$data_disk_name" \
-  --lun 0
+  --lun 0 \
+  --output json >/dev/null
 boot_id=$(ssh "${ssh_options[@]}" "$ssh_target" 'cat /proc/sys/kernel/random/boot_id')
 reboot_and_reconnect "$boot_id"
 

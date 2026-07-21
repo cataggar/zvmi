@@ -541,6 +541,11 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         self.assertEqual(acceptance.count("clientSecret"), 2)
         self.assertIn("AZURE_CLIENT_SECRET_VALUE", acceptance)
         self.assertNotIn("protected-environment OIDC", acceptance)
+        self.assertNotIn("AZURE_CORE_OUTPUT", acceptance)
+
+        script = (ROOT / "scripts/azurelinux4_azure_acceptance.sh").read_text()
+        self.assertIn("--query accessSas \\\n  --output tsv", script)
+        self.assertGreaterEqual(script.count("--output json >/dev/null"), 9)
 
     def test_azure_acceptance_uses_current_harness_with_accepted_source_tool(self):
         workflow = (ROOT / ".github/workflows/azurelinux4-release.yml").read_text()

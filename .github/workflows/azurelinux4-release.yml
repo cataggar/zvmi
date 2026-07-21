@@ -429,7 +429,6 @@ jobs:
             location_variable: AZURE_LOCATION_ARM64
             size_variable: AZURE_VM_SIZE_ARM64
     env:
-      AZURE_CORE_OUTPUT: none
       CANDIDATE_KEY: ${{ matrix.key }}
       ARCHITECTURE: ${{ matrix.architecture }}
       FLAVOR: ${{ matrix.flavor }}
