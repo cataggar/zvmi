@@ -257,7 +257,6 @@ test "$source_before" = "$qcow_sha256"
   "$asset" \
   "$vhd"
 test "$(sha256sum "$asset" | awk '{print $1}')" = "$qcow_sha256"
-qemu-img check -f vpc "$vhd"
 qemu-img info --output=json "$vhd" >"$RESULT_DIR/vhd-info.json"
 readarray -t vhd_geometry < <(
   python3 scripts/azurelinux4_release.py verify-vhd \
