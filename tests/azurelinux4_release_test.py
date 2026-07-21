@@ -549,6 +549,10 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         self.assertIn('tolower($1) == "location"', script)
         self.assertIn('response.get("accessSAS")', script)
         self.assertGreaterEqual(script.count("--output json >/dev/null"), 9)
+        self.assertIn("gallery-version-create-response.json", script)
+        self.assertIn("Azure did not accept the exact custom UEFI settings", script)
+        self.assertIn("if actual is not None and actual != expected:", script)
+        self.assertIn("boot validation remains authoritative", script)
 
     def test_azure_acceptance_uses_current_harness_with_accepted_source_tool(self):
         workflow = (ROOT / ".github/workflows/azurelinux4-release.yml").read_text()
