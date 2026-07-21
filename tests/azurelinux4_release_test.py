@@ -456,6 +456,12 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         self.assertIn('if [[ "$has_resource_disk" == true ]]; then', script)
         self.assertIn("! mountpoint -q /d", script)
 
+    def test_fixed_vhd_uses_supported_structural_validation(self):
+        script = (ROOT / "scripts/azurelinux4_azure_acceptance.sh").read_text()
+        self.assertNotIn("qemu-img check -f vpc", script)
+        self.assertIn('qemu-img info --output=json "$vhd"', script)
+        self.assertIn("azurelinux4_release.py verify-vhd", script)
+
     def test_ci_actions_are_pinned_to_audited_commits(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         actions = re.findall(
