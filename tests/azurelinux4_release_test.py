@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import types
 import unittest
@@ -17,6 +18,50 @@ TEST_CERTIFICATE_DER = b"zvmi test certificate DER"
 TEST_CERTIFICATE_SHA256 = hashlib.sha256(TEST_CERTIFICATE_DER).hexdigest()
 TEST_SIGNING_CERTIFICATE_SHA256 = "4" * 64
 TEST_SIGNING_OPERATION_ID = "00000000-0000-4000-8000-000000000001"
+
+
+def fixed_vhd_geometry(virtual_size: int) -> tuple[int, int, int]:
+    total_sectors = min(virtual_size // 512, release.VHD_MAX_CHS_SECTORS)
+    if total_sectors >= 65535 * 16 * 63:
+        sectors_per_track = 255
+        heads = 16
+        cylinders_times_heads = total_sectors // sectors_per_track
+    else:
+        sectors_per_track = 17
+        cylinders_times_heads = total_sectors // sectors_per_track
+        heads = max((cylinders_times_heads + 1023) // 1024, 4)
+        if cylinders_times_heads >= heads * 1024 or heads > 16:
+            sectors_per_track = 31
+            heads = 16
+            cylinders_times_heads = total_sectors // sectors_per_track
+        if cylinders_times_heads >= heads * 1024:
+            sectors_per_track = 63
+            heads = 16
+            cylinders_times_heads = total_sectors // sectors_per_track
+    return cylinders_times_heads // heads, heads, sectors_per_track
+
+
+def qemu_reported_vhd_size(virtual_size: int) -> int:
+    cylinders, heads, sectors_per_track = fixed_vhd_geometry(virtual_size)
+    geometry_sectors = cylinders * heads * sectors_per_track
+    if geometry_sectors == release.VHD_MAX_CHS_SECTORS:
+        return virtual_size
+    return geometry_sectors * 512
+
+
+def fixed_vhd_footer(virtual_size: int, disk_type: int = 2) -> bytes:
+    footer = bytearray(release.VHD_FOOTER_BYTES)
+    footer[:8] = b"conectix"
+    struct.pack_into(">II", footer, 8, 2, 0x00010000)
+    struct.pack_into(">Q", footer, 16, 0xFFFFFFFFFFFFFFFF)
+    footer[28:32] = b"zvmi"
+    struct.pack_into(">I", footer, 32, 0x00010000)
+    struct.pack_into(">QQ", footer, 40, virtual_size, virtual_size)
+    struct.pack_into(">HBB", footer, 56, *fixed_vhd_geometry(virtual_size))
+    struct.pack_into(">I", footer, 60, disk_type)
+    checksum = (~sum(footer)) & 0xFFFFFFFF
+    struct.pack_into(">I", footer, 64, checksum)
+    return bytes(footer)
 
 
 class AzureLinuxReleaseTest(unittest.TestCase):
@@ -335,43 +380,98 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         virtual_size = 2 * release.AZURE_VHD_ALIGNMENT
         info = {
             "format": "vpc",
-            "virtual-size": virtual_size,
+            "virtual-size": qemu_reported_vhd_size(virtual_size),
         }
         file_size = virtual_size + release.VHD_FOOTER_BYTES
         self.assertNotEqual(file_size % release.AZURE_VHD_ALIGNMENT, 0)
         self.assertEqual(
-            release.validate_azure_vhd_info(info, file_size), virtual_size
+            release.validate_azure_vhd_info(
+                info, file_size, fixed_vhd_footer(virtual_size)
+            ),
+            virtual_size,
         )
 
     def test_fixed_vhd_rejects_unaligned_virtual_size(self):
         virtual_size = 2 * release.AZURE_VHD_ALIGNMENT + 512
         info = {
             "format": "vpc",
-            "virtual-size": virtual_size,
+            "virtual-size": qemu_reported_vhd_size(virtual_size),
         }
         with self.assertRaises(SystemExit):
             release.validate_azure_vhd_info(
-                info, virtual_size + release.VHD_FOOTER_BYTES
+                info,
+                virtual_size + release.VHD_FOOTER_BYTES,
+                fixed_vhd_footer(virtual_size),
             )
 
     def test_fixed_vhd_requires_exact_footer_relationship(self):
         virtual_size = 2 * release.AZURE_VHD_ALIGNMENT
         info = {
             "format": "vpc",
-            "virtual-size": virtual_size,
+            "virtual-size": qemu_reported_vhd_size(virtual_size),
         }
         with self.assertRaises(SystemExit):
-            release.validate_azure_vhd_info(info, virtual_size)
+            release.validate_azure_vhd_info(
+                info, virtual_size, fixed_vhd_footer(virtual_size)
+            )
 
     def test_fixed_vhd_rejects_non_vpc_format(self):
         virtual_size = 2 * release.AZURE_VHD_ALIGNMENT
         info = {
             "format": "raw",
-            "virtual-size": virtual_size,
+            "virtual-size": qemu_reported_vhd_size(virtual_size),
         }
         with self.assertRaises(SystemExit):
             release.validate_azure_vhd_info(
-                info, virtual_size + release.VHD_FOOTER_BYTES
+                info,
+                virtual_size + release.VHD_FOOTER_BYTES,
+                fixed_vhd_footer(virtual_size),
+            )
+
+    def test_fixed_vhd_rejects_dynamic_footer(self):
+        virtual_size = 2 * release.AZURE_VHD_ALIGNMENT
+        info = {
+            "format": "vpc",
+            "virtual-size": qemu_reported_vhd_size(virtual_size),
+        }
+        with self.assertRaises(SystemExit):
+            release.validate_azure_vhd_info(
+                info,
+                virtual_size + release.VHD_FOOTER_BYTES,
+                fixed_vhd_footer(virtual_size, disk_type=3),
+            )
+
+    def test_fixed_vhd_rejects_corrupt_footer_checksum(self):
+        virtual_size = 2 * release.AZURE_VHD_ALIGNMENT
+        info = {
+            "format": "vpc",
+            "virtual-size": qemu_reported_vhd_size(virtual_size),
+        }
+        footer = bytearray(fixed_vhd_footer(virtual_size))
+        footer[100] ^= 0xFF
+        with self.assertRaises(SystemExit):
+            release.validate_azure_vhd_info(
+                info,
+                virtual_size + release.VHD_FOOTER_BYTES,
+                bytes(footer),
+            )
+
+    def test_fixed_vhd_rejects_inconsistent_chs_geometry(self):
+        virtual_size = 2 * release.AZURE_VHD_ALIGNMENT
+        info = {
+            "format": "vpc",
+            "virtual-size": qemu_reported_vhd_size(virtual_size),
+        }
+        footer = bytearray(fixed_vhd_footer(virtual_size))
+        cylinders = struct.unpack_from(">H", footer, 56)[0]
+        struct.pack_into(">H", footer, 56, cylinders - 1)
+        footer[64:68] = b"\0" * 4
+        struct.pack_into(">I", footer, 64, (~sum(footer)) & 0xFFFFFFFF)
+        with self.assertRaises(SystemExit):
+            release.validate_azure_vhd_info(
+                info,
+                virtual_size + release.VHD_FOOTER_BYTES,
+                bytes(footer),
             )
 
     def test_release_artifacts_use_visible_attempt_bound_staging(self):
