@@ -271,6 +271,7 @@ boot_log="$RESULT_DIR/boot.log"
 sku_json="$RESULT_DIR/sku.json"
 certificate_der="$RESULT_DIR/signing-certificate.der"
 uefi_request="$RESULT_DIR/gallery-version-request.json"
+uefi_create_response="$RESULT_DIR/gallery-version-create-response.json"
 uefi_response="$RESULT_DIR/gallery-version-response.json"
 vm_security_json="$RESULT_DIR/vm-security.json"
 instance_security_json="$RESULT_DIR/instance-security.json"
@@ -499,6 +500,18 @@ az rest \
   --uri "https://management.azure.com${image_version_id}?api-version=2025-03-03" \
   --body "@$uefi_request" \
   --output json >"$uefi_response"
+cp "$uefi_response" "$uefi_create_response"
+python3 - "$uefi_request" "$uefi_create_response" <<'PY'
+import json
+import sys
+
+request = json.load(open(sys.argv[1], encoding="utf-8"))
+response = json.load(open(sys.argv[2], encoding="utf-8"))
+expected = request["properties"]["securityProfile"]["uefiSettings"]
+actual = response.get("properties", {}).get("securityProfile", {}).get("uefiSettings")
+if actual != expected:
+    raise SystemExit("Azure did not accept the exact custom UEFI settings")
+PY
 for _ in {1..120}; do
   provisioning_state=$(python3 - "$uefi_response" <<'PY'
 import json
@@ -530,8 +543,10 @@ if response.get("id", "").lower() != sys.argv[3].lower():
     raise SystemExit("Azure returned a different gallery image-version identity")
 expected = request["properties"]["securityProfile"]["uefiSettings"]
 actual = response.get("properties", {}).get("securityProfile", {}).get("uefiSettings")
-if actual != expected:
-    raise SystemExit("Azure did not preserve the exact custom UEFI settings")
+if actual is not None and actual != expected:
+    raise SystemExit("Azure returned different custom UEFI settings after provisioning")
+if actual is None:
+    print("Azure omitted custom UEFI settings from the final GET; boot validation remains authoritative")
 state = response.get("properties", {}).get("provisioningState")
 if state != "Succeeded":
     raise SystemExit(f"gallery image-version provisioning did not succeed: {state!r}")
