@@ -88,12 +88,137 @@ fi
 [[ "$AZURE_VM_SIZE" =~ ^Standard_[A-Za-z0-9_]+$ ]]
 [[ -x "$ZVMI" ]]
 
-for tool in az azcopy python3 qemu-img sha256sum ssh ssh-keygen; do
+for tool in az azcopy curl python3 qemu-img sha256sum ssh ssh-keygen; do
   command -v "$tool" >/dev/null || {
     echo "::error::Required Azure acceptance tool $tool is unavailable"
     exit 1
   }
 done
+
+grant_disk_write_access() {
+  local disk_id=$1
+  local duration_seconds=$2
+  local attempt auth_header headers location request_dir response_body retry_after sas status token
+  request_dir=$(mktemp -d "$RESULT_DIR/disk-access.XXXXXX")
+  auth_header="$request_dir/auth-header"
+  headers="$request_dir/headers"
+  response_body="$request_dir/body"
+  if ! token=$(az account get-access-token \
+      --resource https://management.azure.com/ \
+      --query accessToken \
+      --output tsv)
+  then
+    echo "::error::Could not acquire an Azure management token" >&2
+    rm -rf "$request_dir"
+    return 1
+  fi
+  if [[ -z "$token" ]]; then
+    echo "::error::Azure returned an empty management token" >&2
+    rm -rf "$request_dir"
+    return 1
+  fi
+  (umask 077; printf 'Authorization: Bearer %s\n' "$token" >"$auth_header")
+  token=
+
+  if ! status=$(curl \
+      --silent \
+      --show-error \
+      --connect-timeout 30 \
+      --max-time 60 \
+      --retry 3 \
+      --retry-max-time 120 \
+      --dump-header "$headers" \
+      --output "$response_body" \
+      --write-out '%{http_code}' \
+      --request POST \
+      --header "@$auth_header" \
+      --header 'Content-Type: application/json' \
+      --data "{\"access\":\"Write\",\"durationInSeconds\":$duration_seconds}" \
+      "https://management.azure.com${disk_id}/beginGetAccess?api-version=2025-01-02")
+  then
+    echo "::error::Azure disk access request failed" >&2
+    rm -rf "$request_dir"
+    return 1
+  fi
+  if [[ "$status" == 202 ]]; then
+    location=$(
+      awk -F: '
+        tolower($1) == "location" {
+          sub(/^[^:]*:[[:space:]]*/, "")
+          sub(/\r$/, "")
+          print
+          exit
+        }
+      ' "$headers"
+    )
+    if [[ "$location" != https://* ]]; then
+      echo "::error::Azure disk access response omitted the polling location" >&2
+      rm -rf "$request_dir"
+      return 1
+    fi
+    for ((attempt = 1; attempt <= 60; attempt++)); do
+      retry_after=$(
+        awk -F: '
+          tolower($1) == "retry-after" {
+            sub(/^[^:]*:[[:space:]]*/, "")
+            sub(/\r$/, "")
+            print
+            exit
+          }
+        ' "$headers"
+      )
+      if [[ ! "$retry_after" =~ ^[0-9]+$ || "$retry_after" -lt 1 ]]; then
+        retry_after=2
+      elif [[ "$retry_after" -gt 30 ]]; then
+        retry_after=30
+      fi
+      sleep "$retry_after"
+      if ! status=$(curl \
+          --silent \
+          --show-error \
+          --connect-timeout 30 \
+          --max-time 60 \
+          --retry 3 \
+          --retry-max-time 120 \
+          --dump-header "$headers" \
+          --output "$response_body" \
+          --write-out '%{http_code}' \
+          --header "@$auth_header" \
+          "$location")
+      then
+        echo "::error::Azure disk access polling request failed" >&2
+        rm -rf "$request_dir"
+        return 1
+      fi
+      [[ "$status" == 202 ]] || break
+    done
+  fi
+  if [[ "$status" != 200 ]]; then
+    echo "::error::Azure disk access polling ended with HTTP $status" >&2
+    rm -rf "$request_dir"
+    return 1
+  fi
+  if ! sas=$(
+      python3 - "$response_body" <<'PY'
+import json
+import sys
+
+response = json.load(open(sys.argv[1], encoding="utf-8"))
+print(response.get("accessSAS") or response.get("accessSas") or "")
+PY
+    )
+  then
+    echo "::error::Azure disk access response was not valid JSON" >&2
+    rm -rf "$request_dir"
+    return 1
+  fi
+  rm -rf "$request_dir"
+  if [[ "$sas" != https://* ]]; then
+    echo "::error::Azure disk access response omitted the SAS URL" >&2
+    return 1
+  fi
+  printf '%s\n' "$sas"
+}
 
 mkdir -p "$RESULT_DIR"
 manifest="$CANDIDATE_DIR/candidate.json"
@@ -282,13 +407,13 @@ az disk create \
   --hyper-v-generation V2 \
   --architecture "$azure_image_architecture" \
   --output json >/dev/null
-upload_sas=$(az disk grant-access \
+disk_id=$(az disk show \
   --resource-group "$resource_group" \
   --name "$disk_name" \
-  --access-level Write \
-  --duration-in-seconds 7200 \
-  --query accessSas \
+  --query id \
   --output tsv)
+[[ "$disk_id" == /subscriptions/* ]]
+upload_sas=$(grant_disk_write_access "$disk_id" 7200)
 [[ "$upload_sas" == https://* ]]
 echo "::add-mask::$upload_sas"
 azcopy copy "$vhd" "$upload_sas" --blob-type PageBlob
@@ -304,12 +429,6 @@ az disk update \
   --name "$disk_name" \
   --size-gb "$expanded_size_gib" \
   --output json >/dev/null
-disk_id=$(az disk show \
-  --resource-group "$resource_group" \
-  --name "$disk_name" \
-  --query id \
-  --output tsv)
-[[ "$disk_id" == /subscriptions/* ]]
 
 az sig create \
   --resource-group "$resource_group" \
