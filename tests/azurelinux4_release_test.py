@@ -544,7 +544,10 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         self.assertNotIn("AZURE_CORE_OUTPUT", acceptance)
 
         script = (ROOT / "scripts/azurelinux4_azure_acceptance.sh").read_text()
-        self.assertIn("--query accessSas \\\n  --output tsv", script)
+        self.assertNotIn("az disk grant-access", script)
+        self.assertIn("/beginGetAccess?api-version=2025-01-02", script)
+        self.assertIn('tolower($1) == "location"', script)
+        self.assertIn('response.get("accessSAS")', script)
         self.assertGreaterEqual(script.count("--output json >/dev/null"), 9)
 
     def test_azure_acceptance_uses_current_harness_with_accepted_source_tool(self):
