@@ -388,7 +388,51 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         self.assertEqual(len(artifact_references), 5)
         for reference in artifact_references:
             self.assertIn("${{ needs.prepare.outputs.source_commit }}", reference)
+        candidate_references = [
+            reference
+            for reference in artifact_references
+            if "azurelinux4-candidate-" in reference
+        ]
+        self.assertEqual(len(candidate_references), 3)
+        for reference in candidate_references:
+            if "${{ matrix.key }}" not in reference:
+                self.assertIn(
+                    "${{ needs.prepare.outputs.candidate_run_attempt }}",
+                    reference,
+                )
+        azure_references = [
+            reference
+            for reference in artifact_references
+            if "azurelinux4-azure-" in reference
+        ]
+        self.assertEqual(len(azure_references), 2)
+        for reference in azure_references:
             self.assertIn("${{ github.run_attempt }}", reference)
+
+    def test_release_reuse_is_bound_to_completed_candidates(self):
+        workflow = (ROOT / ".github/workflows/azurelinux4-release.yml").read_text()
+        self.assertIn("candidate_run_id:", workflow)
+        self.assertIn('test "$(jq -r .status <<<"$run")" = completed', workflow)
+        self.assertIn('.conclusion == "success"', workflow)
+        self.assertIn(".expired == false", workflow)
+        self.assertIn(
+            'test "$(git ls-remote origin "refs/tags/$RELEASE_TAG"',
+            workflow,
+        )
+        self.assertEqual(
+            workflow.count("run-id: ${{ needs.prepare.outputs.candidate_run_id }}"),
+            2,
+        )
+
+    def test_azure_acceptance_uses_protected_short_lived_credential(self):
+        workflow = (ROOT / ".github/workflows/azurelinux4-release.yml").read_text()
+        acceptance = workflow.split("  azure_acceptance:", 1)[1].split(
+            "\n  publish:", 1
+        )[0]
+        self.assertNotIn("id-token: write", acceptance)
+        self.assertEqual(acceptance.count("clientSecret"), 2)
+        self.assertIn("AZURE_CLIENT_SECRET_VALUE", acceptance)
+        self.assertNotIn("protected-environment OIDC", acceptance)
 
     def test_ci_actions_are_pinned_to_audited_commits(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()

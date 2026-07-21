@@ -2,8 +2,14 @@ name: Build, validate, and publish Azure Linux 4 images
 
 on:
   workflow_dispatch:
+    inputs:
+      candidate_run_id:
+        description: Completed release run whose successful candidates should be reused
+        required: false
+        type: string
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -22,6 +28,9 @@ jobs:
     timeout-minutes: 10
     outputs:
       source_commit: ${{ steps.source.outputs.commit }}
+      candidate_run_id: ${{ steps.source.outputs.candidate_run_id }}
+      candidate_run_attempt: ${{ steps.source.outputs.candidate_run_attempt }}
+      reuse_candidates: ${{ steps.source.outputs.reuse_candidates }}
     steps:
       - name: Check out merged main
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -32,17 +41,73 @@ jobs:
 
       - name: Bind release to source commit
         id: source
+        env:
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          commit=$(git rev-parse HEAD)
-          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
-          test "$(git rev-parse origin/main)" = "$commit"
+          if [[ -z "$CANDIDATE_RUN_ID" ]]; then
+            commit=$(git rev-parse HEAD)
+            [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+            test "$(git rev-parse origin/main)" = "$commit"
+            candidate_run_id=$GITHUB_RUN_ID
+            candidate_run_attempt=$GITHUB_RUN_ATTEMPT
+            reuse_candidates=false
+          else
+            [[ "$CANDIDATE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+            test "$CANDIDATE_RUN_ID" != "$GITHUB_RUN_ID"
+
+            run=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID")
+            test "$(jq -r .repository.full_name <<<"$run")" = "$GITHUB_REPOSITORY"
+            test "$(jq -r .path <<<"$run")" = ".github/workflows/azurelinux4-release.yml"
+            test "$(jq -r .event <<<"$run")" = workflow_dispatch
+            test "$(jq -r .head_branch <<<"$run")" = main
+            test "$(jq -r .status <<<"$run")" = completed
+            commit=$(jq -r .head_sha <<<"$run")
+            candidate_run_attempt=$(jq -r .run_attempt <<<"$run")
+            [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+            [[ "$candidate_run_attempt" =~ ^[1-9][0-9]*$ ]]
+
+            jobs=$(
+              gh api --paginate \
+                "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID/jobs?per_page=100" |
+                jq -s '[.[].jobs[]]'
+            )
+            artifacts=$(
+              gh api --paginate \
+                "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID/artifacts?per_page=100" |
+                jq -s '[.[].artifacts[]]'
+            )
+            for key in x86_64-full aarch64-full x86_64-core aarch64-core; do
+              test "$(
+                jq --arg name "build/hosted $key" \
+                  '[.[] | select(.name == $name and .conclusion == "success")] | length' \
+                  <<<"$jobs"
+              )" = 1
+              artifact="azurelinux4-candidate-$key-$commit-$candidate_run_attempt"
+              test "$(
+                jq --arg name "$artifact" \
+                  '[.[] | select(.name == $name and .expired == false)] | length' \
+                  <<<"$artifacts"
+              )" = 1
+            done
+
+            candidate_run_id=$CANDIDATE_RUN_ID
+            reuse_candidates=true
+          fi
+
+          test "$(git ls-remote origin "refs/tags/$RELEASE_TAG" | awk '{print $1}')" = "$commit"
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "candidate_run_id=$candidate_run_id" >> "$GITHUB_OUTPUT"
+          echo "candidate_run_attempt=$candidate_run_attempt" >> "$GITHUB_OUTPUT"
+          echo "reuse_candidates=$reuse_candidates" >> "$GITHUB_OUTPUT"
           echo "Accepted source commit: \`$commit\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Candidate run: \`$candidate_run_id\` attempt \`$candidate_run_attempt\`" >> "$GITHUB_STEP_SUMMARY"
 
   build:
     name: build/hosted ${{ matrix.key }}
     needs: prepare
+    if: needs.prepare.outputs.reuse_candidates != 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
     environment: azurelinux4-signing
@@ -317,12 +382,24 @@ jobs:
   azure_acceptance:
     name: Azure ${{ matrix.key }}
     needs: [prepare, build]
+    if: >-
+      ${{
+        always() &&
+        needs.prepare.result == 'success' &&
+        (
+          needs.build.result == 'success' ||
+          (
+            needs.prepare.outputs.reuse_candidates == 'true' &&
+            needs.build.result == 'skipped'
+          )
+        )
+      }}
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     environment: azurelinux4-release
     permissions:
+      actions: read
       contents: read
-      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -373,29 +450,32 @@ jobs:
       - name: Download exact build-validated candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: azurelinux4-candidate-${{ matrix.key }}-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          name: azurelinux4-candidate-${{ matrix.key }}-${{ needs.prepare.outputs.source_commit }}-${{ needs.prepare.outputs.candidate_run_attempt }}
           path: ${{ env.CANDIDATE_DIR }}
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.prepare.outputs.candidate_run_id }}
 
       - name: Fail closed on missing protected configuration
         env:
           AZURE_CLIENT_ID_VALUE: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET_VALUE: ${{ secrets.AZURE_CLIENT_SECRET }}
           AZURE_TENANT_ID_VALUE: ${{ secrets.AZURE_TENANT_ID }}
           AZURE_SUBSCRIPTION_ID_VALUE: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
         run: |
           set -euo pipefail
           uuid='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
           [[ "$AZURE_CLIENT_ID_VALUE" =~ $uuid ]]
+          test -n "$AZURE_CLIENT_SECRET_VALUE"
           [[ "$AZURE_TENANT_ID_VALUE" =~ $uuid ]]
           [[ "$AZURE_SUBSCRIPTION_ID_VALUE" =~ $uuid ]]
           [[ "$AZURE_LOCATION" =~ ^[a-z0-9-]+$ ]]
           [[ "$AZURE_VM_SIZE" =~ ^Standard_[A-Za-z0-9_]+$ ]]
 
-      - name: Log in to Azure with protected-environment OIDC
+      - name: Log in to Azure with protected short-lived credential
         uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
         with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          creds: >-
+            {"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}"}
 
       - name: Install Zig via ghr
         uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
@@ -434,13 +514,12 @@ jobs:
           export GITHUB_RUN_ATTEMPT=$RUN_ATTEMPT_VALUE
           scripts/azurelinux4_azure_acceptance.sh run
 
-      - name: Refresh Azure OIDC token for unconditional cleanup
+      - name: Refresh Azure credential for unconditional cleanup
         if: always()
         uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
         with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          creds: >-
+            {"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}"}
 
       - name: Delete only owned temporary Azure resources
         if: always()
@@ -477,13 +556,20 @@ jobs:
       ${{
         always() &&
         needs.prepare.result == 'success' &&
-        needs.build.result == 'success' &&
+        (
+          needs.build.result == 'success' ||
+          (
+            needs.prepare.outputs.reuse_candidates == 'true' &&
+            needs.build.result == 'skipped'
+          )
+        ) &&
         needs.azure_acceptance.result == 'success'
       }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     environment: azurelinux4-release
     permissions:
+      actions: read
       contents: write
     env:
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
@@ -493,7 +579,7 @@ jobs:
       REPOSITORY: ${{ github.repository }}
       GH_TOKEN: ${{ github.token }}
       PREPARE_RESULT: ${{ needs.prepare.result }}
-      BUILD_RESULT: ${{ needs.build.result }}
+      BUILD_RESULT: ${{ needs.prepare.outputs.reuse_candidates == 'true' && 'success' || needs.build.result }}
       AZURE_RESULT: ${{ needs.azure_acceptance.result }}
     steps:
       - name: Check out accepted source
@@ -505,9 +591,11 @@ jobs:
       - name: Download all build-validated candidates
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: azurelinux4-candidate-*-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          pattern: azurelinux4-candidate-*-${{ needs.prepare.outputs.source_commit }}-${{ needs.prepare.outputs.candidate_run_attempt }}
           path: ${{ env.CANDIDATES_DIR }}
           merge-multiple: false
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.prepare.outputs.candidate_run_id }}
 
       - name: Download all Azure acceptance results
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
