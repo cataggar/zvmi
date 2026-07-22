@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 command_name=${1:-run}
 if [[ -z ${STATE_FILE:-} || -z ${GITHUB_RUN_ID:-} || -z ${GITHUB_RUN_ATTEMPT:-} || -z ${CANDIDATE_KEY:-} ]]; then
@@ -87,6 +87,14 @@ fi
 [[ "$AZURE_LOCATION" =~ ^[a-z0-9-]+$ ]]
 [[ "$AZURE_VM_SIZE" =~ ^Standard_[A-Za-z0-9_]+$ ]]
 [[ -x "$ZVMI" ]]
+
+report_error() {
+  local status=$1 line=$2 command=$3
+  trap - ERR
+  printf '::error::Azure acceptance failed at line %s: %s\n' "$line" "$command" >&2
+  exit "$status"
+}
+trap 'report_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 
 for tool in az azcopy curl python3 qemu-img sha256sum ssh ssh-keygen; do
   command -v "$tool" >/dev/null || {
