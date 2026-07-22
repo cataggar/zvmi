@@ -815,11 +815,12 @@ GUEST
     --output tsv)" = ProvisioningState/succeeded
 fi
 
+data_disk_size_gib=4
 az disk create \
   --resource-group "$resource_group" \
   --name "$data_disk_name" \
   --location "$AZURE_LOCATION" \
-  --size-gb 4 \
+  --size-gb "$data_disk_size_gib" \
   --sku Standard_LRS \
   --output json >/dev/null
 az vm disk attach \
@@ -831,8 +832,11 @@ az vm disk attach \
 boot_id=$(ssh "${ssh_options[@]}" "$ssh_target" 'cat /proc/sys/kernel/random/boot_id')
 reboot_and_reconnect "$boot_id"
 
-data_device=$(ssh "${ssh_options[@]}" "$ssh_target" '/usr/bin/bash -s' <<'GUEST'
+expected_data_disk_size=$((data_disk_size_gib * 1073741824))
+data_device=$(ssh "${ssh_options[@]}" "$ssh_target" \
+  "/usr/bin/bash -s -- '$expected_data_disk_size'" <<'GUEST'
 set -euo pipefail
+expected_size=$1
 root_source=$(readlink -f "$(findmnt -n -o SOURCE /)")
 root_disk=$(lsblk -n -o PKNAME "$root_source")
 found=
@@ -841,19 +845,19 @@ for sysdev in /sys/class/block/sd* /sys/class/block/nvme*n*; do
   name=${sysdev##*/}
   test "$name" != "$root_disk" || continue
   test ! -e "$sysdev/partition" || continue
-  if [[ "$name" == nvme* ]]; then
-    model=$(cat "$sysdev/device/model" 2>/dev/null || true)
-    nsid=$(cat "$sysdev/device/nsid" 2>/dev/null || true)
-    [[ "$model" == "MSFT NVMe Accelerator v1.0" && "$nsid" == 2 ]] || continue
-  else
-    target=$(readlink -f "$sysdev")
-    address=$(basename "${target%/block/*}")
-    [[ "$address" == *:0 ]] || continue
+  size=$(sudo -n blockdev --getsize64 "/dev/$name")
+  [[ "$size" -eq "$expected_size" ]] || continue
+  if [[ -n "$found" ]]; then
+    echo "multiple unattached disks match the expected size" >&2
+    exit 1
   fi
-  test -z "$found"
   found="/dev/$name"
 done
-test -b "$found"
+if [[ -z "$found" ]]; then
+  echo "no unattached disk matches the expected size $expected_size" >&2
+  lsblk -b -o NAME,TYPE,SIZE,PKNAME,MOUNTPOINTS,MODEL >&2
+  exit 1
+fi
 if lsblk -nr -o TYPE "$found" | tail -n +2 | grep -q '^part$'; then
   exit 1
 fi
