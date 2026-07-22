@@ -678,14 +678,22 @@ fi
 
 ssh "${ssh_options[@]}" "$ssh_target" \
   "/usr/bin/bash -s -- '$virtual_size' '$runtime_architecture' '$ARCHITECTURE'" <<'GUEST'
-set -euo pipefail
+set -Eeuo pipefail
+guest_error() {
+  status=$1
+  trap - ERR
+  printf 'guest acceptance failed at line %s: %s\n' "$2" "$3" >&2
+  exit "$status"
+}
+trap 'guest_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 original_size=$1
 runtime_arch=$2
 release_arch=$3
 test "$(id -un)" = zvmitest
 test "$(uname -m)" = "$runtime_arch"
-sudo -n /usr/sbin/sshd -T | grep -Fxq 'passwordauthentication no'
-sudo -n /usr/sbin/sshd -T | grep -Fxq 'kbdinteractiveauthentication no'
+sshd_config=$(sudo -n /usr/sbin/sshd -T)
+grep -Fxq 'passwordauthentication no' <<<"$sshd_config"
+grep -Fxq 'kbdinteractiveauthentication no' <<<"$sshd_config"
 case "$release_arch" in
   x86_64) grep -Fwq 'console=ttyS0,115200n8' /proc/cmdline ;;
   aarch64) grep -Fwq 'console=ttyAMA0,115200n8' /proc/cmdline ;;
@@ -759,7 +767,14 @@ GUEST
 if [[ "$FLAVOR" == core ]]; then
   ssh "${ssh_options[@]}" "$ssh_target" \
     "/usr/bin/bash -s -- '$has_resource_disk'" <<'GUEST'
-set -euo pipefail
+set -Eeuo pipefail
+guest_error() {
+  status=$1
+  trap - ERR
+  printf 'guest acceptance failed at line %s: %s\n' "$2" "$3" >&2
+  exit "$status"
+}
+trap 'guest_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 has_resource_disk=$1
 sudo -n /usr/bin/test /proc/1/exe -ef /sbin/zvminit
 test -f /var/lib/azagent/provisioned
@@ -835,7 +850,14 @@ reboot_and_reconnect "$boot_id"
 expected_data_disk_size=$((data_disk_size_gib * 1073741824))
 data_device=$(ssh "${ssh_options[@]}" "$ssh_target" \
   "/usr/bin/bash -s -- '$expected_data_disk_size'" <<'GUEST'
-set -euo pipefail
+set -Eeuo pipefail
+guest_error() {
+  status=$1
+  trap - ERR
+  printf 'guest acceptance failed at line %s: %s\n' "$2" "$3" >&2
+  exit "$status"
+}
+trap 'guest_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 expected_size=$1
 root_source=$(readlink -f "$(findmnt -n -o SOURCE /)")
 root_disk=$(lsblk -n -o PKNAME "$root_source")
