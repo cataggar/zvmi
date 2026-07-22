@@ -563,6 +563,7 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         self.assertIn("guest acceptance failed at line", script)
         self.assertIn("sshd_config=$(sudo -n /usr/sbin/sshd -T)", script)
         self.assertNotIn("/usr/sbin/sshd -T | grep", script)
+        self.assertIn("az vm boot-diagnostics get-boot-log", script)
         self.assertNotIn("az disk grant-access", script)
         self.assertIn("/beginGetAccess?api-version=2025-01-02", script)
         self.assertIn('tolower($1) == "location"', script)
@@ -601,6 +602,7 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         self.assertIn("expected_data_disk_size=$((data_disk_size_gib * 1073741824))", script)
         self.assertIn('blockdev --getsize64 "/dev/$name"', script)
         self.assertIn('"$size" -eq "$expected_size"', script)
+        self.assertNotIn('test -z "${first_sector//0/}"', script)
         self.assertNotIn("MSFT NVMe Accelerator", script)
 
     def test_fixed_vhd_uses_supported_structural_validation(self):
