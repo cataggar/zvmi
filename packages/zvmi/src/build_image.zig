@@ -55,6 +55,9 @@ pub const BuildImageOptions = struct {
     generalization: os_customization.GeneralizationPolicy = .none,
     esp_size: u64 = default_esp_size,
     ext4_label: []const u8 = "rootfs",
+    /// Optional SELinux context for the implicit ext4 root inode. The stored
+    /// xattr includes the NUL terminator expected by SELinux tooling.
+    root_selinux_label: ?[]const u8 = null,
     verity: bool = false,
     /// Extra kernel command-line arguments appended after
     /// `root=PARTUUID=<...>` (or `root=/dev/mapper/root ...` when `verity`
@@ -403,10 +406,28 @@ pub fn build(
     try enterStage(options, .populate_filesystem);
     report.root_tree_digest = try root_tree.manifestDigest();
     logStep(options, "populate root ext4 filesystem");
+    var root_xattr_buffer: [1]ext4.Xattr = undefined;
+    var root_selinux_value: ?[]u8 = null;
+    defer if (root_selinux_value) |value| allocator.free(value);
+    const root_xattrs: []const ext4.Xattr = if (options.root_selinux_label) |label| blk: {
+        if (label.len == 0 or std.mem.indexOfScalar(u8, label, 0) != null) {
+            return error.InvalidRootSelinuxLabel;
+        }
+        const value = try allocator.alloc(u8, label.len + 1);
+        std.mem.copyForwards(u8, value[0..label.len], label);
+        value[label.len] = 0;
+        root_selinux_value = value;
+        root_xattr_buffer[0] = .{
+            .name = "security.selinux",
+            .value = value,
+        };
+        break :blk &root_xattr_buffer;
+    } else &.{};
     _ = try ext4.populate(io, raw_img.file, allocator, try root_tree.ext4View(), .{
         .offset = root_partition.planned.offset_bytes,
         .length = rootfs_length,
         .label = options.ext4_label,
+        .root_xattrs = root_xattrs,
         .uuid = root_filesystem_uuid,
         .timestamp = if (options.deterministic) |deterministic| deterministic.filesystem_timestamp else 0,
     });
@@ -3132,6 +3153,7 @@ test "build-image can skip the ISO rootfs while retaining boot assets" {
         .generation = .gen2,
         .size = 256 * mib,
         .skip_iso_rootfs = true,
+        .root_selinux_label = "system_u:object_r:root_t:s0",
     });
     defer report.deinit(allocator);
 
@@ -3167,6 +3189,9 @@ test "build-image can skip the ISO rootfs while retaining boot assets" {
     const capability = try root_reader.readXattrAlloc(io, allocator, "usr/bin/chronyd", "security.capability");
     defer allocator.free(capability);
     try std.testing.expectEqualStrings("chronyd-capability", capability);
+    const root_selinux = try root_reader.readXattrAlloc(io, allocator, "/", "security.selinux");
+    defer allocator.free(root_selinux);
+    try std.testing.expectEqualSlices(u8, "system_u:object_r:root_t:s0\x00", root_selinux);
 
     try std.testing.expectError(error.NotFound, root_reader.readFileAlloc(io, allocator, "etc/hostname"));
 }

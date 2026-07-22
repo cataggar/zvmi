@@ -23,7 +23,8 @@ const validation = @import("validation.zig");
 
 pub const ParseError = error{ MissingField, InvalidUsername, InvalidPublicKey };
 
-/// A single `<PublicKey>` entry's `<Value>` (raw `ssh-<type> ...` text).
+/// A single `<PublicKey>` entry's `<Value>` (`ssh-<type> ...` text with
+/// surrounding XML whitespace removed).
 /// The `<Fingerprint>`/certificate-thumbprint path is not supported (see
 /// module doc comment); such entries are silently skipped by `parse`.
 pub const PublicKey = struct {
@@ -37,7 +38,7 @@ pub const OvfEnv = struct {
     hostname: []const u8,
     username: []const u8,
     disable_ssh_password_auth: bool,
-    /// Up to `max_public_keys` raw-value public keys found in the document
+    /// Up to `max_public_keys` public keys found in the document
     /// (real ovf-env.xml documents have at most a handful).
     public_keys_buf: [max_public_keys]PublicKey = undefined,
     public_keys_len: usize = 0,
@@ -69,7 +70,8 @@ pub const OvfEnv = struct {
         var it = xml.ElementIterator.init(conf_set, "PublicKey");
         while (it.next()) |pubkey_block| {
             if (result.public_keys_len >= max_public_keys) break;
-            const value = xml.findElement(pubkey_block, "Value") orelse continue;
+            const raw_value = xml.findElement(pubkey_block, "Value") orelse continue;
+            const value = std.mem.trim(u8, raw_value, " \t\r\n");
             try validation.validatePublicKey(value);
             result.public_keys_buf[result.public_keys_len] = .{ .value = value };
             result.public_keys_len += 1;
@@ -157,6 +159,22 @@ test "OvfEnv.parse skips PublicKey entries with no Value (certificate-thumbprint
         \\  <SSH><PublicKeys>
         \\    <PublicKey><Fingerprint>ABC123</Fingerprint><Path>p</Path></PublicKey>
         \\    <PublicKey><Fingerprint>DEF456</Fingerprint><Path>p2</Path><Value>ssh-ed25519 AAAA== a@b</Value></PublicKey>
+        \\  </PublicKeys></SSH>
+        \\</LinuxProvisioningConfigurationSet>
+    ;
+    const env = try OvfEnv.parse(doc);
+    try std.testing.expectEqual(@as(usize, 1), env.publicKeys().len);
+    try std.testing.expectEqualStrings("ssh-ed25519 AAAA== a@b", env.publicKeys()[0].value);
+}
+
+test "OvfEnv.parse trims Azure whitespace around public key values" {
+    const doc =
+        \\<LinuxProvisioningConfigurationSet>
+        \\  <HostName>h</HostName>
+        \\  <UserName>azureuser</UserName>
+        \\  <SSH><PublicKeys>
+        \\    <PublicKey><Value>  ssh-ed25519 AAAA== a@b
+        \\</Value></PublicKey>
         \\  </PublicKeys></SSH>
         \\</LinuxProvisioningConfigurationSet>
     ;

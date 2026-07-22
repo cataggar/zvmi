@@ -158,13 +158,14 @@ const full_required_rootfs_paths = [_][]const u8{
     "usr/bin/bash",
     "usr/bin/cloud-init",
     "usr/bin/rpm",
+    "usr/bin/setfiles",
     "usr/bin/sshd",
     "usr/bin/waagent",
     "usr/lib/systemd/systemd",
     "usr/lib/systemd/system/chronyd.service",
     "usr/lib/sysusers.d/chrony.conf",
+    "etc/systemd/network/20-wired.network",
     "etc/waagent.conf",
-    ".autorelabel",
 };
 
 const core_forbidden_rootfs_paths = [_][]const u8{};
@@ -175,6 +176,8 @@ const full_forbidden_rootfs_paths = [_][]const u8{
     "usr/bin/azagent",
     "etc/ssh/sshd_config.d/10-zvminit.conf",
     "var/lib/azagent/provisioned",
+    // Offline labeling replaces the first-boot relabel marker.
+    ".autorelabel",
 };
 
 const full_required_systemd_units = [_][]const u8{
@@ -198,6 +201,18 @@ const full_enabled_systemd_units = [_][]const u8{
     "sshd.service",
     "systemd-networkd.service",
 };
+
+const full_networkd_config =
+    \\[Match]
+    \\Kind=!*
+    \\Type=ether
+    \\
+    \\[Network]
+    \\DHCP=yes
+    \\
+;
+
+const full_root_selinux_label = "system_u:object_r:root_t:s0";
 
 const FlavorDescriptor = struct {
     flavor: Flavor,
@@ -1563,6 +1578,11 @@ fn chronyStateContractMatches(service: []const u8, sysusers: []const u8) bool {
         sysusersDefinesHome(sysusers, "chrony", "/var/lib/chrony");
 }
 
+fn selinuxLabelIsUsable(label: []const u8) bool {
+    return std.mem.indexOf(u8, label, ":object_r:") != null and
+        std.mem.indexOf(u8, label, ":unlabeled_t:") == null;
+}
+
 fn setRootConfigValue(
     gpa: Allocator,
     io: Io,
@@ -1660,6 +1680,15 @@ fn configureFullGuest(
     try setRootConfigValue(gpa, io, rootfs_path, work_dir, "etc/waagent.conf", "Provisioning.Agent", "auto");
     try setRootConfigValue(gpa, io, rootfs_path, work_dir, "etc/waagent.conf", "ResourceDisk.Format", "n");
     try setRootConfigValue(gpa, io, rootfs_path, work_dir, "etc/waagent.conf", "ResourceDisk.EnableSwap", "n");
+    try writeRootFile(
+        gpa,
+        io,
+        rootfs_path,
+        work_dir,
+        "etc/systemd/network/20-wired.network",
+        full_networkd_config,
+        "0644",
+    );
     try writeRootFile(gpa, io, rootfs_path, work_dir, "etc/ssh/sshd_config.d/20-zvmi-full.conf", "PasswordAuthentication no\n" ++
         "PermitEmptyPasswords no\n" ++
         "PubkeyAuthentication yes\n" ++
@@ -1685,9 +1714,19 @@ fn configureFullGuest(
             return error.FullServiceNotEnabled;
         }
     }
-    try writeRootFile(gpa, io, rootfs_path, work_dir, ".autorelabel", "", "0600");
     try sudo(gpa, io, &.{ "chroot", rootfs_path, "/usr/bin/ssh-keygen", "-A" });
     try sudo(gpa, io, &.{ "chroot", rootfs_path, "/usr/bin/sshd", "-t" });
+}
+
+fn labelFullRootfs(gpa: Allocator, io: Io, rootfs_path: []const u8) !void {
+    try sudo(gpa, io, &.{
+        "chroot",
+        rootfs_path,
+        "/usr/sbin/setfiles",
+        "-F",
+        "/etc/selinux/targeted/contexts/files/file_contexts",
+        "/",
+    });
 }
 
 fn configureCoreGuest(
@@ -2047,6 +2086,9 @@ fn installGuestContent(
     try sudo(gpa, io, &.{ "rm", "-rf", rootfs_dnf_cache });
     try sudo(gpa, io, &.{ "rm", "-f", dnf_log });
 
+    if (flavor.flavor == .full) {
+        try labelFullRootfs(gpa, io, rootfs_path);
+    }
     try validateGeneralizedRootfs(gpa, io, rootfs_path, flavor);
     return installed_closure;
 }
@@ -3039,6 +3081,25 @@ fn requireImageRootfsPathAbsent(
     return error.BakedIdentityState;
 }
 
+fn requireUsableSelinuxLabel(
+    rootfs: *const zvmi.ext4.Reader,
+    gpa: Allocator,
+    io: Io,
+    path: []const u8,
+) !void {
+    const label = rootfs.readXattrAlloc(
+        io,
+        gpa,
+        path,
+        "security.selinux",
+    ) catch |err| switch (err) {
+        error.XattrNotFound => return error.MissingSelinuxLabel,
+        else => return err,
+    };
+    defer gpa.free(label);
+    if (!selinuxLabelIsUsable(label)) return error.InvalidSelinuxLabel;
+}
+
 fn validateFinalizedImageRootfs(
     gpa: Allocator,
     io: Io,
@@ -3087,8 +3148,26 @@ fn validateFinalizedImageRootfs(
     const machine_id = try rootfs.statPath(io, "etc/machine-id");
     if (machine_id.size != 0) return error.GeneratedMachineId;
     if (flavor.flavor == .full) {
-        const autorelabel = try rootfs.statPath(io, ".autorelabel");
-        if (autorelabel.kind != .file) return error.MissingAutorelabel;
+        const networkd_config = try rootfs.readFileAlloc(
+            io,
+            gpa,
+            "etc/systemd/network/20-wired.network",
+        );
+        defer gpa.free(networkd_config);
+        if (!std.mem.eql(u8, networkd_config, full_networkd_config)) {
+            return error.InvalidFullNetworkConfiguration;
+        }
+        for (&[_][]const u8{
+            "/",
+            "bin",
+            "usr/lib/systemd/systemd",
+            "usr/lib/systemd/system/systemd-networkd.service",
+            "usr/bin/cloud-init",
+            "usr/bin/waagent",
+            "usr/bin/sshd",
+            "etc/waagent.conf",
+            "etc/systemd/network/20-wired.network",
+        }) |path| try requireUsableSelinuxLabel(&rootfs, gpa, io, path);
         const chrony_service = try rootfs.readFileAlloc(
             io,
             gpa,
@@ -3823,7 +3902,9 @@ pub fn main(init: std.process.Init) !void {
     defer gpa.free(max_oci_archive_size_arg);
 
     std.debug.print("Building disk image...\n", .{});
-    try run(gpa, io, &.{
+    var build_args = std.array_list.Managed([]const u8).init(gpa);
+    defer build_args.deinit();
+    try build_args.appendSlice(&.{
         zvmi_path,
         "build-image",
         "--iso",
@@ -3841,6 +3922,14 @@ pub fn main(init: std.process.Init) !void {
         "--size",
         size_arg,
         "--skip-iso-rootfs",
+    });
+    if (flavor.flavor == .full) {
+        try build_args.appendSlice(&.{
+            "--root-selinux-label",
+            full_root_selinux_label,
+        });
+    }
+    try build_args.appendSlice(&.{
         "--boot-mode",
         "uki",
         "--stub-source-path",
@@ -3855,6 +3944,7 @@ pub fn main(init: std.process.Init) !void {
         "qcow2",
         "-v",
     });
+    try run(gpa, io, build_args.items);
 
     var signing_report: ?UkiSigningReport = null;
     defer if (signing_report) |*report| report.deinit(gpa);
@@ -4233,9 +4323,12 @@ test "flavor contracts keep full systemd-only and core zvminit-only" {
     try std.testing.expect(argvContains(full.required_rootfs_paths, "usr/bin/sshd"));
     try std.testing.expect(argvContains(full.required_rootfs_paths, "usr/bin/waagent"));
     try std.testing.expect(argvContains(full.required_rootfs_paths, "usr/bin/rpm"));
+    try std.testing.expect(argvContains(full.required_rootfs_paths, "usr/bin/setfiles"));
     try std.testing.expect(argvContains(full.required_rootfs_paths, "usr/lib/systemd/system/chronyd.service"));
     try std.testing.expect(argvContains(full.required_rootfs_paths, "usr/lib/sysusers.d/chrony.conf"));
-    try std.testing.expect(argvContains(full.required_rootfs_paths, ".autorelabel"));
+    try std.testing.expect(argvContains(full.required_rootfs_paths, "etc/systemd/network/20-wired.network"));
+    try std.testing.expect(!argvContains(full.required_rootfs_paths, ".autorelabel"));
+    try std.testing.expect(argvContains(full.forbidden_rootfs_paths, ".autorelabel"));
     try std.testing.expect(!argvContains(full.required_rootfs_paths, "usr/sbin/waagent"));
     try std.testing.expect(!argvContains(&full_required_systemd_units, "cloud-init.service"));
     try std.testing.expect(argvContains(&full_required_systemd_units, "cloud-init-main.service"));
@@ -4251,6 +4344,15 @@ test "flavor contracts keep full systemd-only and core zvminit-only" {
     try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024 * 1024), full_oci_limits.max_archive_size);
     try std.testing.expectEqual(@as(usize, 3), ociLayerPlanCount(&core));
     try std.testing.expectEqual(@as(usize, 7), ociLayerPlanCount(&full));
+}
+
+test "full network and SELinux boot contracts are fail closed" {
+    try std.testing.expect(std.mem.indexOf(u8, full_networkd_config, "Type=ether") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full_networkd_config, "DHCP=yes") != null);
+    try std.testing.expect(selinuxLabelIsUsable(full_root_selinux_label));
+    try std.testing.expect(selinuxLabelIsUsable("system_u:object_r:init_exec_t:s0"));
+    try std.testing.expect(!selinuxLabelIsUsable(""));
+    try std.testing.expect(!selinuxLabelIsUsable("system_u:object_r:unlabeled_t:s0"));
 }
 
 test "full key URI and package-state contracts are canonical" {
