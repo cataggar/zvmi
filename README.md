@@ -674,7 +674,7 @@ power off cleanly.
 
 ### Azure Linux 4 release images
 
-Release `AzureLinux-4.0-20260717` contains exactly four Gen2 QCOW2 assets:
+Release `AzureLinux-4.0-20260721` contains exactly four Gen2 QCOW2 assets:
 
 ```text
 AzureLinux-4.0-x86_64.qcow2
@@ -692,7 +692,7 @@ cannot expose SSH until that key has been supplied through the Azure OVF
 profile. Release UKIs are trusted through the exact Artifact Signing leaf enrolled in UEFI `db`; its fingerprint is recorded in `candidate.json`, `publish-manifest.json`, release notes, local Secure Boot acceptance, and Azure acceptance together with every signing operation ID.
 
 `zvmi qemu` defaults to the full x86_64 asset pinned as
-`AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260717`. Select an AArch64 or
+`AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260721`. Select an AArch64 or
 core file explicitly when needed.
 
 The manual release workflow builds and externally signs all four candidates on
@@ -829,7 +829,7 @@ zvmi qemu AzureLinux-4.0-x86_64
 
 If `AzureLinux-4.0-x86_64.qcow2` is absent, `zvmi` runs the verified ghr
 download for
-`cataggar/zvmi/AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260717`.
+`cataggar/zvmi/AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260721`.
 Existing images are never refreshed or overwritten. QEMU and its matching
 EDK2 firmware are resolved from the `cataggar/qemu` ghr installation first,
 then from a system QEMU/UEFI installation. Directory-prefixed aliases such as
@@ -911,7 +911,7 @@ zvmi qemu AzureLinux-4.0-aarch64
 
 It becomes downloadable when the exact asset
 `AzureLinux-4.0-aarch64.qcow2` is published to release
-`AzureLinux-4.0-20260717`; until then, ghr reports the missing asset and the
+`AzureLinux-4.0-20260721`; until then, ghr reports the missing asset and the
 command exits without creating a partial bundle.
 
 Use `--qemu`, `--firmware-code`, and `--firmware-vars` (or the compatible
