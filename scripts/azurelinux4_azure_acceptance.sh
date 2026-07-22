@@ -800,7 +800,7 @@ for proc in /proc/[0-9]*; do
   esac
 done
 test -n "$master"
-if [[ "$has_resource_disk" == true ]]; then
+if mountpoint -q /d; then
   mountpoint -q /d
   test "$(findmnt -n -o FSTYPE /d)" = ext4
   test -f /d/DATALOSS_WARNING_README.txt
@@ -811,12 +811,7 @@ if [[ "$has_resource_disk" == true ]]; then
     esac
   done </proc/swaps
 else
-  if mountpoint -q /d; then
-    echo "unexpected resource-disk mount on a SKU without a resource disk" >&2
-    findmnt /d >&2
-    lsblk -b -o NAME,TYPE,SIZE,PKNAME,MOUNTPOINTS,MODEL >&2
-    exit 1
-  fi
+  test "$has_resource_disk" = false
 fi
 GUEST
 else

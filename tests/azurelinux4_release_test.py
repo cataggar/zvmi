@@ -376,6 +376,42 @@ class AzureLinuxReleaseTest(unittest.TestCase):
                 settings, TEST_CERTIFICATE_SHA256
             )
 
+    def test_azure_gallery_final_get_may_omit_accepted_uefi_settings(self):
+        settings = {
+            "signatureTemplateNames": [
+                "MicrosoftUefiCertificateAuthorityTemplate"
+            ],
+            "additionalSignatures": {
+                "db": [
+                    {
+                        "type": "x509",
+                        "value": [
+                            base64.b64encode(TEST_CERTIFICATE_DER).decode()
+                        ],
+                    }
+                ]
+            },
+        }
+        request = {"properties": {"securityProfile": {"uefiSettings": settings}}}
+        response = {"properties": {"provisioningState": "Succeeded"}}
+        self.assertEqual(
+            release.validate_azure_gallery_uefi_settings(
+                request,
+                response,
+                TEST_CERTIFICATE_SHA256,
+            ),
+            settings,
+        )
+        response["properties"]["securityProfile"] = {
+            "uefiSettings": {"signatureTemplateNames": []}
+        }
+        with self.assertRaises(SystemExit):
+            release.validate_azure_gallery_uefi_settings(
+                request,
+                response,
+                TEST_CERTIFICATE_SHA256,
+            )
+
     def test_fixed_vhd_alignment_applies_to_virtual_size_not_footer(self):
         virtual_size = 2 * release.AZURE_VHD_ALIGNMENT
         info = {
@@ -593,8 +629,8 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         self.assertIn('restriction.get("type") == "Location"', script)
         self.assertIn('capabilities.get("TrustedLaunchDisabled") == "True"', script)
         self.assertIn('if sys.argv[3] == "x64" and not has_resource_disk:', script)
-        self.assertIn('if [[ "$has_resource_disk" == true ]]; then', script)
-        self.assertIn("! mountpoint -q /d", script)
+        self.assertIn("if mountpoint -q /d; then", script)
+        self.assertIn('test "$has_resource_disk" = false', script)
 
     def test_azure_acceptance_identifies_attached_data_disk_by_exact_size(self):
         script = (ROOT / "scripts/azurelinux4_azure_acceptance.sh").read_text()

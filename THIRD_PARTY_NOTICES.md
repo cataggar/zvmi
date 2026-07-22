@@ -12,7 +12,7 @@ https://github.com/ctaggart/ghr/blob/main/LICENSE
 
 ## zig-bzip2
 
-This project uses the `silver-signal/zig-bzip2` Zig build wrapper, version
+This project vendors the `silver-signal/zig-bzip2` Zig build wrapper, version
 1.0.8.
 
 Copyright (c) 2024 silver-signal contributors.
