@@ -141,6 +141,21 @@ def gallery_uefi_settings(document: dict[str, object]) -> object:
     return security_profile.get("uefiSettings")
 
 
+def validate_azure_gallery_uefi_settings(
+    request: dict[str, object],
+    response: dict[str, object],
+    certificate_sha256: str,
+) -> dict[str, object]:
+    request_uefi = gallery_uefi_settings(request)
+    response_uefi = gallery_uefi_settings(response)
+    if not isinstance(request_uefi, dict):
+        fail("Azure gallery request omitted custom UEFI settings")
+    if response_uefi is not None and request_uefi != response_uefi:
+        fail("Azure gallery version returned different custom UEFI settings")
+    validate_azure_uefi_settings(request_uefi, certificate_sha256)
+    return request_uefi
+
+
 def validate_azure_vhd_info(
     info: dict[str, object], file_size: int, footer: bytes
 ) -> int:
@@ -646,12 +661,10 @@ def azure_result_command(args: argparse.Namespace) -> None:
         fail(f"derived VHD is missing: {vhd}")
     request = read_json(args.uefi_request)
     response = read_json(args.uefi_response)
-    request_uefi = gallery_uefi_settings(request)
-    response_uefi = gallery_uefi_settings(response)
-    if not isinstance(request_uefi, dict) or request_uefi != response_uefi:
-        fail("Azure gallery version did not preserve the exact custom UEFI settings")
-    validate_azure_uefi_settings(
-        request_uefi, candidate["uki_signing"]["certificate_sha256"]
+    request_uefi = validate_azure_gallery_uefi_settings(
+        request,
+        response,
+        candidate["uki_signing"]["certificate_sha256"],
     )
     write_json(
         args.output,
