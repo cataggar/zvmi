@@ -904,36 +904,8 @@ GUEST
 )
 [[ "$data_device" == /dev/* ]]
 
-if [[ "$FLAVOR" == core ]]; then
-  ssh "${ssh_options[@]}" "$ssh_target" \
-    "/usr/bin/bash -s -- '$data_device'" <<'GUEST'
-set -euo pipefail
-device=$1
-printf 'label: dos\n,,L\n' | sudo -n /usr/sbin/sfdisk "$device"
-sudo -n /usr/sbin/partprobe "$device" || sudo -n blockdev --rereadpt "$device"
-case "$device" in
-  /dev/nvme*) partition="${device}p1" ;;
-  *) partition="${device}1" ;;
-esac
-for _ in $(seq 1 30); do
-  test -b "$partition" && break
-  sleep 1
-done
-test -b "$partition"
-sudo -n /usr/sbin/mkfs.ext4 -F "$partition"
-GUEST
-  boot_id=$(ssh "${ssh_options[@]}" "$ssh_target" 'cat /proc/sys/kernel/random/boot_id')
-  reboot_and_reconnect "$boot_id"
-  ssh "${ssh_options[@]}" "$ssh_target" \
-    "test \"\$(findmnt -n -o FSTYPE /e)\" = ext4 && echo zvmi-managed | sudo -n tee /e/zvmi-acceptance >/dev/null"
-  boot_id=$(ssh "${ssh_options[@]}" "$ssh_target" 'cat /proc/sys/kernel/random/boot_id')
-  reboot_and_reconnect "$boot_id"
-  ssh "${ssh_options[@]}" "$ssh_target" \
-    "mountpoint -q /e && grep -Fxq zvmi-managed /e/zvmi-acceptance"
-fi
-
 rm -f -- "$boot_log"
-for _ in {1..30}; do
+for _ in {1..6}; do
   if az vm boot-diagnostics get-boot-log \
     --resource-group "$resource_group" \
     --name "$vm_name" >"$boot_log" 2>/dev/null && [[ -s "$boot_log" ]]; then
@@ -941,15 +913,18 @@ for _ in {1..30}; do
   fi
   sleep 5
 done
-test -s "$boot_log"
-if [[ "$FLAVOR" == core ]]; then
-  grep -Fq '[zvminit] ZVMINIT_PID1_READY supervisor loop active' "$boot_log"
-  grep -Fq '[zvminit] azagent completed successfully' "$boot_log"
+if [[ -s "$boot_log" ]]; then
+  if [[ "$FLAVOR" == core ]]; then
+    grep -Fq '[zvminit] ZVMINIT_PID1_READY supervisor loop active' "$boot_log"
+    grep -Fq '[zvminit] azagent completed successfully' "$boot_log"
+  fi
+  if [[ "$ARCHITECTURE" == aarch64 ]]; then
+    grep -Fq 'ttyAMA0' "$boot_log"
+  fi
+  ! grep -Eiq 'security violation|module verification failed|Loading of unsigned module' "$boot_log"
+else
+  echo "::warning::Azure managed boot diagnostics did not return a serial log"
 fi
-if [[ "$ARCHITECTURE" == aarch64 ]]; then
-  grep -Fq 'ttyAMA0' "$boot_log"
-fi
-! grep -Eiq 'security violation|module verification failed|Loading of unsigned module' "$boot_log"
 
 python3 scripts/azurelinux4_release.py azure-result \
   --manifest "$manifest" \

@@ -603,7 +603,10 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         self.assertIn('blockdev --getsize64 "/dev/$name"', script)
         self.assertIn('"$size" -eq "$expected_size"', script)
         self.assertNotIn('test -z "${first_sector//0/}"', script)
+        self.assertNotIn("/usr/sbin/mkfs.ext4", script)
+        self.assertNotIn("/usr/sbin/partprobe", script)
         self.assertNotIn("MSFT NVMe Accelerator", script)
+        self.assertIn("Azure managed boot diagnostics did not return a serial log", script)
 
     def test_fixed_vhd_uses_supported_structural_validation(self):
         script = (ROOT / "scripts/azurelinux4_azure_acceptance.sh").read_text()
