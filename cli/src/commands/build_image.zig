@@ -4,12 +4,14 @@ const std = @import("std");
 const zvmi = @import("zvmi");
 
 const help_text =
-    \\usage: zvmi build-image --iso <file.iso> --container <oci-layout> --generation 1|2 --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}> [-O raw|vhd|vhdx|qcow2] [--rootfs-path <path>] [--skip-iso-rootfs] [--max-oci-blob-size <size>] [--max-oci-layer-size <size>] [--max-oci-archive-size <size>] [--esp-size <size>] [--ext4-label <label>] [--stub-source-path <path>] [--os-release-source-path <path>] [--splash-source-path <path>] [--uki-output-directory <path>] [--verity] [--extra-kernel-options <opts>] [--boot-mode bls|uki|both] [--dry-run] [-v]
+    \\usage: zvmi build-image --iso <file.iso> --container <oci-layout> --generation 1|2 --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}> [-O raw|vhd|vhdx|qcow2] [--rootfs-path <path>] [--skip-iso-rootfs] [--max-oci-blob-size <size>] [--max-oci-layer-size <size>] [--max-oci-archive-size <size>] [--esp-size <size>] [--ext4-label <label>] [--root-selinux-label <context>] [--stub-source-path <path>] [--os-release-source-path <path>] [--splash-source-path <path>] [--uki-output-directory <path>] [--verity] [--extra-kernel-options <opts>] [--boot-mode bls|uki|both] [--dry-run] [-v]
     \\
     \\Options:
     \\  --boot-mode bls|uki|both   Gen2 boot files: GRUB+BLS only (default), UKI only, or both.
     \\  --esp-size <size>          ESP size (default 96M). UKI/both commonly need 512M or larger.
     \\  --ext4-label <label>       Root ext4 filesystem label (default rootfs).
+    \\  --root-selinux-label <context>
+    \\                              SELinux context for the implicit root inode.
     \\  --skip-iso-rootfs          Use the container as the root filesystem; keep only boot-critical files from the ISO/squashfs.
     \\  --max-oci-blob-size <size> Maximum compressed OCI blob size (default 64M).
     \\  --max-oci-layer-size <size>
@@ -59,6 +61,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     var size: ?u64 = null;
     var esp_size: ?u64 = null;
     var ext4_label: []const u8 = "rootfs";
+    var root_selinux_label: ?[]const u8 = null;
     var stub_source_path: ?[]const u8 = null;
     var os_release_source_path: ?[]const u8 = null;
     var splash_source_path: ?[]const u8 = null;
@@ -104,6 +107,10 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
             i += 1;
             if (i >= args.len) return fail("build-image: --ext4-label requires a value", .{});
             ext4_label = args[i];
+        } else if (std.mem.eql(u8, arg, "--root-selinux-label")) {
+            i += 1;
+            if (i >= args.len) return fail("build-image: --root-selinux-label requires a value", .{});
+            root_selinux_label = args[i];
         } else if (std.mem.eql(u8, arg, "--stub-source-path")) {
             i += 1;
             if (i >= args.len) return fail("build-image: --stub-source-path requires a path", .{});
@@ -192,6 +199,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
             .skip_iso_rootfs = skip_iso_rootfs,
             .esp_size = esp_size orelse zvmi.build_image.default_esp_size,
             .ext4_label = ext4_label,
+            .root_selinux_label = root_selinux_label,
             .verity = enable_verity,
             .extra_kernel_options = extra_kernel_options,
             .boot_mode = boot_mode,

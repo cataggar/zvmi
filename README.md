@@ -536,8 +536,11 @@ cloud-init plus WALinuxAgent 2.15 (`Provisioning.Agent=auto`,
 `ResourceDisk.Format=n`), key-only OpenSSH, and no custom `zvminit` or
 `azagent`. It uses the profile's explicit 5 GiB default and rejects a root
 partition that cannot retain 1 GiB free. Core retains its 1184 MiB default.
-Full writes `/.autorelabel`, so SELinux policy labels are established on first
-boot rather than asserted from an unlabelled DNF installroot.
+Full configures systemd-networkd DHCP for physical Ethernet devices and labels
+the completed installroot with its targeted SELinux policy before OCI and ext4
+assembly. Final image validation rejects a missing or unusable systemd SELinux
+label or root-inode label, so enforcing mode cannot freeze PID 1 on an
+unlabelled root filesystem.
 
 Both flavors use `--skip-iso-rootfs`: the ISO supplies only the
 architecture-matched kernel, initramfs, and UEFI assets. Full never publishes

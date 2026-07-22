@@ -113,6 +113,8 @@ pub const PopulateOptions = struct {
     block_size: u32 = default_block_size,
     /// Optional volume label, truncated at 16 bytes.
     label: []const u8 = "",
+    /// Extended attributes applied to the implicit root inode.
+    root_xattrs: []const Xattr = &.{},
     /// If omitted, a zero UUID is written.
     uuid: ?[16]u8 = null,
     /// POSIX seconds timestamp written to the superblock/inodes.
@@ -3094,6 +3096,8 @@ fn buildPlan(allocator: std.mem.Allocator, tree: *FileTreeView, options: Populat
     const node_count = entries_list.items.len + 1;
     const nodes = try allocator.alloc(Node, node_count);
     errdefer allocator.free(nodes);
+    const root_xattrs = try dupXattrs(allocator, options.root_xattrs);
+    errdefer freeOwnedXattrSlice(allocator, root_xattrs);
 
     nodes[0] = .{
         .path = "",
@@ -3107,7 +3111,7 @@ fn buildPlan(allocator: std.mem.Allocator, tree: *FileTreeView, options: Populat
         .gid = 0,
         .declared_size = 0,
         .content = null,
-        .xattrs = &.{},
+        .xattrs = root_xattrs,
     };
 
     var next_inode = first_non_reserved_inode;
@@ -3380,26 +3384,27 @@ fn writeNodeData(io: Io, file: Io.File, nodes: []Node, options: PopulateOptions)
                 }
             },
             .file, .symlink => {
-                if (node.uses_fast_symlink or node.data_block_count == 0) continue;
-                const content = node.content orelse return error.MissingContentReader;
-                var written_data: u64 = 0;
-                var extent_index: usize = 0;
-                while (extent_index < node.extents.len) : (extent_index += 1) {
-                    const extent = node.extents[extent_index];
-                    var block_index: u16 = 0;
-                    while (block_index < extent.block_count) : (block_index += 1) {
-                        @memset(&scratch, 0);
-                        const copy_off = written_data;
-                        const remaining = node.size_on_disk - copy_off;
-                        const to_read = @min(@as(u64, options.block_size), remaining);
-                        const want = @as(usize, @intCast(to_read));
-                        if (want > 0) {
-                            const got = try content.readAt(scratch[0..want], copy_off);
-                            if (got != want) return error.UnexpectedContentLength;
+                if (!node.uses_fast_symlink and node.data_block_count != 0) {
+                    const content = node.content orelse return error.MissingContentReader;
+                    var written_data: u64 = 0;
+                    var extent_index: usize = 0;
+                    while (extent_index < node.extents.len) : (extent_index += 1) {
+                        const extent = node.extents[extent_index];
+                        var block_index: u16 = 0;
+                        while (block_index < extent.block_count) : (block_index += 1) {
+                            @memset(&scratch, 0);
+                            const copy_off = written_data;
+                            const remaining = node.size_on_disk - copy_off;
+                            const to_read = @min(@as(u64, options.block_size), remaining);
+                            const want = @as(usize, @intCast(to_read));
+                            if (want > 0) {
+                                const got = try content.readAt(scratch[0..want], copy_off);
+                                if (got != want) return error.UnexpectedContentLength;
+                            }
+                            const physical_block = extent.start_block + block_index;
+                            try file.writePositionalAll(io, &scratch, options.offset + physical_block * options.block_size);
+                            written_data += want;
                         }
-                        const physical_block = extent.start_block + block_index;
-                        try file.writePositionalAll(io, &scratch, options.offset + physical_block * options.block_size);
-                        written_data += want;
                     }
                 }
             },
@@ -5264,7 +5269,9 @@ test "populate round-trips xattrs and metadata checksums" {
 
     var tree = InMemoryTree.init(&[_]InMemoryEntry{
         .{ .path = "etc", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0, .xattrs = &dir_xattrs },
+        .{ .path = "etc/empty", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 0, .xattrs = &selinux },
         .{ .path = "etc/hostname", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 10, .bytes = "zvmi-test\n", .xattrs = &selinux },
+        .{ .path = "etc/hostname-link", .kind = .symlink, .mode = 0o777, .uid = 0, .gid = 0, .size = 8, .bytes = "hostname", .xattrs = &selinux },
     });
     tree.bind();
 
@@ -5276,6 +5283,7 @@ test "populate round-trips xattrs and metadata checksums" {
             .length = 16 * 1024 * 1024,
             .uuid = [_]u8{0x42} ** 16,
             .timestamp = 1_717_171_717,
+            .root_xattrs = &selinux,
         });
         try std.testing.expectEqual(writer_feature_compat, info.feature_compat);
         try std.testing.expect(info.feature_ro_compat & feature_ro_compat_metadata_csum != 0);
@@ -5288,19 +5296,33 @@ test "populate round-trips xattrs and metadata checksums" {
         try expectXattrValue(file_xattrs, "security.selinux", "system_u:object_r:bin_t:s0");
         try expectXattrValue(file_xattrs, "user.comment", "hello-from-zvmi");
 
+        const root_xattrs = try reader.readXattrsAlloc(io, std.testing.allocator, "/");
+        defer freeXattrs(std.testing.allocator, root_xattrs);
+        try expectXattrValue(root_xattrs, "security.selinux", "system_u:object_r:bin_t:s0");
+
         const dir_entries = try reader.listDir(io, std.testing.allocator, "etc");
         defer freeDirEntries(std.testing.allocator, dir_entries);
-        try expectDirNames(dir_entries, &.{"hostname"});
+        try expectDirNames(dir_entries, &.{ "empty", "hostname", "hostname-link" });
 
         const dir_attrs = try reader.readXattrsAlloc(io, std.testing.allocator, "etc");
         defer freeXattrs(std.testing.allocator, dir_attrs);
         try expectXattrValue(dir_attrs, "user.label", "config-dir");
+
+        const empty_xattrs = try reader.readXattrsAlloc(io, std.testing.allocator, "etc/empty");
+        defer freeXattrs(std.testing.allocator, empty_xattrs);
+        try expectXattrValue(empty_xattrs, "security.selinux", "system_u:object_r:bin_t:s0");
+
+        const link_xattrs = try reader.readXattrsAlloc(io, std.testing.allocator, "etc/hostname-link");
+        defer freeXattrs(std.testing.allocator, link_xattrs);
+        try expectXattrValue(link_xattrs, "security.selinux", "system_u:object_r:bin_t:s0");
 
         const raw_hostname_inode = try readRawInodeForPath(io, file, &reader, "etc/hostname");
         try std.testing.expect(readInt(u32, raw_hostname_inode.bytes[104..108]) != 0);
         try std.testing.expectEqual(@as(u32, 2 * sectors_per_block), readInt(u32, raw_hostname_inode.bytes[28..32]));
 
         try expectMetadataChecksumsValid(io, file, 0, "etc/hostname", "etc");
+        try expectMetadataChecksumsValid(io, file, 0, "etc/empty", "etc");
+        try expectMetadataChecksumsValid(io, file, 0, "etc/hostname-link", "etc");
     }
 
     try expectE2fsckClean(path);
