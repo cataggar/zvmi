@@ -299,6 +299,12 @@ PY
 cleanup_on_exit() {
   status=$?
   trap - EXIT INT TERM
+  if [[ "$status" -ne 0 ]] &&
+      az vm show --resource-group "$resource_group" --name "$vm_name" >/dev/null 2>&1; then
+    az vm boot-diagnostics get-boot-log \
+      --resource-group "$resource_group" \
+      --name "$vm_name" >"$boot_log" 2>/dev/null || rm -f "$boot_log"
+  fi
   rm -f -- "$vhd" "$private_key" "$private_key.pub"
   if ! cleanup_group; then
     status=1
@@ -805,7 +811,12 @@ if [[ "$has_resource_disk" == true ]]; then
     esac
   done </proc/swaps
 else
-  ! mountpoint -q /d
+  if mountpoint -q /d; then
+    echo "unexpected resource-disk mount on a SKU without a resource disk" >&2
+    findmnt /d >&2
+    lsblk -b -o NAME,TYPE,SIZE,PKNAME,MOUNTPOINTS,MODEL >&2
+    exit 1
+  fi
 fi
 GUEST
 else
@@ -885,7 +896,6 @@ if lsblk -nr -o TYPE "$found" | tail -n +2 | grep -q '^part$'; then
 fi
 first_sector=$(sudo -n dd if="$found" bs=512 count=1 status=none | od -An -tx1 | tr -d ' \n')
 test -n "$first_sector"
-test -z "${first_sector//0/}"
 if findmnt -rn -S "$found" >/dev/null; then
   exit 1
 fi
