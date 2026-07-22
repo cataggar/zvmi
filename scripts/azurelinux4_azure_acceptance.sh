@@ -652,18 +652,16 @@ wait_for_ssh() {
 reboot_and_reconnect() {
   local old_boot_id=$1
   ssh "${ssh_options[@]}" "$ssh_target" 'sudo -n /sbin/reboot' >/dev/null 2>&1 || true
-  local saw_disconnect=false boot_id
+  local boot_id
   for _ in {1..180}; do
     boot_id=$(ssh "${ssh_options[@]}" "$ssh_target" \
       'cat /proc/sys/kernel/random/boot_id' 2>/dev/null || true)
-    if [[ -z "$boot_id" ]]; then
-      saw_disconnect=true
-    elif [[ "$saw_disconnect" == true && "$boot_id" != "$old_boot_id" ]]; then
+    if [[ -n "$boot_id" && "$boot_id" != "$old_boot_id" ]]; then
       return
     fi
     sleep 5
   done
-  echo "::error::Guest did not disconnect, reboot, and reconnect"
+  echo "::error::Guest did not reboot and reconnect with a new boot ID"
   return 1
 }
 

@@ -656,6 +656,11 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         self.assertNotIn("/usr/sbin/partprobe", script)
         self.assertNotIn("MSFT NVMe Accelerator", script)
         self.assertIn("Azure managed boot diagnostics did not return a serial log", script)
+        self.assertIn(
+            '[[ -n "$boot_id" && "$boot_id" != "$old_boot_id" ]]',
+            script,
+        )
+        self.assertNotIn("saw_disconnect", script)
 
     def test_fixed_vhd_uses_supported_structural_validation(self):
         script = (ROOT / "scripts/azurelinux4_azure_acceptance.sh").read_text()
