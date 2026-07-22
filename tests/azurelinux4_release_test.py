@@ -213,7 +213,7 @@ class AzureLinuxReleaseTest(unittest.TestCase):
                 candidates=self.candidates,
                 azure_results=self.azure,
                 source_commit=self.source_commit,
-                release_tag="AzureLinux-4.0-20260721",
+                release_tag="AzureLinux-4.0-20260722",
                 output=output,
                 notes=notes,
             )
