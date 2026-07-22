@@ -592,6 +592,14 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         self.assertIn('if [[ "$has_resource_disk" == true ]]; then', script)
         self.assertIn("! mountpoint -q /d", script)
 
+    def test_azure_acceptance_identifies_attached_data_disk_by_exact_size(self):
+        script = (ROOT / "scripts/azurelinux4_azure_acceptance.sh").read_text()
+        self.assertIn("data_disk_size_gib=4", script)
+        self.assertIn("expected_data_disk_size=$((data_disk_size_gib * 1073741824))", script)
+        self.assertIn('blockdev --getsize64 "/dev/$name"', script)
+        self.assertIn('"$size" -eq "$expected_size"', script)
+        self.assertNotIn("MSFT NVMe Accelerator", script)
+
     def test_fixed_vhd_uses_supported_structural_validation(self):
         script = (ROOT / "scripts/azurelinux4_azure_acceptance.sh").read_text()
         self.assertNotIn("qemu-img check -f vpc", script)
