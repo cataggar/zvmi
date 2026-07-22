@@ -13,12 +13,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: azurelinux4-release-20260717
+  group: azurelinux4-release-20260721
   cancel-in-progress: false
 
 env:
-  RELEASE_TAG: AzureLinux-4.0-20260717
-  RELEASE_TITLE: Azure Linux 4.0 - 20260717
+  RELEASE_TAG: AzureLinux-4.0-20260721
+  RELEASE_TITLE: Azure Linux 4.0 - 20260721
 
 jobs:
   prepare:
