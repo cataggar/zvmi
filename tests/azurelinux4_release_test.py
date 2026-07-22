@@ -493,7 +493,7 @@ class AzureLinuxReleaseTest(unittest.TestCase):
             for line in workflow.splitlines()
             if re.match(r"\s+(name|pattern): azurelinux4-(candidate|azure)-", line)
         ]
-        self.assertEqual(len(artifact_references), 5)
+        self.assertEqual(len(artifact_references), 6)
         for reference in artifact_references:
             self.assertIn("${{ needs.prepare.outputs.source_commit }}", reference)
         candidate_references = [
@@ -513,7 +513,7 @@ class AzureLinuxReleaseTest(unittest.TestCase):
             for reference in artifact_references
             if "azurelinux4-azure-" in reference
         ]
-        self.assertEqual(len(azure_references), 2)
+        self.assertEqual(len(azure_references), 3)
         for reference in azure_references:
             self.assertIn("${{ github.run_attempt }}", reference)
 
@@ -532,18 +532,34 @@ class AzureLinuxReleaseTest(unittest.TestCase):
             2,
         )
 
-    def test_azure_acceptance_uses_protected_short_lived_credential(self):
+    def test_azure_acceptance_uses_protected_environment_oidc(self):
         workflow = (ROOT / ".github/workflows/azurelinux4-release.yml").read_text()
         acceptance = workflow.split("  azure_acceptance:", 1)[1].split(
             "\n  publish:", 1
         )[0]
-        self.assertNotIn("id-token: write", acceptance)
-        self.assertEqual(acceptance.count("clientSecret"), 2)
-        self.assertIn("AZURE_CLIENT_SECRET_VALUE", acceptance)
-        self.assertNotIn("protected-environment OIDC", acceptance)
+        self.assertIn("id-token: write", acceptance)
+        self.assertEqual(
+            acceptance.count("client-id: ${{ secrets.AZURE_CLIENT_ID }}"),
+            2,
+        )
+        self.assertEqual(
+            acceptance.count("tenant-id: ${{ secrets.AZURE_TENANT_ID }}"),
+            2,
+        )
+        self.assertEqual(
+            acceptance.count(
+                "subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+            ),
+            2,
+        )
+        self.assertNotIn("clientSecret", acceptance)
+        self.assertNotIn("AZURE_CLIENT_SECRET", acceptance)
+        self.assertIn("Upload failed Azure acceptance diagnostics", acceptance)
         self.assertNotIn("AZURE_CORE_OUTPUT", acceptance)
 
         script = (ROOT / "scripts/azurelinux4_azure_acceptance.sh").read_text()
+        self.assertIn("set -Eeuo pipefail", script)
+        self.assertIn("Azure acceptance failed at line", script)
         self.assertNotIn("az disk grant-access", script)
         self.assertIn("/beginGetAccess?api-version=2025-01-02", script)
         self.assertIn('tolower($1) == "location"', script)

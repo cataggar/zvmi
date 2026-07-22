@@ -400,6 +400,7 @@ jobs:
     permissions:
       actions: read
       contents: read
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -464,24 +465,23 @@ jobs:
       - name: Fail closed on missing protected configuration
         env:
           AZURE_CLIENT_ID_VALUE: ${{ secrets.AZURE_CLIENT_ID }}
-          AZURE_CLIENT_SECRET_VALUE: ${{ secrets.AZURE_CLIENT_SECRET }}
           AZURE_TENANT_ID_VALUE: ${{ secrets.AZURE_TENANT_ID }}
           AZURE_SUBSCRIPTION_ID_VALUE: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
         run: |
           set -euo pipefail
           uuid='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
           [[ "$AZURE_CLIENT_ID_VALUE" =~ $uuid ]]
-          test -n "$AZURE_CLIENT_SECRET_VALUE"
           [[ "$AZURE_TENANT_ID_VALUE" =~ $uuid ]]
           [[ "$AZURE_SUBSCRIPTION_ID_VALUE" =~ $uuid ]]
           [[ "$AZURE_LOCATION" =~ ^[a-z0-9-]+$ ]]
           [[ "$AZURE_VM_SIZE" =~ ^Standard_[A-Za-z0-9_]+$ ]]
 
-      - name: Log in to Azure with protected short-lived credential
+      - name: Log in to Azure with protected-environment OIDC
         uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
         with:
-          creds: >-
-            {"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}"}
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Install Zig via ghr
         uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
@@ -521,12 +521,13 @@ jobs:
           export GITHUB_RUN_ATTEMPT=$RUN_ATTEMPT_VALUE
           scripts/azurelinux4_azure_acceptance.sh run
 
-      - name: Refresh Azure credential for unconditional cleanup
+      - name: Refresh Azure OIDC credential for unconditional cleanup
         if: always()
         uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
         with:
-          creds: >-
-            {"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}"}
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Delete only owned temporary Azure resources
         if: always()
@@ -542,6 +543,18 @@ jobs:
             echo "::error::Cleanup script is absent while Azure state exists"
             exit 1
           fi
+
+      - name: Upload failed Azure acceptance diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: azurelinux4-azure-failure-${{ matrix.key }}-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.RESULT_DIR }}/*.json
+            ${{ env.RESULT_DIR }}/boot.log
+            ${{ env.RESULT_DIR }}/uefi-db.bin
+          if-no-files-found: warn
+          retention-days: 2
 
       - name: Upload exact Azure acceptance result
         if: success()
