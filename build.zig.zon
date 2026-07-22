@@ -6,8 +6,7 @@
 
     .dependencies = .{
         .bzip2 = .{
-            .url = "https://github.com/silver-signal/zig-bzip2/archive/refs/tags/1.0.8.tar.gz",
-            .hash = "bzip2-1.0.8-U45n218UAAD7Ic57yiQVR6us3Q0A-VgMmwiMXZUUGMke",
+            .path = "vendor/zig-bzip2",
         },
     },
 
@@ -26,6 +25,7 @@
         "wireserver",
         "scripts",
         "tests",
+        "vendor",
         "README.md",
         "LICENSE",
         "THIRD_PARTY_NOTICES.md",
