@@ -780,9 +780,9 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         delete = script.index("if ! az group delete")
         self.assertLess(ownership_guard, delete)
 
-    def test_qemu_readme_distinguishes_default_full_and_core_output(self):
-        readme = (ROOT / "README.md").read_text()
-        section = readme.split("### Booting the release image with QEMU", 1)[1]
+    def test_qemu_guide_distinguishes_default_full_and_core_output(self):
+        guide = (ROOT / "doc/qemu.md").read_text()
+        section = guide.split("## Booting the release image with QEMU", 1)[1]
         self.assertIn("full image's systemd startup and login prompt", section)
         self.assertIn("only when an explicit `*.core.qcow2` image", section)
         self.assertNotIn(
@@ -790,6 +790,32 @@ class AzureLinuxReleaseTest(unittest.TestCase):
             "the PID 1 readiness marker",
             section,
         )
+
+    def test_azure_linux_guide_distinguishes_full_and_core_images(self):
+        guide = (ROOT / "doc/azure-linux.md").read_text()
+        self.assertIn("| PID 1 | systemd | `zvminit` |", guide)
+        self.assertIn("| Default virtual size | 5 GiB | 1184 MiB |", guide)
+        self.assertIn(
+            "released Azure core images use `zvminit.mode=persistent`",
+            guide,
+        )
+        self.assertIn(
+            "| Azure extensions | Standard WALinuxAgent extension support | "
+            "No general WALinuxAgent extension stack |",
+            guide,
+        )
+
+    def test_root_readme_is_a_short_documentation_landing_page(self):
+        readme = (ROOT / "README.md").read_text()
+        headings = [line for line in readme.splitlines() if line.startswith("#")]
+        self.assertEqual(headings, ["# zvmi", "## Install", "## Documentation"])
+        self.assertLess(len(readme.splitlines()), 60)
+        self.assertIn("[Documentation index](doc/readme.md)", readme)
+
+    def test_cli_release_packages_documentation(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        self.assertIn("test -f doc/readme.md", workflow)
+        self.assertIn('cp -R doc "$package/"', workflow)
 
 
 if __name__ == "__main__":

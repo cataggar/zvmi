@@ -5,10 +5,10 @@
 `zvmi build-image --boot-mode uki` needs a systemd EFI stub (e.g.
 `linuxx64.efi.stub`, typically from the `systemd-boot-unsigned`/
 `systemd-boot-efi` package) to exist somewhere in the merged ISO/squashfs/
-container source tree -- see README.md's "UKI generation also requires a
-systemd EFI stub" note. `zvmi.bootconfig` discovers it by *basename* match
-anywhere in the merged tree (not a fixed path), so this only needs to
-overlay the single stub file; the archive path used below
+container source tree -- see the UKI guidance in `doc/image-building.md`.
+`zvmi.bootconfig` discovers it by *basename* match anywhere in the merged
+tree (not a fixed path), so this only needs to overlay the single stub file;
+the archive path used below
 (`usr/lib/systemd/boot/efi/linuxx64.efi.stub`) simply mirrors the
 conventional on-disk location.
 
