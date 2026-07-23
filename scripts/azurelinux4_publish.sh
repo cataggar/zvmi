@@ -119,6 +119,12 @@ else
     --notes-file "$notes_file" >/dev/null
 fi
 release_mutated=true
+release_id=$(gh release view "$RELEASE_TAG" \
+  --repo "$REPOSITORY" \
+  --json databaseId \
+  --jq .databaseId)
+[[ "$release_id" =~ ^[0-9]+$ ]]
+release_api="repos/$REPOSITORY/releases/$release_id"
 
 while IFS=$'\t' read -r asset_name expected_sha expected_bytes; do
   test "$(sha256sum "$assets_dir/$asset_name" | awk '{print $1}')" = "$expected_sha"
@@ -128,7 +134,7 @@ while IFS=$'\t' read -r asset_name expected_sha expected_bytes; do
     --repo "$REPOSITORY"
 done <"$expected_file"
 
-gh api "repos/$REPOSITORY/releases/tags/$RELEASE_TAG" >"$release_file"
+gh api "$release_api" >"$release_file"
 python3 - "$release_file" "$expected_file" >"$STAGING_ROOT/stale-asset-ids" <<'PY'
 import json
 import sys
@@ -143,7 +149,7 @@ while read -r asset_id; do
   gh api --method DELETE "repos/$REPOSITORY/releases/assets/$asset_id"
 done <"$STAGING_ROOT/stale-asset-ids"
 
-gh api "repos/$REPOSITORY/releases/tags/$RELEASE_TAG" >"$release_file"
+gh api "$release_api" >"$release_file"
 python3 - "$release_file" "$expected_file" <<'PY'
 import json
 import sys
@@ -198,7 +204,7 @@ gh release edit "$RELEASE_TAG" \
   --title "$RELEASE_TITLE" \
   --notes-file "$notes_file" >/dev/null
 
-gh api "repos/$REPOSITORY/releases/tags/$RELEASE_TAG" >"$release_file"
+gh api "$release_api" >"$release_file"
 python3 - "$release_file" "$expected_file" <<'PY'
 import json
 import sys
