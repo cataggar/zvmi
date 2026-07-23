@@ -5,10 +5,10 @@ initramfs at `boot/initramfs-<kver>.img`, for use as the
 
 `zvmi build-image --verity` needs the source initramfs to already include
 dm-verity userspace tooling (`systemd-veritysetup-generator`/
-`systemd-veritysetup`/`veritysetup`) -- see README.md's "Producing a
-verity-capable initramfs" section. Container layers always take precedence
-over ISO/squashfs entries at the same path, so overlaying the regenerated
-initramfs at the exact same `boot/initramfs-<kver>.img` path the ISO uses
+`systemd-veritysetup`/`veritysetup`) -- see "Producing a verity-capable
+initramfs" in `doc/image-building.md`. Container layers always take
+precedence over ISO/squashfs entries at the same path, so overlaying the
+regenerated initramfs at the exact same `boot/initramfs-<kver>.img` path the ISO uses
 (matching kernel version is essential -- see
 `build-verity-initramfs-fixture.sh`, which produces both the initramfs and
 its kernel version) cleanly replaces the stock copy with no extra `zvmi`

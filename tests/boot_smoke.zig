@@ -595,8 +595,8 @@ test "build-image --boot-mode uki opportunistically boot-smokes a provisioned st
         .output_format = .raw,
         .generation = .gen2,
         // UKI mode stores the kernel/initrd inside the EFI binary itself, so
-        // it needs a bigger ESP than BLS/GRUB mode -- see README.md's
-        // `--esp-size` note.
+        // it needs a bigger ESP than BLS/GRUB mode -- see the UKI guidance
+        // in doc/image-building.md.
         .esp_size = 512 * zvmi.azure.one_mib,
         .size = qemu_boot_smoke_disk_size + 512 * zvmi.azure.one_mib,
         .boot_mode = .uki_only,
@@ -660,8 +660,8 @@ test "build-image --verity opportunistically boot-smokes a provisioned verity-ca
     // separately-provisioned fixture: an OCI container that overlays a
     // regenerated initramfs (built with e.g. `dracut --add veritysetup`)
     // at the same boot/initramfs-<kver>.img path the base ISO/squashfs
-    // rootfs uses -- see README.md's "Producing a verity-capable
-    // initramfs" section. Most dev/CI setups won't have this provisioned,
+    // rootfs uses -- see "Producing a verity-capable initramfs" in
+    // doc/image-building.md. Most dev/CI setups won't have this provisioned,
     // so this skips (not fails) when ZVMI_BOOT_TEST_VERITY_OCI isn't set,
     // on top of the usual QEMU/OVMF/ISO prerequisites.
     const allocator = std.testing.allocator;

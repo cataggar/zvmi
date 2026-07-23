@@ -1,0 +1,283 @@
+# Azure Linux images
+
+Azure Linux release images are available in full and core variants for both x86_64 and AArch64. Choose full for a conventional, general-purpose Azure Linux VM; choose core for a smaller appliance-style guest with a deliberately limited runtime.
+
+## Full and core image comparison
+
+| Concern | Full image | Core image |
+|---|---|---|
+| Intended use | General-purpose Azure Linux VM | Minimal appliance-style Azure Linux VM |
+| PID 1 | systemd | `zvminit` |
+| Provisioning | cloud-init and WALinuxAgent | `azagent` supervised by `zvminit` |
+| SSH | `sshd.service` | OpenSSH directly supervised by `zvminit` |
+| Azure extensions | Standard WALinuxAgent extension support | No general WALinuxAgent extension stack |
+| Default virtual size | 5 GiB | 1184 MiB |
+| Released persistence | Normal writable system | `zvminit.mode=persistent` for provisioned identity and keys |
+| Asset naming | Unsuffixed `*.qcow2` | `*.core.qcow2` |
+
+Both flavors are Gen2 direct-UKI images with x86_64 and AArch64 variants. Release candidates use Azure Artifact Signing and are validated with Azure Trusted Launch, Secure Boot, and vTPM. Neither flavor contains baked credentials; supply a public SSH key during provisioning.
+
+`zvminit` supports an immutable default for other appliance uses, but the released Azure core images use `zvminit.mode=persistent` so the provisioned account, SSH keys, host keys, and agent state survive reboot.
+
+See [QEMU](qemu.md) for local launch and provisioning behavior.
+
+## Generalized Azure Linux 4 core and full QCOW2
+
+Host-side image builders can reuse `zvmi.artifact_pipeline` for bounded SHA-256-verified acquisition and transactional publication. Download callbacks receive only a pipeline-owned writer rather than a staging path, `decompressXz` requires an explicit XZ Utils executable plus compressed-input digest, memory limit, and output-size limit, and Linux-only `finalizeQcow2` converts a digest-pinned raw or standalone QCOW2 source to a validated standalone QCOW2. `zvmi.azure.deriveFixedVhd` converts a digest-pinned standalone GPT QCOW2 into a 1 MiB-aligned fixed VHD through a descriptor-pinned atomic stage, strictly cross-validates the primary and backup GPT copies, preserves the raw partition array and every partition extent, relocates the backup GPT, and revalidates the VHD and both GPT copies before publication. All operations preserve an existing destination until validation succeeds.
+
+`scripts/build_generalized_azurelinux4.zig` (run via
+`zig build -Dazurelinux-arch=x86_64|aarch64 -Dazurelinux-flavor=core|full generalized-azurelinux4`)
+builds the architecture-matched **core** or **full** recipe. Core remains the
+compatible default and is built from
+`mcr.microsoft.com/azurelinux-beta/base/core:4.0`: OpenSSH, static
+`zvminit`/`azagent`, and no host identity. The build graph compiles those two
+guest executables only for the core flavor; the CLI, builder, and preload
+library remain native to the build host.
+
+Full materializes a fresh rootfs with the official Azure Linux
+[`base/images/vm-base/vm-base.kiwi`](https://github.com/microsoft/azurelinux/blob/5b41bff6ebaf7e8fc78637b564efee23b66e7d67/base/images/vm-base/vm-base.kiwi)
+`vm-base` package profile, pinned to commit
+`5b41bff6ebaf7e8fc78637b564efee23b66e7d67` and blob
+`8c870852e711273275c83f0b94ecd914ff709af8`. Its package manifest is encoded
+in the builder, so KIWI is not a build dependency. Full uses systemd PID 1,
+cloud-init plus WALinuxAgent 2.15 (`Provisioning.Agent=auto`,
+`ResourceDisk.Format=n`), key-only OpenSSH, and no custom `zvminit` or
+`azagent`. It uses the profile's explicit 5 GiB default and rejects a root
+partition that cannot retain 1 GiB free. Core retains its 1184 MiB default.
+Full configures systemd-networkd DHCP for physical Ethernet devices and labels
+the completed installroot with its targeted SELinux policy before OCI and ext4
+assembly. Final image validation rejects a missing or unusable systemd SELinux
+label or root-inode label, so enforcing mode cannot freeze PID 1 on an
+unlabelled root filesystem.
+
+Both flavors use `--skip-iso-rootfs`: the ISO supplies only the
+architecture-matched kernel, initramfs, and UEFI assets. Full never publishes
+the ISO LiveOS/Anaconda rootfs. A pinned core OCI is used only to extract and
+checksum/fingerprint-validate the RPM signing key before its filesystem is
+discarded. Full verifies ISO kernel/initramfs releases against installed
+kernel-core/kernel-modules rather than emitting an incoherent userspace/module
+mix. Its kernel and kernel-modules package requests are pinned to the release
+inside the checksum-pinned ISO's nested `LiveOS` rootfs, and the builder mounts
+that nested rootfs to verify the exact release before image assembly.
+
+The recipe creates bounded flavor-specific OCI layers, validates rootfs
+identity cleanup, GPT/root GUIDs, fallback EFI, UKI PE sections/cmdline,
+partition geometry, free space, and OCI architecture/provenance before
+transactional QCOW2 publication. The x86_64 image uses `linuxx64.efi.stub`,
+`EFI/BOOT/BOOTX64.EFI`, and `ttyS0`; AArch64 uses `linuxaa64.efi.stub`,
+`EFI/BOOT/BOOTAA64.EFI`, and `ttyAMA0`. Core UKIs retain the `zvminit`
+contract; full UKIs contain only the root PARTUUID and architecture serial
+console. OCI ingestion preserves USTAR uid/gid plus bounded relevant PAX
+`user.*`, `trusted.*`, `security.*`, and `system.*` xattrs, including file
+capabilities; absent tar metadata remains root:root with no xattrs.
+
+The OpenSSH/sudo package transaction is also reproducibly locked: each
+descriptor pins the Azure Linux base repository's `repomd.xml` SHA-256. The
+builder verifies the live metadata, populates an isolated per-build DNF
+cache/persist directory, verifies DNF's cached `repomd.xml`, and performs the
+transaction with metadata expiration disabled globally and for
+`azurelinux-base`. That prevents metadata refresh while allowing DNF to
+download uncached RPM payloads. Payload downloads use a one-byte-per-second
+minimum rate, a five-minute timeout, and twenty retries so a slow Microsoft
+package endpoint does not discard an otherwise valid pinned transaction. DNF
+then verifies RPM signatures and package payload checksums from that pinned
+metadata. The cached and live metadata are verified again after the
+transaction; a repository change fails the build. The newly installed, sorted
+NEVRA closure is emitted and recorded under the builder work directory's
+`provenance/` directory.
+
+The image boots directly through `UEFI -> EFI/BOOT/BOOTX64.EFI` (x86_64) or
+`EFI/BOOT/BOOTAA64.EFI` (AArch64) `-> UKI -> kernel/initramfs -> zvminit`; it
+does not require shim, GRUB, or BLS configuration. Optional host-side signing runs after the unpublished QCOW2 is assembled and before final zstd compression. It verifies the configured certificate's canonical-DER SHA-256, signs every named `EFI/Linux/*.efi`, rewrites the fallback copy with identical signed bytes, verifies each Authenticode signature and PE payload, and re-verifies the exact UKIs extracted from the finalized QCOW2. Signing keys and provider diagnostics never enter the image, build log, artifact staging, or provenance.
+
+```console
+# Defaults: AzureLinux-4.0-x86_64.core.qcow2 and .scratch/azurelinux4-core-x86_64
+zig build -Dazurelinux-arch=x86_64 -Dazurelinux-flavor=core generalized-azurelinux4 --
+
+# Defaults: AzureLinux-4.0-aarch64.core.qcow2 and .scratch/azurelinux4-core-aarch64
+zig build -Dazurelinux-arch=aarch64 -Dazurelinux-flavor=core generalized-azurelinux4 --
+
+# Defaults: AzureLinux-4.0-x86_64.qcow2 and .scratch/azurelinux4-full-x86_64
+zig build -Dazurelinux-arch=x86_64 -Dazurelinux-flavor=full generalized-azurelinux4 --
+
+# Defaults: AzureLinux-4.0-aarch64.qcow2 and .scratch/azurelinux4-full-aarch64
+zig build -Dazurelinux-arch=aarch64 -Dazurelinux-flavor=full generalized-azurelinux4 --
+
+# Local development signing only
+zig build -Dazurelinux-arch=x86_64 -Dazurelinux-flavor=core generalized-azurelinux4 -- \
+  --uki-signing-certificate test.crt \
+  --uki-signing-certificate-sha256 <canonical-DER-SHA-256> \
+  --uki-signing-key test.key
+
+# Production Azure Artifact Signing
+zig build install-zvmi
+export ZVMI_AZURE_TENANT_ID=<Microsoft-Entra-tenant-UUID>
+export ZVMI_AZURE_CLIENT_ID=<federated-application-client-UUID>
+export ZVMI_ARTIFACT_SIGNING_ENDPOINT=https://wus.codesigning.azure.net/
+export ZVMI_ARTIFACT_SIGNING_ACCOUNT=cataggar
+export ZVMI_ARTIFACT_SIGNING_PROFILE=zvmi-uki
+zig build -Dazurelinux-arch=x86_64 -Dazurelinux-flavor=core generalized-azurelinux4 -- \
+  --uki-signing-certificate zvmi-uki-current-leaf.crt \
+  --uki-signing-certificate-sha256 <canonical-DER-SHA-256> \
+  --uki-sign-command "$PWD/zig-out/bin/zvmi" \
+  --uki-sign-command-arg sign
+```
+
+`zvmi sign` is the built-in production provider adapter. It validates the unsigned UKI and exact signing-leaf fingerprint, constructs the Authenticode signed attributes locally, obtains a GitHub OIDC token for `api://AzureADTokenExchange`, exchanges it with Microsoft Entra for the `https://codesigning.azure.net/.default` scope, and submits only the SHA-256 digest to Artifact Signing's stable `2024-06-15` `RS256` API. It polls the returned operation without following redirects, decodes the operation's nested Base64 PKCS#7 certificate bundle, requires its encapsulated signing leaf to exactly match the configured certificate, embeds the complete deduplicated chain in Authenticode CMS, and atomically publishes the signed UKI and non-secret provider metadata. `zvmi sign certificate <absolute-output.pem>` fetches the profile's current leaf from the authenticated certificate-bundle endpoint. The private key never leaves Azure. The external-provider protocol supplies `ZVMI_UKI_UNSIGNED`, `ZVMI_UKI_SIGNED`, `ZVMI_UKI_CERTIFICATE`, `ZVMI_UKI_ARCHITECTURE`, `ZVMI_UKI_FLAVOR`, `ZVMI_UKI_UNSIGNED_SHA256`, `ZVMI_UKI_CERTIFICATE_SHA256`, and `ZVMI_UKI_SIGNING_METADATA`.
+
+Create a dedicated Private Trust certificate profile named `zvmi-uki` in the existing `cataggar` Artifact Signing account. Configure the Entra federated credential for audience `api://AzureADTokenExchange`, issuer `https://token.actions.githubusercontent.com`, and subject `repo:cataggar/zvmi:environment:azurelinux4-signing`, then grant `Artifact Signing Certificate Profile Signer` at the `zvmi-uki` profile scope. The observed Private Trust chain terminates at a shared Microsoft Enterprise identity hierarchy, and UEFI cannot restrict trust with Artifact Signing's subscriber-unique EKU. Secure Boot therefore enrolls the exact short-lived signing leaf for each release, never the broad AOC intermediate or Microsoft root. The workflow fetches the current leaf immediately before signing and fails if the operation returns another leaf; release validation also fails if the leaf or provider identity changes across candidates. Artifact Signing leaves rotate daily and are valid for about three days. The raw digest API does not add an RFC 3161 timestamp; firmware and `sbverify` do not enforce signing-certificate wall-clock validity, but general long-term Authenticode validation requires a separately implemented timestamp policy.
+
+The builder requires Zig 0.16, `curl`, `dnf`, GNU tar, `qemu-img`, and
+passwordless or interactive `sudo`. On a host that differs from the selected
+guest architecture, the matching enabled binfmt registration plus
+`qemu-x86_64-static` or `qemu-aarch64-static` is required so RPM scriptlets
+can run inside the target rootfs; the temporary interpreter is removed before
+the OCI layout is produced. `--iso` accepts an already-downloaded ISO, but it
+is still validated against the architecture's pinned official SHA-256. Use
+`--size` overrides the flavor default (1184 MiB core, 5 GiB full). The fixed
+512 MiB ESP is retained when the total size is overridden, with the root
+partition consuming the remaining aligned capacity; full still requires 1 GiB
+root free space. The build system automatically passes the selected
+architecture, flavor, native zvmi, and preload library, plus the guest
+zvminit/azagent binaries for core only; no separate `zig build` invocation is
+needed.
+
+### Finalized-image native QEMU acceptance
+
+`test-azurelinux4-acceptance` is the reusable, opt-in release-candidate
+acceptance step. It receives the completed artifact through
+`ZVMI_AZURELINUX4_IMAGE` and refuses a mismatched basename, so it never tests
+an intermediate builder file. The selected build options map exactly to these
+four candidates:
+
+```text
+x86_64 full:    AzureLinux-4.0-x86_64.qcow2
+aarch64 full:   AzureLinux-4.0-aarch64.qcow2
+x86_64 core:    AzureLinux-4.0-x86_64.core.qcow2
+aarch64 core:   AzureLinux-4.0-aarch64.core.qcow2
+```
+
+For example, run the native x86_64 core entry as:
+
+```text
+ZVMI_AZURELINUX4_IMAGE=/path/to/AzureLinux-4.0-x86_64.core.qcow2 \
+ZVMI_AZURELINUX4_SIGNING_CERTIFICATE=/path/to/release.crt \
+ZVMI_AZURELINUX4_SIGNING_CERTIFICATE_SHA256=<canonical-DER-SHA-256> \
+ZVMI_AZURELINUX4_UKI_SHA256=<fallback-UKI-SHA-256> \
+ZVMI_AZURELINUX4_ACCEPTANCE_RESULT=/tmp/local-secure-boot-result.json \
+zig build -Dazurelinux-arch=x86_64 -Dazurelinux-flavor=core \
+  test-azurelinux4-acceptance
+```
+
+When `ZVMI_AZURELINUX4_IMAGE` is absent, the opt-in test skips cleanly. Once it
+is set, the invocation fails closed: native Linux/KVM, matching host
+architecture, QEMU and support tools, readable image, and matching UEFI
+Secure-Boot firmware, `sbverify`, OpenSSL, and `virt-fw-vars` are all mandatory. The step explicitly refuses TCG. It validates the supplied standalone zstd QCOW2, GPT root GUID, UKI architecture/flavor command line and exact signature, appends the release certificate to the Microsoft-enrolled firmware `db`, then boots two concurrent disposable overlays with independent UEFI variables and hybrid NoCloud/OVF seed media.
+It proves key-only SSH as `zvmitest`, first boot, reboot/reconnect, per-guest
+machine-ID and SSH-host-key stability, and distinct identities across the two
+instances. Both guests must report Secure Boot, the exact release certificate in `db`, kernel lockdown, accepted required modules, and no module-signature failures. A second test changes one Authenticode-covered `.cmdline` space to a tab in a disposable overlay, preserving kernel-option tokenization. It proves the changed UKI boots with Secure Boot disabled and requires a deterministic firmware refusal (`Security Violation` or `Access Denied`) with Secure Boot enabled before any Linux/PID 1/SSH marker. Core additionally verifies `zvminit` PID 1 and its supervised
+foreground-sshd restart behavior; full verifies systemd PID 1 plus cloud-init,
+WALinuxAgent, sshd, and networkd active/enabled contracts. Both instances must
+power off cleanly.
+
+## Azure Linux 4 release images
+
+Release `AzureLinux-4.0-20260723` contains exactly four Gen2 QCOW2 assets:
+
+```text
+AzureLinux-4.0-x86_64.qcow2
+AzureLinux-4.0-aarch64.qcow2
+AzureLinux-4.0-x86_64.core.qcow2
+AzureLinux-4.0-aarch64.core.qcow2
+```
+
+The unsuffixed **full** images use systemd, cloud-init for the provisioned
+account and SSH key, WALinuxAgent for Azure Ready/extensions, and
+`sshd.service`. The **core** images use `zvminit` as PID 1, `azagent` for
+provisioning/Ready, and directly supervised OpenSSH. Both flavors have no
+baked credentials and require a public SSH key at provisioning time; core
+cannot expose SSH until that key has been supplied through the Azure OVF
+profile. Release UKIs are trusted through the exact Artifact Signing leaf enrolled in UEFI `db`; its fingerprint is recorded in `candidate.json`, `publish-manifest.json`, release notes, local Secure Boot acceptance, and Azure acceptance together with every signing operation ID.
+
+`zvmi qemu` defaults to the full x86_64 asset pinned as
+`AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260723`. Select an AArch64 or
+core file explicitly when needed.
+
+The manual release workflow builds and externally signs all four candidates on
+GitHub-hosted `ubuntu-24.04` and `ubuntu-24.04-arm` runners. Hosted jobs perform
+structural QCOW2, GPT, UKI, provenance, and digest validation. They do not
+require local KVM or claim a local native boot result; the exact candidate
+bytes must pass the protected Azure acceptance matrix on matching x86_64 and
+AArch64 VMs before publication.
+
+The fail-closed native KVM test remains available for optional validation on a
+suitable machine:
+
+```sh
+# AArch64
+sudo apt-get update
+sudo apt-get install -y qemu-system-arm
+scripts/check_azurelinux4_release_runner.sh aarch64
+```
+
+It must print `architecture=aarch64 accelerator=kvm`. Use `x86_64` and install
+`qemu-system-x86` for optional x86_64 validation. This probe is not part of
+the hosted release gate.
+
+Build/sign/local acceptance use the separate protected `azurelinux4-signing` GitHub environment, restricted to `main` with required reviewers. It defines these variables:
+
+```text
+ZVMI_AZURE_TENANT_ID=<Microsoft-Entra-tenant-UUID>
+ZVMI_AZURE_CLIENT_ID=<federated-application-client-UUID>
+ZVMI_ARTIFACT_SIGNING_ENDPOINT=https://wus.codesigning.azure.net/
+ZVMI_ARTIFACT_SIGNING_ACCOUNT=cataggar
+ZVMI_ARTIFACT_SIGNING_PROFILE=zvmi-uki
+```
+
+The workflow builds `zvmi` from the accepted source commit, uses `zvmi sign certificate` to fetch the current public leaf, and uses the absolute `zig-out/bin/zvmi sign` path; no separately installed adapter or static certificate secret is trusted. The signer receives `id-token: write`; all other build permissions remain read-only. Grant the federated application `Artifact Signing Certificate Profile Signer` only at the `zvmi-uki` profile scope. No production private key, access token, OIDC token, or raw provider response is stored in the repository, image, provenance, logs, workflow artifacts, or release assets.
+
+Real-Azure validation and publication use the protected
+`azurelinux4-release` GitHub environment. Configure it with required
+reviewers, allow deployments only from `main`, and create this OIDC federated
+subject:
+
+```text
+repo:cataggar/zvmi:environment:azurelinux4-release
+```
+
+The environment must define these secrets:
+
+```text
+AZURE_CLIENT_ID
+AZURE_TENANT_ID
+AZURE_SUBSCRIPTION_ID
+```
+
+and these variables:
+
+```text
+AZURE_LOCATION_X64=eastus2
+AZURE_VM_SIZE_X64=Standard_D2ds_v5
+AZURE_LOCATION_ARM64=eastus2
+AZURE_VM_SIZE_ARM64=Standard_D2pds_v5
+```
+
+Equivalent regions/SKUs are allowed, but each configured SKU must be
+available, expose the requested x64/Arm64 architecture and Gen2, and have a
+temporary resource disk. Missing credentials, tools, capacity, or
+configuration fail the workflow. The OIDC identity needs permission to
+create/delete the uniquely tagged temporary resource groups and their
+Compute, Network, and Compute Gallery resources; use a dedicated validation
+subscription or an equivalent least-privilege custom role.
+
+Every candidate is rebound to its SHA-256 after artifact download. A complete
+four-entry protected Azure matrix creates a Gen2 `TrustedLaunchSupported` gallery definition, publishes the image version through Compute REST API `2025-03-03` with `MicrosoftUefiCertificateAuthorityTemplate` plus the canonical DER release certificate in `additionalSignatures.db`, and deploys a Trusted Launch VM with Secure Boot and vTPM enabled. It validates the exact certificate in guest `db`, the signed UKI, lockdown and module trust, key-only SSH, agent Ready, root growth, resource/data disks, reboot/reconnect, and flavor/runtime identity. The configured regions must support custom UEFI keys; unsupported-region and unsupported-Arm64 service responses fail the four-candidate gate rather than weakening it.
+Only then can the single publisher stage the release as a draft, clobber the
+four QCOW2s, remove stale assets, verify downloaded remote bytes, and publish.
+Existing tags are peeled and must resolve to the accepted source commit.
+Derived VHDs and Azure resources are temporary and are never retained.
+SHA-256 values appear in release notes and job summaries only: **checksum
+sidecar assets are not published**.
+
+Artifact Signing leaf rotation is release-scoped: each gallery version enrolls the exact leaf used for that version, and all four candidates must finish under one leaf. Retain old public leaf certificates and release-to-fingerprint mappings through the rollback window. On compromise, stop publication, revoke or rotate immediately, add the compromised leaf or hash to `dbx` in future gallery versions, and require reimage/redeployment; existing image versions and VM firmware state are not assumed to inherit later `db`/`dbx` changes. `NoSignatureTemplate` is not used because it would replace Microsoft/Azure trust anchors.
+

@@ -6,8 +6,9 @@ network access to a container registry.
 The resulting layout contains a single tiny layer (just a `/hello` text
 file) -- enough for `zvmi build-image` to have a valid OCI container to
 merge on top of the real ISO/squashfs rootfs, matching the "container
-becomes the effective root filesystem" documentation in README.md without
-needing anything from it beyond `architecture`/`os` and one harmless file.
+becomes the effective root filesystem" documentation in
+`doc/image-building.md` without needing anything from it beyond
+`architecture`/`os` and one harmless file.
 
 Usage: make-minimal-oci-fixture.py <output-dir>
 """
