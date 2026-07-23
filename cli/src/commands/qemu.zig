@@ -23,13 +23,13 @@ const known_images = [_]KnownImage{
     .{
         .alias = "AzureLinux-4.0-x86_64",
         .disk_name = "AzureLinux-4.0-x86_64.qcow2",
-        .release_spec = "cataggar/zvmi/AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260722",
+        .release_spec = "cataggar/zvmi/AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260723",
         .architecture = .x86_64,
     },
     .{
         .alias = "AzureLinux-4.0-aarch64",
         .disk_name = "AzureLinux-4.0-aarch64.qcow2",
-        .release_spec = "cataggar/zvmi/AzureLinux-4.0-aarch64.qcow2@AzureLinux-4.0-20260722",
+        .release_spec = "cataggar/zvmi/AzureLinux-4.0-aarch64.qcow2@AzureLinux-4.0-20260723",
         .architecture = .aarch64,
     },
 };
@@ -2540,15 +2540,15 @@ test "qemu-img snapshot overlay argv is explicit" {
 
 test "qemu release download spec remains pinned to the validated Azure Linux release" {
     try std.testing.expectEqualStrings(
-        "cataggar/zvmi/AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260722",
+        "cataggar/zvmi/AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260723",
         default_image_spec,
     );
     try std.testing.expectEqualStrings(
-        "cataggar/zvmi/AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260722",
+        "cataggar/zvmi/AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260723",
         known_images[0].release_spec,
     );
     try std.testing.expectEqualStrings(
-        "cataggar/zvmi/AzureLinux-4.0-aarch64.qcow2@AzureLinux-4.0-20260722",
+        "cataggar/zvmi/AzureLinux-4.0-aarch64.qcow2@AzureLinux-4.0-20260723",
         known_images[1].release_spec,
     );
 }
@@ -2564,7 +2564,7 @@ test "qemu known image download argv is exact" {
     try expectArgv(&.{
         "ghr",
         "download",
-        "cataggar/zvmi/AzureLinux-4.0-aarch64.qcow2@AzureLinux-4.0-20260722",
+        "cataggar/zvmi/AzureLinux-4.0-aarch64.qcow2@AzureLinux-4.0-20260723",
         "--output",
         "images/AzureLinux-4.0-aarch64.qcow2",
     }, &argv);
