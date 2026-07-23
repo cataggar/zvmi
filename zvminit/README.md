@@ -30,12 +30,12 @@ A minimal (~160 KB), statically-linked PID 1 replacement for real-boot testing o
   `zvminit.shell=on` explicitly enables a respawning diagnostic root shell on
   the discovered serial device; the default is `off`.
 - Detects Azure before launching `azagent`. Automatic detection accepts either
-  a readable `ovf-env.xml` provisioning disc or DHCP option 245, and classifies
-  a completed DHCP lease with neither signal as non-Azure. Persistent mode
-  stores the result in `/var/lib/azagent/azure-environment`, bound to the
-  current DMI product UUID so moving the disk to a different VM forces
-  redetection. Failed DHCP or not-yet-readable media remains unknown and is
-  retried without repeatedly launching `azagent`.
+  a readable `ovf-env.xml` provisioning disc or DHCP option 245. Missing
+  positive evidence remains unknown and is retried because Azure can expose
+  the provisioning disc after networking completes. Persistent mode stores
+  positive Azure detections in `/var/lib/azagent/azure-environment`, bound to
+  the current DMI product UUID so moving the disk to a different VM forces
+  redetection.
 - Distinguishes synthetic local OVF media only by the explicit
   `zvmi-local-provisioning` marker file. Marked media runs
   `azagent --skip-ready` under the default automatic policy; an unmarked
@@ -97,7 +97,7 @@ zvmi build-image --iso <azurelinux.iso> --container <oci-layout-with-zvminit-age
 
 `init=/sbin/zvminit` is required when the packaged OpenSSH dependency set includes systemd; otherwise the systemd-based initramfs selects `/usr/lib/systemd/systemd` directly instead of zvminit. Persistent mode is intentionally incompatible with a read-only dm-verity root. If the root remount fails, zvminit leaves provisioning and SSH disabled and retains serial-console access for diagnosis.
 
-`zvminit.azure=auto` is the default. Use `zvminit.azure=on` to force provisioning retries when Azure's early-boot signals are unavailable, or `zvminit.azure=off` to suppress `azagent` explicitly. Overrides apply only to the current boot and do not replace the cached automatic decision. `zvmi azure deprovision` removes `/var/lib/azagent`, including both the provisioning sentinel and cached environment decision.
+`zvminit.azure=auto` is the default and does not infer non-Azure from temporarily missing evidence. Use `zvminit.azure=on` to force provisioning retries when Azure's early-boot signals are unavailable, or `zvminit.azure=off` to suppress `azagent` explicitly. Overrides apply only to the current boot and do not replace the cached automatic decision. `zvmi azure deprovision` removes `/var/lib/azagent`, including both the provisioning sentinel and cached environment decision.
 
 `zvminit.shell=off` is also the default. Add `zvminit.shell=on` only to a
 temporary diagnostic boot command line when unauthenticated serial root access

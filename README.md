@@ -482,9 +482,10 @@ images using `zvminit` must add `zvminit.mode=persistent` to the kernel command
 line so provisioned users, SSH keys, host keys, and the azagent sentinel are
 written to the root filesystem instead of ephemeral overlays. `zvminit` defaults
 to `zvminit.azure=auto`: readable provisioning media or DHCP option 245 selects
-Azure, while a completed DHCP lease with neither signal selects non-Azure and
-skips `azagent`. Persistent decisions are stored under `/var/lib/azagent` and
-bound to the current DMI product UUID; `zvmi azure deprovision` clears them.
+Azure, while missing positive evidence remains unknown and is retried because
+Azure can expose the provisioning disc after networking completes. Positive
+Azure decisions are stored under `/var/lib/azagent` and bound to the current
+DMI product UUID; `zvmi azure deprovision` clears them.
 Use `zvminit.azure=on` or `off` as a per-boot diagnostic override. Also add
 `init=/sbin/zvminit` when the container includes systemd as an OpenSSH dependency,
 ensuring the initramfs launches `zvminit` rather than systemd directly.
@@ -923,8 +924,8 @@ the full image's systemd startup and login prompt. It does not emit
 `zvminit` readiness markers.
 
 Those markers apply only when an explicit `*.core.qcow2` image is selected.
-A successful core boot reports that non-Azure `azagent` provisioning was
-skipped, the diagnostic root shell is disabled, and the
+A successful unprovisioned core boot reports that automatic Azure detection is
+still pending, the diagnostic root shell is disabled, and the
 `ZVMINIT_PID1_READY supervisor loop active` marker.
 
 To provision an administrator at launch, supply
