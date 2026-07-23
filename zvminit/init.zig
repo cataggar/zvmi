@@ -474,8 +474,6 @@ fn resolveAzureDecision(policy: AzurePolicy, cached: ?AzureDecision, evidence: A
             .local
         else if (cached) |decision|
             decision
-        else if (evidence.dhcp_acknowledged and evidence.media == .absent)
-            .non_azure
         else
             .unknown,
     };
@@ -1400,16 +1398,15 @@ fn azureEvidence(network: NetworkResult, media: provisioning_media.ProbeResult) 
 
 fn persistObservedAzureDecision(
     policy: AzurePolicy,
-    cached: ?AzureDecision,
     identity: ?[36]u8,
     evidence: AzureEvidence,
 ) void {
     if (policy != .auto) return;
-    if (evidence.saw_option_245 or evidence.media == .azure) {
-        persistAzureDecision(identity, .azure);
-    } else if (cached == null and evidence.dhcp_acknowledged and evidence.media == .absent) {
-        persistAzureDecision(identity, .non_azure);
-    }
+    if (automaticDecisionToPersist(evidence)) |decision| persistAzureDecision(identity, decision);
+}
+
+fn automaticDecisionToPersist(evidence: AzureEvidence) ?AzureDecision {
+    return if (evidence.saw_option_245 or evidence.media == .azure) .azure else null;
 }
 
 fn logAzureDecision(decision: AzureDecision, policy: AzurePolicy, evidence: AzureEvidence, cached: ?AzureDecision) void {
@@ -1615,7 +1612,7 @@ fn updateDetection(supervisor: *Supervisor) void {
     const evidence = azureEvidence(supervisor.network, supervisor.media);
     const next_decision = resolveAzureDecision(supervisor.policy, supervisor.cached, evidence);
     if (supervisor.persist_detection) {
-        persistObservedAzureDecision(supervisor.policy, supervisor.cached, supervisor.identity, evidence);
+        persistObservedAzureDecision(supervisor.policy, supervisor.identity, evidence);
     }
     if (next_decision != .unknown) {
         supervisor.decision = next_decision;
@@ -1639,7 +1636,7 @@ fn initializeSupervisor(
     const evidence = azureEvidence(network, media);
     const decision = resolveAzureDecision(boot_config.azure_policy, cached, evidence);
     if (persist_detection) {
-        persistObservedAzureDecision(boot_config.azure_policy, cached, identity, evidence);
+        persistObservedAzureDecision(boot_config.azure_policy, identity, evidence);
     }
     logAzureDecision(decision, boot_config.azure_policy, evidence, cached);
     return .{
@@ -1925,7 +1922,7 @@ test "formatMachineId emits lowercase hex and a newline" {
     );
 }
 
-test "resolveAzureDecision honors overrides, positive evidence, cache, and safe negatives" {
+test "resolveAzureDecision honors overrides, positive evidence, cache, and fail-closed unknowns" {
     const none: AzureEvidence = .{ .media = .absent };
     try std.testing.expectEqual(AzureDecision.azure, resolveAzureDecision(.on, .non_azure, none));
     try std.testing.expectEqual(AzureDecision.azure, resolveAzureDecision(.on, null, .{ .media = .local }));
@@ -1948,7 +1945,7 @@ test "resolveAzureDecision honors overrides, positive evidence, cache, and safe 
         resolveAzureDecision(.auto, null, .{ .saw_option_245 = true, .media = .local }),
     );
     try std.testing.expectEqual(AzureDecision.azure, resolveAzureDecision(.auto, .azure, none));
-    try std.testing.expectEqual(AzureDecision.non_azure, resolveAzureDecision(.auto, null, .{
+    try std.testing.expectEqual(AzureDecision.unknown, resolveAzureDecision(.auto, null, .{
         .dhcp_acknowledged = true,
         .media = .absent,
     }));
@@ -1957,6 +1954,21 @@ test "resolveAzureDecision honors overrides, positive evidence, cache, and safe 
         .media = .indeterminate,
     }));
     try std.testing.expectEqual(AzureDecision.unknown, resolveAzureDecision(.auto, null, none));
+}
+
+test "automatic persistence requires positive Azure evidence" {
+    try std.testing.expectEqual(
+        AzureDecision.azure,
+        automaticDecisionToPersist(.{ .saw_option_245 = true }).?,
+    );
+    try std.testing.expectEqual(
+        AzureDecision.azure,
+        automaticDecisionToPersist(.{ .media = .azure }).?,
+    );
+    try std.testing.expectEqual(
+        @as(?AzureDecision, null),
+        automaticDecisionToPersist(.{ .dhcp_acknowledged = true, .media = .absent }),
+    );
 }
 
 test "Azure environment state normalizes identities, round trips, and rejects mismatches" {
