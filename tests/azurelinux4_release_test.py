@@ -668,6 +668,13 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         self.assertIn('qemu-img info -f vpc --output=json "$vhd"', script)
         self.assertIn("azurelinux4_release.py verify-vhd", script)
 
+    def test_publisher_verifies_drafts_by_release_id(self):
+        script = (ROOT / "scripts/azurelinux4_publish.sh").read_text()
+        self.assertIn("--json databaseId", script)
+        self.assertIn('release_api="repos/$REPOSITORY/releases/$release_id"', script)
+        self.assertEqual(script.count('gh api "$release_api"'), 3)
+        self.assertNotIn("releases/tags/$RELEASE_TAG", script)
+
     def test_ci_actions_are_pinned_to_audited_commits(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         actions = re.findall(
