@@ -144,6 +144,21 @@ pub const Source = struct {
         return self.readVerifiedAlloc(path, digest, descriptor.size);
     }
 
+    /// Opens a content blob after validating its canonical digest path and
+    /// declared size. The caller must verify the digest while consuming it.
+    pub fn openBlob(self: Source, descriptor: model.Descriptor) !Io.File {
+        const digest = content.Digest.parse(descriptor.digest) catch return error.CorruptBlob;
+        const hex = digest.blobPathComponent();
+        var path_buf: [80]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "blobs/sha256/{s}", .{hex});
+        var dir = try Io.Dir.cwd().openDir(self.io, self.path, .{});
+        defer dir.close(self.io);
+        const file = dir.openFile(self.io, path, .{}) catch return error.CorruptBlob;
+        errdefer file.close(self.io);
+        if (try file.length(self.io) != descriptor.size) return error.CorruptBlob;
+        return file;
+    }
+
     pub fn validateLayout(self: Source) !void {
         const bytes = try self.readFile("oci-layout", 4096);
         defer self.allocator.free(bytes);
@@ -354,6 +369,10 @@ pub const Destination = struct {
     /// corrupt paths are rejected and never overwritten.
     pub fn ensureBlob(self: *Destination, source: transport.Source, descriptor: model.Descriptor, counts: *Counts) !void {
         return self.ensureContent(source, descriptor, null, counts);
+    }
+
+    pub fn ensureBytes(self: *Destination, descriptor: model.Descriptor, bytes: []const u8, counts: *Counts) !void {
+        return self.ensureMetadataBlob(descriptor, bytes, counts);
     }
 
     fn ensureMetadataBlob(

@@ -1,4 +1,4 @@
-//! `zvmi oci copy|inspect|list-tags` transport-aware OCI operations.
+//! Transport-aware OCI operations and editable runtime bundles.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -12,6 +12,9 @@ const usage =
     \\  zvmi oci copy [options] <source> <destination>
     \\  zvmi oci inspect [options] <source>
     \\  zvmi oci list-tags [options] docker://<registry>/<repository>
+    \\  zvmi oci unpack [options] --image oci:<layout>[:tag] <bundle>
+    \\  zvmi oci repack --image oci:<layout>:<tag> <bundle>
+    \\  zvmi oci config [options] --image oci:<layout>[:tag]
     \\
     \\copy options:
     \\  --all
@@ -35,6 +38,24 @@ const usage =
     \\  --authfile <path>
     \\  --tls-ca <path>
     \\  --plain-http
+    \\
+    \\unpack options:
+    \\  --image <reference>
+    \\  --override-os <name>
+    \\  --override-arch <name>
+    \\  --override-variant <name>
+    \\  --rootless
+    \\  --force
+    \\
+    \\repack options:
+    \\  --image <reference>
+    \\  --compression <same|gzip|none>
+    \\
+    \\config options:
+    \\  --image <reference>
+    \\  --override-os <name>
+    \\  --override-arch <name>
+    \\  --override-variant <name>
     \\
 ;
 
@@ -104,6 +125,23 @@ const PlatformOptions = struct {
         const options = try self.graph();
         return .{ .mode = options.mode, .max_depth = options.max_depth };
     }
+
+    fn selected(self: PlatformOptions) ParseError!oci.model.Platform {
+        if (self.all_set) return error.ConflictingPlatformOptions;
+        const os = self.os orelse hostOs();
+        const architecture = self.architecture orelse hostArchitecture();
+        if (!validPlatformComponent(os) or
+            !validPlatformComponent(architecture) or
+            (self.variant != null and !validPlatformComponent(self.variant.?)))
+        {
+            return error.InvalidPlatform;
+        }
+        return .{
+            .os = os,
+            .architecture = architecture,
+            .variant = self.variant,
+        };
+    }
 };
 
 const CopyArgs = struct {
@@ -123,6 +161,25 @@ const InspectArgs = struct {
 const TagsArgs = struct {
     source: []const u8,
     endpoint: EndpointOptions,
+};
+
+const UnpackArgs = struct {
+    source: []const u8,
+    destination: []const u8,
+    platform: oci.model.Platform,
+    rootless: bool,
+    force: bool,
+};
+
+const RepackArgs = struct {
+    target: []const u8,
+    bundle: []const u8,
+    compression: oci.repack.Compression,
+};
+
+const ConfigArgs = struct {
+    source: []const u8,
+    platform: oci.model.Platform,
 };
 
 pub fn run(
@@ -151,7 +208,121 @@ pub fn run(
             return argumentFailure("list-tags", err);
         return runTags(allocator, io, environ, parsed);
     }
+    if (std.mem.eql(u8, args[0], "unpack")) {
+        const parsed = parseUnpack(args[1..]) catch |err|
+            return argumentFailure("unpack", err);
+        return runUnpack(allocator, io, parsed);
+    }
+    if (std.mem.eql(u8, args[0], "repack")) {
+        const parsed = parseRepack(args[1..]) catch |err|
+            return argumentFailure("repack", err);
+        return runRepack(allocator, io, parsed);
+    }
+    if (std.mem.eql(u8, args[0], "config")) {
+        const parsed = parseConfig(args[1..]) catch |err|
+            return argumentFailure("config", err);
+        return runConfig(allocator, io, parsed);
+    }
     return fail("zvmi oci: unknown subcommand '{s}'\n\n{s}", .{ args[0], usage });
+}
+
+fn runConfig(
+    allocator: std.mem.Allocator,
+    io: Io,
+    args: ConfigArgs,
+) u8 {
+    const parsed = oci.reference.parse(args.source, .source) catch |err|
+        return fail("zvmi oci config: invalid source '{s}': {s}", .{ args.source, @errorName(err) });
+    const source_ref = switch (parsed) {
+        .layout => |value| value,
+        .registry => return fail(
+            "zvmi oci config: source must be a local OCI layout: '{s}'",
+            .{args.source},
+        ),
+    };
+    var source = oci.layout.Source.init(io, allocator, source_ref.path);
+    var resolved = oci.image_resolver.resolveLayout(
+        allocator,
+        &source,
+        source_ref,
+        .{ .platform = args.platform },
+    ) catch |err| return fail(
+        "zvmi oci config: '{s}' failed: {s}",
+        .{ args.source, @errorName(err) },
+    );
+    defer resolved.deinit();
+    writeLine(io, resolved.config_bytes) catch |err|
+        return fail("zvmi oci config: failed to write output: {s}", .{@errorName(err)});
+    return 0;
+}
+
+fn runRepack(
+    allocator: std.mem.Allocator,
+    io: Io,
+    args: RepackArgs,
+) u8 {
+    const parsed = oci.reference.parse(args.target, .destination) catch |err|
+        return fail("zvmi oci repack: invalid target '{s}': {s}", .{ args.target, @errorName(err) });
+    const target = switch (parsed) {
+        .layout => |value| value,
+        .registry => return fail(
+            "zvmi oci repack: target must be a local OCI layout: '{s}'",
+            .{args.target},
+        ),
+    };
+    const result = oci.repack.repackLayout(
+        allocator,
+        io,
+        target,
+        args.bundle,
+        .{ .compression = args.compression },
+    ) catch |err| return fail(
+        "zvmi oci repack: '{s}' to '{s}' failed: {s}",
+        .{ args.bundle, args.target, @errorName(err) },
+    );
+    writeLine(io, result.digest()) catch |err|
+        return fail("zvmi oci repack: failed to write output: {s}", .{@errorName(err)});
+    return 0;
+}
+
+fn runUnpack(
+    allocator: std.mem.Allocator,
+    io: Io,
+    args: UnpackArgs,
+) u8 {
+    const source = oci.reference.parse(args.source, .source) catch |err|
+        return fail("zvmi oci unpack: invalid source '{s}': {s}", .{ args.source, @errorName(err) });
+    const local = switch (source) {
+        .layout => |value| value,
+        .registry => return fail(
+            "zvmi oci unpack: source must be a local OCI layout: '{s}'",
+            .{args.source},
+        ),
+    };
+    const result = oci.bundle.unpackLayout(
+        allocator,
+        io,
+        args.source,
+        local,
+        args.destination,
+        .{
+            .platform = args.platform,
+            .preserve_ownership = !args.rootless,
+            .force = args.force,
+        },
+    ) catch |err| return fail(
+        "zvmi oci unpack: '{s}' to '{s}' failed: {s}",
+        .{ args.source, args.destination, @errorName(err) },
+    );
+    if (result.cleanup_warning) {
+        std.debug.print(
+            "zvmi oci unpack: warning: replaced bundle was left at a hidden staging path because cleanup failed\n",
+            .{},
+        );
+    }
+    writeLine(io, result.digest()) catch |err|
+        return fail("zvmi oci unpack: failed to write output: {s}", .{@errorName(err)});
+    return 0;
 }
 
 fn runCopy(
@@ -567,6 +738,107 @@ fn parseTags(args: []const []const u8) ParseError!TagsArgs {
     return .{ .source = source orelse return error.InvalidArguments, .endpoint = endpoint };
 }
 
+fn parseUnpack(args: []const []const u8) ParseError!UnpackArgs {
+    var source: ?[]const u8 = null;
+    var destination: ?[]const u8 = null;
+    var platform: PlatformOptions = .{};
+    var rootless = false;
+    var rootless_set = false;
+    var force = false;
+    var force_set = false;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const argument = args[i];
+        if (std.mem.eql(u8, argument, "--image")) {
+            source = try uniqueValue(args, &i, source);
+        } else if (std.mem.eql(u8, argument, "--override-os")) {
+            platform.os = try uniqueValue(args, &i, platform.os);
+        } else if (std.mem.eql(u8, argument, "--override-arch")) {
+            platform.architecture = try uniqueValue(args, &i, platform.architecture);
+        } else if (std.mem.eql(u8, argument, "--override-variant")) {
+            platform.variant = try uniqueValue(args, &i, platform.variant);
+        } else if (std.mem.eql(u8, argument, "--rootless")) {
+            if (rootless_set) return error.DuplicateOption;
+            rootless = true;
+            rootless_set = true;
+        } else if (std.mem.eql(u8, argument, "--force")) {
+            if (force_set) return error.DuplicateOption;
+            force = true;
+            force_set = true;
+        } else if (std.mem.startsWith(u8, argument, "-")) {
+            return error.InvalidOption;
+        } else if (destination == null) {
+            destination = argument;
+        } else {
+            return error.InvalidArguments;
+        }
+    }
+    return .{
+        .source = source orelse return error.InvalidArguments,
+        .destination = destination orelse return error.InvalidArguments,
+        .platform = try platform.selected(),
+        .rootless = rootless,
+        .force = force,
+    };
+}
+
+fn parseRepack(args: []const []const u8) ParseError!RepackArgs {
+    var target: ?[]const u8 = null;
+    var bundle_path: ?[]const u8 = null;
+    var compression_value: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const argument = args[i];
+        if (std.mem.eql(u8, argument, "--image")) {
+            target = try uniqueValue(args, &i, target);
+        } else if (std.mem.eql(u8, argument, "--compression")) {
+            compression_value = try uniqueValue(args, &i, compression_value);
+        } else if (std.mem.startsWith(u8, argument, "-")) {
+            return error.InvalidOption;
+        } else if (bundle_path == null) {
+            bundle_path = argument;
+        } else {
+            return error.InvalidArguments;
+        }
+    }
+    return .{
+        .target = target orelse return error.InvalidArguments,
+        .bundle = bundle_path orelse return error.InvalidArguments,
+        .compression = if (compression_value) |value|
+            std.meta.stringToEnum(oci.repack.Compression, value) orelse
+                return error.InvalidArguments
+        else
+            .same,
+    };
+}
+
+fn parseConfig(args: []const []const u8) ParseError!ConfigArgs {
+    var source: ?[]const u8 = null;
+    var platform: PlatformOptions = .{};
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const argument = args[i];
+        if (std.mem.eql(u8, argument, "--image")) {
+            source = try uniqueValue(args, &i, source);
+        } else if (std.mem.eql(u8, argument, "--override-os")) {
+            platform.os = try uniqueValue(args, &i, platform.os);
+        } else if (std.mem.eql(u8, argument, "--override-arch")) {
+            platform.architecture = try uniqueValue(args, &i, platform.architecture);
+        } else if (std.mem.eql(u8, argument, "--override-variant")) {
+            platform.variant = try uniqueValue(args, &i, platform.variant);
+        } else {
+            return if (std.mem.startsWith(u8, argument, "-"))
+                error.InvalidOption
+            else
+                error.InvalidArguments;
+        }
+    }
+    return .{
+        .source = source orelse return error.InvalidArguments,
+        .platform = try platform.selected(),
+    };
+}
+
 fn uniqueValue(
     args: []const []const u8,
     index: *usize,
@@ -838,6 +1110,61 @@ test "inspect and list-tags parsers enforce their option sets" {
         error.InvalidTransportOption,
         validateEndpoint(local, .{ .plain_http = true, .plain_http_set = true }),
     );
+}
+
+test "unpack parser accepts image platform and rootless options" {
+    const parsed = try parseUnpack(&.{
+        "--image",
+        "oci:layout:latest",
+        "--override-os",
+        "linux",
+        "--override-arch",
+        "arm64",
+        "--override-variant",
+        "v8",
+        "--rootless",
+        "bundle",
+    });
+    try std.testing.expectEqualStrings("oci:layout:latest", parsed.source);
+    try std.testing.expectEqualStrings("bundle", parsed.destination);
+    try std.testing.expectEqualStrings("linux", parsed.platform.os);
+    try std.testing.expectEqualStrings("arm64", parsed.platform.architecture);
+    try std.testing.expectEqualStrings("v8", parsed.platform.variant.?);
+    try std.testing.expect(parsed.rootless);
+    try std.testing.expectError(error.InvalidArguments, parseUnpack(&.{
+        "bundle",
+    }));
+}
+
+test "repack parser requires target image and bundle" {
+    const parsed = try parseRepack(&.{
+        "--image",
+        "oci:layout:edited",
+        "bundle",
+    });
+    try std.testing.expectEqualStrings("oci:layout:edited", parsed.target);
+    try std.testing.expectEqualStrings("bundle", parsed.bundle);
+    try std.testing.expectError(error.InvalidArguments, parseRepack(&.{
+        "--image",
+        "oci:layout:edited",
+    }));
+}
+
+test "config parser accepts image and explicit platform" {
+    const parsed = try parseConfig(&.{
+        "--image",
+        "oci:layout:latest",
+        "--override-os",
+        "linux",
+        "--override-arch",
+        "amd64",
+    });
+    try std.testing.expectEqualStrings("oci:layout:latest", parsed.source);
+    try std.testing.expectEqualStrings("linux", parsed.platform.os);
+    try std.testing.expectEqualStrings("amd64", parsed.platform.architecture);
+    try std.testing.expectError(error.InvalidArguments, parseConfig(&.{
+        "oci:layout:latest",
+    }));
 }
 
 test "inspect JSON formatting emits annotation objects deterministically" {

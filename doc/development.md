@@ -86,7 +86,7 @@ zvmi/
         map.zig               # `zvmi map`
         azure.zig             # Azure fixed-VHD derivation/readiness helpers
         cosi.zig              # `zvmi cosi`
-        oci.zig               # `zvmi oci copy|inspect|list-tags`
+        oci.zig               # `zvmi oci` transport and bundle commands
         build_image.zig       # `zvmi build-image`
         qemu.zig              # `zvmi qemu`
         opts.zig              # shared `-o subformat=...` parsing

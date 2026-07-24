@@ -147,6 +147,47 @@ pub const ConfigPlatform = struct {
 };
 pub const ImageConfigPlatform = ConfigPlatform;
 
+pub const ImageRootFs = struct {
+    type: []const u8,
+    diff_ids: []const []const u8,
+};
+
+pub const ImageHistory = struct {
+    created: ?[]const u8 = null,
+    author: ?[]const u8 = null,
+    created_by: ?[]const u8 = null,
+    comment: ?[]const u8 = null,
+    empty_layer: bool = false,
+};
+
+pub const ImageExecutionConfig = struct {
+    User: ?[]const u8 = null,
+    ExposedPorts: ?std.json.Value = null,
+    Env: ?[]const []const u8 = null,
+    Entrypoint: ?[]const []const u8 = null,
+    Cmd: ?[]const []const u8 = null,
+    Volumes: ?std.json.Value = null,
+    WorkingDir: ?[]const u8 = null,
+    Labels: ?std.json.Value = null,
+    StopSignal: ?[]const u8 = null,
+};
+
+/// OCI image configuration fields needed by bundle conversion and mutation.
+/// Callers that rewrite an image must retain the separately parsed raw JSON
+/// value so extension fields not represented here survive the operation.
+pub const ImageConfiguration = struct {
+    created: ?[]const u8 = null,
+    author: ?[]const u8 = null,
+    architecture: ?[]const u8 = null,
+    os: ?[]const u8 = null,
+    variant: ?[]const u8 = null,
+    @"os.version": ?[]const u8 = null,
+    @"os.features": ?[]const []const u8 = null,
+    config: ?ImageExecutionConfig = null,
+    rootfs: ImageRootFs,
+    history: ?[]const ImageHistory = null,
+};
+
 pub fn validateIndex(index: Index) ValidationError!void {
     if (index.schemaVersion != 2) return error.InvalidSchemaVersion;
     if (index.mediaType) |media_type| {

@@ -24,6 +24,13 @@ const StringHashMap = std.StringHashMap;
 pub const reference = @import("oci/reference.zig");
 pub const layout = @import("oci/layout.zig");
 pub const copy = @import("oci/copy.zig");
+pub const image_resolver = @import("oci/image.zig");
+pub const layer = @import("oci/layer.zig");
+pub const filesystem = @import("oci/filesystem.zig");
+pub const runtime_config = @import("oci/runtime_config.zig");
+pub const bundle = @import("oci/bundle.zig");
+pub const snapshot = @import("oci/snapshot.zig");
+pub const repack = @import("oci/repack.zig");
 pub const auth = @import("oci/auth.zig");
 pub const registry = @import("oci/registry.zig");
 pub const Digest = content.Digest;
@@ -51,6 +58,16 @@ pub const RegistryInspectOptions = registry.InspectOptions;
 pub const copyRegistryToLayout = registry.Source.copyToLayout;
 pub const copyRegistryToRegistry = registry.Source.copyToRegistry;
 pub const copyLayoutToRegistry = registry.copyLayoutToRegistry;
+
+test {
+    std.testing.refAllDecls(image_resolver);
+    std.testing.refAllDecls(layer);
+    std.testing.refAllDecls(filesystem);
+    std.testing.refAllDecls(runtime_config);
+    std.testing.refAllDecls(bundle);
+    std.testing.refAllDecls(snapshot);
+    std.testing.refAllDecls(repack);
+}
 
 pub const EntryKind = enum {
     file,
@@ -641,6 +658,7 @@ fn applyLayerEntry(
                 .xattrs = xattrs,
             });
         },
+        .character_device, .block_device, .fifo => return error.UnsupportedType,
     }
 }
 
@@ -894,6 +912,263 @@ test "load auto-detects OCI layouts and merges gzip layers, whiteouts, and opaqu
     var seen: usize = 0;
     while (iter.next()) |_| seen += 1;
     try std.testing.expect(seen >= 7);
+}
+
+test "bundle unpack securely publishes a verified runtime bundle" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture_root = "test-oci-bundle-layout";
+    const bundle_root = "test-oci-runtime-bundle";
+    defer Io.Dir.cwd().deleteTree(io, fixture_root) catch {};
+    defer Io.Dir.cwd().deleteTree(io, bundle_root) catch {};
+    defer Io.Dir.cwd().deleteFile(io, ".test-oci-runtime-bundle.zvmi-bundle.lock") catch {};
+
+    var fixture = try createFixtureLayout(allocator, io, fixture_root, .gzip);
+    defer fixture.deinit(allocator);
+    const source_reference = "oci:test-oci-bundle-layout";
+    const parsed = try reference.parse(source_reference, .source);
+    const image_ref = switch (parsed) {
+        .layout => |value| value,
+        else => unreachable,
+    };
+    const result = try bundle.unpackLayout(
+        allocator,
+        io,
+        source_reference,
+        image_ref,
+        bundle_root,
+        .{ .platform = .{ .os = "linux", .architecture = "amd64" } },
+    );
+    try std.testing.expectEqualStrings(fixture.manifest_digest, result.digest());
+
+    var published = try Io.Dir.cwd().openDir(io, bundle_root, .{});
+    defer published.close(io);
+    const hello = try published.readFileAlloc(io, "rootfs/hello.txt", allocator, .limited(1024));
+    defer allocator.free(hello);
+    try std.testing.expectEqualStrings("hello from top\n", hello);
+    try std.testing.expectError(
+        error.FileNotFound,
+        published.statFile(io, "rootfs/etc/remove.txt", .{}),
+    );
+    _ = try published.statFile(io, "config.json", .{});
+    _ = try published.statFile(io, ".zvmi/base.json", .{});
+    _ = try published.statFile(io, ".zvmi/metadata.json", .{});
+    try published.writeFile(io, .{ .sub_path = "stale", .data = "old" });
+    published.close(io);
+
+    try std.testing.expectError(
+        error.BundleExists,
+        bundle.unpackLayout(
+            allocator,
+            io,
+            source_reference,
+            image_ref,
+            bundle_root,
+            .{ .platform = .{ .os = "linux", .architecture = "amd64" } },
+        ),
+    );
+    _ = try bundle.unpackLayout(
+        allocator,
+        io,
+        source_reference,
+        image_ref,
+        bundle_root,
+        .{
+            .platform = .{ .os = "linux", .architecture = "amd64" },
+            .force = true,
+        },
+    );
+    published = try Io.Dir.cwd().openDir(io, bundle_root, .{});
+    try std.testing.expectError(error.FileNotFound, published.statFile(io, "stale", .{}));
+    try published.writeFile(io, .{ .sub_path = "survives-failure", .data = "old" });
+    published.close(io);
+    try std.testing.expectError(
+        error.InjectedFailure,
+        bundle.unpackLayout(
+            allocator,
+            io,
+            source_reference,
+            image_ref,
+            bundle_root,
+            .{
+                .platform = .{ .os = "linux", .architecture = "amd64" },
+                .force = true,
+                .failure_point = .before_publish,
+            },
+        ),
+    );
+    published = try Io.Dir.cwd().openDir(io, bundle_root, .{});
+    _ = try published.statFile(io, "survives-failure", .{});
+}
+
+test "forced bundle unpack rejects a symlink destination" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture_root = "test-oci-bundle-symlink-layout";
+    const outside_root = "test-oci-bundle-symlink-outside";
+    const bundle_link = "test-oci-bundle-symlink-destination";
+    defer Io.Dir.cwd().deleteTree(io, fixture_root) catch {};
+    defer Io.Dir.cwd().deleteTree(io, outside_root) catch {};
+    defer Io.Dir.cwd().deleteFile(io, bundle_link) catch {};
+    defer Io.Dir.cwd().deleteFile(io, ".test-oci-bundle-symlink-destination.zvmi-bundle.lock") catch {};
+    Io.Dir.cwd().deleteFile(io, bundle_link) catch {};
+    try Io.Dir.cwd().createDir(io, outside_root, .fromMode(0o755));
+    try Io.Dir.cwd().symLink(io, outside_root, bundle_link, .{});
+
+    var fixture = try createFixtureLayout(allocator, io, fixture_root, .gzip);
+    defer fixture.deinit(allocator);
+    const source_text = "oci:test-oci-bundle-symlink-layout";
+    const source = (try reference.parse(source_text, .source)).layout;
+    try std.testing.expectError(
+        error.BundleNotDirectory,
+        bundle.unpackLayout(
+            allocator,
+            io,
+            source_text,
+            source,
+            bundle_link,
+            .{
+                .platform = .{ .os = "linux", .architecture = "amd64" },
+                .force = true,
+            },
+        ),
+    );
+    const outside = try Io.Dir.cwd().statFile(io, outside_root, .{});
+    try std.testing.expectEqual(@as(u32, 0o755), @intFromEnum(outside.permissions) & 0o7777);
+}
+
+test "bundle repack publishes deterministic additions changes and whiteouts" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture_root = "test-oci-repack-layout";
+    const bundle_root = "test-oci-repack-bundle";
+    const verify_root = "test-oci-repack-verify";
+    defer Io.Dir.cwd().deleteTree(io, fixture_root) catch {};
+    defer Io.Dir.cwd().deleteTree(io, bundle_root) catch {};
+    defer Io.Dir.cwd().deleteTree(io, verify_root) catch {};
+    defer Io.Dir.cwd().deleteFile(io, ".test-oci-repack-bundle.zvmi-bundle.lock") catch {};
+    defer Io.Dir.cwd().deleteFile(io, ".test-oci-repack-verify.zvmi-bundle.lock") catch {};
+    defer Io.Dir.cwd().deleteFile(io, ".test-oci-repack-layout.zvmi-oci-bootstrap.lock") catch {};
+
+    var fixture = try createFixtureLayout(allocator, io, fixture_root, .gzip);
+    defer fixture.deinit(allocator);
+    const source_text = "oci:test-oci-repack-layout";
+    const source = (try reference.parse(source_text, .source)).layout;
+    _ = try bundle.unpackLayout(
+        allocator,
+        io,
+        source_text,
+        source,
+        bundle_root,
+        .{ .platform = .{ .os = "linux", .architecture = "amd64" } },
+    );
+
+    var editable = try Io.Dir.cwd().openDir(io, bundle_root ++ "/rootfs", .{});
+    defer editable.close(io);
+    {
+        var editable_root = try Io.Dir.cwd().openFile(io, bundle_root ++ "/rootfs", .{
+            .allow_directory = true,
+        });
+        defer editable_root.close(io);
+        try editable_root.setPermissions(io, .fromMode(0o750));
+    }
+    try editable.writeFile(io, .{ .sub_path = "hello.txt", .data = "edited\n" });
+    try editable.deleteFile(io, "etc/keep.txt");
+    try editable.writeFile(io, .{ .sub_path = "added.txt", .data = "new\n" });
+    if (@import("builtin").os.tag == .linux) {
+        var added_file = try editable.openFile(io, "added.txt", .{});
+        defer added_file.close(io);
+        const xattr_result = std.os.linux.fsetxattr(
+            added_file.handle,
+            "user.zvmi",
+            "round-trip",
+            "round-trip".len,
+            0,
+        );
+        try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(xattr_result));
+    }
+
+    const failed_target = (try reference.parse(
+        "oci:test-oci-repack-layout:interrupted",
+        .destination,
+    )).layout;
+    try std.testing.expectError(
+        error.InjectedFailure,
+        repack.repackLayout(allocator, io, failed_target, bundle_root, .{
+            .failure_point = .before_commit,
+        }),
+    );
+    try std.testing.expectError(
+        error.RootNotFound,
+        layout.Source.init(io, allocator, fixture_root).resolve(failed_target),
+    );
+
+    const target = (try reference.parse(
+        "oci:test-oci-repack-layout:edited",
+        .destination,
+    )).layout;
+    const repacked = try repack.repackLayout(allocator, io, target, bundle_root, .{});
+    try std.testing.expect(!std.mem.eql(u8, fixture.manifest_digest, repacked.digest()));
+    const repeated_target = (try reference.parse(
+        "oci:test-oci-repack-layout:edited-again",
+        .destination,
+    )).layout;
+    const repeated = try repack.repackLayout(allocator, io, repeated_target, bundle_root, .{});
+    try std.testing.expectEqualStrings(repacked.digest(), repeated.digest());
+
+    const original_ref = reference.LayoutReference{
+        .path = fixture_root,
+        .selection = .{
+            .digest = try content.Digest.parse(fixture.manifest_digest),
+        },
+    };
+    const original_root = try layout.Source.init(io, allocator, fixture_root).resolve(original_ref);
+    var original = original_root;
+    defer original.deinit();
+    try std.testing.expectEqualStrings(fixture.manifest_digest, original.descriptor.digest);
+
+    _ = try bundle.unpackLayout(
+        allocator,
+        io,
+        "oci:test-oci-repack-layout:edited",
+        target,
+        verify_root,
+        .{ .platform = .{ .os = "linux", .architecture = "amd64" } },
+    );
+    var verified = try Io.Dir.cwd().openDir(io, verify_root ++ "/rootfs", .{});
+    defer verified.close(io);
+    const edited = try verified.readFileAlloc(io, "hello.txt", allocator, .limited(32));
+    defer allocator.free(edited);
+    try std.testing.expectEqualStrings("edited\n", edited);
+    const added = try verified.readFileAlloc(io, "added.txt", allocator, .limited(32));
+    defer allocator.free(added);
+    try std.testing.expectEqualStrings("new\n", added);
+    if (@import("builtin").os.tag == .linux) {
+        var added_file = try verified.openFile(io, "added.txt", .{});
+        defer added_file.close(io);
+        var value: [32]u8 = undefined;
+        const xattr_result = std.os.linux.fgetxattr(
+            added_file.handle,
+            "user.zvmi",
+            &value,
+            value.len,
+        );
+        try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(xattr_result));
+        try std.testing.expectEqualStrings("round-trip", value[0..xattr_result]);
+    }
+    const verified_root = try verified.stat(io);
+    try std.testing.expectEqual(@as(u32, 0o750), @intFromEnum(verified_root.permissions) & 0o7777);
+    try std.testing.expectError(error.FileNotFound, verified.statFile(io, "etc/keep.txt", .{}));
+    try verified.writeFile(io, .{ .sub_path = ".wh.reserved", .data = "not a whiteout" });
+    const reserved_target = (try reference.parse(
+        "oci:test-oci-repack-layout:reserved",
+        .destination,
+    )).layout;
+    try std.testing.expectError(
+        error.ReservedWhiteoutPath,
+        repack.repackLayout(allocator, io, reserved_target, verify_root, .{}),
+    );
 }
 
 test "load auto-detects docker save tarballs and merges whiteouts" {
@@ -1295,10 +1570,14 @@ fn createFixtureLayout(allocator: Allocator, io: Io, root: []const u8, compressi
 
     const layer1_blob = try compressFixtureLayer(allocator, compression, layer1_tar);
     const layer2_blob = try compressFixtureLayer(allocator, compression, layer2_tar);
+    const layer1_diff_id = try sha256DigestString(allocator, layer1_tar);
+    defer allocator.free(layer1_diff_id);
+    const layer2_diff_id = try sha256DigestString(allocator, layer2_tar);
+    defer allocator.free(layer2_diff_id);
     const config_json = try std.fmt.allocPrint(
         allocator,
-        "{{\"architecture\":\"amd64\",\"os\":\"linux\",\"rootfs\":{{\"type\":\"layers\",\"diff_ids\":[]}}}}",
-        .{},
+        "{{\"architecture\":\"amd64\",\"os\":\"linux\",\"rootfs\":{{\"type\":\"layers\",\"diff_ids\":[\"{s}\",\"{s}\"]}}}}",
+        .{ layer1_diff_id, layer2_diff_id },
     );
 
     const config_digest = try writeBlobAndDigest(allocator, io, dir, config_json);
