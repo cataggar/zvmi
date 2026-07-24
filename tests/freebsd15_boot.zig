@@ -10,6 +10,7 @@ const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
 const Io = std.Io;
 const serial_limit: usize = 2 * 1024 * 1024;
+const serial_tail_size: usize = 256 * 1024;
 const boot_timeout_seconds: i64 = 10 * 60;
 
 const Architecture = enum {
@@ -279,6 +280,7 @@ fn waitForSerialMarker(
     client: *qmp.Client,
     serial_path: []const u8,
     marker: []const u8,
+    failure_marker: []const u8,
 ) !void {
     const deadline = Io.Clock.awake.now(io).addDuration(
         .fromSeconds(boot_timeout_seconds),
@@ -295,12 +297,34 @@ fn waitForSerialMarker(
         };
         defer allocator.free(serial);
         if (std.mem.indexOf(u8, serial, marker) != null) return;
+        if (std.mem.indexOf(u8, serial, failure_marker) != null) {
+            return error.GuestReadinessFailed;
+        }
         if (!try qemuRunning(client, deadline)) {
             return error.QemuExitedEarly;
         }
         try Io.sleep(io, .fromMilliseconds(500), .awake);
     }
     return error.BootTimedOut;
+}
+
+fn printSerialTail(
+    allocator: Allocator,
+    io: Io,
+    serial_path: []const u8,
+) void {
+    const serial = Dir.cwd().readFileAlloc(
+        io,
+        serial_path,
+        allocator,
+        .limited(serial_limit),
+    ) catch return;
+    defer allocator.free(serial);
+    const start = serial.len - @min(serial.len, serial_tail_size);
+    std.debug.print(
+        "FreeBSD acceptance serial output tail:\n{s}\n",
+        .{serial[start..]},
+    );
 }
 
 fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
@@ -611,6 +635,7 @@ test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
             &.{ temporary_path, "serial.log" },
         );
         defer allocator.free(serial_path);
+        errdefer printSerialTail(allocator, io, serial_path);
 
         try runCommand(io, &.{
             qemu_img_path,
@@ -655,6 +680,12 @@ test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
             .{&nonce},
         );
         defer allocator.free(ready_marker);
+        const failure_marker = try std.fmt.allocPrint(
+            allocator,
+            "ZVMI_FREEBSD_ACCEPTANCE_FAILED {s}",
+            .{&nonce},
+        );
+        defer allocator.free(failure_marker);
 
         try Dir.cwd().createDir(io, seed_dir, .default_dir);
         const metadata = try std.fmt.allocPrint(
@@ -685,10 +716,21 @@ test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
             \\    content: |
             \\      #!/bin/sh
             \\      sleep 30
-            \\      if [ -s /etc/ssh/ssh_host_ed25519_key ]; then
+            \\      if [ -s /etc/ssh/ssh_host_ed25519_key ] &&
+            \\          [ -s /home/zvmitest/.ssh/authorized_keys ] &&
+            \\          /usr/bin/id zvmitest >/dev/null 2>&1 &&
+            \\          /usr/sbin/service sshd onestatus >/dev/null 2>&1 &&
+            \\          /sbin/ifconfig vtnet0 | /usr/bin/grep -q 'inet '; then
             \\          printf 'ZVMI_FREEBSD_ACCEPTANCE_READY {s}\n' >/dev/console
             \\      else
             \\          printf 'ZVMI_FREEBSD_ACCEPTANCE_FAILED {s}\n' >/dev/console
+            \\          /sbin/ifconfig -a >/dev/console 2>&1 || true
+            \\          /usr/sbin/service sshd onestatus >/dev/console 2>&1 || true
+            \\          /usr/bin/id zvmitest >/dev/console 2>&1 || true
+            \\          /usr/bin/stat -f '%Sp %Su:%Sg %z %N' \
+            \\              /home/zvmitest /home/zvmitest/.ssh \
+            \\              /home/zvmitest/.ssh/authorized_keys \
+            \\              >/dev/console 2>&1 || true
             \\      fi
             \\runcmd:
             \\  - /usr/sbin/daemon -cf /root/zvmi-acceptance-ready.sh
@@ -818,6 +860,7 @@ test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
             spawned.client,
             serial_path,
             ready_marker,
+            failure_marker,
         );
         try waitForSshState(
             allocator,
