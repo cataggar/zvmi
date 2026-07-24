@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const zvmi = @import("zvmi");
+const atomic_output = @import("../atomic_output.zig");
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
@@ -19,6 +20,10 @@ const artifact_signing_scope = "https://codesigning.azure.net/.default";
 const artifact_signing_provider = "azure-artifact-signing";
 const github_actions_host_suffix = ".actions.githubusercontent.com";
 const oidc_audience = "api%3A%2F%2FAzureADTokenExchange";
+const decodePemCertificateAlloc =
+    zvmi.authenticode.decodePemCertificateAlloc;
+const encodePemCertificateAlloc =
+    zvmi.authenticode.encodePemCertificateAlloc;
 
 const OidcResponse = struct {
     value: []const u8,
@@ -177,7 +182,7 @@ fn runFallible(allocator: Allocator, io: Io, environ: Environ) !void {
         signing_result.signature,
     );
     defer allocator.free(signed);
-    try writeAtomic(io, allocator, signed_path, signed);
+    try atomic_output.writeAtomic(io, allocator, signed_path, signed);
 
     const metadata_path_optional = environ.getAlloc(
         allocator,
@@ -212,7 +217,7 @@ fn runFallible(allocator: Allocator, io: Io, environ: Environ) !void {
             .{ .whitespace = .indent_2 },
         );
         defer allocator.free(metadata);
-        try writeAtomic(io, allocator, metadata_path, metadata);
+        try atomic_output.writeAtomic(io, allocator, metadata_path, metadata);
     }
 }
 
@@ -249,7 +254,7 @@ fn exportCertificateFallible(
         certificate_der,
     );
     defer allocator.free(certificate_pem);
-    try writeAtomic(io, allocator, output_path, certificate_pem);
+    try atomic_output.writeAtomic(io, allocator, output_path, certificate_pem);
 }
 
 fn requiredEnvAlloc(
@@ -995,69 +1000,6 @@ fn writeFormComponent(writer: *std.Io.Writer, value: []const u8) !void {
     try writer.writeAll(value[start..]);
 }
 
-fn decodePemCertificateAlloc(
-    allocator: Allocator,
-    pem: []const u8,
-) ![]u8 {
-    const begin_marker = "-----BEGIN CERTIFICATE-----";
-    const end_marker = "-----END CERTIFICATE-----";
-    const begin = std.mem.indexOf(u8, pem, begin_marker) orelse
-        return error.InvalidCertificatePem;
-    if (std.mem.trim(u8, pem[0..begin], " \t\r\n").len != 0)
-        return error.InvalidCertificatePem;
-    const body_start = begin + begin_marker.len;
-    const relative_end = std.mem.indexOf(u8, pem[body_start..], end_marker) orelse
-        return error.InvalidCertificatePem;
-    const body_end = body_start + relative_end;
-    const suffix = pem[body_end + end_marker.len ..];
-    if (std.mem.trim(u8, suffix, " \t\r\n").len != 0)
-        return error.InvalidCertificatePem;
-
-    var encoded: std.Io.Writer.Allocating = .init(allocator);
-    defer encoded.deinit();
-    for (pem[body_start..body_end]) |byte| {
-        if (std.ascii.isWhitespace(byte)) continue;
-        try encoded.writer.writeByte(byte);
-    }
-    const encoded_slice = encoded.written();
-    const decoded_size = try std.base64.standard.Decoder.calcSizeForSlice(
-        encoded_slice,
-    );
-    if (decoded_size == 0 or decoded_size > max_certificate_bytes)
-        return error.InvalidCertificatePem;
-    const certificate = try allocator.alloc(u8, decoded_size);
-    errdefer allocator.free(certificate);
-    try std.base64.standard.Decoder.decode(certificate, encoded_slice);
-    return certificate;
-}
-
-fn encodePemCertificateAlloc(
-    allocator: Allocator,
-    certificate_der: []const u8,
-) ![]u8 {
-    if (certificate_der.len == 0 or certificate_der.len > max_certificate_bytes)
-        return error.InvalidCertificate;
-    const encoded = try allocator.alloc(
-        u8,
-        std.base64.standard.Encoder.calcSize(certificate_der.len),
-    );
-    defer allocator.free(encoded);
-    _ = std.base64.standard.Encoder.encode(encoded, certificate_der);
-
-    var pem: std.Io.Writer.Allocating = .init(allocator);
-    errdefer pem.deinit();
-    try pem.writer.writeAll("-----BEGIN CERTIFICATE-----\n");
-    var offset: usize = 0;
-    while (offset < encoded.len) {
-        const end = @min(offset + 64, encoded.len);
-        try pem.writer.writeAll(encoded[offset..end]);
-        try pem.writer.writeByte('\n');
-        offset = end;
-    }
-    try pem.writer.writeAll("-----END CERTIFICATE-----\n");
-    return pem.toOwnedSlice();
-}
-
 fn validateOidcRequestUrl(url: []const u8) !void {
     const https_prefix = "https://";
     if (!std.mem.startsWith(u8, url, https_prefix) or
@@ -1146,34 +1088,6 @@ fn isUuid(value: []const u8) bool {
     return true;
 }
 
-fn writeAtomic(
-    io: Io,
-    allocator: Allocator,
-    destination: []const u8,
-    bytes: []const u8,
-) !void {
-    const temporary = try std.fmt.allocPrint(
-        allocator,
-        "{s}.zvmi-signing",
-        .{destination},
-    );
-    defer allocator.free(temporary);
-    Dir.cwd().deleteFile(io, temporary) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
-    defer Dir.cwd().deleteFile(io, temporary) catch {};
-    try Dir.cwd().writeFile(io, .{
-        .sub_path = temporary,
-        .data = bytes,
-        .flags = .{
-            .truncate = true,
-            .permissions = .fromMode(0o600),
-        },
-    });
-    try Dir.cwd().renamePreserve(temporary, Dir.cwd(), destination, io);
-}
-
 test "Artifact Signing certificate payload uses nested MIME base64" {
     const decoded = try decodeMimeBase64Alloc(
         std.testing.allocator,
@@ -1189,7 +1103,7 @@ test "Artifact Signing certificate payload uses nested MIME base64" {
 }
 
 test "certificate PEM encoding round trips canonical DER" {
-    const certificate_der = "\x30\x03\x02\x01\x01";
+    const certificate_der = testCertificateDer();
     const pem = try encodePemCertificateAlloc(
         std.testing.allocator,
         certificate_der,
@@ -1399,10 +1313,15 @@ test "Artifact Signing distinguishes malformed JSON from invalid operation schem
 test "PEM certificate decoder accepts one canonical certificate block" {
     const der = try decodePemCertificateAlloc(
         std.testing.allocator,
-        "-----BEGIN CERTIFICATE-----\nMAMCAQE=\n-----END CERTIFICATE-----\n",
+        "-----BEGIN CERTIFICATE-----\n" ++
+            "MIGSMH2gAwIBAgIBATANBgkqhkiG9w0BAQsFADAWMRQwEgYDVQQD\n" ++
+            "DAtUZXN0IFNpZ25lcjAeFw0yNjAxMDEwMDAwMDBaFw0yNzAxMDEw\n" ++
+            "MDAwMDBaMBYxFDASBgNVBAMMC1Rlc3QgU2lnbmVyMBQwDQYJKoZI\n" ++
+            "hvcNAQEBBQADAwAwADANBgkqhkiG9w0BAQsFAAMCAAA=\n" ++
+            "-----END CERTIFICATE-----\n",
     );
     defer std.testing.allocator.free(der);
-    try std.testing.expectEqualSlices(u8, &.{ 0x30, 0x03, 0x02, 0x01, 0x01 }, der);
+    try std.testing.expectEqualSlices(u8, testCertificateDer(), der);
     try std.testing.expectError(
         error.InvalidCertificatePem,
         decodePemCertificateAlloc(
@@ -1410,6 +1329,22 @@ test "PEM certificate decoder accepts one canonical certificate block" {
             "prefix\n-----BEGIN CERTIFICATE-----\nMAMCAQE=\n-----END CERTIFICATE-----",
         ),
     );
+}
+
+fn testCertificateDer() []const u8 {
+    return "\x30\x81\x92\x30\x7d\xa0\x03\x02\x01\x02\x02\x01\x01" ++
+        "\x30\x0d\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0b\x05\x00" ++
+        "\x30\x16\x31\x14\x30\x12\x06\x03\x55\x04\x03\x0c\x0b" ++
+        "Test Signer" ++
+        "\x30\x1e\x17\x0d\x32\x36\x30\x31\x30\x31\x30\x30\x30\x30" ++
+        "\x30\x30\x5a\x17\x0d\x32\x37\x30\x31\x30\x31\x30\x30\x30" ++
+        "\x30\x30\x30\x5a" ++
+        "\x30\x16\x31\x14\x30\x12\x06\x03\x55\x04\x03\x0c\x0b" ++
+        "Test Signer" ++
+        "\x30\x14\x30\x0d\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01" ++
+        "\x01\x05\x00\x03\x03\x00\x30\x00" ++
+        "\x30\x0d\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0b\x05" ++
+        "\x00\x03\x02\x00\x00";
 }
 
 const MockArtifactSigningScenario = enum {

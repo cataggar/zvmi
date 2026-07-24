@@ -593,6 +593,31 @@ fn verifyUkiSignatures(
     });
 }
 
+fn verifyNativeUkiCertificate(
+    allocator: Allocator,
+    io: Io,
+    image_path: []const u8,
+    expected_certificate_der: []const u8,
+    expected_certificate_sha256: zvmi.artifact_pipeline.Digest,
+) !void {
+    var image = try zvmi.Image.openPathReadOnlyStandalone(io, image_path);
+    defer image.close(io);
+    var extracted = try zvmi.uki_certificate.extractAlloc(
+        allocator,
+        io,
+        &image,
+        .{ .expected_sha256 = expected_certificate_sha256 },
+    );
+    defer extracted.deinit(allocator);
+    if (!std.mem.eql(
+        u8,
+        expected_certificate_der,
+        extracted.certificate_der,
+    )) {
+        return error.ExtractedSigningCertificateMismatch;
+    }
+}
+
 fn tamperUkiCmdlineAlloc(
     allocator: Allocator,
     signed: []const u8,
@@ -1883,6 +1908,20 @@ test "Azure Linux 4 finalized QCOW2 boots, provisions, restarts, and powers off"
     if (!std.mem.eql(u8, &certificate_sha256, &expected_certificate_sha256)) {
         return error.SigningCertificateFingerprintMismatch;
     }
+    const certificate_der = try Dir.cwd().readFileAlloc(
+        io,
+        certificate_der_path,
+        allocator,
+        .limited(1024 * 1024),
+    );
+    defer allocator.free(certificate_der);
+    try verifyNativeUkiCertificate(
+        allocator,
+        io,
+        absolute_image,
+        certificate_der,
+        expected_certificate_sha256,
+    );
     const uki_sha256 = try validateFinalizedImage(
         allocator,
         io,

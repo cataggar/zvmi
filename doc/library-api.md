@@ -1,5 +1,34 @@
 # Library API
 
+## Inspect UKI signing certificates
+
+Open a supported disk format with `zvmi.Image`, then use
+`zvmi.uki_certificate.extractAlloc` to inspect its ESP without mounting it:
+
+```zig
+var image = try zvmi.Image.openPathReadOnly(io, "release.qcow2");
+defer image.close(io);
+
+const expected = try zvmi.artifact_pipeline.parseSha256(
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+);
+var signer = try zvmi.uki_certificate.extractAlloc(
+    allocator,
+    io,
+    &image,
+    .{ .expected_sha256 = expected },
+);
+defer signer.deinit(allocator);
+```
+
+The result owns the exact signer DER, its SHA-256, DER subject/issuer names,
+serial number, and sorted fallback/named UKI paths. The API requires one ESP,
+one fallback architecture, at least one `EFI/Linux/*.efi`, and the same leaf
+certificate on every UKI. QCOW2 dependencies are rejected. Certificate
+selection follows CMS `SignerInfo`; extraction does not verify the signature
+or establish trust, so callers must independently pin the image and/or
+expected fingerprint.
+
 ## Use from another `build.zig`
 
 Declare zvmi as a package dependency named `zvmi`, then import its build helper and use the returned `LazyPath` like any other generated file:

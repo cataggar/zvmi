@@ -18,6 +18,7 @@ const build_image_cmd = @import("commands/build_image.zig");
 const qemu_cmd = @import("commands/qemu.zig");
 const sign_cmd = @import("commands/sign.zig");
 const oci_cmd = @import("commands/oci.zig");
+const uki_cmd = @import("commands/uki.zig");
 
 const usage =
     \\Usage: zvmi <command> [options]
@@ -36,6 +37,7 @@ const usage =
     \\  oci copy|inspect|list-tags
     \\  build-image --iso <file.iso> --container <oci-layout> --generation 1|2 --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}> [--skip-iso-rootfs] [--esp-size <size>] [--root-selinux-label <context>] [--boot-mode bls|uki|both] [--stub-source-path <path>] [--verity]
     \\  qemu [<image>] [--architecture auto|x86_64|aarch64] [--admin-username <name>] [--ssh-public-key <path>] [--ssh-port <port>] [--snapshot] [--accel auto|whpx|kvm|hvf|tcg] [--qemu <path>] [--ovmf-code <path>] [--ovmf-vars <path>] [-- <extra-qemu-args...>]
+    \\  uki certificate <disk-image> (--output <certificate.pem>|--output=json) [--expected-sha256 <hex>]
     \\  sign
     \\
     \\Formats: raw, vhd (alias: vpc), vhdx, qcow2
@@ -79,6 +81,7 @@ fn run(
     if (std.mem.eql(u8, command, "qemu")) return qemu_cmd.run(gpa, io, environ, rest);
     if (std.mem.eql(u8, command, "sign")) return sign_cmd.run(gpa, io, environ, rest);
     if (std.mem.eql(u8, command, "oci")) return oci_cmd.run(gpa, io, environ, rest);
+    if (std.mem.eql(u8, command, "uki")) return uki_cmd.run(gpa, io, rest);
     if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h") or std.mem.eql(u8, command, "help")) {
         std.debug.print("{s}", .{usage});
         return 0;
@@ -100,4 +103,5 @@ test {
     _ = qemu_cmd;
     _ = sign_cmd;
     _ = oci_cmd;
+    _ = uki_cmd;
 }

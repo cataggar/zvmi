@@ -71,11 +71,13 @@ pub const Error = error{
     NotDirectory,
     IsDirectory,
     DirectoryNotEmpty,
+    DuplicateName,
     AlreadyExists,
     NoSpaceLeft,
     BadClusterChain,
     UnexpectedEndOfFile,
     FileTooLarge,
+    DirectoryTooLarge,
     InvalidTruncateSize,
     StreamClosed,
 };
@@ -286,6 +288,22 @@ pub const FileSystem = struct {
 
     /// Returns the immediate children of `path` (`/` or empty for the root).
     pub fn listDirAlloc(self: *FileSystem, io: Io, allocator: std.mem.Allocator, path: []const u8) ListError![]DirEntry {
+        return self.listDirAllocLimited(
+            io,
+            allocator,
+            path,
+            std.math.maxInt(usize),
+        );
+    }
+
+    /// Returns at most `max_entries` immediate children of `path`.
+    pub fn listDirAllocLimited(
+        self: *FileSystem,
+        io: Io,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        max_entries: usize,
+    ) ListError![]DirEntry {
         const cluster = if (isRootPath(path)) self.info.root_cluster else blk: {
             const entry = (try self.lookup(io, path)) orelse return error.PathNotFound;
             if (entry.kind() != .directory) return error.NotDirectory;
@@ -301,11 +319,18 @@ pub const FileSystem = struct {
         var iter = try DirectoryIterator.init(self, io, cluster);
         while (try iter.next(io, null)) |raw| {
             if (raw.attr & attr_volume_id != 0) continue;
+            if (entries.items.len >= max_entries)
+                return error.DirectoryTooLarge;
             const name = try raw.nameAlloc(allocator);
             errdefer allocator.free(name);
             if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) {
                 allocator.free(name);
                 continue;
+            }
+            try validateComponent(name);
+            for (entries.items) |existing| {
+                if (std.ascii.eqlIgnoreCase(existing.name, name))
+                    return error.DuplicateName;
             }
             try entries.append(.{
                 .name = name,
@@ -322,6 +347,8 @@ pub const FileSystem = struct {
     pub fn readFileAlloc(self: *FileSystem, io: Io, allocator: std.mem.Allocator, path: []const u8) ReadFileError![]u8 {
         const entry = (try self.lookup(io, path)) orelse return error.PathNotFound;
         if (entry.kind() != .file) return error.IsDirectory;
+        if (entry.size != 0 and !self.isDataCluster(entry.first_cluster))
+            return error.BadClusterChain;
 
         const buffer = try allocator.alloc(u8, entry.size);
         errdefer allocator.free(buffer);
@@ -632,7 +659,9 @@ pub const FileSystem = struct {
 
     fn readChainData(self: *FileSystem, io: Io, first_cluster: u32, buffer: []u8) MutationError!void {
         if (buffer.len == 0) return;
+        if (!self.isDataCluster(first_cluster)) return error.BadClusterChain;
         var cluster = first_cluster;
+        var tracker = ChainTracker.init(first_cluster);
         const cluster_size = self.info.clusterSize();
         var offset: usize = 0;
         while (offset < buffer.len) {
@@ -640,7 +669,10 @@ pub const FileSystem = struct {
             try self.readRegion(io, buffer[offset .. offset + take], self.clusterOffset(cluster));
             offset += take;
             if (offset == buffer.len) break;
-            cluster = (try self.nextCluster(io, cluster)) orelse return error.BadClusterChain;
+            const next = (try self.nextCluster(io, cluster)) orelse
+                return error.BadClusterChain;
+            try tracker.advance(next, self.info.data_cluster_count);
+            cluster = next;
         }
     }
 
@@ -676,6 +708,7 @@ pub const FileSystem = struct {
     }
 
     fn nextCluster(self: *FileSystem, io: Io, cluster: u32) MutationError!?u32 {
+        if (!self.isDataCluster(cluster)) return error.BadClusterChain;
         const entry = try self.readFatEntry(io, cluster);
         if (entry == 0) return error.BadClusterChain;
         if (entry >= fat_entry_eoc_min and entry <= fat_entry_mask) return null;
@@ -713,6 +746,7 @@ pub const FileSystem = struct {
     }
 
     fn readCluster(self: *FileSystem, io: Io, cluster: u32, buffer: []u8) MutationError!void {
+        if (!self.isDataCluster(cluster)) return error.BadClusterChain;
         try self.readRegion(io, buffer, self.clusterOffset(cluster));
     }
 
@@ -724,6 +758,10 @@ pub const FileSystem = struct {
     fn clusterOffset(self: *const FileSystem, cluster: u32) u64 {
         const data_sector = self.info.data_start_sector + @as(u64, cluster - 2) * self.info.sectors_per_cluster;
         return data_sector * self.info.bytes_per_sector;
+    }
+
+    fn isDataCluster(self: *const FileSystem, cluster: u32) bool {
+        return cluster >= 2 and cluster <= self.info.maxClusterNumber();
     }
 
     fn readRegion(self: *const FileSystem, io: Io, buffer: []u8, relative_offset: u64) MutationError!void {
@@ -819,6 +857,8 @@ pub fn open(image: *Image, io: Io, region: Region) OpenError!FileSystem {
     if (total_sectors_32 <= data_start_sector) return error.InvalidBootSector;
     const data_cluster_count: u32 = @intCast((@as(u64, total_sectors_32) - data_start_sector) / sectors_per_cluster);
     if (data_cluster_count < min_fat32_clusters) return error.NotFat32;
+    if (root_cluster > data_cluster_count + 1)
+        return error.InvalidBootSector;
 
     var label: [11]u8 = undefined;
     @memcpy(&label, boot_sector[71..82]);
@@ -957,20 +997,32 @@ const LocatedEntry = struct {
         return true;
     }
 
-    fn nameAlloc(self: LocatedEntry, allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
+    fn nameAlloc(
+        self: LocatedEntry,
+        allocator: std.mem.Allocator,
+    ) (Error || std.mem.Allocator.Error)![]u8 {
         var utf8_len: usize = 0;
         var i: usize = 0;
         while (i < self.utf16_len) {
-            const scalar, const consumed = decodeUtf16Scalar(self.utf16_name[i..self.utf16_len]) catch unreachable;
-            utf8_len += std.unicode.utf8CodepointSequenceLength(scalar) catch unreachable;
+            const scalar, const consumed = try decodeUtf16Scalar(
+                self.utf16_name[i..self.utf16_len],
+            );
+            utf8_len += std.unicode.utf8CodepointSequenceLength(
+                scalar,
+            ) catch return error.UnsupportedName;
             i += consumed;
         }
         const out = try allocator.alloc(u8, utf8_len);
         var out_i: usize = 0;
         i = 0;
         while (i < self.utf16_len) {
-            const scalar, const consumed = decodeUtf16Scalar(self.utf16_name[i..self.utf16_len]) catch unreachable;
-            out_i += std.unicode.utf8Encode(scalar, out[out_i..]) catch unreachable;
+            const scalar, const consumed = try decodeUtf16Scalar(
+                self.utf16_name[i..self.utf16_len],
+            );
+            out_i += std.unicode.utf8Encode(
+                scalar,
+                out[out_i..],
+            ) catch return error.UnsupportedName;
             i += consumed;
         }
         return out;
@@ -985,9 +1037,15 @@ const DirectoryIterator = struct {
     slot_index: usize = 0,
     eof: bool = false,
     lfn: LongNameState = .{},
+    chain_tracker: ChainTracker,
 
     fn init(fs: *FileSystem, io: Io, cluster: u32) MutationError!DirectoryIterator {
-        var iter = DirectoryIterator{ .fs = fs, .cluster = cluster };
+        if (!fs.isDataCluster(cluster)) return error.BadClusterChain;
+        var iter = DirectoryIterator{
+            .fs = fs,
+            .cluster = cluster,
+            .chain_tracker = ChainTracker.init(cluster),
+        };
         try iter.fs.readCluster(io, cluster, iter.cluster_buf[0..iter.fs.info.clusterSize()]);
         return iter;
     }
@@ -1003,6 +1061,10 @@ const DirectoryIterator = struct {
                     self.eof = true;
                     return null;
                 }
+                try self.chain_tracker.advance(
+                    next_cluster.?,
+                    self.fs.info.data_cluster_count,
+                );
                 self.cluster = next_cluster.?;
                 self.offset_in_cluster = 0;
                 try self.fs.readCluster(io, self.cluster, self.cluster_buf[0..cluster_size]);
@@ -1029,6 +1091,35 @@ const DirectoryIterator = struct {
             const located = try makeLocatedEntry(entry, &self.lfn, slot_index);
             self.lfn.reset();
             return located;
+        }
+    }
+};
+
+const ChainTracker = struct {
+    anchor: u32,
+    power: u32 = 1,
+    length: u32 = 0,
+    steps: u32 = 0,
+
+    fn init(first: u32) ChainTracker {
+        return .{ .anchor = first };
+    }
+
+    fn advance(
+        self: *ChainTracker,
+        next: u32,
+        max_steps: u32,
+    ) Error!void {
+        self.steps = std.math.add(u32, self.steps, 1) catch
+            return error.BadClusterChain;
+        if (self.steps > max_steps or next == self.anchor)
+            return error.BadClusterChain;
+        self.length += 1;
+        if (self.length == self.power) {
+            self.anchor = next;
+            self.power = std.math.mul(u32, self.power, 2) catch
+                max_steps;
+            self.length = 0;
         }
     }
 };
@@ -1632,6 +1723,189 @@ test "FAT32 path lookup is case-insensitive for mixed-case names" {
     const upper = try fs.readFileAlloc(io, std.testing.allocator, "EFI/BOOT/BOOTX64.EFI");
     defer std.testing.allocator.free(upper);
     try std.testing.expectEqualStrings("hello", upper);
+}
+
+test "directory enumeration rejects cyclic FAT chains" {
+    const io = std.testing.io;
+    const path = "test-fat32-cyclic-directory.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    const partition_len: u64 = 64 * 1024 * 1024;
+    var img = try Image.create(io, path, .raw, partition_len, .{});
+    defer img.close(io);
+    try format(&img, io, .{
+        .partition_offset = 0,
+        .partition_len = partition_len,
+    });
+    var fs = try open(&img, io, .{ .offset = 0, .length = partition_len });
+    var directory: [max_cluster_size]u8 = [_]u8{0} ** max_cluster_size;
+    const cluster_size = fs.info.clusterSize();
+    var slot: usize = 0;
+    while (slot < cluster_size) : (slot += directory_entry_size) {
+        directory[slot] = 0xe5;
+    }
+    try fs.writeRegion(
+        io,
+        directory[0..cluster_size],
+        fs.clusterOffset(fs.info.root_cluster),
+    );
+    try fs.writeFatEntry(io, fs.info.root_cluster, fs.info.root_cluster);
+    try std.testing.expectError(
+        error.BadClusterChain,
+        fs.listDirAlloc(io, std.testing.allocator, ""),
+    );
+}
+
+test "directory enumeration rejects invalid UTF-16 long names" {
+    const io = std.testing.io;
+    const path = "test-fat32-invalid-long-name.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    const partition_len: u64 = 64 * 1024 * 1024;
+    var img = try Image.create(io, path, .raw, partition_len, .{});
+    defer img.close(io);
+    try format(&img, io, .{
+        .partition_offset = 0,
+        .partition_len = partition_len,
+    });
+    var fs = try open(&img, io, .{ .offset = 0, .length = partition_len });
+    const name = "invalid-surrogate-name.efi";
+    try fs.writeFile(io, name, "payload");
+    const entry = (try fs.findEntry(
+        io,
+        fs.info.root_cluster,
+        name,
+    )).?;
+    var lfn_slot: [directory_entry_size]u8 = undefined;
+    try fs.readDirectorySlot(
+        io,
+        fs.info.root_cluster,
+        entry.first_slot,
+        &lfn_slot,
+    );
+    std.mem.writeInt(u16, lfn_slot[1..3], 0xd800, .little);
+    try fs.writeDirectorySlots(
+        io,
+        fs.info.root_cluster,
+        entry.first_slot,
+        &.{lfn_slot},
+    );
+    try std.testing.expectError(
+        error.UnsupportedName,
+        fs.listDirAlloc(io, std.testing.allocator, ""),
+    );
+}
+
+test "directory enumeration rejects separator-bearing long names" {
+    const io = std.testing.io;
+    const path = "test-fat32-separator-long-name.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    const partition_len: u64 = 64 * 1024 * 1024;
+    var img = try Image.create(io, path, .raw, partition_len, .{});
+    defer img.close(io);
+    try format(&img, io, .{
+        .partition_offset = 0,
+        .partition_len = partition_len,
+    });
+    var fs = try open(&img, io, .{ .offset = 0, .length = partition_len });
+    const name = "separator-name.efi";
+    try fs.writeFile(io, name, "payload");
+    const entry = (try fs.findEntry(
+        io,
+        fs.info.root_cluster,
+        name,
+    )).?;
+    var lfn_slot: [directory_entry_size]u8 = undefined;
+    try fs.readDirectorySlot(
+        io,
+        fs.info.root_cluster,
+        entry.first_slot,
+        &lfn_slot,
+    );
+    std.mem.writeInt(u16, lfn_slot[1..3], '/', .little);
+    try fs.writeDirectorySlots(
+        io,
+        fs.info.root_cluster,
+        entry.first_slot,
+        &.{lfn_slot},
+    );
+    try std.testing.expectError(
+        error.UnsupportedName,
+        fs.listDirAlloc(io, std.testing.allocator, ""),
+    );
+}
+
+test "directory enumeration rejects case-insensitive duplicate names" {
+    const io = std.testing.io;
+    const path = "test-fat32-duplicate-name.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    const partition_len: u64 = 64 * 1024 * 1024;
+    var img = try Image.create(io, path, .raw, partition_len, .{});
+    defer img.close(io);
+    try format(&img, io, .{
+        .partition_offset = 0,
+        .partition_len = partition_len,
+    });
+    var fs = try open(&img, io, .{ .offset = 0, .length = partition_len });
+    try fs.writeFile(io, "alpha.efi", "first");
+    try fs.writeFile(io, "bravo.efi", "second");
+    const second = (try fs.findEntry(
+        io,
+        fs.info.root_cluster,
+        "bravo.efi",
+    )).?;
+    var duplicate_units: [max_long_name_units]u16 = undefined;
+    const duplicate_name = try encodeLongName("ALPHA.EFI", &duplicate_units);
+    var lfn_slots: [1][directory_entry_size]u8 = undefined;
+    buildLfnEntries(&lfn_slots, duplicate_name, second.short_name);
+    try fs.writeDirectorySlots(
+        io,
+        fs.info.root_cluster,
+        second.first_slot,
+        &lfn_slots,
+    );
+    try std.testing.expectError(
+        error.DuplicateName,
+        fs.listDirAlloc(io, std.testing.allocator, ""),
+    );
+}
+
+test "file reads reject nonempty entries without a data cluster" {
+    const io = std.testing.io;
+    const path = "test-fat32-invalid-file-cluster.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    const partition_len: u64 = 64 * 1024 * 1024;
+    var img = try Image.create(io, path, .raw, partition_len, .{});
+    defer img.close(io);
+    try format(&img, io, .{
+        .partition_offset = 0,
+        .partition_len = partition_len,
+    });
+    var fs = try open(&img, io, .{ .offset = 0, .length = partition_len });
+    const name = "bad.bin";
+    try fs.writeFile(io, name, "payload");
+    const entry = (try fs.findEntry(
+        io,
+        fs.info.root_cluster,
+        name,
+    )).?;
+    var short_slot: [directory_entry_size]u8 = undefined;
+    try fs.readDirectorySlot(
+        io,
+        fs.info.root_cluster,
+        entry.location().shortSlot(),
+        &short_slot,
+    );
+    short_slot[20..22].* = .{ 0, 0 };
+    short_slot[26..28].* = .{ 0, 0 };
+    try fs.writeDirectorySlots(
+        io,
+        fs.info.root_cluster,
+        entry.location().shortSlot(),
+        &.{short_slot},
+    );
+    try std.testing.expectError(
+        error.BadClusterChain,
+        fs.readFileAlloc(io, std.testing.allocator, name),
+    );
 }
 
 test "delete frees directory entries and FAT chains for reuse" {

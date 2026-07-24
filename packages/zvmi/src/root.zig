@@ -44,6 +44,7 @@ pub const unsafe_chroot = @import("unsafe_chroot.zig");
 pub const artifact_pipeline = @import("artifact_pipeline.zig");
 pub const verity = @import("verity.zig");
 pub const authenticode = @import("authenticode.zig");
+pub const uki_certificate = @import("uki_certificate.zig");
 const image_mod = @import("image.zig");
 const size_mod = @import("size.zig");
 
