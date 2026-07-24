@@ -31,6 +31,9 @@ jobs:
       - name: Azure Linux release workflow unit tests
         run: python3 -m unittest discover -s tests -p azurelinux4_release_test.py
 
+      - name: FreeBSD release workflow unit tests
+        run: python3 -m unittest discover -s tests -p freebsd15_release_test.py
+
       - name: zig build
         run: zig build
 

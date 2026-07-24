@@ -1,5 +1,5 @@
-//! Opt-in QEMU acceptance for the generalized FreeBSD 15.1 AArch64 image.
-//! Set `ZVMI_FREEBSD15_AARCH64_IMAGE` to run it; otherwise it skips.
+//! Opt-in QEMU acceptance for generalized FreeBSD 15.1 release images.
+//! Set `ZVMI_FREEBSD15_IMAGE` and `ZVMI_FREEBSD15_ARCHITECTURE` to run it.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -12,16 +12,36 @@ const Io = std.Io;
 const serial_limit: usize = 2 * 1024 * 1024;
 const boot_timeout_seconds: i64 = 10 * 60;
 
-const Firmware = struct {
-    code: []u8,
-    vars: []u8,
+const Architecture = enum {
+    aarch64,
+    x86_64,
 
-    fn deinit(self: *Firmware, allocator: Allocator) void {
-        allocator.free(self.code);
-        allocator.free(self.vars);
-        self.* = undefined;
+    fn parse(text: []const u8) ?Architecture {
+        if (std.mem.eql(u8, text, "aarch64")) return .aarch64;
+        if (std.mem.eql(u8, text, "x86_64")) return .x86_64;
+        return null;
+    }
+
+    fn guestArchitecture(self: Architecture) qemu_host.GuestArchitecture {
+        return switch (self) {
+            .aarch64 => .aarch64,
+            .x86_64 => .x86_64,
+        };
+    }
+
+    fn machineArg(self: Architecture) []const u8 {
+        return switch (self) {
+            .aarch64 => "virt,accel=tcg",
+            .x86_64 => "q35,accel=tcg",
+        };
+    }
+
+    fn qemuName(self: Architecture) []const u8 {
+        return qemu_host.qemuSystemName(self.guestArchitecture());
     }
 };
+
+const Firmware = qemu_host.FirmwarePair;
 
 fn optionalEnvAlloc(
     allocator: Allocator,
@@ -33,22 +53,35 @@ fn optionalEnvAlloc(
     };
 }
 
-fn requireImageAlloc(allocator: Allocator, io: Io) ![]u8 {
+fn architectureFromEnvironment(allocator: Allocator) !Architecture {
+    const value = try optionalEnvAlloc(
+        allocator,
+        "ZVMI_FREEBSD15_ARCHITECTURE",
+    ) orelse return .aarch64;
+    defer allocator.free(value);
+    return Architecture.parse(value) orelse error.InvalidArchitecture;
+}
+
+fn requireImageAlloc(
+    allocator: Allocator,
+    io: Io,
+    architecture: Architecture,
+) ![]u8 {
     const path = try optionalEnvAlloc(
         allocator,
-        "ZVMI_FREEBSD15_AARCH64_IMAGE",
+        "ZVMI_FREEBSD15_IMAGE",
     ) orelse {
         std.debug.print(
-            "skipping FreeBSD AArch64 boot acceptance: set " ++
-                "ZVMI_FREEBSD15_AARCH64_IMAGE to a generalized QCOW2\n",
-            .{},
+            "skipping FreeBSD {s} boot acceptance: set " ++
+                "ZVMI_FREEBSD15_IMAGE to a generalized QCOW2\n",
+            .{@tagName(architecture)},
         );
         return error.SkipZigTest;
     };
     errdefer allocator.free(path);
     if (!try qemu_host.pathAccessible(io, path, .{ .read = true })) {
         std.debug.print(
-            "ZVMI_FREEBSD15_AARCH64_IMAGE is not readable: {s}\n",
+            "ZVMI_FREEBSD15_IMAGE is not readable: {s}\n",
             .{path},
         );
         return error.AcceptanceImageNotReadable;
@@ -60,6 +93,7 @@ fn requireToolAlloc(
     allocator: Allocator,
     io: Io,
     name: []const u8,
+    architecture: Architecture,
 ) ![]u8 {
     return try qemu_host.findExecutableInPathAlloc(
         allocator,
@@ -68,8 +102,8 @@ fn requireToolAlloc(
         name,
     ) orelse {
         std.debug.print(
-            "skipping FreeBSD AArch64 boot acceptance: {s} is not in PATH\n",
-            .{name},
+            "skipping FreeBSD {s} boot acceptance: {s} is not in PATH\n",
+            .{ @tagName(architecture), name },
         );
         return error.SkipZigTest;
     };
@@ -80,6 +114,7 @@ fn requireToolOverrideAlloc(
     io: Io,
     comptime environment_name: []const u8,
     default_name: []const u8,
+    architecture: Architecture,
 ) ![]u8 {
     if (try optionalEnvAlloc(allocator, environment_name)) |path| {
         errdefer allocator.free(path);
@@ -88,60 +123,38 @@ fn requireToolOverrideAlloc(
         }
         return path;
     }
-    return requireToolAlloc(allocator, io, default_name);
+    return requireToolAlloc(allocator, io, default_name, architecture);
 }
 
-fn resolveFirmwareAlloc(allocator: Allocator, io: Io) !Firmware {
+fn resolveFirmwareAlloc(
+    allocator: Allocator,
+    io: Io,
+    architecture: Architecture,
+    qemu_path: []const u8,
+) !Firmware {
     const explicit_code = try optionalEnvAlloc(
         allocator,
-        "ZVMI_FREEBSD15_AARCH64_UEFI_CODE",
+        "ZVMI_FREEBSD15_UEFI_CODE",
     );
     defer if (explicit_code) |path| allocator.free(path);
     const explicit_vars = try optionalEnvAlloc(
         allocator,
-        "ZVMI_FREEBSD15_AARCH64_UEFI_VARS",
+        "ZVMI_FREEBSD15_UEFI_VARS",
     );
     defer if (explicit_vars) |path| allocator.free(path);
     if ((explicit_code == null) != (explicit_vars == null)) {
         return error.IncompleteFirmwareOverride;
     }
-    if (explicit_code) |code| {
-        if (!try qemu_host.pathAccessible(io, code, .{ .read = true }) or
-            !try qemu_host.pathAccessible(io, explicit_vars.?, .{ .read = true }))
-        {
-            return error.FirmwareNotReadable;
-        }
-        return .{
-            .code = try allocator.dupe(u8, code),
-            .vars = try allocator.dupe(u8, explicit_vars.?),
-        };
-    }
-
-    const candidates = [_]struct { code: []const u8, vars: []const u8 }{
-        .{
-            .code = "/usr/share/AAVMF/AAVMF_CODE.fd",
-            .vars = "/usr/share/AAVMF/AAVMF_VARS.fd",
-        },
-        .{
-            .code = "/usr/share/edk2/aarch64/QEMU_EFI-pflash.raw",
-            .vars = "/usr/share/edk2/aarch64/vars-template-pflash.raw",
-        },
-    };
-    for (candidates) |candidate| {
-        if (try qemu_host.pathAccessible(io, candidate.code, .{ .read = true }) and
-            try qemu_host.pathAccessible(io, candidate.vars, .{ .read = true }))
-        {
-            return .{
-                .code = try allocator.dupe(u8, candidate.code),
-                .vars = try allocator.dupe(u8, candidate.vars),
-            };
-        }
-    }
+    if (try qemu_host.findFirmwarePairAlloc(allocator, io, .{
+        .architecture = architecture.guestArchitecture(),
+        .explicit_code_path = explicit_code,
+        .explicit_vars_path = explicit_vars,
+        .qemu_path = qemu_path,
+    })) |firmware| return firmware;
     std.debug.print(
-        "skipping FreeBSD AArch64 boot acceptance: AAVMF firmware was not found; " ++
-            "set ZVMI_FREEBSD15_AARCH64_UEFI_CODE and " ++
-            "ZVMI_FREEBSD15_AARCH64_UEFI_VARS\n",
-        .{},
+        "skipping FreeBSD {s} boot acceptance: matching UEFI firmware was not found; " ++
+            "set ZVMI_FREEBSD15_UEFI_CODE and ZVMI_FREEBSD15_UEFI_VARS\n",
+        .{@tagName(architecture)},
     );
     return error.SkipZigTest;
 }
@@ -480,18 +493,19 @@ fn readGuestIdentityAlloc(
     };
 }
 
-test "generalized FreeBSD AArch64 boots, provisions SSH, and survives reboot" {
+test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
+    const allocator = std.testing.allocator;
+    const architecture = try architectureFromEnvironment(allocator);
     if (builtin.os.tag != .linux) {
         std.debug.print(
-            "skipping FreeBSD AArch64 boot acceptance: QEMU path is Linux-only\n",
-            .{},
+            "skipping FreeBSD {s} boot acceptance: QEMU path is Linux-only\n",
+            .{@tagName(architecture)},
         );
         return error.SkipZigTest;
     }
 
-    const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const image_path = try requireImageAlloc(allocator, io);
+    const image_path = try requireImageAlloc(allocator, io, architecture);
     defer allocator.free(image_path);
     const absolute_image = try Dir.cwd().realPathFileAlloc(
         io,
@@ -511,19 +525,40 @@ test "generalized FreeBSD AArch64 boots, provisions SSH, and survives reboot" {
     const qemu_path = try requireToolOverrideAlloc(
         allocator,
         io,
-        "ZVMI_FREEBSD15_AARCH64_QEMU",
-        "qemu-system-aarch64",
+        "ZVMI_FREEBSD15_QEMU",
+        architecture.qemuName(),
+        architecture,
     );
     defer allocator.free(qemu_path);
-    const qemu_img_path = try requireToolAlloc(allocator, io, "qemu-img");
+    const qemu_img_path = try requireToolAlloc(
+        allocator,
+        io,
+        "qemu-img",
+        architecture,
+    );
     defer allocator.free(qemu_img_path);
-    const xorriso_path = try requireToolAlloc(allocator, io, "xorriso");
+    const xorriso_path = try requireToolAlloc(
+        allocator,
+        io,
+        "xorriso",
+        architecture,
+    );
     defer allocator.free(xorriso_path);
-    const ssh_keygen_path = try requireToolAlloc(allocator, io, "ssh-keygen");
+    const ssh_keygen_path = try requireToolAlloc(
+        allocator,
+        io,
+        "ssh-keygen",
+        architecture,
+    );
     defer allocator.free(ssh_keygen_path);
-    const ssh_path = try requireToolAlloc(allocator, io, "ssh");
+    const ssh_path = try requireToolAlloc(allocator, io, "ssh", architecture);
     defer allocator.free(ssh_path);
-    var firmware = try resolveFirmwareAlloc(allocator, io);
+    var firmware = try resolveFirmwareAlloc(
+        allocator,
+        io,
+        architecture,
+        qemu_path,
+    );
     defer firmware.deinit(allocator);
 
     var identities: [2]GuestIdentity = undefined;
@@ -589,7 +624,7 @@ test "generalized FreeBSD AArch64 boots, provisions SSH, and survives reboot" {
             absolute_image,
             overlay_path,
         });
-        try Dir.copyFileAbsolute(firmware.vars, vars_path, io, .{
+        try Dir.copyFileAbsolute(firmware.vars_path, vars_path, io, .{
             .replace = false,
         });
         try runCommand(io, &.{
@@ -713,7 +748,7 @@ test "generalized FreeBSD AArch64 boots, provisions SSH, and survives reboot" {
         const code_drive = try std.fmt.allocPrint(
             allocator,
             "if=pflash,format=raw,readonly=on,file={s}",
-            .{firmware.code},
+            .{firmware.code_path},
         );
         defer allocator.free(code_drive);
         const vars_drive = try std.fmt.allocPrint(
@@ -739,7 +774,7 @@ test "generalized FreeBSD AArch64 boots, provisions SSH, and survives reboot" {
             .binary = qemu_path,
             .extra_args = &.{
                 "-machine",
-                "virt,accel=tcg",
+                architecture.machineArg(),
                 "-cpu",
                 "max",
                 "-smp",
@@ -808,7 +843,8 @@ test "generalized FreeBSD AArch64 boots, provisions SSH, and survives reboot" {
             private_key_path,
             port,
         );
-        errdefer identity_before_reboot.deinit(allocator);
+        var identity_owned = true;
+        errdefer if (identity_owned) identity_before_reboot.deinit(allocator);
 
         const kernel_marker = "FreeBSD 15.1-RELEASE releng/15.1";
         const initial_boot_count = try serialMarkerCount(
@@ -869,6 +905,7 @@ test "generalized FreeBSD AArch64 boots, provisions SSH, and survives reboot" {
         );
         identities[instance_index] = identity_before_reboot;
         identity_count += 1;
+        identity_owned = false;
 
         _ = try sshSucceeded(
             allocator,

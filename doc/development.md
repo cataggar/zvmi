@@ -151,15 +151,16 @@ zvmi/
                               #   gracefully when qemu-system-x86_64, OVMF, or
                               #   the ZVMI_BOOT_TEST_* fixture env vars aren't
                               #   available
-    freebsd15_aarch64_boot.zig
+    freebsd15_boot.zig
                               #   opt-in generalized FreeBSD acceptance under
-                              #   AArch64 UEFI QEMU, including SSH and reboot
+                              #   architecture-matched UEFI QEMU, including
+                              #   SSH and reboot
   scripts/
     build_generalized_azurelinux4.zig  # generalized Azure Linux 4 Gen2 QCOW2
                               #   builder (run via `zig build generalized-azurelinux4`)
-    build_generalized_freebsd15_aarch64.zig
-                              #   generalized FreeBSD 15.1 AArch64 QCOW2
-                              #   builder (run via `zig build generalized-freebsd15-aarch64`)
+    build_generalized_freebsd15.zig
+                              #   generalized FreeBSD 15.1 QCOW2 builder
+                              #   (run via `zig build generalized-freebsd15`)
     zstd_max_preload.zig       # LD_PRELOAD shared library that forces maximum
                               #   zstd compression level in qemu-img
     ci/

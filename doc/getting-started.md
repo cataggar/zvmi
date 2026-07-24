@@ -12,9 +12,9 @@
 zig build
 zig build test
 zig build test-boot-smoke
-zig build test-freebsd15-aarch64-boot
+zig build test-freebsd15-boot
 zig build run -- info foo.vhd
 zig build run -- qemu
 ```
 
-See [Image building](image-building.md) for advanced image commands, [Azure Linux images](azure-linux.md) for the hosted release recipes, and [FreeBSD images](freebsd.md) for the AArch64 FreeBSD workflow.
+See [Image building](image-building.md) for advanced image commands, [Azure Linux images](azure-linux.md) for the hosted release recipes, and [FreeBSD images](freebsd.md) for the FreeBSD workflow.

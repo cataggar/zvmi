@@ -1,11 +1,13 @@
-//! Build a generalized FreeBSD 15.1 AArch64 QCOW2 from the official
+//! Build a generalized FreeBSD 15.1 QCOW2 from an official architecture-
+//! matched
 //! BASIC-CLOUDINIT image. The source is verified and decompressed before a
-//! nonce-authenticated NoCloud customization runs under AArch64 UEFI QEMU.
+//! nonce-authenticated NoCloud customization runs under UEFI QEMU.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const zvmi = @import("zvmi");
 const qmp = @import("qmp");
+const qemu_host = @import("qemu_host");
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
@@ -13,12 +15,8 @@ const File = std.Io.File;
 const Io = std.Io;
 const artifact_pipeline = zvmi.artifact_pipeline;
 
-const source_name = "FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz";
-const source_url = "https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/aarch64/Latest/" ++ source_name;
-const official_source_sha256 = "9722aea499610802de9a14bb645707fc4f6df49ff765cd9ce372b783c4693963";
 const source_max_size: u64 = 2 * 1024 * 1024 * 1024;
 const image_max_size: u64 = 6 * 1024 * 1024 * 1024;
-const official_virtual_size: u64 = 6_477_643_776;
 const finalized_image_max_size: u64 = 7 * 1024 * 1024 * 1024;
 const xz_memory_limit: u64 = 1024 * 1024 * 1024;
 const seed_iso_max_size: u64 = 4 * 1024 * 1024;
@@ -27,6 +25,84 @@ const default_customization_timeout_seconds: u32 = 30 * 60;
 const qmp_connect_timeout_seconds: u32 = 10;
 const customization_result_prefix = "ZVMI_FREEBSD_CUSTOMIZATION_RESULT";
 const serial_tail_size: usize = 256 * 1024;
+
+const SourceProfile = struct {
+    source_name: []const u8,
+    source_url: []const u8,
+    source_sha256: []const u8,
+    virtual_size: u64,
+    output: []const u8,
+    work_dir: []const u8,
+};
+
+const aarch64_profile = SourceProfile{
+    .source_name = "FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz",
+    .source_url = "https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/aarch64/Latest/FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz",
+    .source_sha256 = "9722aea499610802de9a14bb645707fc4f6df49ff765cd9ce372b783c4693963",
+    .virtual_size = 6_477_643_776,
+    .output = "FreeBSD-15.1-aarch64.qcow2",
+    .work_dir = ".scratch/generalized-freebsd15-aarch64",
+};
+
+const x86_64_profile = SourceProfile{
+    .source_name = "FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz",
+    .source_url = "https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/amd64/Latest/FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz",
+    .source_sha256 = "e4ca4db889f8559c9b9dfcacc70405c038476f4b6d41649b152d3809a2ed9e1f",
+    .virtual_size = 6_477_709_312,
+    .output = "FreeBSD-15.1-x86_64.qcow2",
+    .work_dir = ".scratch/generalized-freebsd15-x86_64",
+};
+
+const Architecture = enum {
+    aarch64,
+    x86_64,
+
+    fn parse(text: []const u8) ?Architecture {
+        if (std.mem.eql(u8, text, "aarch64")) return .aarch64;
+        if (std.mem.eql(u8, text, "x86_64")) return .x86_64;
+        return null;
+    }
+
+    fn profile(self: Architecture) *const SourceProfile {
+        return switch (self) {
+            .aarch64 => &aarch64_profile,
+            .x86_64 => &x86_64_profile,
+        };
+    }
+
+    fn guestArchitecture(self: Architecture) qemu_host.GuestArchitecture {
+        return switch (self) {
+            .aarch64 => .aarch64,
+            .x86_64 => .x86_64,
+        };
+    }
+
+    fn hostCpu(self: Architecture) std.Target.Cpu.Arch {
+        return switch (self) {
+            .aarch64 => .aarch64,
+            .x86_64 => .x86_64,
+        };
+    }
+
+    fn qemuName(self: Architecture) []const u8 {
+        return qemu_host.qemuSystemName(self.guestArchitecture());
+    }
+
+    fn machineArg(self: Architecture, accel: Accel) []const u8 {
+        return switch (self) {
+            .aarch64 => switch (accel) {
+                .kvm => "virt,accel=kvm",
+                .tcg => "virt,accel=tcg",
+                .auto => unreachable,
+            },
+            .x86_64 => switch (accel) {
+                .kvm => "q35,accel=kvm",
+                .tcg => "q35,accel=tcg",
+                .auto => unreachable,
+            },
+        };
+    }
+};
 
 const Accel = enum {
     auto,
@@ -42,14 +118,15 @@ const Accel = enum {
 };
 
 const Args = struct {
+    architecture: Architecture = .aarch64,
     source: ?[]const u8 = null,
-    source_sha256: []const u8 = official_source_sha256,
-    output: []const u8 = "zvmi-freebsd15.1-aarch64-generalized.qcow2",
-    work_dir: []const u8 = ".scratch/generalized-freebsd15-aarch64",
+    source_sha256: []const u8 = "",
+    output: []const u8 = "",
+    work_dir: []const u8 = "",
     curl_path: []const u8 = "curl",
     xz_path: []const u8 = "xz",
     qemu_img_path: []const u8 = "qemu-img",
-    qemu_path: []const u8 = "qemu-system-aarch64",
+    qemu_path: []const u8 = "",
     xorriso_path: []const u8 = "xorriso",
     uefi_code_path: ?[]const u8 = null,
     uefi_vars_path: ?[]const u8 = null,
@@ -59,8 +136,9 @@ const Args = struct {
 };
 
 const help_text =
-    \\Usage: build_generalized_freebsd15_aarch64 [options]
+    \\Usage: build_generalized_freebsd15 [options]
     \\
+    \\  --architecture <arch>    Guest architecture: aarch64 (default) or x86_64
     \\  --source <path>          Local .qcow2.xz source (official image if omitted)
     \\  --source-sha256 <hex>    Expected compressed source SHA-256
     \\  --output <path>          Output QCOW2
@@ -68,15 +146,15 @@ const help_text =
     \\  --curl <path>            curl executable (default: curl)
     \\  --xz <path>              XZ Utils executable (default: xz)
     \\  --qemu-img <path>        qemu-img executable (default: qemu-img)
-    \\  --qemu <path>            qemu-system-aarch64 executable
+    \\  --qemu <path>            Architecture-matched qemu-system executable
     \\  --xorriso <path>         xorriso executable used for the NoCloud ISO
-    \\  --uefi-code <path>       AArch64 UEFI pflash code image
-    \\  --uefi-vars <path>       AArch64 UEFI pflash variables template
+    \\  --uefi-code <path>       Architecture-matched UEFI pflash code image
+    \\  --uefi-vars <path>       Architecture-matched UEFI pflash variables template
     \\  --accel <auto|kvm|tcg>   QEMU accelerator (default: auto)
     \\  --timeout <seconds>      Guest customization timeout (default: 1800)
     \\  --base-only              Prepare the verified upstream base without customization
     \\
-    \\Preferred invocation: zig build generalized-freebsd15-aarch64 -- [options]
+    \\Preferred invocation: zig build generalized-freebsd15 -- [options]
     \\
 ;
 
@@ -85,7 +163,10 @@ fn parseArgs(argv: []const []const u8) !Args {
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
-        if (std.mem.eql(u8, arg, "--source")) {
+        if (std.mem.eql(u8, arg, "--architecture")) {
+            args.architecture = Architecture.parse(try nextValue(argv, &i)) orelse
+                return error.InvalidArchitecture;
+        } else if (std.mem.eql(u8, arg, "--source")) {
             args.source = try nextValue(argv, &i);
         } else if (std.mem.eql(u8, arg, "--source-sha256")) {
             args.source_sha256 = try nextValue(argv, &i);
@@ -133,6 +214,11 @@ fn parseArgs(argv: []const []const u8) !Args {
     if ((args.uefi_code_path == null) != (args.uefi_vars_path == null)) {
         return error.IncompleteFirmwareOverride;
     }
+    const profile = args.architecture.profile();
+    if (args.source_sha256.len == 0) args.source_sha256 = profile.source_sha256;
+    if (args.output.len == 0) args.output = profile.output;
+    if (args.work_dir.len == 0) args.work_dir = profile.work_dir;
+    if (args.qemu_path.len == 0) args.qemu_path = args.architecture.qemuName();
     return args;
 }
 
@@ -383,45 +469,17 @@ fn replaceNonceAlloc(
     return output.toOwnedSlice();
 }
 
-const FirmwarePaths = struct {
-    code: []const u8,
-    vars: []const u8,
-};
-
-fn pathReadable(io: Io, path: []const u8) !bool {
-    Dir.cwd().access(io, path, .{ .read = true }) catch |err| switch (err) {
-        error.FileNotFound, error.AccessDenied, error.PermissionDenied => return false,
-        else => return err,
-    };
-    return true;
-}
-
-fn resolveFirmware(io: Io, args: Args) !FirmwarePaths {
-    if (args.uefi_code_path) |code| {
-        const vars = args.uefi_vars_path.?;
-        if (!try pathReadable(io, code) or !try pathReadable(io, vars)) {
-            return error.FirmwareNotReadable;
-        }
-        return .{ .code = code, .vars = vars };
-    }
-    const candidates = [_]FirmwarePaths{
-        .{
-            .code = "/usr/share/AAVMF/AAVMF_CODE.fd",
-            .vars = "/usr/share/AAVMF/AAVMF_VARS.fd",
-        },
-        .{
-            .code = "/usr/share/edk2/aarch64/QEMU_EFI-pflash.raw",
-            .vars = "/usr/share/edk2/aarch64/vars-template-pflash.raw",
-        },
-    };
-    for (candidates) |candidate| {
-        if (try pathReadable(io, candidate.code) and
-            try pathReadable(io, candidate.vars))
-        {
-            return candidate;
-        }
-    }
-    return error.FirmwareNotFound;
+fn resolveFirmware(
+    allocator: Allocator,
+    io: Io,
+    args: Args,
+) !qemu_host.FirmwarePair {
+    return try qemu_host.findFirmwarePairAlloc(allocator, io, .{
+        .architecture = args.architecture.guestArchitecture(),
+        .explicit_code_path = args.uefi_code_path,
+        .explicit_vars_path = args.uefi_vars_path,
+        .qemu_path = args.qemu_path,
+    }) orelse error.FirmwareNotFound;
 }
 
 const TemporaryDirectory = struct {
@@ -579,9 +637,13 @@ fn createSeedIso(
     return seed_iso_path;
 }
 
-fn resolveAccel(io: Io, requested: Accel) !Accel {
+fn resolveAccel(
+    io: Io,
+    requested: Accel,
+    architecture: Architecture,
+) !Accel {
     if (requested != .auto) return requested;
-    if (builtin.cpu.arch == .aarch64) {
+    if (builtin.cpu.arch == architecture.hostCpu()) {
         Dir.cwd().access(
             io,
             "/dev/kvm",
@@ -662,12 +724,8 @@ fn runGuestCustomization(
     serial_path: []const u8,
     nonce: []const u8,
 ) !void {
-    const accel = try resolveAccel(io, args.accel);
-    const machine = switch (accel) {
-        .kvm => "virt,accel=kvm",
-        .tcg => "virt,accel=tcg",
-        .auto => unreachable,
-    };
+    const accel = try resolveAccel(io, args.accel, args.architecture);
+    const machine = args.architecture.machineArg(accel);
     const cpu = if (accel == .kvm) "host" else "max";
     const escaped_code = try escapeQemuDriveValue(allocator, uefi_code_path);
     defer allocator.free(escaped_code);
@@ -846,6 +904,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("error: invalid --source-sha256\n", .{});
         std.process.exit(1);
     };
+    const profile = args.architecture.profile();
 
     try Dir.cwd().createDirPath(io, args.work_dir);
     if (std.fs.path.dirname(args.output)) |parent| {
@@ -854,7 +913,7 @@ pub fn main(init: std.process.Init) !void {
 
     const cached_source = try std.fs.path.join(
         allocator,
-        &.{ args.work_dir, source_name },
+        &.{ args.work_dir, profile.source_name },
     );
     defer allocator.free(cached_source);
     try rejectOutputAlias(
@@ -871,7 +930,7 @@ pub fn main(init: std.process.Init) !void {
             allocator,
             io,
             .{
-                .url = source_url,
+                .url = profile.source_url,
                 .destination_path = cached_source,
                 .expected_sha256 = expected_source,
                 .max_size = source_max_size,
@@ -923,8 +982,8 @@ pub fn main(init: std.process.Init) !void {
                 .expected_input_sha256 = decompressed.sha256,
                 .max_input_size = image_max_size,
                 .source_format = .qcow2,
-                .expected_virtual_size = official_virtual_size,
-                .max_virtual_size = official_virtual_size,
+                .expected_virtual_size = profile.virtual_size,
+                .max_virtual_size = profile.virtual_size,
                 .output_path = args.output,
                 .max_output_size = finalized_image_max_size,
                 .qemu_img_path = args.qemu_img_path,
@@ -932,7 +991,8 @@ pub fn main(init: std.process.Init) !void {
             },
         );
     } else blk: {
-        const firmware = try resolveFirmware(io, args);
+        var firmware = try resolveFirmware(allocator, io, args);
+        defer firmware.deinit(allocator);
         const mutable_path = try std.fs.path.join(
             allocator,
             &.{ temporary.path, "customized.qcow2" },
@@ -963,8 +1023,8 @@ pub fn main(init: std.process.Init) !void {
                 .expected_input_sha256 = decompressed.sha256,
                 .max_input_size = image_max_size,
                 .source_format = .qcow2,
-                .expected_virtual_size = official_virtual_size,
-                .max_virtual_size = official_virtual_size,
+                .expected_virtual_size = profile.virtual_size,
+                .max_virtual_size = profile.virtual_size,
                 .output_path = mutable_path,
                 .max_output_size = finalized_image_max_size,
                 .qemu_img_path = args.qemu_img_path,
@@ -973,13 +1033,13 @@ pub fn main(init: std.process.Init) !void {
         );
         try copyFirmwareBounded(
             io,
-            firmware.code,
+            firmware.code_path,
             code_path,
             firmware_max_size,
         );
         try copyFirmwareBounded(
             io,
-            firmware.vars,
+            firmware.vars_path,
             vars_path,
             firmware_max_size,
         );
@@ -997,8 +1057,11 @@ pub fn main(init: std.process.Init) !void {
         defer allocator.free(seed_iso_path);
 
         std.debug.print(
-            "Customizing under AArch64 UEFI QEMU ({s})...\n",
-            .{@tagName(try resolveAccel(io, args.accel))},
+            "Customizing FreeBSD {s} under UEFI QEMU ({s})...\n",
+            .{
+                @tagName(args.architecture),
+                @tagName(try resolveAccel(io, args.accel, args.architecture)),
+            },
         );
         runGuestCustomization(
             allocator,
@@ -1029,8 +1092,8 @@ pub fn main(init: std.process.Init) !void {
                 .expected_input_sha256 = customized.sha256,
                 .max_input_size = finalized_image_max_size,
                 .source_format = .qcow2,
-                .expected_virtual_size = official_virtual_size,
-                .max_virtual_size = official_virtual_size,
+                .expected_virtual_size = profile.virtual_size,
+                .max_virtual_size = profile.virtual_size,
                 .output_path = args.output,
                 .max_output_size = finalized_image_max_size,
                 .qemu_img_path = args.qemu_img_path,
@@ -1055,7 +1118,12 @@ pub fn main(init: std.process.Init) !void {
 test "FreeBSD builder defaults pin the official release source" {
     const args = try parseArgs(&.{});
     try std.testing.expect(args.source == null);
-    try std.testing.expectEqualStrings(official_source_sha256, args.source_sha256);
+    try std.testing.expectEqual(Architecture.aarch64, args.architecture);
+    try std.testing.expectEqualStrings(
+        aarch64_profile.source_sha256,
+        args.source_sha256,
+    );
+    try std.testing.expectEqualStrings(aarch64_profile.output, args.output);
     try std.testing.expectEqualStrings("curl", args.curl_path);
     try std.testing.expectEqualStrings("xz", args.xz_path);
     try std.testing.expectEqualStrings("qemu-img", args.qemu_img_path);
@@ -1070,8 +1138,22 @@ test "FreeBSD builder defaults pin the official release source" {
     _ = try artifact_pipeline.parseSha256(args.source_sha256);
 }
 
+test "FreeBSD builder selects pinned x86_64 defaults" {
+    const args = try parseArgs(&.{ "--architecture", "x86_64" });
+    try std.testing.expectEqual(Architecture.x86_64, args.architecture);
+    try std.testing.expectEqualStrings(
+        x86_64_profile.source_sha256,
+        args.source_sha256,
+    );
+    try std.testing.expectEqualStrings(x86_64_profile.output, args.output);
+    try std.testing.expectEqualStrings(x86_64_profile.work_dir, args.work_dir);
+    try std.testing.expectEqualStrings("qemu-system-x86_64", args.qemu_path);
+}
+
 test "FreeBSD builder parses explicit source and tool paths" {
     const args = try parseArgs(&.{
+        "--architecture",
+        "x86_64",
         "--source",
         "base.qcow2.xz",
         "--source-sha256",
@@ -1087,7 +1169,7 @@ test "FreeBSD builder parses explicit source and tool paths" {
         "--qemu-img",
         "/tools/qemu-img",
         "--qemu",
-        "/tools/qemu-system-aarch64",
+        "/tools/qemu-system-x86_64",
         "--xorriso",
         "/tools/xorriso",
         "--uefi-code",
@@ -1100,13 +1182,14 @@ test "FreeBSD builder parses explicit source and tool paths" {
         "900",
         "--base-only",
     });
+    try std.testing.expectEqual(Architecture.x86_64, args.architecture);
     try std.testing.expectEqualStrings("base.qcow2.xz", args.source.?);
     try std.testing.expectEqualStrings("out.qcow2", args.output);
     try std.testing.expectEqualStrings("work", args.work_dir);
     try std.testing.expectEqualStrings("/tools/curl", args.curl_path);
     try std.testing.expectEqualStrings("/tools/xz", args.xz_path);
     try std.testing.expectEqualStrings("/tools/qemu-img", args.qemu_img_path);
-    try std.testing.expectEqualStrings("/tools/qemu-system-aarch64", args.qemu_path);
+    try std.testing.expectEqualStrings("/tools/qemu-system-x86_64", args.qemu_path);
     try std.testing.expectEqualStrings("/tools/xorriso", args.xorriso_path);
     try std.testing.expectEqualStrings("/firmware/code.fd", args.uefi_code_path.?);
     try std.testing.expectEqualStrings("/firmware/vars.fd", args.uefi_vars_path.?);
@@ -1129,6 +1212,10 @@ test "FreeBSD builder rejects malformed arguments" {
         parseArgs(&.{ "--accel", "invalid" }),
     );
     try std.testing.expectError(
+        error.InvalidArchitecture,
+        parseArgs(&.{ "--architecture", "amd64" }),
+    );
+    try std.testing.expectError(
         error.InvalidTimeout,
         parseArgs(&.{ "--timeout", "0" }),
     );
@@ -1146,7 +1233,10 @@ test "FreeBSD builder rejects output aliases before acquisition" {
     var root_buffer: [Dir.max_path_bytes]u8 = undefined;
     const root_length = try temporary.dir.realPath(io, &root_buffer);
     const root = root_buffer[0..root_length];
-    const cached = try std.fs.path.join(allocator, &.{ root, source_name });
+    const cached = try std.fs.path.join(
+        allocator,
+        &.{ root, aarch64_profile.source_name },
+    );
     defer allocator.free(cached);
     const output = try std.fs.path.join(allocator, &.{ root, "output.qcow2" });
     defer allocator.free(output);
@@ -1159,7 +1249,7 @@ test "FreeBSD builder rejects output aliases before acquisition" {
 
     try temporary.dir.symLink(
         io,
-        source_name,
+        aarch64_profile.source_name,
         "output.qcow2",
         .{},
     );
