@@ -343,7 +343,12 @@ const customization_user_data_template =
     \\          if [ "${status}" -eq 0 ]; then
     \\              status=1
     \\          fi
-    \\          printf 'ZVMI_FREEBSD_CUSTOMIZATION_RESULT @NONCE@ %d\n' "${status}" >/dev/console
+    \\          for output in /dev/console /dev/ttyu0; do
+    \\              if [ -w "${output}" ]; then
+    \\                  printf 'ZVMI_FREEBSD_CUSTOMIZATION_RESULT @NONCE@ %d\n' \
+    \\                      "${status}" >"${output}" || true
+    \\              fi
+    \\          done
     \\          exit "${status}"
     \\      }
     \\      trap report_failure EXIT
@@ -431,7 +436,12 @@ const customization_user_data_template =
     \\          touch /firstboot
     \\          rm -f /etc/rc.d/zvmi_generalize
     \\          sync
-    \\          printf 'ZVMI_FREEBSD_CUSTOMIZATION_RESULT @NONCE@ 0\n' >/dev/console
+    \\          for output in /dev/console /dev/ttyu0; do
+    \\              if [ -w "${output}" ]; then
+    \\                  printf 'ZVMI_FREEBSD_CUSTOMIZATION_RESULT @NONCE@ 0\n' \
+    \\                      >"${output}" || true
+    \\              fi
+    \\          done
     \\      }
     \\      load_rc_config "${name}"
     \\      run_rc_command "$1"
@@ -1309,6 +1319,11 @@ test "FreeBSD customization seed pins secure generalization behavior" {
         u8,
         user_data,
         "boot_serial=YES",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        user_data,
+        "/dev/console /dev/ttyu0",
     ) != null);
     const expected_result = customization_result_prefix ++ " " ++ nonce ++ " 0";
     try std.testing.expect(std.mem.indexOf(
