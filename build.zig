@@ -390,7 +390,7 @@ pub fn build(b: *std.Build) void {
     host_qemu_host_mod.linkLibrary(host_bzip2.artifact("bz2"));
     const freebsd_boot_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/freebsd15_aarch64_boot.zig"),
+            .root_source_file = b.path("tests/freebsd15_boot.zig"),
             .target = b.graph.host,
             .optimize = optimize,
             .imports = &.{
@@ -401,10 +401,15 @@ pub fn build(b: *std.Build) void {
     });
     const run_freebsd_boot_tests = b.addRunArtifact(freebsd_boot_tests);
     const freebsd_boot_test_step = b.step(
+        "test-freebsd15-boot",
+        "Run opt-in generalized FreeBSD 15.1 QEMU acceptance",
+    );
+    freebsd_boot_test_step.dependOn(&run_freebsd_boot_tests.step);
+    const freebsd_aarch64_boot_test_step = b.step(
         "test-freebsd15-aarch64-boot",
         "Run opt-in generalized FreeBSD 15.1 AArch64 QEMU acceptance",
     );
-    freebsd_boot_test_step.dependOn(&run_freebsd_boot_tests.step);
+    freebsd_aarch64_boot_test_step.dependOn(&run_freebsd_boot_tests.step);
     const unsafe_chroot_real_boot_exe = b.addExecutable(.{
         .name = "zvmi-unsafe-chroot-real-boot",
         .root_module = b.createModule(.{
@@ -740,16 +745,17 @@ pub fn build(b: *std.Build) void {
         azurelinux_acceptance_step.dependOn(&run_azurelinux_acceptance_tests.step);
 
         const freebsd_builder_mod = b.createModule(.{
-            .root_source_file = b.path("scripts/build_generalized_freebsd15_aarch64.zig"),
+            .root_source_file = b.path("scripts/build_generalized_freebsd15.zig"),
             .target = b.graph.host,
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "zvmi", .module = host_zvmi_mod },
                 .{ .name = "qmp", .module = host_qmp_mod },
+                .{ .name = "qemu_host", .module = host_qemu_host_mod },
             },
         });
         const freebsd_builder_exe = b.addExecutable(.{
-            .name = "build_generalized_freebsd15_aarch64",
+            .name = "build_generalized_freebsd15",
             .root_module = freebsd_builder_mod,
         });
         b.installArtifact(freebsd_builder_exe);
@@ -757,10 +763,15 @@ pub fn build(b: *std.Build) void {
         const run_freebsd_builder = b.addRunArtifact(freebsd_builder_exe);
         if (b.args) |args| run_freebsd_builder.addArgs(args);
         const generalized_freebsd_step = b.step(
+            "generalized-freebsd15",
+            "Build a generalized FreeBSD 15.1 QCOW2 (Linux, QEMU, UEFI)",
+        );
+        generalized_freebsd_step.dependOn(&run_freebsd_builder.step);
+        const generalized_freebsd_aarch64_step = b.step(
             "generalized-freebsd15-aarch64",
             "Build a generalized FreeBSD 15.1 AArch64 QCOW2 (Linux, QEMU, UEFI)",
         );
-        generalized_freebsd_step.dependOn(&run_freebsd_builder.step);
+        generalized_freebsd_aarch64_step.dependOn(&run_freebsd_builder.step);
 
         const freebsd_builder_tests = b.addTest(.{
             .root_module = freebsd_builder_mod,
@@ -769,10 +780,17 @@ pub fn build(b: *std.Build) void {
             freebsd_builder_tests,
         );
         const freebsd_builder_test_step = b.step(
-            "test-generalized-freebsd15-aarch64",
-            "Run FreeBSD 15.1 AArch64 builder unit tests",
+            "test-generalized-freebsd15",
+            "Run FreeBSD 15.1 builder unit tests",
         );
         freebsd_builder_test_step.dependOn(&run_freebsd_builder_tests.step);
+        const freebsd_aarch64_builder_test_step = b.step(
+            "test-generalized-freebsd15-aarch64",
+            "Run FreeBSD 15.1 builder unit tests",
+        );
+        freebsd_aarch64_builder_test_step.dependOn(
+            &run_freebsd_builder_tests.step,
+        );
         test_step.dependOn(&run_freebsd_builder_tests.step);
     }
 
