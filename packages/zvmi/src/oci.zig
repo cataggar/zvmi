@@ -8,17 +8,49 @@
 //!    an OCI image-layout directory.
 //!  - Docker save tarballs may select a manifest entry by exact `RepoTags`
 //!    match via `LoadOptions.repo_tag`; otherwise the first entry is loaded.
-//!  - Registry/network access, signatures, and manifest-list/platform
-//!    resolution are out of scope; callers may optionally pick a specific
-//!    manifest digest when `index.json` contains more than one entry, or a
-//!    specific docker/podman save tag when `manifest.json` has multiple items.
+//!  - Local loaders retain their historical single-manifest behavior.
+//!    Registry reads and graph-aware layout copies are exposed through the
+//!    `registry`, `copy`, and `reference` submodules.
 
 const std = @import("std");
 const Io = std.Io;
 const tar = @import("tar.zig");
+pub const content = @import("oci/content.zig");
+pub const model = @import("oci/model.zig");
 
 const Allocator = std.mem.Allocator;
 const StringHashMap = std.StringHashMap;
+
+pub const reference = @import("oci/reference.zig");
+pub const layout = @import("oci/layout.zig");
+pub const copy = @import("oci/copy.zig");
+pub const auth = @import("oci/auth.zig");
+pub const registry = @import("oci/registry.zig");
+pub const Digest = content.Digest;
+pub const ContentVerifier = content.Verifier;
+pub const Descriptor = model.Descriptor;
+pub const Platform = model.Platform;
+pub const Index = model.Index;
+pub const Manifest = model.Manifest;
+pub const ConfigPlatform = model.ConfigPlatform;
+pub const ImageConfigPlatform = model.ImageConfigPlatform;
+pub const MediaTypeClass = model.MediaTypeClass;
+pub const classifyMediaType = model.classifyMediaType;
+pub const parseReference = reference.parse;
+pub const Reference = reference.Reference;
+pub const ParseMode = reference.ParseMode;
+pub const LayoutSource = layout.Source;
+pub const LayoutDestination = layout.Destination;
+pub const copyLocalToLocal = copy.localToLocal;
+pub const RegistrySource = registry.Source;
+pub const RegistryDestination = registry.Destination;
+pub const RegistryOptions = registry.Options;
+pub const RegistryTagList = registry.TagList;
+pub const RegistryInspectResult = registry.InspectResult;
+pub const RegistryInspectOptions = registry.InspectOptions;
+pub const copyRegistryToLayout = registry.Source.copyToLayout;
+pub const copyRegistryToRegistry = registry.Source.copyToRegistry;
+pub const copyLayoutToRegistry = registry.copyLayoutToRegistry;
 
 pub const EntryKind = enum {
     file,
@@ -177,9 +209,12 @@ pub const LoadError = error{
     UnsupportedLayerMediaType,
     BlobTooLarge,
     LayerTooLarge,
+    InvalidDigest,
+    SizeMismatch,
+    DigestMismatch,
     InvalidLayerPath,
     LayerDecompressionFailed,
-} || Allocator.Error || Io.File.OpenError || Io.File.ReadPositionalError ||
+} || model.ValidationError || Allocator.Error || Io.File.OpenError || Io.File.ReadPositionalError ||
     Io.File.StatError || Io.Dir.OpenError || std.json.ParseError(std.json.Scanner) ||
     tar.Error || error{StreamTooLong};
 
@@ -214,24 +249,27 @@ pub fn loadDockerSaveTarball(io: Io, allocator: Allocator, tarball_path: []const
 fn loadLayoutDir(io: Io, allocator: Allocator, layout_dir: Io.Dir, options: LoadOptions) LoadError!Image {
     const layout_bytes = try readFileAtMost(io, allocator, layout_dir, "oci-layout", options.max_blob_size);
     defer allocator.free(layout_bytes);
-    const layout = try std.json.parseFromSlice(LayoutFile, allocator, layout_bytes, .{ .ignore_unknown_fields = true });
-    defer layout.deinit();
-    if (layout.value.imageLayoutVersion.len == 0) return error.MissingOciLayout;
+    const parsed_layout = try std.json.parseFromSlice(LayoutFile, allocator, layout_bytes, .{ .ignore_unknown_fields = true });
+    defer parsed_layout.deinit();
+    if (parsed_layout.value.imageLayoutVersion.len == 0) return error.MissingOciLayout;
 
     const index_bytes = try readFileAtMost(io, allocator, layout_dir, "index.json", options.max_blob_size);
     defer allocator.free(index_bytes);
     const index = try std.json.parseFromSlice(IndexDocument, allocator, index_bytes, .{ .ignore_unknown_fields = true });
     defer index.deinit();
+    try model.validateIndex(index.value);
 
     const manifest_desc = selectManifest(index.value, options.manifest_digest) orelse return error.MissingImageManifest;
+    try model.validateRootDescriptor(manifest_desc);
     if (isManifestListMediaType(manifest_desc.mediaType)) return error.UnsupportedManifestList;
 
-    const manifest_bytes = try readBlob(io, allocator, layout_dir, manifest_desc.digest, options.max_blob_size);
+    const manifest_bytes = try readBlob(io, allocator, layout_dir, manifest_desc, options.max_blob_size);
     defer allocator.free(manifest_bytes);
     const manifest = try std.json.parseFromSlice(ManifestDocument, allocator, manifest_bytes, .{ .ignore_unknown_fields = true });
     defer manifest.deinit();
+    try model.validateManifest(manifest.value);
 
-    const config_bytes = try readBlob(io, allocator, layout_dir, manifest.value.config.digest, options.max_blob_size);
+    const config_bytes = try readBlob(io, allocator, layout_dir, manifest.value.config, options.max_blob_size);
     defer allocator.free(config_bytes);
     const config_doc = try std.json.parseFromSlice(ConfigDocument, allocator, config_bytes, .{ .ignore_unknown_fields = true });
     defer config_doc.deinit();
@@ -262,22 +300,8 @@ const LayoutFile = struct {
     imageLayoutVersion: []const u8,
 };
 
-const Descriptor = struct {
-    mediaType: ?[]const u8 = null,
-    digest: []const u8,
-    size: u64,
-};
-
-const IndexDocument = struct {
-    schemaVersion: u32,
-    manifests: []const Descriptor,
-};
-
-const ManifestDocument = struct {
-    schemaVersion: u32,
-    config: Descriptor,
-    layers: []const Descriptor,
-};
+const IndexDocument = model.Index;
+const ManifestDocument = model.Manifest;
 
 const DockerSaveManifestItem = struct {
     Config: []const u8,
@@ -285,10 +309,7 @@ const DockerSaveManifestItem = struct {
     Layers: []const []const u8,
 };
 
-const ConfigDocument = struct {
-    architecture: ?[]const u8 = null,
-    os: ?[]const u8 = null,
-};
+const ConfigDocument = model.ConfigPlatform;
 
 const ArchiveEntry = struct {
     kind: tar.Kind,
@@ -407,9 +428,7 @@ fn selectManifest(index: IndexDocument, requested_digest: ?[]const u8) ?Descript
 }
 
 fn isManifestListMediaType(media_type: ?[]const u8) bool {
-    const mt = media_type orelse return false;
-    return std.mem.eql(u8, mt, "application/vnd.oci.image.index.v1+json") or
-        std.mem.eql(u8, mt, "application/vnd.docker.distribution.manifest.list.v2+json");
+    return model.classifyMediaType(media_type).isIndex();
 }
 
 fn applyLayer(
@@ -423,7 +442,7 @@ fn applyLayer(
     if (layer_desc.mediaType) |media_type| {
         if (!isSupportedLayerMediaType(media_type)) return error.UnsupportedLayerMediaType;
     }
-    const layer_blob = try readBlob(io, allocator, layout_dir, layer_desc.digest, options.max_blob_size);
+    const layer_blob = try readBlob(io, allocator, layout_dir, layer_desc, options.max_blob_size);
     defer allocator.free(layer_blob);
 
     try applyLayerBytes(allocator, entry_map, layer_desc.mediaType, layer_blob, options);
@@ -563,8 +582,8 @@ fn applyLayerEntry(
             });
         },
         .file => {
-            const content = try allocator.dupe(u8, layer_entry.content);
-            errdefer allocator.free(content);
+            const file_content = try allocator.dupe(u8, layer_entry.content);
+            errdefer allocator.free(file_content);
             const owned_path = try allocator.dupe(u8, normalized_path);
             errdefer allocator.free(owned_path);
             const xattrs = try dupeTarXattrs(allocator, layer_entry.xattrs);
@@ -575,8 +594,8 @@ fn applyLayerEntry(
                 .mode = nonZeroMode(layer_entry.mode, 0o644),
                 .uid = layer_entry.uid,
                 .gid = layer_entry.gid,
-                .size = content.len,
-                .content = content,
+                .size = file_content.len,
+                .content = file_content,
                 .xattrs = xattrs,
             });
         },
@@ -818,12 +837,26 @@ fn normalizeArchivePath(allocator: Allocator, raw_path: []const u8) LoadError![]
     return normalizeLayerPath(allocator, raw_path);
 }
 
-fn readBlob(io: Io, allocator: Allocator, layout_dir: Io.Dir, digest: []const u8, max_size: usize) LoadError![]u8 {
-    if (!std.mem.startsWith(u8, digest, "sha256:")) return error.UnsupportedDigestAlgorithm;
-    const hex = digest[7..];
+fn readBlob(io: Io, allocator: Allocator, layout_dir: Io.Dir, descriptor: Descriptor, max_size: usize) LoadError![]u8 {
+    const digest = content.Digest.parse(descriptor.digest) catch |err| switch (err) {
+        error.UnsupportedDigestAlgorithm => return error.UnsupportedDigestAlgorithm,
+        error.InvalidDigest => return error.InvalidDigest,
+        else => unreachable,
+    };
+    if (descriptor.size > max_size) return error.BlobTooLarge;
+    const hex = digest.blobPathComponent();
     const path = try std.fmt.allocPrint(allocator, "blobs/sha256/{s}", .{hex});
     defer allocator.free(path);
-    return readFileAtMost(io, allocator, layout_dir, path, max_size);
+    const bytes = try readFileAtMost(io, allocator, layout_dir, path, max_size);
+    errdefer allocator.free(bytes);
+    content.verifyBytes(digest, descriptor.size, bytes) catch |err| switch (err) {
+        error.SizeMismatch => return error.SizeMismatch,
+        error.DigestMismatch => return error.DigestMismatch,
+        error.SizeOverflow => return error.SizeMismatch,
+        error.InvalidDigest => unreachable,
+        error.UnsupportedDigestAlgorithm => unreachable,
+    };
+    return bytes;
 }
 
 fn readFileAtMost(io: Io, allocator: Allocator, dir: Io.Dir, sub_path: []const u8, max_size: usize) LoadError![]u8 {
@@ -914,6 +947,112 @@ test "loadLayout merges zstd-compressed OCI layers" {
     defer image.deinit();
 
     try expectMergedFixtureImage(image);
+}
+
+test "loadLayout rejects corrupted manifest, config, and layer blobs" {
+    const io = std.testing.io;
+    const fixture_root = "test-oci-layout-corruption-fixture";
+    defer Io.Dir.cwd().deleteTree(io, fixture_root) catch {};
+
+    {
+        var fixture = try createFixtureLayout(std.testing.allocator, io, fixture_root, .gzip);
+        defer fixture.deinit(std.testing.allocator);
+        try corruptFixtureBlob(io, fixture_root, fixture.manifest_digest, fixture.manifest_json);
+        try std.testing.expectError(error.DigestMismatch, loadLayout(io, std.testing.allocator, fixture_root, .{}));
+    }
+    try Io.Dir.cwd().deleteTree(io, fixture_root);
+
+    {
+        var fixture = try createFixtureLayout(std.testing.allocator, io, fixture_root, .gzip);
+        defer fixture.deinit(std.testing.allocator);
+        try corruptFixtureBlob(io, fixture_root, fixture.config_digest, fixture.config_json);
+        try std.testing.expectError(error.DigestMismatch, loadLayout(io, std.testing.allocator, fixture_root, .{}));
+    }
+    try Io.Dir.cwd().deleteTree(io, fixture_root);
+
+    {
+        var fixture = try createFixtureLayout(std.testing.allocator, io, fixture_root, .gzip);
+        defer fixture.deinit(std.testing.allocator);
+        try corruptFixtureBlob(io, fixture_root, fixture.layer1_digest, fixture.layer1_blob);
+        try std.testing.expectError(error.DigestMismatch, loadLayout(io, std.testing.allocator, fixture_root, .{}));
+    }
+}
+
+test "loadLayout preserves digest algorithm and malformed digest errors" {
+    const io = std.testing.io;
+    const fixture_root = "test-oci-layout-digest-errors";
+    defer Io.Dir.cwd().deleteTree(io, fixture_root) catch {};
+
+    {
+        var fixture = try createFixtureLayout(std.testing.allocator, io, fixture_root, .gzip);
+        defer fixture.deinit(std.testing.allocator);
+        try writeFixtureIndex(io, fixture_root,
+            \\{"schemaVersion":2,"manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha512:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","size":1}]}
+        );
+        try std.testing.expectError(error.UnsupportedDigestAlgorithm, loadLayout(io, std.testing.allocator, fixture_root, .{}));
+    }
+    try Io.Dir.cwd().deleteTree(io, fixture_root);
+
+    {
+        var fixture = try createFixtureLayout(std.testing.allocator, io, fixture_root, .gzip);
+        defer fixture.deinit(std.testing.allocator);
+        try writeFixtureIndex(io, fixture_root,
+            \\{"schemaVersion":2,"manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:not-hex","size":1}]}
+        );
+        try std.testing.expectError(error.InvalidDigest, loadLayout(io, std.testing.allocator, fixture_root, .{}));
+    }
+}
+
+test "loadLayout validates OCI schema and descriptor media types" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture_root = "test-oci-layout-model-validation";
+    defer Io.Dir.cwd().deleteTree(io, fixture_root) catch {};
+
+    {
+        var fixture = try createFixtureLayout(allocator, io, fixture_root, .gzip);
+        defer fixture.deinit(allocator);
+        try writeFixtureIndex(io, fixture_root, "{\"schemaVersion\":1,\"manifests\":[]}");
+        try std.testing.expectError(error.InvalidSchemaVersion, loadLayout(io, allocator, fixture_root, .{}));
+    }
+    try Io.Dir.cwd().deleteTree(io, fixture_root);
+
+    {
+        var fixture = try createFixtureLayout(allocator, io, fixture_root, .gzip);
+        defer fixture.deinit(allocator);
+        const index_json = try std.fmt.allocPrint(
+            allocator,
+            "{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"application/vnd.docker.distribution.manifest.v1+json\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
+            .{ fixture.manifest_digest, fixture.manifest_json.len },
+        );
+        defer allocator.free(index_json);
+        try writeFixtureIndex(io, fixture_root, index_json);
+        try std.testing.expectError(error.UnsupportedDescriptorMediaType, loadLayout(io, allocator, fixture_root, .{}));
+    }
+    try Io.Dir.cwd().deleteTree(io, fixture_root);
+
+    {
+        var fixture = try createFixtureLayout(allocator, io, fixture_root, .gzip);
+        defer fixture.deinit(allocator);
+        var dir = try Io.Dir.cwd().openDir(io, fixture_root, .{});
+        defer dir.close(io);
+        const invalid_manifest = try std.fmt.allocPrint(
+            allocator,
+            "{{\"schemaVersion\":1,\"config\":{{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\"{s}\",\"size\":{d}}},\"layers\":[]}}",
+            .{ fixture.config_digest, fixture.config_json.len },
+        );
+        defer allocator.free(invalid_manifest);
+        const manifest_digest = try writeBlobAndDigest(allocator, io, dir, invalid_manifest);
+        defer allocator.free(manifest_digest);
+        const index_json = try std.fmt.allocPrint(
+            allocator,
+            "{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
+            .{ manifest_digest, invalid_manifest.len },
+        );
+        defer allocator.free(index_json);
+        try dir.writeFile(io, .{ .sub_path = "index.json", .data = index_json });
+        try std.testing.expectError(error.InvalidSchemaVersion, loadLayout(io, allocator, fixture_root, .{}));
+    }
 }
 
 test "OCI layers preserve ownership and PAX xattrs across whiteouts and hardlinks" {
@@ -1336,6 +1475,21 @@ fn writeBlobAndDigest(allocator: Allocator, io: Io, dir: Io.Dir, data: []const u
     defer allocator.free(blob_path);
     try dir.writeFile(io, .{ .sub_path = blob_path, .data = data });
     return digest_string;
+}
+
+fn corruptFixtureBlob(io: Io, root: []const u8, digest: []const u8, original: []const u8) !void {
+    const mutated = try std.testing.allocator.dupe(u8, original);
+    defer std.testing.allocator.free(mutated);
+    mutated[0] ^= 1;
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/blobs/sha256/{s}", .{ root, digest["sha256:".len..] });
+    defer std.testing.allocator.free(path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = mutated });
+}
+
+fn writeFixtureIndex(io: Io, root: []const u8, index_json: []const u8) !void {
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/index.json", .{root});
+    defer std.testing.allocator.free(path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = index_json });
 }
 
 const TarSpec = struct {

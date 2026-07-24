@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const image_build = @import("build/image.zig");
+const oci_build = @import("build/oci.zig");
 
 const AzureLinuxArchitecture = enum {
     x86_64,
@@ -31,6 +32,14 @@ pub const PreservedImageOperation = image_build.PreservedOperation;
 pub const PreservedImageBackend = image_build.PreservedBackend;
 pub const PreservedImageOptions = image_build.PreservedOptions;
 pub const addPreservedImage = image_build.addPreserved;
+pub const OciPullPlatform = oci_build.Platform;
+pub const OciPullOptions = oci_build.Options;
+pub const OciPullResult = oci_build.Result;
+pub const addOciPull = oci_build.add;
+
+test {
+    std.testing.refAllDecls(oci_build);
+}
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -68,9 +77,35 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const host_zvmi_mod = b.createModule(.{
+        .root_source_file = b.path("packages/zvmi/src/root.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
 
     const zvmi_tests = b.addTest(.{ .root_module = zvmi_mod });
     const run_zvmi_tests = b.addRunArtifact(zvmi_tests);
+    const tls_fixture = b.dependency("tls", .{
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    const oci_registry_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/oci_registry.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zvmi", .module = host_zvmi_mod },
+                .{ .name = "tls", .module = tls_fixture.module("tls") },
+            },
+        }),
+    });
+    const run_oci_registry_tests = b.addRunArtifact(oci_registry_tests);
+    const oci_registry_test_step = b.step(
+        "test-oci-registry",
+        "Run deterministic OCI registry transport tests",
+    );
+    oci_registry_test_step.dependOn(&run_oci_registry_tests.step);
 
     // ---- wireserver: native Zig client for the Azure WireServer
     // goal-state protocol (minimal provisioning subset). A self-contained
@@ -162,14 +197,11 @@ pub fn build(b: *std.Build) void {
 
     const cli_tests = b.addTest(.{ .root_module = cli_exe.root_module });
     const run_cli_tests = b.addRunArtifact(cli_tests);
+    const cli_test_step = b.step("test-cli", "Run zvmi CLI tests");
+    cli_test_step.dependOn(&run_cli_tests.step);
 
     // Host-only image builders used by the exported build helpers. They remain
     // executable even when the dependency is configured for a foreign target.
-    const host_zvmi_mod = b.createModule(.{
-        .root_source_file = b.path("packages/zvmi/src/root.zig"),
-        .target = b.graph.host,
-        .optimize = optimize,
-    });
     const image_builder_exe = b.addExecutable(.{
         .name = "zvmi-image-builder",
         .root_module = b.createModule(.{
@@ -506,6 +538,20 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run all tests");
 
+    const build_api_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("build.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    const run_build_api_tests = b.addRunArtifact(build_api_tests);
+    const build_api_test_step = b.step(
+        "test-build-api",
+        "Run exported build API unit tests",
+    );
+    build_api_test_step.dependOn(&run_build_api_tests.step);
+
     const build_api_consumer_check = b.addSystemCommand(&.{
         b.graph.zig_exe,
         "build",
@@ -731,6 +777,7 @@ pub fn build(b: *std.Build) void {
     }
 
     test_step.dependOn(&run_zvmi_tests.step);
+    test_step.dependOn(&run_oci_registry_tests.step);
     test_step.dependOn(&run_wireserver_tests.step);
     test_step.dependOn(&run_qemu_host_tests.step);
     test_step.dependOn(&run_azagent_tests.step);
@@ -752,6 +799,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_qcow2_mod_tests.step);
     test_step.dependOn(&run_qcow2_exe_tests.step);
     test_step.dependOn(&run_zvminit_tests.step);
+    test_step.dependOn(&run_build_api_tests.step);
     test_step.dependOn(&build_api_consumer_check.step);
     test_step.dependOn(&build_api_diagnostics_check.step);
     test_step.dependOn(&build_api_execution_diagnostics_check.step);

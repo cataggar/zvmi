@@ -59,6 +59,33 @@ pub fn build(b: *std.Build) void {
 
 Use `.container = .{ .archive = ... }` for a docker/podman save tarball. OCI layout directories are validated and snapshotted into the Zig build cache so adding, removing, or changing a blob invalidates the image step. Layouts containing symlinks or special files are rejected because Zig 0.16's cached directory-copy step cannot preserve them. The helper runs the dedicated `zvmi-image-builder` artifact for the build host even when the consuming project targets another architecture.
 
+To acquire a registry image as a tracked OCI layout, construct a digest-pinned pull and pass its output directly to `addImage`:
+
+```zig
+const pull = zvmi.addOciPull(b, dependency, .{
+    .name = "appliance-container",
+    .source = "docker://registry.example/team/appliance@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    .platform = .{
+        .os = "linux",
+        .architecture = "amd64",
+    },
+    // Optional tracked inputs:
+    // .authfile = b.path("registry-auth.json"),
+    // .tls_ca = b.path("registry-ca.pem"),
+});
+
+const image = zvmi.addImage(b, dependency, .{
+    .name = "appliance",
+    .input = .{
+        .iso = b.path("inputs/azurelinux.iso"),
+        .container = .{ .oci_layout = pull.layout },
+    },
+    // Remaining image options...
+});
+```
+
+`addOciPull` requires a fully qualified `docker://` SHA-256 digest reference and rejects mutable tags while constructing the build graph. Its selected platform defaults to the build host and may be overridden explicitly; all-platform pulls are intentionally not representable because `addImage` consumes a leaf manifest. `authfile` and `tls_ca` are tracked `LazyPath` inputs, and `plain_http` is an explicit development-registry opt-in. The result exposes `layout` and the underlying run `step`; the network request runs only when a dependent build step needs the layout.
+
 `addImage` accepts ordered file/directory/symlink/removal/metadata operations, hostname, groups, users and SSH keys, systemd service state, kernel-module settings, and Azure generalization. File inputs may be inline bytes or tracked `LazyPath` values; plaintext passwords are intentionally not representable, so callers must lock an account or provide a crypt-style pre-hashed value. The helper also returns `plan_path`, `diagnostics_path`, and `provenance_path` from image execution, plus `preflight_plan_path`, `preflight_diagnostics_path`, and `preflight_provenance_path` from a separate non-cacheable capability check. The preflight artifacts remain consumable even when its status gate blocks image execution; unavailable plan or provenance documents contain JSON `null`, while diagnostics explains the failure. Preflight and execution use separate build-cache bundle paths, so their plan hashes intentionally differ; execution repeats preflight against its exact resolved plan before mutation. Successful execution bundles are reused only when a content key covering the host builder, complete request arguments, ISO, container, customization document, and tracked files still matches; failed or stale bundles are cleared and retried instead of becoming permanent cache hits. The target architecture, rootfs path, deterministic seed, and source timestamp are explicit inputs; the resolved plan records generated identifiers and operation ordering, while provenance records source, final root-tree, and output SHA-256 hashes.
 
 To transactionally edit an existing image, use the typed `addPreservedImage` helper:

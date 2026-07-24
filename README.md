@@ -22,6 +22,7 @@ to use the library or the repository's other tools.
 - [Getting started](doc/getting-started.md)
 - [Library API](doc/library-api.md)
 - [Image building](doc/image-building.md)
+- [OCI copy, inspect, and tag listing](doc/oci.md)
 - [Azure Linux images](doc/azure-linux.md)
 - [QEMU](doc/qemu.md)
 

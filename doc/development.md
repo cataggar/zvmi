@@ -35,7 +35,9 @@ zvmi/
                               #   inode/directory/fragment tables, XZ/zstd
                               #   compressed blocks)
         oci.zig                # local OCI/docker-save image ingestion
-                              #   (layer extraction + whiteout-aware merge)
+                              #   plus shared OCI transport exports
+        oci/                   # references/models, verified content, local
+                              #   layouts, registry/auth, and copy engine
         ext4.zig              # native ext4 writer + readback helper (htree
                               #   dirs, metadata checksums, extent trees,
                               #   offline resize; no journal)
@@ -84,6 +86,7 @@ zvmi/
         map.zig               # `zvmi map`
         azure.zig             # Azure fixed-VHD derivation/readiness helpers
         cosi.zig              # `zvmi cosi`
+        oci.zig               # `zvmi oci copy|inspect|list-tags`
         build_image.zig       # `zvmi build-image`
         qemu.zig              # `zvmi qemu`
         opts.zig              # shared `-o subformat=...` parsing
@@ -136,6 +139,8 @@ zvmi/
                               #   "growpart" equivalent); runs every boot,
                               #   not sentinel-gated
   tests/
+    oci_registry.zig        # deterministic loopback registry/auth/TLS/copy
+                              #   transport coverage
     boot_smoke.zig          # opportunistic real-QEMU boot verification for
                               #   build-image output (Gen1/Gen2, --verity,
                               #   --boot-mode uki); driven by qmp, skips
