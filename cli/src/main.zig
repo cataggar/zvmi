@@ -31,11 +31,11 @@ const usage =
     \\  check <file>
     \\  map [--output=human|json] <file>
     \\  azure derive --input-sha256 <hex> [--expected-virtual-size <size>] <input.qcow2> <output.vhd>
-    \\  azure fixup --generation 1|2 <file>
+    \\  azure fixup [--generation 1|2] <file>  # defaults to Gen2; non-VHD becomes <basename>.vhd
     \\  azure deprovision [--user <username>] <file>
     \\  cosi <disk-image> -o <output.cosi>
     \\  oci copy|inspect|list-tags
-    \\  build-image --iso <file.iso> --container <oci-layout> --generation 1|2 --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}> [--skip-iso-rootfs] [--esp-size <size>] [--root-selinux-label <context>] [--boot-mode bls|uki|both] [--stub-source-path <path>] [--verity]
+    \\  build-image --iso <file.iso> --container <oci-layout> [--generation 1|2] --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}> [--skip-iso-rootfs] [--esp-size <size>] [--root-selinux-label <context>] [--boot-mode bls|uki|both] [--stub-source-path <path>] [--verity]
     \\  qemu [<image>] [--architecture auto|x86_64|aarch64] [--admin-username <name>] [--ssh-public-key <path>] [--ssh-port <port>] [--snapshot] [--secure-boot] [--secure-boot-certificate <path> --secure-boot-certificate-sha256 <hex>] [--accel auto|whpx|kvm|hvf|tcg] [--qemu <path>] [--ovmf-code <path>] [--ovmf-vars <path>] [-- <extra-qemu-args...>]
     \\  uki certificate <disk-image> (--output <certificate.pem>|--output=json) [--expected-sha256 <hex>]
     \\  sign
