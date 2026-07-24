@@ -1,6 +1,7 @@
-# OCI transports
+# OCI images and bundles
 
-`zvmi oci` copies and inspects OCI images without a container daemon:
+`zvmi oci` copies, inspects, unpacks, and repacks OCI images without a
+container daemon:
 
 ```console
 zvmi oci copy docker://registry.example/team/image:stable oci:./layout:stable
@@ -8,9 +9,14 @@ zvmi oci copy --override-os linux --override-arch arm64 oci:./layout:stable dock
 zvmi oci copy --all docker://registry.example/team/image:stable oci:./complete:stable
 zvmi oci inspect oci:./layout:stable
 zvmi oci list-tags docker://registry.example/team/image
+zvmi oci unpack --image oci:./layout:stable ./bundle
+zvmi oci repack --image oci:./layout:edited ./bundle
+zvmi oci config --image oci:./layout:edited
 ```
 
-`copy` prints the committed root digest. `inspect` and `list-tags` print deterministic JSON. Diagnostics are written to stderr.
+`copy`, `unpack`, and `repack` print the committed or selected root digest.
+`inspect`, `list-tags`, and `config` print JSON. Diagnostics are written to
+stderr.
 
 ## References
 
@@ -35,6 +41,68 @@ Manifest and index bytes are hashed and copied exactly; publication never reseri
 Local layouts publish `index.json` last under an advisory lock. Existing names and unknown descriptor fields are preserved, while replacing a name changes only that reference. An interruption may leave verified unreferenced blobs, but it does not expose a partial new reference.
 
 Registry destinations check for existing blobs, attempt a cross-repository mount for same-registry copies, upload missing content, and publish manifests dependency-first. The destination tag or digest is committed by the final manifest PUT. A failed operation may leave unreferenced blobs or abandoned upload sessions for registry garbage collection.
+
+## Editable runtime bundles
+
+`unpack` accepts a local OCI-layout reference through `--image` and creates an
+OCI runtime bundle containing `rootfs/` and `config.json`. It resolves nested
+indexes for the host platform by default; `--override-os`, `--override-arch`,
+and `--override-variant` select another platform. Compressed descriptor size
+and SHA-256, the uncompressed DiffID, tar checksums, paths, PAX metadata, entry
+sizes, entry count, and total expanded bytes are all verified or bounded.
+
+Extraction applies layers in order and implements regular and opaque
+whiteouts. Archive-controlled symlinks are never followed while creating
+parents. Regular files, directories, symlinks, hard links, modes, nanosecond
+timestamps, ownership, FIFOs, Linux device nodes, and `user.`, `trusted.`,
+`security.`, and `system.` PAX xattrs are preserved. Device creation and
+privileged ownership/xattrs require the corresponding Linux capabilities.
+Symlink xattrs are rejected rather than silently discarded.
+
+Image `Entrypoint` and `Cmd` become runtime arguments, with `/bin/sh` as the
+empty-command fallback. Environment, working directory, numeric or named
+users, supplemental groups, volumes, exposed ports, stop signal, labels, and
+standard image annotations are translated. Named users and groups are
+resolved from the extracted `/etc/passwd` and `/etc/group`; malformed or
+missing requested entries fail unpack.
+
+The destination must not exist unless `--force` is supplied. A new bundle is
+built in a same-parent staging directory and renamed only after all content,
+`config.json`, the base snapshot, and provenance are synced. On Linux,
+`--force` uses `renameat2(RENAME_EXCHANGE)`; there is no non-atomic fallback.
+An extraction or verification failure leaves the existing bundle visible.
+
+`--rootless` stores all extracted objects under the invoking UID/GID while
+recording the image UID/GID for every base path. The runtime configuration
+maps container ID 0 to that host UID/GID. Repack restores recorded ownership
+for base paths and maps new paths owned by the invoking UID/GID to container
+ID 0; any other new ownership is rejected as unmapped. This one-ID mapping
+does not emulate a subordinate-ID range, so rootless unpack rejects images
+configured to run as a nonzero user or with supplemental groups.
+
+The private `.zvmi/metadata.json` records the exact root and selected manifest,
+config digest, platform, source layout, and unpack ownership mode.
+`.zvmi/base.json` is a sorted, no-follow snapshot containing content hashes,
+links, modes, timestamps, owners, device numbers, and base64 xattrs. Repack
+refuses a missing or changed base graph.
+
+`repack` compares `rootfs/` with that snapshot, emits deterministic additions,
+metadata/content changes, hard links, and whiteouts, and appends one history
+entry and DiffID. The layer tar is ordered, PAX metadata is canonical, and
+gzip output is reproducible. `--compression same` (the default) preserves
+uncompressed or gzip layer compression and the OCI/Docker media-type family;
+`--compression gzip` and `--compression none` override it. Repacking a zstd
+base with `same` is rejected because zstd layer encoding is not currently
+implemented.
+
+Config, layer, manifest, and ancestor-index blobs are written
+content-addressably. The destination name is changed by a final locked
+`index.json` replacement, so a new tag leaves the source tag unchanged.
+Verified unreferenced blobs may remain after interruption and are safe for
+layout garbage collection.
+
+`config --image ...` resolves the same selected image and prints its verified
+image-configuration JSON without rewriting extension fields.
 
 ## Registry options and authentication
 
@@ -63,4 +131,8 @@ Tag output has `schema_version`, `repository`, and a deduplicated, lexically sor
 
 ## Current limits
 
-The OCI commands do not support schema 1, non-SHA-256 digests, referrers/signatures, trust policies, insecure HTTPS, proxies, mTLS, resumable cross-process uploads, registry catalogs/deletion, layer conversion, or non-OCI transports. Filesystem unpack/repack behavior belongs to issue #223 rather than these transport commands.
+The OCI commands do not support schema 1, non-SHA-256 digests,
+referrers/signatures, trust policies, insecure HTTPS, proxies, mTLS, resumable
+cross-process uploads, registry catalogs/deletion, or non-OCI transports.
+Bundle operations currently require local layouts. Repack does not encode
+zstd layers or preserve symlink xattrs.
