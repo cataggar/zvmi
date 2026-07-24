@@ -45,6 +45,10 @@ zvmi/
                               #   + Secure Boot MOK/UKI orchestration)
         uki.zig                # low-level UKI/systemd-stub PE section
                               #   assembly helpers
+        authenticode.zig       # native PE Authenticode signing and signer
+                              #   certificate inspection
+        uki_certificate.zig    # GPT/FAT32 fallback + named UKI signer
+                              #   extraction and consistency checks
         verity.zig             # dm-verity SHA-256 hash-tree generation +
                               #   kernel cmdline metadata helpers
         cpio.zig               # minimal read-only newc-format cpio archive

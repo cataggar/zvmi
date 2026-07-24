@@ -23,6 +23,7 @@ to use the library or the repository's other tools.
 - [Library API](doc/library-api.md)
 - [Image building](doc/image-building.md)
 - [OCI copy, inspect, and tag listing](doc/oci.md)
+- [UKI signing certificate extraction](doc/uki-certificate.md)
 - [Azure Linux images](doc/azure-linux.md)
 - [QEMU](doc/qemu.md)
 

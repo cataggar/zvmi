@@ -95,7 +95,7 @@ pub const Image = struct {
     pub fn openPath(io: Io, path: []const u8) OpenError!Image {
         const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
         errdefer file.close(io);
-        return openFileWithPath(io, file, path);
+        return openFileWithPath(io, file, path, false);
     }
 
     /// Opens an image and all path-relative backing files without write access.
@@ -104,12 +104,20 @@ pub const Image = struct {
     pub fn openPathReadOnly(io: Io, path: []const u8) OpenError!Image {
         const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
         errdefer file.close(io);
-        return openFileWithPath(io, file, path);
+        return openFileWithPath(io, file, path, false);
+    }
+
+    /// Opens an image read-only while rejecting QCOW2 backing and external
+    /// data paths before they can cause host-file I/O.
+    pub fn openPathReadOnlyStandalone(io: Io, path: []const u8) OpenError!Image {
+        const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+        errdefer file.close(io);
+        return openFileWithPath(io, file, path, true);
     }
 
     /// Takes ownership of `file` (closing the returned `Image` closes it).
     pub fn openFile(io: Io, file: Io.File) OpenError!Image {
-        return openFileWithPath(io, file, null);
+        return openFileWithPath(io, file, null, false);
     }
 
     /// Takes ownership of a standalone qcow2 file without resolving or
@@ -137,7 +145,12 @@ pub const Image = struct {
         return allocator.alloc([]u8, 0);
     }
 
-    fn openFileWithPath(io: Io, file: Io.File, path: ?[]const u8) OpenError!Image {
+    fn openFileWithPath(
+        io: Io,
+        file: Io.File,
+        path: ?[]const u8,
+        standalone_qcow2: bool,
+    ) OpenError!Image {
         const file_size = (try file.stat(io)).size;
 
         // qcow2 and VHDX signatures both live at the very start of the file
@@ -149,7 +162,12 @@ pub const Image = struct {
             var sig_buf: [8]u8 = undefined;
             const n = try file.readPositionalAll(io, &sig_buf, 0);
             if (n >= 4 and std.mem.eql(u8, sig_buf[0..4], &qcow2.file_signature)) {
-                const qcow2_info = if (path) |p| try qcow2.openAtPath(io, file, p) else try qcow2.open(io, file);
+                const qcow2_info = if (standalone_qcow2)
+                    try qcow2.openStandalone(io, file)
+                else if (path) |p|
+                    try qcow2.openAtPath(io, file, p)
+                else
+                    try qcow2.open(io, file);
                 return .{
                     .file = file,
                     .format = .qcow2,

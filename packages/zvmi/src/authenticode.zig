@@ -19,19 +19,44 @@ const oid_data = "\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x07\x01";
 const oid_content_type = "\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x09\x03";
 const oid_message_digest = "\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x09\x04";
 const max_der_nesting = 32;
+const max_certificate_bytes = 1024 * 1024;
 
 const Error = error{
     InvalidPe,
     AlreadySigned,
+    UnsignedPe,
+    InvalidWinCertificate,
+    UnsupportedWinCertificate,
+    MultipleAuthenticodeSignatures,
+    InvalidAuthenticodeCms,
+    MissingSignerInfo,
+    MultipleSignerInfos,
+    UnsupportedSignerIdentifier,
+    SignerCertificateNotFound,
+    AmbiguousSignerCertificate,
     FileTooLarge,
     InvalidDer,
     InvalidCertificate,
+    InvalidCertificatePem,
     InvalidSignatureLength,
 };
 
 const Pe = struct {
+    machine: u16,
     checksum_offset: usize,
     security_directory_offset: usize,
+    certificate_offset: usize,
+    certificate_size: usize,
+};
+
+/// Signer selected from an existing PE's Authenticode CMS `SignerInfo`.
+/// Every slice borrows from the PE passed to `embeddedSigner`.
+pub const EmbeddedSigner = struct {
+    machine: u16,
+    certificate_der: []const u8,
+    subject_der: []const u8,
+    issuer_der: []const u8,
+    serial_number: []const u8,
 };
 
 /// Values passed between the external signing operation and CMS construction.
@@ -142,6 +167,303 @@ pub fn validateX509CertificateDer(certificate_der: []const u8) !void {
         return error.InvalidCertificate;
     try validateDerTree(certificate_der, certificate, 0);
     _ = try extractIssuerAndSerial(certificate_der);
+}
+
+/// Identifies the certificate referenced by an existing PE's Authenticode
+/// `SignerInfo`. This validates structure and identity binding, not the
+/// cryptographic signature or certificate chain.
+pub fn embeddedSigner(pe_bytes: []const u8) !EmbeddedSigner {
+    const pe = try parsePe(pe_bytes);
+    if (pe.certificate_offset == 0 and pe.certificate_size == 0)
+        return error.UnsignedPe;
+    if (pe.certificate_offset == 0 or pe.certificate_size == 0 or
+        pe.certificate_offset % 8 != 0)
+    {
+        return error.InvalidWinCertificate;
+    }
+    const table_end = std.math.add(
+        usize,
+        pe.certificate_offset,
+        pe.certificate_size,
+    ) catch return error.InvalidWinCertificate;
+    if (table_end > pe_bytes.len) return error.InvalidWinCertificate;
+
+    var result: ?EmbeddedSigner = null;
+    var offset = pe.certificate_offset;
+    while (offset < table_end) {
+        const header_end = std.math.add(usize, offset, 8) catch
+            return error.InvalidWinCertificate;
+        if (header_end > table_end) return error.InvalidWinCertificate;
+        const entry_length = @as(usize, readU32Le(pe_bytes[offset..][0..4]));
+        if (entry_length < 8) return error.InvalidWinCertificate;
+        const entry_end = std.math.add(usize, offset, entry_length) catch
+            return error.InvalidWinCertificate;
+        if (entry_end > table_end) return error.InvalidWinCertificate;
+        if (readU16Le(pe_bytes[offset + 4 ..][0..2]) != 0x0200 or
+            readU16Le(pe_bytes[offset + 6 ..][0..2]) != 0x0002)
+        {
+            return error.UnsupportedWinCertificate;
+        }
+        if (result != null) return error.MultipleAuthenticodeSignatures;
+        result = try parseAuthenticodeCms(
+            pe.machine,
+            pe_bytes[offset + 8 .. entry_end],
+        );
+
+        const next = align8(entry_end) catch return error.InvalidWinCertificate;
+        if (next > table_end) return error.InvalidWinCertificate;
+        for (pe_bytes[entry_end..next]) |padding| {
+            if (padding != 0) return error.InvalidWinCertificate;
+        }
+        offset = next;
+    }
+    if (offset != table_end) return error.InvalidWinCertificate;
+    return result orelse error.UnsignedPe;
+}
+
+pub fn decodePemCertificateAlloc(
+    allocator: std.mem.Allocator,
+    pem: []const u8,
+) ![]u8 {
+    const begin_marker = "-----BEGIN CERTIFICATE-----";
+    const end_marker = "-----END CERTIFICATE-----";
+    const begin = std.mem.indexOf(u8, pem, begin_marker) orelse
+        return error.InvalidCertificatePem;
+    if (std.mem.trim(u8, pem[0..begin], " \t\r\n").len != 0)
+        return error.InvalidCertificatePem;
+    const body_start = begin + begin_marker.len;
+    const relative_end = std.mem.indexOf(
+        u8,
+        pem[body_start..],
+        end_marker,
+    ) orelse return error.InvalidCertificatePem;
+    const body_end = body_start + relative_end;
+    const suffix = pem[body_end + end_marker.len ..];
+    if (std.mem.trim(u8, suffix, " \t\r\n").len != 0)
+        return error.InvalidCertificatePem;
+
+    var encoded: std.Io.Writer.Allocating = .init(allocator);
+    defer encoded.deinit();
+    for (pem[body_start..body_end]) |byte| {
+        if (std.ascii.isWhitespace(byte)) continue;
+        try encoded.writer.writeByte(byte);
+    }
+    const encoded_slice = encoded.written();
+    const decoded_size = std.base64.standard.Decoder.calcSizeForSlice(
+        encoded_slice,
+    ) catch return error.InvalidCertificatePem;
+    if (decoded_size == 0 or decoded_size > max_certificate_bytes)
+        return error.InvalidCertificatePem;
+    const certificate = try allocator.alloc(u8, decoded_size);
+    errdefer allocator.free(certificate);
+    std.base64.standard.Decoder.decode(certificate, encoded_slice) catch
+        return error.InvalidCertificatePem;
+    try validateX509CertificateDer(certificate);
+    return certificate;
+}
+
+pub fn encodePemCertificateAlloc(
+    allocator: std.mem.Allocator,
+    certificate_der: []const u8,
+) ![]u8 {
+    if (certificate_der.len == 0 or
+        certificate_der.len > max_certificate_bytes)
+    {
+        return error.InvalidCertificate;
+    }
+    try validateX509CertificateDer(certificate_der);
+    const encoded = try allocator.alloc(
+        u8,
+        std.base64.standard.Encoder.calcSize(certificate_der.len),
+    );
+    defer allocator.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, certificate_der);
+
+    var pem: std.Io.Writer.Allocating = .init(allocator);
+    errdefer pem.deinit();
+    try pem.writer.writeAll("-----BEGIN CERTIFICATE-----\n");
+    var offset: usize = 0;
+    while (offset < encoded.len) {
+        const end = @min(offset + 64, encoded.len);
+        try pem.writer.writeAll(encoded[offset..end]);
+        try pem.writer.writeByte('\n');
+        offset = end;
+    }
+    try pem.writer.writeAll("-----END CERTIFICATE-----\n");
+    return pem.toOwnedSlice();
+}
+
+fn parseAuthenticodeCms(machine: u16, body: []const u8) Error!EmbeddedSigner {
+    return parseAuthenticodeCmsInner(machine, body) catch |err| switch (err) {
+        error.MissingSignerInfo,
+        error.MultipleSignerInfos,
+        error.UnsupportedSignerIdentifier,
+        error.SignerCertificateNotFound,
+        error.AmbiguousSignerCertificate,
+        => err,
+        else => error.InvalidAuthenticodeCms,
+    };
+}
+
+fn parseAuthenticodeCmsInner(
+    machine: u16,
+    body: []const u8,
+) Error!EmbeddedSigner {
+    const content_info = try parseDerElement(body, 0);
+    if (content_info.tag != 0x30 or content_info.end != body.len)
+        return error.InvalidDer;
+    try validateDerTree(body, content_info, 0);
+
+    var index = content_info.content_start;
+    const content_type = try parseDerElement(body, index);
+    if (content_type.tag != 0x06 or
+        !std.mem.eql(
+            u8,
+            body[content_type.start..content_type.end],
+            oid_signed_data,
+        ))
+    {
+        return error.InvalidDer;
+    }
+    index = content_type.end;
+    const signed_data_explicit = try parseDerElement(body, index);
+    if (signed_data_explicit.tag != 0xa0 or
+        signed_data_explicit.end != content_info.end)
+    {
+        return error.InvalidDer;
+    }
+    const signed_data = try parseDerElement(
+        body,
+        signed_data_explicit.content_start,
+    );
+    if (signed_data.tag != 0x30 or
+        signed_data.end != signed_data_explicit.end)
+    {
+        return error.InvalidDer;
+    }
+
+    index = signed_data.content_start;
+    const version = try parseDerElement(body, index);
+    if (version.tag != 0x02 or version.content_start == version.end)
+        return error.InvalidDer;
+    index = version.end;
+    const digest_algorithms = try parseDerElement(body, index);
+    if (digest_algorithms.tag != 0x31) return error.InvalidDer;
+    index = digest_algorithms.end;
+    const encap_content_info = try parseDerElement(body, index);
+    if (encap_content_info.tag != 0x30) return error.InvalidDer;
+    var encap_index = encap_content_info.content_start;
+    const encap_content_type = try parseDerElement(body, encap_index);
+    if (encap_content_type.tag != 0x06 or
+        !std.mem.eql(
+            u8,
+            body[encap_content_type.start..encap_content_type.end],
+            oid_spc_indirect_data,
+        ))
+    {
+        return error.InvalidDer;
+    }
+    encap_index = encap_content_type.end;
+    while (encap_index < encap_content_info.end) {
+        encap_index = (try parseDerElement(body, encap_index)).end;
+    }
+    if (encap_index != encap_content_info.end) return error.InvalidDer;
+    index = encap_content_info.end;
+
+    const certificates = try parseDerElement(body, index);
+    if (certificates.tag != 0xa0 or
+        certificates.content_start == certificates.end)
+    {
+        return error.InvalidDer;
+    }
+    index = certificates.end;
+    if (index < signed_data.end) {
+        const possible_crls = try parseDerElement(body, index);
+        if (possible_crls.tag == 0xa1) index = possible_crls.end;
+    }
+    const signer_infos = try parseDerElement(body, index);
+    if (signer_infos.tag != 0x31 or signer_infos.end != signed_data.end)
+        return error.InvalidDer;
+
+    var signer_index = signer_infos.content_start;
+    if (signer_index == signer_infos.end) return error.MissingSignerInfo;
+    const signer_info = try parseDerElement(body, signer_index);
+    if (signer_info.tag != 0x30) return error.InvalidDer;
+    signer_index = signer_info.end;
+    if (signer_index != signer_infos.end) return error.MultipleSignerInfos;
+
+    var field_index = signer_info.content_start;
+    const signer_version = try parseDerElement(body, field_index);
+    if (signer_version.tag != 0x02 or
+        signer_version.content_start == signer_version.end)
+    {
+        return error.InvalidDer;
+    }
+    field_index = signer_version.end;
+    const signer_identifier = try parseDerElement(body, field_index);
+    if (signer_identifier.tag != 0x30)
+        return error.UnsupportedSignerIdentifier;
+    var sid_index = signer_identifier.content_start;
+    const sid_issuer = try parseDerElement(body, sid_index);
+    if (sid_issuer.tag != 0x30) return error.InvalidDer;
+    sid_index = sid_issuer.end;
+    const sid_serial = try parseDerElement(body, sid_index);
+    if (sid_serial.tag != 0x02 or sid_serial.content_start == sid_serial.end)
+        return error.InvalidDer;
+    sid_index = sid_serial.end;
+    if (sid_index != signer_identifier.end) return error.InvalidDer;
+
+    field_index = signer_identifier.end;
+    const digest_algorithm = try parseDerElement(body, field_index);
+    if (digest_algorithm.tag != 0x30) return error.InvalidDer;
+    field_index = digest_algorithm.end;
+    var field = try parseDerElement(body, field_index);
+    if (field.tag == 0xa0) {
+        field_index = field.end;
+        field = try parseDerElement(body, field_index);
+    }
+    if (field.tag != 0x30) return error.InvalidDer;
+    field_index = field.end;
+    const signature = try parseDerElement(body, field_index);
+    if (signature.tag != 0x04 or signature.content_start == signature.end)
+        return error.InvalidDer;
+    field_index = signature.end;
+    if (field_index < signer_info.end) {
+        const unsigned_attributes = try parseDerElement(body, field_index);
+        if (unsigned_attributes.tag != 0xa1) return error.InvalidDer;
+        field_index = unsigned_attributes.end;
+    }
+    if (field_index != signer_info.end) return error.InvalidDer;
+
+    var match: ?EmbeddedSigner = null;
+    var certificate_index = certificates.content_start;
+    while (certificate_index < certificates.end) {
+        const certificate = try parseDerElement(body, certificate_index);
+        if (certificate.tag != 0x30) return error.InvalidCertificate;
+        const certificate_der = body[certificate.start..certificate.end];
+        const identity = try extractIssuerAndSerial(certificate_der);
+        if (std.mem.eql(
+            u8,
+            identity.issuer,
+            body[sid_issuer.start..sid_issuer.end],
+        ) and std.mem.eql(
+            u8,
+            identity.serial,
+            body[sid_serial.start..sid_serial.end],
+        )) {
+            if (match != null) return error.AmbiguousSignerCertificate;
+            match = .{
+                .machine = machine,
+                .certificate_der = certificate_der,
+                .subject_der = identity.subject,
+                .issuer_der = identity.issuer,
+                .serial_number = identity.serial_number,
+            };
+        }
+        certificate_index = certificate.end;
+    }
+    if (certificate_index != certificates.end) return error.InvalidDer;
+    return match orelse error.SignerCertificateNotFound;
 }
 
 fn parseArtifactSigningCms(body: []const u8) !ArtifactSigningCms {
@@ -274,6 +596,13 @@ pub fn finishRsaSha256WithChainAlloc(
 }
 
 fn parseUnsignedPe(bytes: []const u8) Error!Pe {
+    const pe = try parsePe(bytes);
+    if (pe.certificate_offset != 0 or pe.certificate_size != 0)
+        return error.AlreadySigned;
+    return pe;
+}
+
+fn parsePe(bytes: []const u8) Error!Pe {
     try requireU32Size(bytes.len);
     if (bytes.len < 0x40 or !std.mem.eql(u8, bytes[0..2], "MZ")) return error.InvalidPe;
     const nt_offset = @as(usize, readU32Le(bytes[0x3c..][0..4]));
@@ -316,10 +645,12 @@ fn parseUnsignedPe(bytes: []const u8) Error!Pe {
     if (security_directory_end > optional_end) return error.InvalidPe;
     const certificate_offset = readU32Le(bytes[security_directory_offset..][0..4]);
     const certificate_size = readU32Le(bytes[security_directory_offset + 4 ..][0..4]);
-    if (certificate_offset != 0 or certificate_size != 0) return error.AlreadySigned;
     return .{
+        .machine = readU16Le(bytes[file_header_offset..][0..2]),
         .checksum_offset = checksum_offset,
         .security_directory_offset = security_directory_offset,
+        .certificate_offset = certificate_offset,
+        .certificate_size = certificate_size,
     };
 }
 
@@ -401,6 +732,7 @@ const IssuerAndSerial = struct {
     issuer: []const u8,
     subject: []const u8,
     serial: []const u8,
+    serial_number: []const u8,
 };
 
 fn makeCertificateSet(
@@ -469,31 +801,200 @@ fn extractIssuerAndSerial(certificate: []const u8) Error!IssuerAndSerial {
     }
     if (field.tag != 0x02 or field.content_start == field.end) return error.InvalidCertificate;
     const serial = certificate[field.start..field.end];
+    if (certificate[field.content_start] & 0x80 != 0)
+        return error.InvalidCertificate;
     index = field.end;
     const signature_algorithm = try parseCertificateElement(certificate, index);
-    if (signature_algorithm.tag != 0x30) return error.InvalidCertificate;
+    try validateAlgorithmIdentifier(certificate, signature_algorithm);
     index = signature_algorithm.end;
     const issuer_field = try parseCertificateElement(certificate, index);
-    if (issuer_field.tag != 0x30) return error.InvalidCertificate;
+    try validateName(certificate, issuer_field, false);
     const issuer = certificate[issuer_field.start..issuer_field.end];
 
     index = issuer_field.end;
     const validity_field = try parseCertificateElement(certificate, index);
-    if (validity_field.tag != 0x30) return error.InvalidCertificate;
+    try validateValidity(certificate, validity_field);
     index = validity_field.end;
     const subject_field = try parseCertificateElement(certificate, index);
-    if (subject_field.tag != 0x30) return error.InvalidCertificate;
+    try validateName(certificate, subject_field, true);
     const subject = certificate[subject_field.start..subject_field.end];
 
     index = subject_field.end;
-    while (index < tbs.end) index = (try parseCertificateElement(certificate, index)).end;
+    const subject_public_key_info = try parseCertificateElement(
+        certificate,
+        index,
+    );
+    try validateSubjectPublicKeyInfo(certificate, subject_public_key_info);
+    index = subject_public_key_info.end;
+    var last_optional_tag: u8 = 0x80;
+    while (index < tbs.end) {
+        const optional = try parseCertificateElement(certificate, index);
+        if (optional.tag <= last_optional_tag) return error.InvalidCertificate;
+        switch (optional.tag) {
+            0x81, 0x82 => try validateBitStringContent(
+                certificate[optional.content_start..optional.end],
+            ),
+            0xa3 => try validateExtensions(certificate, optional),
+            else => return error.InvalidCertificate,
+        }
+        last_optional_tag = optional.tag;
+        index = optional.end;
+    }
     if (index != tbs.end) return error.InvalidCertificate;
     index = tbs.end;
     const outer_signature = try parseCertificateElement(certificate, index);
-    if (outer_signature.tag != 0x30) return error.InvalidCertificate;
+    try validateAlgorithmIdentifier(certificate, outer_signature);
+    if (!std.mem.eql(
+        u8,
+        certificate[signature_algorithm.start..signature_algorithm.end],
+        certificate[outer_signature.start..outer_signature.end],
+    )) {
+        return error.InvalidCertificate;
+    }
     const signature_value = try parseCertificateElement(certificate, outer_signature.end);
     if (signature_value.tag != 0x03 or signature_value.end != outer.end) return error.InvalidCertificate;
-    return .{ .issuer = issuer, .subject = subject, .serial = serial };
+    try validateBitStringContent(
+        certificate[signature_value.content_start..signature_value.end],
+    );
+    return .{
+        .issuer = issuer,
+        .subject = subject,
+        .serial = serial,
+        .serial_number = certificate[field.content_start..field.end],
+    };
+}
+
+fn validateAlgorithmIdentifier(
+    bytes: []const u8,
+    algorithm: DerElement,
+) Error!void {
+    if (algorithm.tag != 0x30) return error.InvalidCertificate;
+    var index = algorithm.content_start;
+    const oid = try parseCertificateElement(bytes, index);
+    if (oid.tag != 0x06 or oid.content_start == oid.end)
+        return error.InvalidCertificate;
+    index = oid.end;
+    if (index < algorithm.end) {
+        index = (try parseCertificateElement(bytes, index)).end;
+    }
+    if (index != algorithm.end) return error.InvalidCertificate;
+}
+
+fn validateName(
+    bytes: []const u8,
+    name: DerElement,
+    allow_empty: bool,
+) Error!void {
+    if (name.tag != 0x30 or
+        (!allow_empty and name.content_start == name.end))
+    {
+        return error.InvalidCertificate;
+    }
+    var rdn_index = name.content_start;
+    while (rdn_index < name.end) {
+        const rdn = try parseCertificateElement(bytes, rdn_index);
+        if (rdn.tag != 0x31 or rdn.content_start == rdn.end)
+            return error.InvalidCertificate;
+        var attribute_index = rdn.content_start;
+        while (attribute_index < rdn.end) {
+            const attribute = try parseCertificateElement(
+                bytes,
+                attribute_index,
+            );
+            if (attribute.tag != 0x30) return error.InvalidCertificate;
+            var value_index = attribute.content_start;
+            const oid = try parseCertificateElement(bytes, value_index);
+            if (oid.tag != 0x06 or oid.content_start == oid.end)
+                return error.InvalidCertificate;
+            value_index = oid.end;
+            const value = try parseCertificateElement(bytes, value_index);
+            if (value.end != attribute.end) return error.InvalidCertificate;
+            attribute_index = attribute.end;
+        }
+        if (attribute_index != rdn.end) return error.InvalidCertificate;
+        rdn_index = rdn.end;
+    }
+    if (rdn_index != name.end) return error.InvalidCertificate;
+}
+
+fn validateValidity(bytes: []const u8, validity: DerElement) Error!void {
+    if (validity.tag != 0x30) return error.InvalidCertificate;
+    var index = validity.content_start;
+    const not_before = try parseCertificateElement(bytes, index);
+    if (!isCertificateTime(not_before)) return error.InvalidCertificate;
+    index = not_before.end;
+    const not_after = try parseCertificateElement(bytes, index);
+    if (!isCertificateTime(not_after) or not_after.end != validity.end)
+        return error.InvalidCertificate;
+}
+
+fn isCertificateTime(element: DerElement) bool {
+    return (element.tag == 0x17 or element.tag == 0x18) and
+        element.content_start != element.end;
+}
+
+fn validateSubjectPublicKeyInfo(
+    bytes: []const u8,
+    subject_public_key_info: DerElement,
+) Error!void {
+    if (subject_public_key_info.tag != 0x30)
+        return error.InvalidCertificate;
+    var index = subject_public_key_info.content_start;
+    const algorithm = try parseCertificateElement(bytes, index);
+    try validateAlgorithmIdentifier(bytes, algorithm);
+    index = algorithm.end;
+    const public_key = try parseCertificateElement(bytes, index);
+    if (public_key.tag != 0x03 or
+        public_key.end != subject_public_key_info.end)
+    {
+        return error.InvalidCertificate;
+    }
+    try validateBitStringContent(
+        bytes[public_key.content_start..public_key.end],
+    );
+}
+
+fn validateBitStringContent(content: []const u8) Error!void {
+    if (content.len < 2 or content[0] > 7) return error.InvalidCertificate;
+    if (content[0] != 0) {
+        const unused_mask = (@as(u8, 1) << @intCast(content[0])) - 1;
+        if (content[content.len - 1] & unused_mask != 0)
+            return error.InvalidCertificate;
+    }
+}
+
+fn validateExtensions(bytes: []const u8, explicit: DerElement) Error!void {
+    const extensions = try parseCertificateElement(
+        bytes,
+        explicit.content_start,
+    );
+    if (extensions.tag != 0x30 or extensions.end != explicit.end)
+        return error.InvalidCertificate;
+    var index = extensions.content_start;
+    while (index < extensions.end) {
+        const extension = try parseCertificateElement(bytes, index);
+        if (extension.tag != 0x30) return error.InvalidCertificate;
+        var field_index = extension.content_start;
+        const oid = try parseCertificateElement(bytes, field_index);
+        if (oid.tag != 0x06 or oid.content_start == oid.end)
+            return error.InvalidCertificate;
+        field_index = oid.end;
+        var value = try parseCertificateElement(bytes, field_index);
+        if (value.tag == 0x01) {
+            if (value.end - value.content_start != 1 or
+                (bytes[value.content_start] != 0x00 and
+                    bytes[value.content_start] != 0xff))
+            {
+                return error.InvalidCertificate;
+            }
+            field_index = value.end;
+            value = try parseCertificateElement(bytes, field_index);
+        }
+        if (value.tag != 0x04 or value.end != extension.end)
+            return error.InvalidCertificate;
+        index = extension.end;
+    }
+    if (index != extensions.end) return error.InvalidCertificate;
 }
 
 fn makeCms(
@@ -790,7 +1291,13 @@ test "finish writes an aligned WIN_CERTIFICATE and security directory" {
     try std.testing.expectEqual(@as(u16, 0x0002), readU16Le(signed[table_offset + 6 ..][0..2]));
     const entry_size = @as(usize, readU32Le(signed[table_offset..][0..4]));
     try std.testing.expect(entry_size <= table_size);
-    try std.testing.expect(std.mem.indexOf(u8, signed[table_offset + 8 ..], "\x30\x00\x02\x02\x00\x01") != null);
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            signed[table_offset + 8 ..],
+            certificate,
+        ) != null,
+    );
 }
 
 test "finish rejects malformed certificates and unsupported signatures" {
@@ -844,6 +1351,96 @@ test "chain-aware finish omits self-issued roots and deduplicates certificates" 
     try std.testing.expectError(
         error.InvalidCertificate,
         finishRsaSha256WithChainAlloc(allocator, prepared, leaf, &malformed_chain, &signature),
+    );
+}
+
+test "embedded signer follows SignerInfo instead of certificate order" {
+    const allocator = std.testing.allocator;
+    const image = try makeTestPe(allocator, 512);
+    defer allocator.free(image);
+    var prepared = try prepareRsaSha256Alloc(allocator, image);
+    defer prepared.deinit(allocator);
+    const leaf = testCertificate();
+    const chain = [_][]const u8{testCertificateTwo()};
+    const signature = [_]u8{0} ** 256;
+    const signed = try finishRsaSha256WithChainAlloc(
+        allocator,
+        prepared,
+        leaf,
+        &chain,
+        &signature,
+    );
+    defer allocator.free(signed);
+
+    const signer = try embeddedSigner(signed);
+    try std.testing.expectEqual(@as(u16, 0x8664), signer.machine);
+    try std.testing.expectEqualSlices(u8, leaf, signer.certificate_der);
+    try std.testing.expectEqualSlices(u8, "\x01", signer.serial_number);
+    const identity = try extractIssuerAndSerial(leaf);
+    try std.testing.expectEqualSlices(u8, identity.subject, signer.subject_der);
+    try std.testing.expectEqualSlices(u8, identity.issuer, signer.issuer_der);
+}
+
+test "embedded signer rejects unsigned malformed and unresolved signatures" {
+    const allocator = std.testing.allocator;
+    const unsigned = try makeTestPe(allocator, 512);
+    defer allocator.free(unsigned);
+    try std.testing.expectError(error.UnsignedPe, embeddedSigner(unsigned));
+
+    var prepared = try prepareRsaSha256Alloc(allocator, unsigned);
+    defer prepared.deinit(allocator);
+    const signature = [_]u8{0} ** 256;
+    const signed = try finishRsaSha256Alloc(
+        allocator,
+        prepared,
+        testCertificate(),
+        &signature,
+    );
+    defer allocator.free(signed);
+
+    const table_offset = @as(usize, readU32Le(signed[0x128..][0..4]));
+    const malformed = try allocator.dupe(u8, signed);
+    defer allocator.free(malformed);
+    writeU16Le(malformed[table_offset + 4 ..][0..2], 0x0100);
+    try std.testing.expectError(
+        error.UnsupportedWinCertificate,
+        embeddedSigner(malformed),
+    );
+
+    const unresolved = try allocator.dupe(u8, signed);
+    defer allocator.free(unresolved);
+    const identity = try extractIssuerAndSerial(testCertificate());
+    const signer_offset = std.mem.lastIndexOf(
+        u8,
+        unresolved,
+        identity.serial,
+    ) orelse
+        return error.TestUnexpectedResult;
+    unresolved[signer_offset + identity.serial.len - 1] = 0x7f;
+    try std.testing.expectError(
+        error.SignerCertificateNotFound,
+        embeddedSigner(unresolved),
+    );
+}
+
+test "certificate PEM helpers preserve canonical DER" {
+    const certificate = testCertificate();
+    const pem = try encodePemCertificateAlloc(
+        std.testing.allocator,
+        certificate,
+    );
+    defer std.testing.allocator.free(pem);
+    const decoded = try decodePemCertificateAlloc(std.testing.allocator, pem);
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualSlices(u8, certificate, decoded);
+    try std.testing.expectError(
+        error.InvalidCertificate,
+        validateX509CertificateDer(
+            "\x30\x1a" ++
+                "\x30\x13\xa0\x03\x02\x01\x02\x02\x02\x00\x01" ++
+                "\x30\x00\x30\x00\x30\x00\x30\x00\x30\x00" ++
+                "\x30\x00\x03\x01\x00",
+        ),
     );
 }
 
@@ -958,21 +1555,44 @@ test "alignment padding contributes to PE digest" {
 }
 
 fn testCertificate() []const u8 {
-    return "\x30\x1a" ++
-        "\x30\x13\xa0\x03\x02\x01\x02\x02\x02\x00\x01\x30\x00\x30\x00\x30\x00\x30\x00\x30\x00" ++
-        "\x30\x00\x03\x01\x00";
+    return testCertificateSerial(1);
 }
 
 fn testCertificateTwo() []const u8 {
-    return "\x30\x1c" ++
-        "\x30\x15\xa0\x03\x02\x01\x02\x02\x02\x00\x02\x30\x00\x30\x02\x05\x00\x30\x00\x30\x00\x30\x00" ++
-        "\x30\x00\x03\x01\x00";
+    return "\x30\x81\x93\x30\x7e\xa0\x03\x02\x01\x02\x02\x01\x02" ++
+        "\x30\x0d\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0b\x05\x00" ++
+        "\x30\x16\x31\x14\x30\x12\x06\x03\x55\x04\x03\x0c\x0b" ++
+        "Test Signer" ++
+        "\x30\x1e\x17\x0d\x32\x36\x30\x31\x30\x31\x30\x30\x30\x30" ++
+        "\x30\x30\x5a\x17\x0d\x32\x37\x30\x31\x30\x31\x30\x30\x30" ++
+        "\x30\x30\x30\x5a" ++
+        "\x30\x17\x31\x15\x30\x13\x06\x03\x55\x04\x03\x0c\x0c" ++
+        "Intermediate" ++
+        "\x30\x14\x30\x0d\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01" ++
+        "\x01\x05\x00\x03\x03\x00\x30\x00" ++
+        "\x30\x0d\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0b\x05" ++
+        "\x00\x03\x02\x00\x00";
 }
 
 fn testCertificateThree() []const u8 {
-    return "\x30\x1a" ++
-        "\x30\x13\xa0\x03\x02\x01\x02\x02\x02\x00\x03\x30\x00\x30\x00\x30\x00\x30\x00\x30\x00" ++
-        "\x30\x00\x03\x01\x00";
+    return testCertificateSerial(3);
+}
+
+fn testCertificateSerial(comptime serial: u8) []const u8 {
+    return "\x30\x81\x92\x30\x7d\xa0\x03\x02\x01\x02\x02\x01" ++
+        [_]u8{serial} ++
+        "\x30\x0d\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0b\x05\x00" ++
+        "\x30\x16\x31\x14\x30\x12\x06\x03\x55\x04\x03\x0c\x0b" ++
+        "Test Signer" ++
+        "\x30\x1e\x17\x0d\x32\x36\x30\x31\x30\x31\x30\x30\x30\x30" ++
+        "\x30\x30\x5a\x17\x0d\x32\x37\x30\x31\x30\x31\x30\x30\x30" ++
+        "\x30\x30\x30\x5a" ++
+        "\x30\x16\x31\x14\x30\x12\x06\x03\x55\x04\x03\x0c\x0b" ++
+        "Test Signer" ++
+        "\x30\x14\x30\x0d\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01" ++
+        "\x01\x05\x00\x03\x03\x00\x30\x00" ++
+        "\x30\x0d\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0b\x05" ++
+        "\x00\x03\x02\x00\x00";
 }
 
 fn makeTestCertificateChainContentInfo(
@@ -1022,6 +1642,7 @@ fn makeTestPe(allocator: std.mem.Allocator, length: usize) ![]u8 {
     image[1] = 'Z';
     writeU32Le(image[0x3c..][0..4], 0x80);
     @memcpy(image[0x80..0x84], "PE\x00\x00");
+    writeU16Le(image[0x84..][0..2], 0x8664);
     writeU16Le(image[0x94..][0..2], 0xf0);
     writeU16Le(image[0x98..][0..2], 0x20b);
     writeU32Le(image[0x104..][0..4], 5);
