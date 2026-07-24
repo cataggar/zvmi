@@ -66,14 +66,37 @@ if gh release view "$RELEASE_TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
   echo "::error::Release $RELEASE_TAG already exists; refusing to replace it"
   exit 1
 fi
-tag_sha=$(gh api "repos/$REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq .object.sha 2>/dev/null || true)
-if [[ -z "$tag_sha" ]]; then
+tag_ref_file="$STAGING_ROOT/tag-ref.json"
+tag_error_file="$STAGING_ROOT/tag-ref.error"
+if gh api "repos/$REPOSITORY/git/ref/tags/$RELEASE_TAG" \
+  >"$tag_ref_file" 2>"$tag_error_file"; then
+  tag_sha=$(python3 - "$tag_ref_file" <<'PY'
+import json
+import sys
+
+document = json.load(open(sys.argv[1], encoding="utf-8"))
+print(document["object"]["sha"])
+PY
+)
+  if [[ "$tag_sha" != "$SOURCE_COMMIT" ]]; then
+    echo "::error::Existing tag $RELEASE_TAG does not target $SOURCE_COMMIT"
+    exit 1
+  fi
+elif python3 - "$tag_ref_file" <<'PY'
+import json
+import sys
+
+document = json.load(open(sys.argv[1], encoding="utf-8"))
+raise SystemExit(document.get("status") != "404")
+PY
+then
   gh api --method POST "repos/$REPOSITORY/git/refs" \
     -f "ref=refs/tags/$RELEASE_TAG" \
     -f "sha=$SOURCE_COMMIT" >/dev/null
   tag_created=true
-elif [[ "$tag_sha" != "$SOURCE_COMMIT" ]]; then
-  echo "::error::Existing tag $RELEASE_TAG does not target $SOURCE_COMMIT"
+else
+  cat "$tag_error_file" >&2
+  echo "::error::Unable to inspect existing tag $RELEASE_TAG"
   exit 1
 fi
 
