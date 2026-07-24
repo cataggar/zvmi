@@ -47,6 +47,8 @@ layers, and 512 MiB docker/podman save archives. Deliberately larger trusted
 inputs can opt into explicit bounded limits with `--max-oci-blob-size`,
 `--max-oci-layer-size`, and `--max-oci-archive-size`.
 
+`build-image` consumes a local OCI layout. Materialize a remote image first with `zvmi oci copy docker://registry/repository@sha256:<digest> oci:./oci-layout`, or use the digest-pinned `addOciPull` helper from an external `build.zig`. See [OCI transports](oci.md) and [Library API](library-api.md).
+
 `--skip-iso-rootfs` is useful with genuinely minimal base containers: it keeps
 the container as the effective root filesystem and carries over only the
 boot-critical assets from the ISO/squashfs (kernel, initramfs, EFI binaries,
@@ -285,4 +287,3 @@ needs:
 This was verified end-to-end with a real QEMU + OVMF boot of a Gen2 +
 `--verity` Azure Linux 4.0 image built this way: the image reaches a real
 login prompt and root shell with `veritysetup.target` active.
-

@@ -7,6 +7,30 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSafe,
     });
 
+    const pull = zvmi.addOciPull(b, dependency, .{
+        .name = "remote-container",
+        .source = "docker://registry.example/team/image@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        .platform = .{ .os = "linux", .architecture = "amd64" },
+    });
+    _ = zvmi.addImage(b, dependency, .{
+        .name = "remote-layout-fixture",
+        .input = .{
+            .iso = b.path("fixtures/os.iso"),
+            .container = .{ .oci_layout = pull.layout },
+        },
+        .output = .{
+            .format = .qcow2,
+            .basename = "remote-layout-fixture.qcow2",
+        },
+        .size = 256 * 1024 * 1024,
+        .target_architecture = .x86_64,
+        .rootfs_path_in_iso = "images/rootfs.squashfs",
+        .reproducibility = .{
+            .seed = [_]u8{0x55} ** 32,
+            .source_date_epoch = 1_735_689_600,
+        },
+    });
+
     const layout_image = zvmi.addImage(b, dependency, .{
         .name = "layout-fixture",
         .input = .{

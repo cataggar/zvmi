@@ -1,6 +1,7 @@
 //! `zvmi`: a qemu-img-like CLI over the `zvmi` library. Supports `create`,
 //! `info`, `convert`, `resize`, `check`, `map`, `build-image`, `azure`,
-//! `cosi`, `qemu`, and release signing over `raw`, `vhd`, `vhdx`, and `qcow2`.
+//! `cosi`, `oci`, `qemu`, and release signing over `raw`, `vhd`, `vhdx`, and
+//! `qcow2`.
 
 const std = @import("std");
 const zvmi = @import("zvmi");
@@ -16,6 +17,7 @@ const cosi_cmd = @import("commands/cosi.zig");
 const build_image_cmd = @import("commands/build_image.zig");
 const qemu_cmd = @import("commands/qemu.zig");
 const sign_cmd = @import("commands/sign.zig");
+const oci_cmd = @import("commands/oci.zig");
 
 const usage =
     \\Usage: zvmi <command> [options]
@@ -31,6 +33,7 @@ const usage =
     \\  azure fixup --generation 1|2 <file>
     \\  azure deprovision [--user <username>] <file>
     \\  cosi <disk-image> -o <output.cosi>
+    \\  oci copy|inspect|list-tags
     \\  build-image --iso <file.iso> --container <oci-layout> --generation 1|2 --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}> [--skip-iso-rootfs] [--esp-size <size>] [--root-selinux-label <context>] [--boot-mode bls|uki|both] [--stub-source-path <path>] [--verity]
     \\  qemu [<image>] [--architecture auto|x86_64|aarch64] [--admin-username <name>] [--ssh-public-key <path>] [--ssh-port <port>] [--snapshot] [--accel auto|whpx|kvm|hvf|tcg] [--qemu <path>] [--ovmf-code <path>] [--ovmf-vars <path>] [-- <extra-qemu-args...>]
     \\  sign
@@ -75,6 +78,7 @@ fn run(
     if (std.mem.eql(u8, command, "build-image")) return build_image_cmd.run(gpa, io, rest);
     if (std.mem.eql(u8, command, "qemu")) return qemu_cmd.run(gpa, io, environ, rest);
     if (std.mem.eql(u8, command, "sign")) return sign_cmd.run(gpa, io, environ, rest);
+    if (std.mem.eql(u8, command, "oci")) return oci_cmd.run(gpa, io, environ, rest);
     if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h") or std.mem.eql(u8, command, "help")) {
         std.debug.print("{s}", .{usage});
         return 0;
@@ -95,4 +99,5 @@ test {
     _ = build_image_cmd;
     _ = qemu_cmd;
     _ = sign_cmd;
+    _ = oci_cmd;
 }
