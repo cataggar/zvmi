@@ -208,7 +208,12 @@ profile. Release UKIs are trusted through the exact Artifact Signing leaf enroll
 
 `zvmi qemu` defaults to the full x86_64 asset pinned as
 `AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260723`. Select an AArch64 or
-core file explicitly when needed.
+core file explicitly when needed. Add `--secure-boot` to verify the cataloged
+asset and embedded release signer, enroll only that exact leaf into a separate
+Microsoft-keyed variables store, and launch with the architecture-specific
+secure firmware contract. Non-catalog images require
+`--secure-boot-certificate` and
+`--secure-boot-certificate-sha256`.
 
 The manual release workflow builds and externally signs all four candidates on
 GitHub-hosted `ubuntu-24.04` and `ubuntu-24.04-arm` runners. Hosted jobs perform

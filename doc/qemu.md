@@ -27,29 +27,41 @@ then from a system QEMU/UEFI installation. Directory-prefixed aliases such as
 firmware under that directory.
 
 The published images use the signed direct UKI boot path described in
-[Azure Linux images](azure-linux.md). `zvmi qemu` does not silently enroll
-release trust or claim Secure Boot; use the release acceptance path or
-explicitly create enrolled variables. On Ubuntu x86_64, for example:
+[Azure Linux images](azure-linux.md). Secure Boot is opt-in:
 
 ```text
-virt-fw-vars \
-  --input /usr/share/OVMF/OVMF_VARS_4M.ms.fd \
-  --output AzureLinux-4.0-x86_64.secboot-vars.fd \
-  --add-db 7f32d4a1-7c10-4e6d-8a89-15ba3f4db734 release.crt \
-  --secure-boot
-qemu-system-x86_64 \
-  -machine q35,smm=on \
-  -global driver=cfi.pflash01,property=secure,value=on \
-  -drive if=pflash,unit=0,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.secboot.fd \
-  -drive if=pflash,unit=1,format=raw,file=AzureLinux-4.0-x86_64.secboot-vars.fd \
-  -drive file=AzureLinux-4.0-x86_64.qcow2,format=qcow2,if=virtio
+zvmi qemu AzureLinux --secure-boot
+zvmi qemu AzureLinux-4.0-aarch64 --secure-boot
 ```
 
-Use `/usr/share/AAVMF/AAVMF_CODE.secboot.fd` and `/usr/share/AAVMF/AAVMF_VARS.ms.fd` for the equivalent AArch64 enrollment. `--architecture x86_64|aarch64` selects q35/OVMF or
-virt/AAVMF respectively; `--architecture auto` requires an unambiguous
-architecture-bearing GPT root/USR GUID or UKI PE header. `AzureLinux` remains
-the short alias for the x86_64 Azure Linux image, while exact catalog aliases
-select their corresponding architecture.
+This mode requires `virt-fw-vars` from `python3-virt-firmware` and
+architecture-appropriate Secure-Boot-capable OVMF or AAVMF. The catalog pins
+both the release asset SHA-256 and the canonical-DER SHA-256 of the exact Azure
+Artifact Signing leaf. Before first enrollment, `zvmi` verifies the pristine
+catalog image digest, extracts the signer from every fallback and named UKI,
+and requires that signer to match the catalog fingerprint. It then appends
+only that leaf to the Microsoft-enrolled variables template. It never enrolls
+the shared intermediate or root and never retries with Secure Boot disabled.
+
+An explicit image that is not a matching catalog entry requires independent
+trust material:
+
+```text
+zvmi qemu custom.qcow2 --secure-boot \
+  --secure-boot-certificate release.pem \
+  --secure-boot-certificate-sha256 <canonical-DER-SHA-256>
+```
+
+The PEM must contain exactly one certificate. Its canonical DER fingerprint
+and bytes must match the signer embedded in every UKI. Certificate options are
+rejected without `--secure-boot`, and extra QEMU arguments are rejected in
+Secure Boot mode so they cannot replace the machine or firmware contract.
+
+`--architecture x86_64|aarch64` selects q35/OVMF or virt/AAVMF respectively;
+`--architecture auto` requires an unambiguous architecture-bearing GPT
+root/USR GUID or UKI PE header. `AzureLinux` remains the short alias for the
+x86_64 Azure Linux image, while exact catalog aliases select their
+corresponding architecture.
 
 Inside a full image, equivalent manual checks are `mokutil --sb-state`, `mokutil --db`, `mokutil --dbx`, `cat /sys/kernel/security/lockdown`, and `sudo dmesg | grep -Ei 'secure boot|lockdown|module verification'`. Release acceptance parses the EFI variables directly so the core image does not need `mokutil`.
 
@@ -61,14 +73,34 @@ AzureLinux-4.0-x86_64.code.fd
 AzureLinux-4.0-x86_64.vars.fd
 ```
 
+Secure Boot uses separate state and never modifies the ordinary variables
+bundle:
+
+```text
+AzureLinux-4.0-x86_64.secboot.vars.fd
+AzureLinux-4.0-x86_64.secboot.vars.json
+```
+
+The metadata binds persistent Secure Boot state to the enrolled leaf.
+Cataloged disks may change during persistent guest use after initial
+digest-bound enrollment, but every subsequent launch still requires the
+pinned embedded signer. `zvmi` also recreates the expected enrollment from the
+selected Microsoft template and requires the persistent PK, KEK, and complete
+`db` contents to match before reuse.
+
 QEMU and matching EDK2 firmware are resolved from the `cataggar/qemu` ghr
 installation first, then from a system QEMU/UEFI installation. Missing bundle
 firmware is copied from raw sources or decompressed from `.fd.bz2` sources.
 The installed QEMU package is never changed.
 
 The default boot is persistent: QEMU writes directly to the image and its
-`.vars.fd` guest UEFI state. Use snapshot mode when guest changes should be
-discarded:
+`.vars.fd` guest UEFI state. Secure Boot launches the verified image inode
+through a temporary, validated hard link so replacing the original pathname
+cannot substitute different bytes between verification and QEMU open. Guest
+writes still reach the original inode and the temporary link is removed after
+QEMU exits.
+
+Use snapshot mode when guest changes should be discarded:
 
 ```text
 zvmi qemu AzureLinux --snapshot
@@ -76,8 +108,10 @@ zvmi qemu AzureLinux --snapshot
 
 Snapshot mode uses the sibling `qemu-img` binary to create a temporary qcow2
 overlay and creates temporary UEFI variables directly from the pristine
-firmware source, not from the persistent `.vars.fd`. `zvmi` removes both when
-QEMU exits. The automatic accelerator is WHPX for x86_64 Windows, HVF for
+firmware source, not from persistent `.vars.fd` or `.secboot.vars.fd` state.
+Secure Boot snapshots enroll the same verified leaf into that temporary
+template. `zvmi` removes both when QEMU exits. The automatic accelerator is
+WHPX for x86_64 Windows, HVF for
 same-architecture macOS guests, KVM for same-architecture Linux guests when
 `/dev/kvm` is available, and TCG otherwise. Override it when needed:
 

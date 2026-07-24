@@ -105,7 +105,7 @@ test "protected output rejects an alias through a symlinked directory" {
     const output_path = alias_dir ++ "/disk.img";
     defer cwd.deleteFile(io, alias_dir) catch {};
     defer cwd.deleteTree(io, real_dir) catch {};
-    try cwd.createDir(io, real_dir);
+    try cwd.createDir(io, real_dir, .default_dir);
     try cwd.writeFile(io, .{ .sub_path = input_path, .data = "disk image" });
     try cwd.symLink(io, real_dir, alias_dir, .{ .is_directory = true });
     const input_file = try cwd.openFile(io, input_path, .{
