@@ -2,6 +2,8 @@
 //!             [--admin-username <name>] [--ssh-public-key <path>]
 //!             [--ssh-port <port>] [--snapshot] [--accel auto|whpx|kvm|hvf|tcg]
 //!             [--qemu <path>] [--ovmf-code <path>] [--ovmf-vars <path>]
+//!             [--secure-boot [--secure-boot-certificate <path>
+//!              --secure-boot-certificate-sha256 <hex>]]
 //!             [-- <extra-qemu-args...>]`
 
 const std = @import("std");
@@ -9,6 +11,7 @@ const builtin = @import("builtin");
 const zvmi = @import("zvmi");
 const qemu_host = @import("qemu_host");
 const guest_validation = @import("guest_validation");
+const atomic_output = @import("../atomic_output.zig");
 
 const GuestArchitecture = qemu_host.GuestArchitecture;
 
@@ -17,7 +20,12 @@ const KnownImage = struct {
     disk_name: []const u8,
     release_spec: []const u8,
     architecture: GuestArchitecture,
+    image_sha256: []const u8,
+    certificate_sha256: []const u8,
 };
+
+const release_certificate_sha256 =
+    "2d8105e245806574d3129b37165ffd6715d9c3eb9b763b0af7efaffd22243177";
 
 const known_images = [_]KnownImage{
     .{
@@ -25,12 +33,32 @@ const known_images = [_]KnownImage{
         .disk_name = "AzureLinux-4.0-x86_64.qcow2",
         .release_spec = "cataggar/zvmi/AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260723",
         .architecture = .x86_64,
+        .image_sha256 = "e7b79748bc994f55c20b48d07323d4fb2695703380c7a8abc068d39f46711ce3",
+        .certificate_sha256 = release_certificate_sha256,
     },
     .{
         .alias = "AzureLinux-4.0-aarch64",
         .disk_name = "AzureLinux-4.0-aarch64.qcow2",
         .release_spec = "cataggar/zvmi/AzureLinux-4.0-aarch64.qcow2@AzureLinux-4.0-20260723",
         .architecture = .aarch64,
+        .image_sha256 = "590c6eddbbbc952ff21c8d9a026ae16e10f22ad71e940dc87c10e5e8016ef544",
+        .certificate_sha256 = release_certificate_sha256,
+    },
+    .{
+        .alias = "",
+        .disk_name = "AzureLinux-4.0-x86_64.core.qcow2",
+        .release_spec = "cataggar/zvmi/AzureLinux-4.0-x86_64.core.qcow2@AzureLinux-4.0-20260723",
+        .architecture = .x86_64,
+        .image_sha256 = "44992c857178e95b3a3d2c2c1c2008791d3e5a704f845f4500cc6e86a0baadc6",
+        .certificate_sha256 = release_certificate_sha256,
+    },
+    .{
+        .alias = "",
+        .disk_name = "AzureLinux-4.0-aarch64.core.qcow2",
+        .release_spec = "cataggar/zvmi/AzureLinux-4.0-aarch64.core.qcow2@AzureLinux-4.0-20260723",
+        .architecture = .aarch64,
+        .image_sha256 = "ff294c8655ea80f890a41a7c6dc545d997da498dc5f5f03fd3aee8dea81b0f65",
+        .certificate_sha256 = release_certificate_sha256,
     },
 };
 
@@ -38,6 +66,7 @@ const default_image_name = known_images[0].disk_name;
 const default_image_spec = known_images[0].release_spec;
 const default_ssh_port: u16 = 2222;
 const max_ssh_port: u16 = 65535;
+const max_secure_boot_certificate_bytes: usize = 1024 * 1024;
 const local_provisioning_marker = "zvmi-local-provisioning";
 
 const help_text =
@@ -45,6 +74,8 @@ const help_text =
     \\                  [--admin-username <name>] [--ssh-public-key <path>]
     \\                  [--ssh-port <port>] [--snapshot] [--accel auto|whpx|kvm|hvf|tcg]
     \\                  [--qemu <path>] [--ovmf-code <path>] [--ovmf-vars <path>]
+    \\                  [--secure-boot [--secure-boot-certificate <path>
+    \\                   --secure-boot-certificate-sha256 <hex>]]
     \\                  [-- <extra-qemu-args...>]
     \\
     \\Boot an x86_64 or AArch64 Gen2/UEFI image interactively under QEMU.
@@ -70,6 +101,9 @@ const help_text =
     \\  --firmware-code <p> Explicit read-only UEFI code firmware (OVMF alias).
     \\  --firmware-vars <p> Explicit UEFI variables template (OVMF alias).
     \\  --ovmf-code/--ovmf-vars Retained compatibility aliases.
+    \\  --secure-boot       Enforce UEFI Secure Boot with release-bound trust.
+    \\  --secure-boot-certificate <p> Explicit image signing leaf in PEM form.
+    \\  --secure-boot-certificate-sha256 <hex> Canonical-DER leaf fingerprint.
     \\  -h, --help          Show this help.
     \\
 ;
@@ -118,6 +152,9 @@ const Options = struct {
     qemu_path: ?[]const u8 = null,
     ovmf_code_path: ?[]const u8 = null,
     ovmf_vars_path: ?[]const u8 = null,
+    secure_boot: bool = false,
+    secure_boot_certificate_path: ?[]const u8 = null,
+    secure_boot_certificate_sha256: ?zvmi.artifact_pipeline.Digest = null,
     admin_username: ?[]const u8 = null,
     ssh_public_key_path: ?[]const u8 = null,
     ssh_port: ?u16 = null,
@@ -139,6 +176,10 @@ const ParseFailure = struct {
         provisioning_pair,
         ssh_port_without_provisioning,
         invalid_firmware_override,
+        invalid_secure_boot_sha256,
+        secure_boot_certificate_pair,
+        secure_boot_trust_without_secure_boot,
+        secure_boot_passthrough,
         unknown_option,
         extra_image,
     };
@@ -153,14 +194,22 @@ const ResolvedImage = struct {
     disk_path: []u8,
     code_path: []u8,
     vars_path: []u8,
+    secure_code_path: []u8,
+    secure_vars_path: []u8,
+    secure_vars_metadata_path: []u8,
     architecture: GuestArchitecture,
     release_spec: ?[]const u8,
+    expected_image_sha256: ?zvmi.artifact_pipeline.Digest,
+    expected_certificate_sha256: ?zvmi.artifact_pipeline.Digest,
     download_allowed: bool,
 
     fn deinit(self: *ResolvedImage, allocator: std.mem.Allocator) void {
         allocator.free(self.disk_path);
         allocator.free(self.code_path);
         allocator.free(self.vars_path);
+        allocator.free(self.secure_code_path);
+        allocator.free(self.secure_vars_path);
+        allocator.free(self.secure_vars_metadata_path);
         self.* = undefined;
     }
 };
@@ -183,6 +232,7 @@ const LaunchPlan = struct {
     seed_iso_path: ?[]const u8 = null,
     ssh_port: ?u16 = null,
     provisioned: bool = false,
+    secure_boot: bool = false,
     extra_qemu_args: []const []const u8 = &.{},
 };
 
@@ -212,6 +262,41 @@ const GhrPackagePaths = struct {
 
 const GhrMetadata = struct {
     bins: []const []const u8,
+};
+
+const SecureBootCertificate = struct {
+    pem: []u8,
+    sha256: zvmi.artifact_pipeline.Digest,
+    launch_image_path: []u8,
+
+    fn deinit(
+        self: *SecureBootCertificate,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+    ) void {
+        if (std.fs.path.dirname(self.launch_image_path)) |directory|
+            std.Io.Dir.cwd().deleteTree(io, directory) catch {};
+        allocator.free(self.launch_image_path);
+        allocator.free(self.pem);
+        self.* = undefined;
+    }
+};
+
+const SecureBootMetadata = struct {
+    schema: u32,
+    certificate_sha256: []const u8,
+};
+
+const SecureBootTrustState = struct {
+    pk_sha256: zvmi.artifact_pipeline.Digest,
+    kek_sha256: zvmi.artifact_pipeline.Digest,
+    db_sha256: zvmi.artifact_pipeline.Digest,
+
+    fn eql(self: SecureBootTrustState, other: SecureBootTrustState) bool {
+        return std.mem.eql(u8, &self.pk_sha256, &other.pk_sha256) and
+            std.mem.eql(u8, &self.kek_sha256, &other.kek_sha256) and
+            std.mem.eql(u8, &self.db_sha256, &other.db_sha256);
+    }
 };
 
 const PreparedVmState = struct {
@@ -399,6 +484,42 @@ fn runVm(
         return 1;
     };
 
+    var secure_boot_certificate: ?SecureBootCertificate = null;
+    var secure_boot_state_exists = false;
+    defer if (secure_boot_certificate) |*certificate| certificate.deinit(gpa, io);
+    if (options.secure_boot) {
+        secure_boot_state_exists = secureBootStateExists(
+            io,
+            image.secure_vars_path,
+            image.secure_vars_metadata_path,
+        ) catch |err| {
+            printSecureBootPreparationError(image.disk_path, err);
+            return 1;
+        };
+        secure_boot_certificate = prepareSecureBootCertificateAlloc(
+            gpa,
+            io,
+            options,
+            image,
+            image.expected_image_sha256 != null and
+                !secure_boot_state_exists,
+        ) catch |err| {
+            printSecureBootPreparationError(image.disk_path, err);
+            return 1;
+        };
+        if (secure_boot_state_exists) {
+            validateSecureBootMetadata(
+                gpa,
+                io,
+                image.secure_vars_metadata_path,
+                secure_boot_certificate.?.sha256,
+            ) catch |err| {
+                printSecureBootPreparationError(image.disk_path, err);
+                return 1;
+            };
+        }
+    }
+
     var qemu = resolveQemuAlloc(gpa, io, environ, options, architecture) catch |err| {
         printQemuResolutionError(options, architecture, err);
         return 1;
@@ -409,7 +530,21 @@ fn runVm(
     var local_firmware: ?qemu_host.FirmwarePair = null;
     defer if (local_firmware) |*firmware| firmware.deinit(gpa);
 
-    if (explicit_firmware and !options.snapshot) {
+    var firmware_code_path: []const u8 = qemu.firmware.code.path;
+    if (options.secure_boot) {
+        if (qemu.firmware.code.encoding == .bzip2) {
+            qemu_host.materializeFirmwareFile(
+                io,
+                qemu.firmware.code,
+                image.secure_code_path,
+                .{},
+            ) catch |err| {
+                printFirmwarePreparationError(image.secure_code_path, err);
+                return 1;
+            };
+            firmware_code_path = image.secure_code_path;
+        }
+    } else if (explicit_firmware and !options.snapshot) {
         qemu_host.materializeFirmwareFile(
             io,
             qemu.firmware.vars,
@@ -431,23 +566,43 @@ fn runVm(
             printFirmwarePreparationError(image.disk_path, err);
             return 1;
         };
+        firmware_code_path = local_firmware.?.code_path;
     }
 
     const host = currentHostCapabilities(io);
     const accel = resolveAccel(options.accel, host, architecture);
-    var vm_state = prepareVmStateAlloc(
-        gpa,
-        io,
-        environ,
-        options.snapshot,
-        image.disk_path,
-        image.vars_path,
-        qemu.firmware.vars,
-    ) catch |err| {
-        std.debug.print(
-            "qemu: failed to prepare UEFI vars from '{s}': {s}\n",
-            .{ qemu.firmware.vars.path, @errorName(err) },
-        );
+    var vm_state = blk: {
+        break :blk if (options.secure_boot)
+            prepareSecureBootVmStateAlloc(
+                gpa,
+                io,
+                environ,
+                options.snapshot,
+                secure_boot_state_exists,
+                image.secure_vars_path,
+                image.secure_vars_metadata_path,
+                qemu.firmware.vars,
+                secure_boot_certificate.?,
+            )
+        else
+            prepareVmStateAlloc(
+                gpa,
+                io,
+                environ,
+                options.snapshot,
+                image.disk_path,
+                image.vars_path,
+                qemu.firmware.vars,
+            );
+    } catch |err| {
+        if (options.secure_boot) {
+            printSecureBootPreparationError(image.disk_path, err);
+        } else {
+            std.debug.print(
+                "qemu: failed to prepare UEFI vars from '{s}': {s}\n",
+                .{ qemu.firmware.vars.path, @errorName(err) },
+            );
+        }
         return 1;
     };
     defer vm_state.deinit(gpa, io);
@@ -472,7 +627,10 @@ fn runVm(
             environ,
             qemu.binary_path,
             temp_dir,
-            image.disk_path,
+            if (options.secure_boot)
+                secure_boot_certificate.?.launch_image_path
+            else
+                image.disk_path,
             image_format,
         ) catch |err| {
             std.debug.print("qemu: failed to create temporary disk overlay: {s}\n", .{@errorName(err)});
@@ -480,7 +638,11 @@ fn runVm(
         };
     }
 
-    const launch_image_path = vm_state.overlay_path orelse image.disk_path;
+    const launch_image_path = vm_state.overlay_path orelse
+        if (options.secure_boot)
+            secure_boot_certificate.?.launch_image_path
+        else
+            image.disk_path;
     const launch_image_format: zvmi.Format = if (vm_state.overlay_path != null) .qcow2 else image_format;
     var argv = buildQemuArgv(gpa, .{
         .qemu_path = qemu.binary_path,
@@ -488,15 +650,13 @@ fn runVm(
         .architecture = architecture,
         .image_path = launch_image_path,
         .image_format = launch_image_format,
-        .ovmf_code_path = if (explicit_firmware)
-            qemu.firmware.code.path
-        else
-            local_firmware.?.code_path,
+        .ovmf_code_path = firmware_code_path,
         .ovmf_vars_path = vm_state.vars_path,
         .accel = accel,
         .seed_iso_path = if (seed) |seed_state| seed_state.iso_path else null,
         .ssh_port = options.ssh_port,
         .provisioned = seed != null,
+        .secure_boot = options.secure_boot,
         .extra_qemu_args = options.extra_qemu_args,
     }) catch |err| {
         std.debug.print("qemu: failed to build QEMU arguments: {s}\n", .{@errorName(err)});
@@ -506,20 +666,21 @@ fn runVm(
 
     const mode = if (options.snapshot) "snapshot" else "persistent";
     std.debug.print(
-        "qemu: launching image='{s}' arch={s} format={s} qemu='{s}' accel={s} mode={s}\n",
+        "qemu: launching image='{s}' arch={s} format={s} qemu='{s}' accel={s} mode={s} secure_boot={s}\n",
         .{
             image.disk_path,
-            @tagName(image.architecture),
+            @tagName(architecture),
             qemuFormatName(image_format),
             qemu.binary_path,
             accel.cliName(),
             mode,
+            if (options.secure_boot) "on" else "off",
         },
     );
     std.debug.print(
         "qemu: UEFI code='{s}' vars='{s}'\n",
         .{
-            if (explicit_firmware) qemu.firmware.code.path else local_firmware.?.code_path,
+            firmware_code_path,
             vm_state.vars_path,
         },
     );
@@ -561,6 +722,18 @@ fn parseArgs(args: []const []const u8) ParseResult {
             options.help = true;
         } else if (std.mem.eql(u8, arg, "--snapshot")) {
             options.snapshot = true;
+        } else if (std.mem.eql(u8, arg, "--secure-boot")) {
+            options.secure_boot = true;
+        } else if (std.mem.eql(u8, arg, "--secure-boot-certificate")) {
+            i += 1;
+            if (i >= args.len) return parseFailure(.missing_value, arg);
+            options.secure_boot_certificate_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--secure-boot-certificate-sha256")) {
+            i += 1;
+            if (i >= args.len) return parseFailure(.missing_value, arg);
+            options.secure_boot_certificate_sha256 =
+                zvmi.artifact_pipeline.parseSha256(args[i]) catch
+                    return parseFailure(.invalid_secure_boot_sha256, args[i]);
         } else if (std.mem.eql(u8, arg, "--architecture")) {
             i += 1;
             if (i >= args.len) return parseFailure(.missing_value, arg);
@@ -628,6 +801,21 @@ fn parseArgs(args: []const []const u8) ParseResult {
         return parseFailure(.ssh_port_without_provisioning, "--ssh-port");
     if ((options.ovmf_code_path == null) != (options.ovmf_vars_path == null))
         return parseFailure(.invalid_firmware_override, "--firmware-code/--firmware-vars");
+    if ((options.secure_boot_certificate_path == null) !=
+        (options.secure_boot_certificate_sha256 == null))
+    {
+        return parseFailure(
+            .secure_boot_certificate_pair,
+            "--secure-boot-certificate/--secure-boot-certificate-sha256",
+        );
+    }
+    if (!options.secure_boot and options.secure_boot_certificate_path != null)
+        return parseFailure(
+            .secure_boot_trust_without_secure_boot,
+            "--secure-boot-certificate",
+        );
+    if (options.secure_boot and options.extra_qemu_args.len != 0)
+        return parseFailure(.secure_boot_passthrough, "--");
     if (options.ssh_public_key_path != null and options.ssh_port == null)
         options.ssh_port = default_ssh_port;
 
@@ -677,6 +865,22 @@ fn printParseFailure(failure: ParseFailure) void {
             "qemu: firmware code and vars overrides must be supplied together\n",
             .{},
         ),
+        .invalid_secure_boot_sha256 => std.debug.print(
+            "qemu: invalid Secure Boot certificate SHA-256 '{s}'\n",
+            .{failure.arg},
+        ),
+        .secure_boot_certificate_pair => std.debug.print(
+            "qemu: --secure-boot-certificate and --secure-boot-certificate-sha256 must be supplied together\n",
+            .{},
+        ),
+        .secure_boot_trust_without_secure_boot => std.debug.print(
+            "qemu: explicit Secure Boot trust requires --secure-boot\n",
+            .{},
+        ),
+        .secure_boot_passthrough => std.debug.print(
+            "qemu: extra QEMU arguments are not allowed with --secure-boot\n",
+            .{},
+        ),
         .unknown_option => std.debug.print("qemu: unknown option '{s}'\n", .{failure.arg}),
         .extra_image => std.debug.print("qemu: unexpected image argument '{s}'\n", .{failure.arg}),
     }
@@ -699,7 +903,7 @@ fn resolveImageAlloc(
             true,
         );
     for (known_images) |known| {
-        if (std.mem.eql(u8, basename, known.alias))
+        if (known.alias.len != 0 and std.mem.eql(u8, basename, known.alias))
             return resolvedKnownImageAlloc(
                 allocator,
                 known,
@@ -715,6 +919,8 @@ fn resolveImageAlloc(
                 argument,
                 known.architecture,
                 known.release_spec,
+                try zvmi.artifact_pipeline.parseSha256(known.image_sha256),
+                try zvmi.artifact_pipeline.parseSha256(known.certificate_sha256),
                 false,
             );
     }
@@ -723,6 +929,8 @@ fn resolveImageAlloc(
         allocator,
         argument,
         .x86_64,
+        null,
+        null,
         null,
         false,
     );
@@ -770,6 +978,8 @@ fn resolvedKnownImageAlloc(
         disk_path,
         known.architecture,
         known.release_spec,
+        try zvmi.artifact_pipeline.parseSha256(known.image_sha256),
+        try zvmi.artifact_pipeline.parseSha256(known.certificate_sha256),
         download_allowed,
     );
 }
@@ -779,6 +989,8 @@ fn resolvedDiskImageAlloc(
     disk_path: []const u8,
     architecture: GuestArchitecture,
     release_spec: ?[]const u8,
+    expected_image_sha256: ?zvmi.artifact_pipeline.Digest,
+    expected_certificate_sha256: ?zvmi.artifact_pipeline.Digest,
     download_allowed: bool,
 ) !ResolvedImage {
     const owned_disk_path = try allocator.dupe(u8, disk_path);
@@ -786,13 +998,28 @@ fn resolvedDiskImageAlloc(
     const code_path = try bundlePathAlloc(allocator, disk_path, ".code.fd");
     errdefer allocator.free(code_path);
     const vars_path = try bundlePathAlloc(allocator, disk_path, ".vars.fd");
+    errdefer allocator.free(vars_path);
+    const secure_code_path = try bundlePathAlloc(allocator, disk_path, ".secboot.code.fd");
+    errdefer allocator.free(secure_code_path);
+    const secure_vars_path = try bundlePathAlloc(allocator, disk_path, ".secboot.vars.fd");
+    errdefer allocator.free(secure_vars_path);
+    const secure_vars_metadata_path = try bundlePathAlloc(
+        allocator,
+        disk_path,
+        ".secboot.vars.json",
+    );
 
     return .{
         .disk_path = owned_disk_path,
         .code_path = code_path,
         .vars_path = vars_path,
+        .secure_code_path = secure_code_path,
+        .secure_vars_path = secure_vars_path,
+        .secure_vars_metadata_path = secure_vars_metadata_path,
         .architecture = architecture,
         .release_spec = release_spec,
+        .expected_image_sha256 = expected_image_sha256,
+        .expected_certificate_sha256 = expected_certificate_sha256,
         .download_allowed = download_allowed,
     };
 }
@@ -874,6 +1101,200 @@ fn detectImageFormat(io: std.Io, image_path: []const u8) !zvmi.Format {
     }
 
     return .raw;
+}
+
+fn hashOpenFile(
+    io: std.Io,
+    file: std.Io.File,
+) !zvmi.artifact_pipeline.Digest {
+    const initial = try file.stat(io);
+    if (initial.kind != .file) return error.ImageNotRegularFile;
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var buffer: [128 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < initial.size) {
+        const length: usize = @intCast(@min(initial.size - offset, buffer.len));
+        const read = try file.readPositionalAll(io, buffer[0..length], offset);
+        if (read != length) return error.ImageChangedDuringHash;
+        hash.update(buffer[0..read]);
+        offset += read;
+    }
+    const final = try file.stat(io);
+    if (initial.kind != final.kind or
+        initial.inode != final.inode or
+        initial.size != final.size or
+        initial.mtime.nanoseconds != final.mtime.nanoseconds or
+        initial.ctime.nanoseconds != final.ctime.nanoseconds)
+    {
+        return error.ImageChangedDuringHash;
+    }
+    var digest: zvmi.artifact_pipeline.Digest = undefined;
+    hash.final(&digest);
+    return digest;
+}
+
+fn sameImageSnapshot(a: std.Io.File.Stat, b: std.Io.File.Stat) bool {
+    return a.kind == b.kind and
+        a.inode == b.inode and
+        a.size == b.size and
+        a.mtime.nanoseconds == b.mtime.nanoseconds and
+        a.ctime.nanoseconds == b.ctime.nanoseconds;
+}
+
+fn createValidatedImageLinkAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    image_file: std.Io.File,
+    image_path: []const u8,
+    verified_sha256: zvmi.artifact_pipeline.Digest,
+) ![]u8 {
+    const parent = std.fs.path.dirname(image_path) orelse ".";
+    const directory = try randomTempPathAlloc(
+        allocator,
+        io,
+        parent,
+        ".zvmi-secure-boot-image-",
+        "",
+    );
+    defer allocator.free(directory);
+    errdefer std.Io.Dir.cwd().deleteTree(io, directory) catch {};
+    try std.Io.Dir.cwd().createDir(
+        io,
+        directory,
+        privateDirectoryPermissions(),
+    );
+
+    const stable_path = try std.fs.path.join(
+        allocator,
+        &.{ directory, std.fs.path.basename(image_path) },
+    );
+    errdefer allocator.free(stable_path);
+    try std.Io.Dir.cwd().hardLink(
+        image_path,
+        std.Io.Dir.cwd(),
+        stable_path,
+        io,
+        .{ .follow_symlinks = true },
+    );
+    const stable_file = try std.Io.Dir.cwd().openFile(io, stable_path, .{
+        .mode = .read_only,
+        .allow_directory = false,
+    });
+    defer stable_file.close(io);
+    if (!sameImageSnapshot(
+        try image_file.stat(io),
+        try stable_file.stat(io),
+    )) return error.SecureBootImageChanged;
+    const stable_sha256 = try hashOpenFile(io, stable_file);
+    if (!std.mem.eql(u8, &stable_sha256, &verified_sha256))
+        return error.SecureBootImageChanged;
+    return stable_path;
+}
+
+fn prepareSecureBootCertificateAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: Options,
+    image: ResolvedImage,
+    require_catalog_image_digest: bool,
+) !SecureBootCertificate {
+    const catalog_certificate_sha256 = image.expected_certificate_sha256;
+    const explicit_certificate_sha256 = options.secure_boot_certificate_sha256;
+    if (catalog_certificate_sha256) |catalog_digest| {
+        if (explicit_certificate_sha256) |explicit_digest| {
+            if (!std.mem.eql(u8, &catalog_digest, &explicit_digest))
+                return error.CatalogCertificateFingerprintMismatch;
+        }
+    }
+    const expected_certificate_sha256 =
+        catalog_certificate_sha256 orelse
+        explicit_certificate_sha256 orelse
+        return error.SecureBootTrustRequired;
+
+    var explicit_certificate_der: ?[]u8 = null;
+    defer if (explicit_certificate_der) |der| allocator.free(der);
+    if (options.secure_boot_certificate_path) |certificate_path| {
+        const certificate_pem = try std.Io.Dir.cwd().readFileAlloc(
+            io,
+            certificate_path,
+            allocator,
+            .limited(max_secure_boot_certificate_bytes),
+        );
+        defer allocator.free(certificate_pem);
+        const certificate_der = try zvmi.authenticode.decodePemCertificateAlloc(
+            allocator,
+            certificate_pem,
+        );
+        const certificate_sha256 = zvmi.artifact_pipeline.sha256Bytes(
+            certificate_der,
+        );
+        if (!std.mem.eql(
+            u8,
+            &certificate_sha256,
+            &expected_certificate_sha256,
+        )) {
+            allocator.free(certificate_der);
+            return error.ExplicitCertificateFingerprintMismatch;
+        }
+        explicit_certificate_der = certificate_der;
+    }
+
+    var initial_image_sha256: ?zvmi.artifact_pipeline.Digest = null;
+    var disk = blk: {
+        const image_file = try std.Io.Dir.cwd().openFile(io, image.disk_path, .{
+            .mode = .read_only,
+            .allow_directory = false,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+        });
+        errdefer image_file.close(io);
+        if (require_catalog_image_digest) {
+            const expected_image_sha256 = image.expected_image_sha256 orelse
+                return error.SecureBootTrustRequired;
+            const actual_image_sha256 = try hashOpenFile(io, image_file);
+            if (!std.mem.eql(u8, &actual_image_sha256, &expected_image_sha256))
+                return error.CatalogImageDigestMismatch;
+            initial_image_sha256 = actual_image_sha256;
+        }
+        break :blk try zvmi.Image.openFile(io, image_file);
+    };
+    defer disk.close(io);
+    var extracted = try zvmi.uki_certificate.extractAlloc(
+        allocator,
+        io,
+        &disk,
+        .{ .expected_sha256 = expected_certificate_sha256 },
+    );
+    defer extracted.deinit(allocator);
+    const final_image_sha256 = try hashOpenFile(io, disk.file);
+    if (require_catalog_image_digest) {
+        const expected_image_sha256 = image.expected_image_sha256.?;
+        if (!std.mem.eql(u8, &final_image_sha256, &expected_image_sha256) or
+            !std.mem.eql(u8, &final_image_sha256, &initial_image_sha256.?))
+            return error.CatalogImageDigestMismatch;
+    }
+    if (explicit_certificate_der) |certificate_der| {
+        if (!std.mem.eql(u8, certificate_der, extracted.certificate_der))
+            return error.ExplicitCertificateDoesNotMatchImage;
+    }
+
+    const pem = try zvmi.authenticode.encodePemCertificateAlloc(
+        allocator,
+        extracted.certificate_der,
+    );
+    errdefer allocator.free(pem);
+    const launch_image_path = try createValidatedImageLinkAlloc(
+        allocator,
+        io,
+        disk.file,
+        image.disk_path,
+        final_image_sha256,
+    );
+    return .{
+        .pem = pem,
+        .sha256 = extracted.certificate_sha256,
+        .launch_image_path = launch_image_path,
+    };
 }
 
 fn resolveArchitecture(
@@ -986,6 +1407,524 @@ fn persistentVarsPathAlloc(
     const extension = std.fs.path.extension(image_path);
     const stem = image_path[0 .. image_path.len - extension.len];
     return std.fmt.allocPrint(allocator, "{s}.vars.fd", .{stem});
+}
+
+fn secureBootStateExists(
+    io: std.Io,
+    vars_path: []const u8,
+    metadata_path: []const u8,
+) !bool {
+    const vars_exists = try qemu_host.pathAccessible(io, vars_path, .{ .read = true });
+    const metadata_exists = try qemu_host.pathAccessible(io, metadata_path, .{ .read = true });
+    if (vars_exists != metadata_exists) return error.IncompleteSecureBootState;
+    return vars_exists;
+}
+
+fn validateSecureBootMetadata(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    metadata_path: []const u8,
+    expected_certificate_sha256: zvmi.artifact_pipeline.Digest,
+) !void {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        metadata_path,
+        allocator,
+        .limited(16 * 1024),
+    );
+    defer allocator.free(bytes);
+    const parsed = std.json.parseFromSlice(
+        SecureBootMetadata,
+        allocator,
+        bytes,
+        .{ .ignore_unknown_fields = true },
+    ) catch return error.InvalidSecureBootMetadata;
+    defer parsed.deinit();
+    if (parsed.value.schema != 1) return error.InvalidSecureBootMetadata;
+    const actual = zvmi.artifact_pipeline.parseSha256(
+        parsed.value.certificate_sha256,
+    ) catch return error.InvalidSecureBootMetadata;
+    if (!std.mem.eql(u8, &actual, &expected_certificate_sha256))
+        return error.SecureBootStateCertificateMismatch;
+}
+
+fn writeSecureBootMetadata(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    metadata_path: []const u8,
+    certificate_sha256: zvmi.artifact_pipeline.Digest,
+) !void {
+    const fingerprint = zvmi.artifact_pipeline.formatSha256(certificate_sha256);
+    const bytes = try std.json.Stringify.valueAlloc(
+        allocator,
+        .{
+            .schema = @as(u32, 1),
+            .certificate_sha256 = &fingerprint,
+        },
+        .{ .whitespace = .indent_2 },
+    );
+    defer allocator.free(bytes);
+    try atomic_output.writeAtomic(io, allocator, metadata_path, bytes);
+}
+
+fn resolveVirtFwVarsAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: std.process.Environ,
+) ![]u8 {
+    return try qemu_host.findExecutableInPathAlloc(
+        allocator,
+        io,
+        environ,
+        qemu_host.executableName("virt-fw-vars"),
+    ) orelse error.VirtFwVarsNotFound;
+}
+
+fn runVirtFwVars(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+) !void {
+    const result = try std.process.run(allocator, io, .{
+        .argv = argv,
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
+        .timeout = .{ .duration = .{
+            .raw = .fromSeconds(90),
+            .clock = .awake,
+        } },
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code == 0) return,
+        else => {},
+    }
+    if (result.stderr.len != 0)
+        std.debug.print("qemu: virt-fw-vars failed: {s}\n", .{result.stderr});
+    return error.VirtFwVarsFailed;
+}
+
+fn efiSignatureDatabaseCertificateCount(
+    database: []const u8,
+    certificate_sha256: zvmi.artifact_pipeline.Digest,
+) !usize {
+    const efi_cert_x509_guid = [_]u8{
+        0xa1, 0x59, 0xc0, 0xa5, 0xe4, 0x94, 0xa7, 0x4a,
+        0x87, 0xb5, 0xab, 0x15, 0x5c, 0x2b, 0xf0, 0x72,
+    };
+    var matches: usize = 0;
+    var list_offset: usize = 0;
+    while (list_offset < database.len) {
+        if (database.len - list_offset < 28)
+            return error.InvalidEnrolledSecureBootVars;
+        const list_size = std.mem.readInt(
+            u32,
+            database[list_offset + 16 ..][0..4],
+            .little,
+        );
+        const header_size = std.mem.readInt(
+            u32,
+            database[list_offset + 20 ..][0..4],
+            .little,
+        );
+        const signature_size = std.mem.readInt(
+            u32,
+            database[list_offset + 24 ..][0..4],
+            .little,
+        );
+        if (list_size < 28 or signature_size <= 16)
+            return error.InvalidEnrolledSecureBootVars;
+        const list_end = std.math.add(usize, list_offset, list_size) catch
+            return error.InvalidEnrolledSecureBootVars;
+        const signatures_start = std.math.add(
+            usize,
+            list_offset + 28,
+            header_size,
+        ) catch return error.InvalidEnrolledSecureBootVars;
+        if (list_end > database.len or signatures_start > list_end)
+            return error.InvalidEnrolledSecureBootVars;
+        const signatures_bytes = list_end - signatures_start;
+        if (signatures_bytes == 0 or signatures_bytes % signature_size != 0)
+            return error.InvalidEnrolledSecureBootVars;
+        if (std.mem.eql(
+            u8,
+            database[list_offset..][0..efi_cert_x509_guid.len],
+            &efi_cert_x509_guid,
+        )) {
+            var signature_offset = signatures_start;
+            while (signature_offset < list_end) : (signature_offset += signature_size) {
+                const certificate = database[signature_offset + 16 .. signature_offset + signature_size];
+                const digest = zvmi.artifact_pipeline.sha256Bytes(certificate);
+                if (std.mem.eql(u8, &digest, &certificate_sha256))
+                    matches += 1;
+            }
+        }
+        list_offset = list_end;
+    }
+    return matches;
+}
+
+fn validateEnrolledVarsJson(
+    allocator: std.mem.Allocator,
+    json: []const u8,
+    certificate_sha256: zvmi.artifact_pipeline.Digest,
+) !SecureBootTrustState {
+    const global_variable_guid = "8be4df61-93ca-11d2-aa0d-00e098032b8c";
+    const image_security_database_guid = "d719b2cb-3d3a-4596-a3bc-dad00e67656f";
+    const secure_boot_enable_guid = "f0a30bc7-af08-4556-99c4-001009c93a44";
+    const custom_mode_guid = "c076ec0c-7028-4399-a072-71ee5c448b9f";
+    const boot_service_attributes: i64 = 3;
+    const authenticated_variable_attributes: i64 = 39;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch
+        return error.InvalidEnrolledSecureBootVars;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidEnrolledSecureBootVars,
+    };
+    const version = root.get("version") orelse
+        return error.InvalidEnrolledSecureBootVars;
+    if (version != .integer or version.integer != 2)
+        return error.InvalidEnrolledSecureBootVars;
+    const variables_value = root.get("variables") orelse
+        return error.InvalidEnrolledSecureBootVars;
+    const variables = switch (variables_value) {
+        .array => |array| array,
+        else => return error.InvalidEnrolledSecureBootVars,
+    };
+
+    var secure_boot_enable = false;
+    var secure_boot_enable_seen = false;
+    var custom_mode_disabled = false;
+    var custom_mode_seen = false;
+    var pk_sha256: ?zvmi.artifact_pipeline.Digest = null;
+    var kek_sha256: ?zvmi.artifact_pipeline.Digest = null;
+    var db_sha256: ?zvmi.artifact_pipeline.Digest = null;
+    var certificate_matches: usize = 0;
+    for (variables.items) |variable_value| {
+        const variable = switch (variable_value) {
+            .object => |object| object,
+            else => return error.InvalidEnrolledSecureBootVars,
+        };
+        const name_value = variable.get("name") orelse
+            return error.InvalidEnrolledSecureBootVars;
+        const guid_value = variable.get("guid") orelse
+            return error.InvalidEnrolledSecureBootVars;
+        const attr_value = variable.get("attr") orelse
+            return error.InvalidEnrolledSecureBootVars;
+        const data_value = variable.get("data") orelse
+            return error.InvalidEnrolledSecureBootVars;
+        if (name_value != .string or
+            guid_value != .string or
+            attr_value != .integer or
+            data_value != .string)
+        {
+            return error.InvalidEnrolledSecureBootVars;
+        }
+        const name = name_value.string;
+        const guid = guid_value.string;
+        const attributes = attr_value.integer;
+        const data_hex = data_value.string;
+        if (std.mem.eql(u8, name, "SecureBootEnable")) {
+            if (secure_boot_enable_seen or
+                !std.mem.eql(u8, guid, secure_boot_enable_guid) or
+                attributes != boot_service_attributes)
+            {
+                return error.InvalidEnrolledSecureBootVars;
+            }
+            secure_boot_enable_seen = true;
+            secure_boot_enable = std.mem.eql(u8, data_hex, "01");
+        } else if (std.mem.eql(u8, name, "CustomMode")) {
+            if (custom_mode_seen or
+                !std.mem.eql(u8, guid, custom_mode_guid) or
+                attributes != boot_service_attributes)
+            {
+                return error.InvalidEnrolledSecureBootVars;
+            }
+            custom_mode_seen = true;
+            custom_mode_disabled = std.mem.eql(u8, data_hex, "00");
+        } else if (std.mem.eql(u8, name, "PK")) {
+            if (pk_sha256 != null or
+                !std.mem.eql(u8, guid, global_variable_guid) or
+                attributes != authenticated_variable_attributes)
+            {
+                return error.InvalidEnrolledSecureBootVars;
+            }
+            pk_sha256 = try sha256HexDataAlloc(allocator, data_hex);
+        } else if (std.mem.eql(u8, name, "KEK")) {
+            if (kek_sha256 != null or
+                !std.mem.eql(u8, guid, global_variable_guid) or
+                attributes != authenticated_variable_attributes)
+            {
+                return error.InvalidEnrolledSecureBootVars;
+            }
+            kek_sha256 = try sha256HexDataAlloc(allocator, data_hex);
+        } else if (std.mem.eql(u8, name, "db")) {
+            if (db_sha256 != null or
+                !std.mem.eql(u8, guid, image_security_database_guid) or
+                attributes != authenticated_variable_attributes)
+            {
+                return error.InvalidEnrolledSecureBootVars;
+            }
+            if (data_hex.len % 2 != 0)
+                return error.InvalidEnrolledSecureBootVars;
+            const database = try allocator.alloc(u8, data_hex.len / 2);
+            defer allocator.free(database);
+            _ = std.fmt.hexToBytes(database, data_hex) catch
+                return error.InvalidEnrolledSecureBootVars;
+            certificate_matches = try efiSignatureDatabaseCertificateCount(
+                database,
+                certificate_sha256,
+            );
+            db_sha256 = zvmi.artifact_pipeline.sha256Bytes(database);
+        }
+    }
+    if (!secure_boot_enable or
+        !custom_mode_disabled or
+        pk_sha256 == null or
+        kek_sha256 == null or
+        db_sha256 == null or
+        certificate_matches != 1)
+    {
+        return error.InvalidEnrolledSecureBootVars;
+    }
+    return .{
+        .pk_sha256 = pk_sha256.?,
+        .kek_sha256 = kek_sha256.?,
+        .db_sha256 = db_sha256.?,
+    };
+}
+
+fn sha256HexDataAlloc(
+    allocator: std.mem.Allocator,
+    data_hex: []const u8,
+) !zvmi.artifact_pipeline.Digest {
+    if (data_hex.len == 0 or data_hex.len % 2 != 0)
+        return error.InvalidEnrolledSecureBootVars;
+    const data = try allocator.alloc(u8, data_hex.len / 2);
+    defer allocator.free(data);
+    _ = std.fmt.hexToBytes(data, data_hex) catch
+        return error.InvalidEnrolledSecureBootVars;
+    return zvmi.artifact_pipeline.sha256Bytes(data);
+}
+
+fn enrollSecureBootVars(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    virt_fw_vars_path: []const u8,
+    template_path: []const u8,
+    certificate_path: []const u8,
+    certificate_sha256: zvmi.artifact_pipeline.Digest,
+    output_path: []const u8,
+    validation_json_path: []const u8,
+) !SecureBootTrustState {
+    try runVirtFwVars(allocator, io, &.{
+        virt_fw_vars_path,
+        "--input",
+        template_path,
+        "--output",
+        output_path,
+        "--add-db",
+        "7f32d4a1-7c10-4e6d-8a89-15ba3f4db734",
+        certificate_path,
+        "--secure-boot",
+    });
+    try qemu_host.requireFirmwareWritable(io, output_path);
+    return validateSecureBootVars(
+        allocator,
+        io,
+        virt_fw_vars_path,
+        output_path,
+        validation_json_path,
+        certificate_sha256,
+    );
+}
+
+fn validateSecureBootVars(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    virt_fw_vars_path: []const u8,
+    vars_path: []const u8,
+    validation_json_path: []const u8,
+    certificate_sha256: zvmi.artifact_pipeline.Digest,
+) !SecureBootTrustState {
+    try runVirtFwVars(allocator, io, &.{
+        virt_fw_vars_path,
+        "--input",
+        vars_path,
+        "--output-json",
+        validation_json_path,
+    });
+    const json = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        validation_json_path,
+        allocator,
+        .limited(32 * 1024 * 1024),
+    );
+    defer allocator.free(json);
+    return validateEnrolledVarsJson(allocator, json, certificate_sha256);
+}
+
+fn prepareSecureBootVmStateAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: std.process.Environ,
+    snapshot: bool,
+    expected_state_exists: bool,
+    persistent_vars_path: []const u8,
+    metadata_path: []const u8,
+    vars_source: qemu_host.FirmwareSource,
+    certificate: SecureBootCertificate,
+) !PreparedVmState {
+    const state_exists = secureBootStateExists(
+        io,
+        persistent_vars_path,
+        metadata_path,
+    ) catch return error.SecureBootStateChanged;
+    if (state_exists != expected_state_exists)
+        return error.SecureBootStateChanged;
+
+    const virt_fw_vars_path = try resolveVirtFwVarsAlloc(allocator, io, environ);
+    defer allocator.free(virt_fw_vars_path);
+    const temp_dir = try createTemporaryWorkDirAlloc(
+        allocator,
+        io,
+        environ,
+        "zvmi-secure-boot-",
+    );
+    errdefer {
+        std.Io.Dir.cwd().deleteTree(io, temp_dir) catch {};
+        allocator.free(temp_dir);
+    }
+    const template_path = try std.fs.path.join(
+        allocator,
+        &.{ temp_dir, "template-vars.fd" },
+    );
+    defer allocator.free(template_path);
+    const certificate_path = try std.fs.path.join(
+        allocator,
+        &.{ temp_dir, "release-leaf.pem" },
+    );
+    defer allocator.free(certificate_path);
+    const enrolled_path = try std.fs.path.join(
+        allocator,
+        &.{ temp_dir, "enrolled-vars.fd" },
+    );
+    errdefer allocator.free(enrolled_path);
+    const validation_json_path = try std.fs.path.join(
+        allocator,
+        &.{ temp_dir, "enrolled-vars.json" },
+    );
+    defer allocator.free(validation_json_path);
+    const persistent_validation_json_path = try std.fs.path.join(
+        allocator,
+        &.{ temp_dir, "persistent-vars.json" },
+    );
+    defer allocator.free(persistent_validation_json_path);
+
+    try qemu_host.materializeFirmwareFile(io, vars_source, template_path, .{});
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = certificate_path,
+        .data = certificate.pem,
+        .flags = .{
+            .truncate = true,
+            .permissions = .fromMode(0o600),
+        },
+    });
+    const expected_trust_state = try enrollSecureBootVars(
+        allocator,
+        io,
+        virt_fw_vars_path,
+        template_path,
+        certificate_path,
+        certificate.sha256,
+        enrolled_path,
+        validation_json_path,
+    );
+
+    if (state_exists) {
+        try validateSecureBootMetadata(
+            allocator,
+            io,
+            metadata_path,
+            certificate.sha256,
+        );
+        const persistent_trust_state = try validateSecureBootVars(
+            allocator,
+            io,
+            virt_fw_vars_path,
+            persistent_vars_path,
+            persistent_validation_json_path,
+            certificate.sha256,
+        );
+        if (!persistent_trust_state.eql(expected_trust_state))
+            return error.SecureBootStateTrustMismatch;
+        if (!snapshot) {
+            const persistent_state = try preparePersistentVmStateAlloc(
+                allocator,
+                io,
+                persistent_vars_path,
+            );
+            std.Io.Dir.cwd().deleteTree(io, temp_dir) catch {};
+            allocator.free(temp_dir);
+            allocator.free(enrolled_path);
+            return persistent_state;
+        }
+    }
+
+    if (snapshot) {
+        return .{
+            .vars_path = enrolled_path,
+            .temporary = true,
+            .temporary_dir = temp_dir,
+        };
+    }
+
+    const final_state_exists = secureBootStateExists(
+        io,
+        persistent_vars_path,
+        metadata_path,
+    ) catch return error.SecureBootStateChanged;
+    if (final_state_exists != expected_state_exists)
+        return error.SecureBootStateChanged;
+    const vars_created = try qemu_host.materializeFirmwareFileCreated(
+        io,
+        .{ .path = enrolled_path, .encoding = .raw },
+        persistent_vars_path,
+        .{},
+    );
+    if (!vars_created) return error.SecureBootStateChanged;
+    errdefer {
+        std.Io.Dir.cwd().deleteFile(io, persistent_vars_path) catch {};
+        std.Io.Dir.cwd().deleteFile(io, metadata_path) catch {};
+    }
+    const published_trust_state = try validateSecureBootVars(
+        allocator,
+        io,
+        virt_fw_vars_path,
+        persistent_vars_path,
+        persistent_validation_json_path,
+        certificate.sha256,
+    );
+    if (!published_trust_state.eql(expected_trust_state))
+        return error.SecureBootStateTrustMismatch;
+    try writeSecureBootMetadata(
+        allocator,
+        io,
+        metadata_path,
+        certificate.sha256,
+    );
+    try qemu_host.requireFirmwareWritable(io, persistent_vars_path);
+    const owned_vars_path = try allocator.dupe(u8, persistent_vars_path);
+    std.Io.Dir.cwd().deleteTree(io, temp_dir) catch {};
+    allocator.free(temp_dir);
+    allocator.free(enrolled_path);
+    return .{
+        .vars_path = owned_vars_path,
+        .temporary = false,
+    };
 }
 
 fn prepareVmStateAlloc(
@@ -1171,26 +2110,19 @@ fn createTemporaryWorkDirAlloc(
         std.Io.Dir.cwd().deleteTree(io, work_dir) catch {};
         allocator.free(work_dir);
     }
-    try std.Io.Dir.cwd().createDir(io, work_dir, .default_dir);
-    try setPrivateDirectoryPermissions(io, work_dir);
+    try std.Io.Dir.cwd().createDir(
+        io,
+        work_dir,
+        privateDirectoryPermissions(),
+    );
     return work_dir;
 }
 
-fn setPrivateDirectoryPermissions(io: std.Io, path: []const u8) !void {
-    switch (builtin.os.tag) {
-        .windows => {},
-        else => try setDirectoryPermissions(io, path, .fromMode(0o700)),
-    }
-}
-
-fn setDirectoryPermissions(
-    io: std.Io,
-    path: []const u8,
-    permissions: std.Io.File.Permissions,
-) !void {
-    var directory = try std.Io.Dir.cwd().openDir(io, path, .{});
-    defer directory.close(io);
-    try directory.setPermissions(io, permissions);
+fn privateDirectoryPermissions() std.Io.File.Permissions {
+    return switch (builtin.os.tag) {
+        .windows => .default_dir,
+        else => .fromMode(0o700),
+    };
 }
 
 fn temporaryDirectoryAlloc(
@@ -1236,6 +2168,7 @@ fn resolveQemuAlloc(
         errdefer allocator.free(binary_path);
         const firmware = (try qemu_host.findFirmwareSourcePairAlloc(allocator, io, .{
             .architecture = architecture,
+            .secure_boot = options.secure_boot,
             .explicit_code_path = options.ovmf_code_path,
             .explicit_vars_path = options.ovmf_vars_path,
             .qemu_path = binary_path,
@@ -1286,6 +2219,7 @@ fn findSystemQemuInPathValueAlloc(
 
     const firmware = (try qemu_host.findFirmwareSourcePairAlloc(allocator, io, .{
         .architecture = architecture,
+        .secure_boot = options.secure_boot,
         .explicit_code_path = options.ovmf_code_path,
         .explicit_vars_path = options.ovmf_vars_path,
         .qemu_path = system_qemu,
@@ -1351,6 +2285,7 @@ fn findGhrQemuAtToolsPathAlloc(
 
     const firmware_optional = qemu_host.findFirmwareSourcePairAlloc(allocator, io, .{
         .architecture = architecture,
+        .secure_boot = options.secure_boot,
         .explicit_code_path = options.ovmf_code_path,
         .explicit_vars_path = options.ovmf_vars_path,
         .qemu_path = package_paths.binary_path,
@@ -1663,8 +2598,11 @@ fn createSeedStateAlloc(
     }
     const seed_dir = try std.fs.path.join(allocator, &.{ work_dir, "seed" });
     defer allocator.free(seed_dir);
-    try std.Io.Dir.cwd().createDir(io, seed_dir, .default_dir);
-    try setPrivateDirectoryPermissions(io, seed_dir);
+    try std.Io.Dir.cwd().createDir(
+        io,
+        seed_dir,
+        privateDirectoryPermissions(),
+    );
 
     const meta_path = try std.fs.path.join(allocator, &.{ seed_dir, "meta-data" });
     defer allocator.free(meta_path);
@@ -1739,9 +2677,16 @@ fn printQemuResolutionError(
             "qemu: configured UEFI firmware is not readable\n",
             .{},
         ),
+        error.FirmwareNotSecureBootCapable => std.debug.print(
+            "qemu: configured UEFI code is not identified as Secure-Boot-capable\n",
+            .{},
+        ),
         error.FirmwareNotFound => std.debug.print(
-            "qemu: {s} firmware was not found; use --firmware-code and --firmware-vars\n",
-            .{if (architecture == .x86_64) "OVMF" else "AAVMF"},
+            "qemu: {s}{s} firmware was not found; use --firmware-code and --firmware-vars\n",
+            .{
+                if (options.secure_boot) "Secure-Boot-capable " else "",
+                if (architecture == .x86_64) "OVMF" else "AAVMF",
+            },
         ),
         error.QemuImgNotFound => std.debug.print(
             "qemu: qemu-img was not found; install the QEMU utilities\n",
@@ -1776,6 +2721,74 @@ fn printFirmwarePreparationError(path: []const u8, err: anyerror) void {
     }
 }
 
+fn printSecureBootPreparationError(image_path: []const u8, err: anyerror) void {
+    switch (err) {
+        error.SecureBootTrustRequired => std.debug.print(
+            "qemu: Secure Boot for explicit image '{s}' requires --secure-boot-certificate and --secure-boot-certificate-sha256\n",
+            .{image_path},
+        ),
+        error.CatalogImageDigestMismatch => std.debug.print(
+            "qemu: image '{s}' does not match the cataloged release SHA-256; restore the pristine image before initial Secure Boot enrollment\n",
+            .{image_path},
+        ),
+        error.SecureBootImageChanged => std.debug.print(
+            "qemu: image '{s}' changed while its verified Secure Boot launch path was being created\n",
+            .{image_path},
+        ),
+        error.ImageChangedDuringHash => std.debug.print(
+            "qemu: image '{s}' changed while its catalog digest was being verified\n",
+            .{image_path},
+        ),
+        error.CatalogCertificateFingerprintMismatch => std.debug.print(
+            "qemu: the explicit certificate fingerprint conflicts with the cataloged release signer\n",
+            .{},
+        ),
+        error.ExplicitCertificateFingerprintMismatch => std.debug.print(
+            "qemu: the explicit certificate does not match --secure-boot-certificate-sha256\n",
+            .{},
+        ),
+        error.ExplicitCertificateDoesNotMatchImage,
+        error.CertificateFingerprintMismatch,
+        => std.debug.print(
+            "qemu: the UKI signer in '{s}' does not match the trusted Secure Boot certificate\n",
+            .{image_path},
+        ),
+        error.VirtFwVarsNotFound => std.debug.print(
+            "qemu: virt-fw-vars was not found; install python3-virt-firmware before creating Secure Boot variables\n",
+            .{},
+        ),
+        error.IncompleteSecureBootState => std.debug.print(
+            "qemu: the Secure Boot variables bundle for '{s}' is incomplete; move or delete its .secboot.vars files before retrying\n",
+            .{image_path},
+        ),
+        error.InvalidSecureBootMetadata,
+        error.SecureBootStateCertificateMismatch,
+        error.SecureBootStateTrustMismatch,
+        => std.debug.print(
+            "qemu: the persistent Secure Boot variables for '{s}' do not match the selected Microsoft template and release leaf\n",
+            .{image_path},
+        ),
+        error.VirtFwVarsFailed,
+        error.InvalidEnrolledSecureBootVars,
+        => std.debug.print(
+            "qemu: failed to enroll or validate the release leaf in Secure Boot variables for '{s}'\n",
+            .{image_path},
+        ),
+        error.ConcurrentSecureBootStateCreation => std.debug.print(
+            "qemu: another process created Secure Boot variables for '{s}'; retry to validate and reuse that state\n",
+            .{image_path},
+        ),
+        error.SecureBootStateChanged => std.debug.print(
+            "qemu: the Secure Boot variables for '{s}' changed while launch state was being prepared; retry from a stable state\n",
+            .{image_path},
+        ),
+        else => std.debug.print(
+            "qemu: failed to prepare Secure Boot for '{s}': {s}\n",
+            .{ image_path, @errorName(err) },
+        ),
+    }
+}
+
 fn qemuCpuName(
     architecture: qemu_host.GuestArchitecture,
     accel: Accel,
@@ -1803,10 +2816,16 @@ fn buildQemuArgv(
         try result.append(allocator, data_dir);
     }
     try result.append(allocator, "-M");
-    try result.appendFmt(allocator, "{s},accel={s}", .{
-        if (plan.architecture == .x86_64) "q35" else "virt",
-        plan.accel.cliName(),
-    });
+    if (plan.secure_boot and plan.architecture == .x86_64) {
+        try result.appendFmt(allocator, "q35,accel={s},smm=on", .{
+            plan.accel.cliName(),
+        });
+    } else {
+        try result.appendFmt(allocator, "{s},accel={s}", .{
+            if (plan.architecture == .x86_64) "q35" else "virt",
+            plan.accel.cliName(),
+        });
+    }
     try result.append(allocator, "-cpu");
     try result.append(allocator, qemuCpuName(plan.architecture, plan.accel));
     try result.append(allocator, "-m");
@@ -1825,6 +2844,13 @@ fn buildQemuArgv(
         "if=pflash,unit=1,format=raw,file={s}",
         .{plan.ovmf_vars_path},
     );
+    if (plan.secure_boot and plan.architecture == .x86_64) {
+        try result.append(allocator, "-global");
+        try result.append(
+            allocator,
+            "driver=cfi.pflash01,property=secure,value=on",
+        );
+    }
     try result.append(allocator, "-drive");
     try result.appendFmt(
         allocator,
@@ -1941,6 +2967,57 @@ test "qemu parser accepts architecture and defaults the provisioning port" {
     try std.testing.expectEqual(@as(?u16, 2222), options.ssh_port);
 }
 
+test "qemu parser validates Secure Boot trust options" {
+    const digest =
+        "1111111111111111111111111111111111111111111111111111111111111111";
+    const parsed = parseArgs(&.{
+        "custom.qcow2",
+        "--secure-boot",
+        "--secure-boot-certificate",
+        "release.pem",
+        "--secure-boot-certificate-sha256",
+        digest,
+    });
+    try std.testing.expect(parsed.options.secure_boot);
+    try std.testing.expectEqualStrings(
+        "release.pem",
+        parsed.options.secure_boot_certificate_path.?,
+    );
+    try std.testing.expect(parsed.options.secure_boot_certificate_sha256 != null);
+
+    try std.testing.expectEqual(
+        ParseFailure.Kind.secure_boot_certificate_pair,
+        parseArgs(&.{
+            "--secure-boot",
+            "--secure-boot-certificate",
+            "release.pem",
+        }).failure.kind,
+    );
+    try std.testing.expectEqual(
+        ParseFailure.Kind.secure_boot_trust_without_secure_boot,
+        parseArgs(&.{
+            "--secure-boot-certificate",
+            "release.pem",
+            "--secure-boot-certificate-sha256",
+            digest,
+        }).failure.kind,
+    );
+    try std.testing.expectEqual(
+        ParseFailure.Kind.invalid_secure_boot_sha256,
+        parseArgs(&.{
+            "--secure-boot",
+            "--secure-boot-certificate",
+            "release.pem",
+            "--secure-boot-certificate-sha256",
+            "not-a-digest",
+        }).failure.kind,
+    );
+    try std.testing.expectEqual(
+        ParseFailure.Kind.secure_boot_passthrough,
+        parseArgs(&.{ "--secure-boot", "--", "-M", "q35,smm=off" }).failure.kind,
+    );
+}
+
 test "qemu parser validates provisioning cross-options and ports" {
     try std.testing.expectEqual(
         ParseFailure.Kind.provisioning_pair,
@@ -1975,7 +3052,14 @@ test "qemu parser recognizes help" {
 }
 
 test "qemu parser reports missing values" {
-    const flags = [_][]const u8{ "--accel", "--qemu", "--ovmf-code", "--ovmf-vars" };
+    const flags = [_][]const u8{
+        "--accel",
+        "--qemu",
+        "--ovmf-code",
+        "--ovmf-vars",
+        "--secure-boot-certificate",
+        "--secure-boot-certificate-sha256",
+    };
     for (flags) |flag| {
         const parsed = parseArgs(&.{flag});
         try std.testing.expectEqual(ParseFailure.Kind.missing_value, parsed.failure.kind);
@@ -2014,7 +3098,13 @@ test "qemu resolves known aliases and explicit image paths" {
     try std.testing.expectEqualStrings("AzureLinux-4.0-x86_64.qcow2", short_alias.disk_path);
     try std.testing.expectEqualStrings("AzureLinux-4.0-x86_64.code.fd", short_alias.code_path);
     try std.testing.expectEqualStrings("AzureLinux-4.0-x86_64.vars.fd", short_alias.vars_path);
+    try std.testing.expectEqualStrings(
+        "AzureLinux-4.0-x86_64.secboot.vars.fd",
+        short_alias.secure_vars_path,
+    );
     try std.testing.expectEqual(GuestArchitecture.x86_64, short_alias.architecture);
+    try std.testing.expect(short_alias.expected_image_sha256 != null);
+    try std.testing.expect(short_alias.expected_certificate_sha256 != null);
     try std.testing.expect(short_alias.download_allowed);
 
     var prefixed = try resolveImageAlloc(allocator, .{
@@ -2046,7 +3136,19 @@ test "qemu resolves known aliases and explicit image paths" {
     try std.testing.expectEqualStrings("custom.vars.fd", custom.vars_path);
     try std.testing.expectEqual(GuestArchitecture.x86_64, custom.architecture);
     try std.testing.expect(custom.release_spec == null);
+    try std.testing.expect(custom.expected_image_sha256 == null);
+    try std.testing.expect(custom.expected_certificate_sha256 == null);
     try std.testing.expect(!custom.download_allowed);
+
+    var core = try resolveImageAlloc(allocator, .{
+        .image_path = "AzureLinux-4.0-aarch64.core.qcow2",
+        .image_was_explicit = true,
+    });
+    defer core.deinit(allocator);
+    try std.testing.expectEqual(GuestArchitecture.aarch64, core.architecture);
+    try std.testing.expect(core.expected_image_sha256 != null);
+    try std.testing.expect(core.expected_certificate_sha256 != null);
+    try std.testing.expect(!core.download_allowed);
 }
 
 test "qemu image selection keeps the implicit x86 default downloadable" {
@@ -2197,6 +3299,187 @@ test "qemu detects supported image signatures without fully opening the image" {
     try std.testing.expectEqual(zvmi.Format.raw, try detectImageFormat(io, raw_path));
 }
 
+test "qemu Secure Boot validated image link survives source path replacement" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "disk.qcow2",
+        .data = "verified image",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "replacement.qcow2",
+        .data = "replacement image",
+    });
+
+    const image_path = try tmp.dir.realPathFileAlloc(io, "disk.qcow2", allocator);
+    defer allocator.free(image_path);
+    const image_file = try std.Io.Dir.cwd().openFile(io, image_path, .{
+        .mode = .read_only,
+        .allow_directory = false,
+    });
+    defer image_file.close(io);
+    const digest = try hashOpenFile(io, image_file);
+    const stable_path = try createValidatedImageLinkAlloc(
+        allocator,
+        io,
+        image_file,
+        image_path,
+        digest,
+    );
+    defer {
+        std.Io.Dir.cwd().deleteTree(
+            io,
+            std.fs.path.dirname(stable_path).?,
+        ) catch {};
+        allocator.free(stable_path);
+    }
+
+    try tmp.dir.rename(
+        "replacement.qcow2",
+        tmp.dir,
+        "disk.qcow2",
+        io,
+    );
+    const stable_contents = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        stable_path,
+        allocator,
+        .limited(64),
+    );
+    defer allocator.free(stable_contents);
+    try std.testing.expectEqualStrings("verified image", stable_contents);
+}
+
+test "qemu Secure Boot validated image link preserves guest writes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "disk.qcow2",
+        .data = "verified image",
+    });
+
+    const image_path = try tmp.dir.realPathFileAlloc(io, "disk.qcow2", allocator);
+    defer allocator.free(image_path);
+    const image_file = try std.Io.Dir.cwd().openFile(io, image_path, .{
+        .mode = .read_only,
+        .allow_directory = false,
+    });
+    defer image_file.close(io);
+    const digest = try hashOpenFile(io, image_file);
+    const stable_path = try createValidatedImageLinkAlloc(
+        allocator,
+        io,
+        image_file,
+        image_path,
+        digest,
+    );
+    defer {
+        std.Io.Dir.cwd().deleteTree(
+            io,
+            std.fs.path.dirname(stable_path).?,
+        ) catch {};
+        allocator.free(stable_path);
+    }
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = stable_path,
+        .data = "persistent guest changes",
+    });
+
+    const published = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        image_path,
+        allocator,
+        .limited(64),
+    );
+    defer allocator.free(published);
+    try std.testing.expectEqualStrings("persistent guest changes", published);
+}
+
+test "qemu Secure Boot trust fails before inspecting untrusted image contents" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "AzureLinux-4.0-x86_64.qcow2",
+        .data = "not the cataloged release",
+    });
+    const known_path = try tmp.dir.realPathFileAlloc(
+        io,
+        "AzureLinux-4.0-x86_64.qcow2",
+        allocator,
+    );
+    defer allocator.free(known_path);
+    var known = try resolveImageAlloc(allocator, .{
+        .image_path = known_path,
+        .image_was_explicit = true,
+        .secure_boot = true,
+    });
+    defer known.deinit(allocator);
+    try std.testing.expectError(
+        error.CatalogImageDigestMismatch,
+        prepareSecureBootCertificateAlloc(
+            allocator,
+            io,
+            .{ .secure_boot = true },
+            known,
+            true,
+        ),
+    );
+    if (prepareSecureBootCertificateAlloc(
+        allocator,
+        io,
+        .{ .secure_boot = true },
+        known,
+        false,
+    )) |certificate| {
+        var unexpected = certificate;
+        unexpected.deinit(allocator, io);
+        return error.ExpectedSecureBootCertificateFailure;
+    } else |_| {}
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "custom.qcow2",
+        .data = "explicit image",
+    });
+    const custom_path = try tmp.dir.realPathFileAlloc(io, "custom.qcow2", allocator);
+    defer allocator.free(custom_path);
+    var custom = try resolveImageAlloc(allocator, .{
+        .image_path = custom_path,
+        .image_was_explicit = true,
+        .secure_boot = true,
+    });
+    defer custom.deinit(allocator);
+    try std.testing.expectError(
+        error.SecureBootTrustRequired,
+        prepareSecureBootCertificateAlloc(
+            allocator,
+            io,
+            .{ .secure_boot = true },
+            custom,
+            false,
+        ),
+    );
+
+    try std.testing.expectError(
+        error.CatalogCertificateFingerprintMismatch,
+        prepareSecureBootCertificateAlloc(
+            allocator,
+            io,
+            .{
+                .secure_boot = true,
+                .secure_boot_certificate_sha256 = zvmi.artifact_pipeline.sha256Bytes("wrong leaf"),
+            },
+            known,
+            true,
+        ),
+    );
+}
+
 test "qemu bundle paths replace the image extension" {
     const allocator = std.testing.allocator;
 
@@ -2207,6 +3490,209 @@ test "qemu bundle paths replace the image extension" {
     const without_extension = try bundlePathAlloc(allocator, "disk", ".code.fd");
     defer allocator.free(without_extension);
     try std.testing.expectEqualStrings("disk.code.fd", without_extension);
+}
+
+test "qemu Secure Boot state requires matching vars and metadata" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const vars_path = try std.fs.path.join(
+        allocator,
+        &.{ root_buf[0..root_len], "state.vars.fd" },
+    );
+    defer allocator.free(vars_path);
+    const metadata_path = try std.fs.path.join(
+        allocator,
+        &.{ root_buf[0..root_len], "state.vars.json" },
+    );
+    defer allocator.free(metadata_path);
+    const digest = zvmi.artifact_pipeline.sha256Bytes("release leaf");
+
+    try std.testing.expect(!try secureBootStateExists(
+        io,
+        vars_path,
+        metadata_path,
+    ));
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "state.vars.fd",
+        .data = "firmware state",
+    });
+    try std.testing.expectError(
+        error.IncompleteSecureBootState,
+        secureBootStateExists(io, vars_path, metadata_path),
+    );
+    try writeSecureBootMetadata(allocator, io, metadata_path, digest);
+    try std.testing.expect(try secureBootStateExists(
+        io,
+        vars_path,
+        metadata_path,
+    ));
+    try validateSecureBootMetadata(
+        allocator,
+        io,
+        metadata_path,
+        digest,
+    );
+    try std.testing.expectError(
+        error.SecureBootStateCertificateMismatch,
+        validateSecureBootMetadata(
+            allocator,
+            io,
+            metadata_path,
+            zvmi.artifact_pipeline.sha256Bytes("other leaf"),
+        ),
+    );
+}
+
+test "qemu validates the exact release leaf in enrolled vars JSON" {
+    const allocator = std.testing.allocator;
+    const certificate = "DER certificate";
+    const efi_cert_x509_guid = [_]u8{
+        0xa1, 0x59, 0xc0, 0xa5, 0xe4, 0x94, 0xa7, 0x4a,
+        0x87, 0xb5, 0xab, 0x15, 0x5c, 0x2b, 0xf0, 0x72,
+    };
+    var database = [_]u8{0} ** (28 + 16 + certificate.len);
+    @memcpy(database[0..efi_cert_x509_guid.len], &efi_cert_x509_guid);
+    std.mem.writeInt(u32, database[16..20], database.len, .little);
+    std.mem.writeInt(u32, database[20..24], 0, .little);
+    std.mem.writeInt(u32, database[24..28], 16 + certificate.len, .little);
+    @memcpy(database[28 + 16 ..], certificate);
+    const digest = zvmi.artifact_pipeline.sha256Bytes(certificate);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try efiSignatureDatabaseCertificateCount(&database, digest),
+    );
+
+    const database_hex = std.fmt.bytesToHex(database, .lower);
+    const json = try std.json.Stringify.valueAlloc(
+        allocator,
+        .{
+            .version = 2,
+            .variables = &.{
+                .{
+                    .name = "SecureBootEnable",
+                    .guid = "f0a30bc7-af08-4556-99c4-001009c93a44",
+                    .attr = 3,
+                    .data = "01",
+                },
+                .{
+                    .name = "CustomMode",
+                    .guid = "c076ec0c-7028-4399-a072-71ee5c448b9f",
+                    .attr = 3,
+                    .data = "00",
+                },
+                .{
+                    .name = "PK",
+                    .guid = "8be4df61-93ca-11d2-aa0d-00e098032b8c",
+                    .attr = 39,
+                    .data = "01",
+                },
+                .{
+                    .name = "KEK",
+                    .guid = "8be4df61-93ca-11d2-aa0d-00e098032b8c",
+                    .attr = 39,
+                    .data = "01",
+                },
+                .{
+                    .name = "db",
+                    .guid = "d719b2cb-3d3a-4596-a3bc-dad00e67656f",
+                    .attr = 39,
+                    .data = &database_hex,
+                },
+            },
+        },
+        .{},
+    );
+    defer allocator.free(json);
+    const trust_state = try validateEnrolledVarsJson(allocator, json, digest);
+    var changed_trust_state = trust_state;
+    changed_trust_state.pk_sha256 =
+        zvmi.artifact_pipeline.sha256Bytes("different platform key");
+    try std.testing.expect(!changed_trust_state.eql(trust_state));
+    try std.testing.expectError(
+        error.InvalidEnrolledSecureBootVars,
+        validateEnrolledVarsJson(
+            allocator,
+            json,
+            zvmi.artifact_pipeline.sha256Bytes("other certificate"),
+        ),
+    );
+
+    const invalid_guid_json = try allocator.dupe(u8, json);
+    defer allocator.free(invalid_guid_json);
+    const guid_offset = std.mem.indexOf(
+        u8,
+        invalid_guid_json,
+        "8be4df61-93ca-11d2-aa0d-00e098032b8c",
+    ).?;
+    invalid_guid_json[guid_offset] = '9';
+    try std.testing.expectError(
+        error.InvalidEnrolledSecureBootVars,
+        validateEnrolledVarsJson(allocator, invalid_guid_json, digest),
+    );
+
+    const invalid_attr_json = try allocator.dupe(u8, json);
+    defer allocator.free(invalid_attr_json);
+    const attr_offset = std.mem.indexOf(u8, invalid_attr_json, "\"attr\":39").?;
+    invalid_attr_json[attr_offset + "\"attr\":3".len] = '8';
+    try std.testing.expectError(
+        error.InvalidEnrolledSecureBootVars,
+        validateEnrolledVarsJson(allocator, invalid_attr_json, digest),
+    );
+
+    const duplicate_json = try std.json.Stringify.valueAlloc(
+        allocator,
+        .{
+            .version = 2,
+            .variables = &.{
+                .{
+                    .name = "SecureBootEnable",
+                    .guid = "f0a30bc7-af08-4556-99c4-001009c93a44",
+                    .attr = 3,
+                    .data = "01",
+                },
+                .{
+                    .name = "CustomMode",
+                    .guid = "c076ec0c-7028-4399-a072-71ee5c448b9f",
+                    .attr = 3,
+                    .data = "00",
+                },
+                .{
+                    .name = "PK",
+                    .guid = "8be4df61-93ca-11d2-aa0d-00e098032b8c",
+                    .attr = 39,
+                    .data = "01",
+                },
+                .{
+                    .name = "PK",
+                    .guid = "8be4df61-93ca-11d2-aa0d-00e098032b8c",
+                    .attr = 39,
+                    .data = "01",
+                },
+                .{
+                    .name = "KEK",
+                    .guid = "8be4df61-93ca-11d2-aa0d-00e098032b8c",
+                    .attr = 39,
+                    .data = "01",
+                },
+                .{
+                    .name = "db",
+                    .guid = "d719b2cb-3d3a-4596-a3bc-dad00e67656f",
+                    .attr = 39,
+                    .data = &database_hex,
+                },
+            },
+        },
+        .{},
+    );
+    defer allocator.free(duplicate_json);
+    try std.testing.expectError(
+        error.InvalidEnrolledSecureBootVars,
+        validateEnrolledVarsJson(allocator, duplicate_json, digest),
+    );
 }
 
 test "qemu persistent vars are reused" {
@@ -2368,6 +3854,84 @@ test "qemu persistent launch argv matches the Azure Linux boot shape" {
         "-nographic",
         "-d",
         "guest_errors",
+    }, argv.items.items);
+}
+
+test "qemu x86 Secure Boot argv enables SMM and secure pflash" {
+    const allocator = std.testing.allocator;
+    var argv = try buildQemuArgv(allocator, .{
+        .qemu_path = "qemu-system-x86_64",
+        .qemu_data_dir = null,
+        .architecture = .x86_64,
+        .image_path = "disk.qcow2",
+        .image_format = .qcow2,
+        .ovmf_code_path = "OVMF_CODE_4M.secboot.fd",
+        .ovmf_vars_path = "disk.secboot.vars.fd",
+        .accel = .kvm,
+        .secure_boot = true,
+    });
+    defer argv.deinit(allocator);
+
+    try expectArgv(&.{
+        "qemu-system-x86_64",
+        "-M",
+        "q35,accel=kvm,smm=on",
+        "-cpu",
+        "Nehalem-v1",
+        "-m",
+        "2G",
+        "-smp",
+        "2",
+        "-drive",
+        "if=pflash,unit=0,format=raw,readonly=on,file=OVMF_CODE_4M.secboot.fd",
+        "-drive",
+        "if=pflash,unit=1,format=raw,file=disk.secboot.vars.fd",
+        "-global",
+        "driver=cfi.pflash01,property=secure,value=on",
+        "-drive",
+        "file=disk.qcow2,format=qcow2,if=virtio",
+        "-nic",
+        "user,model=virtio-net-pci",
+        "-no-reboot",
+        "-nographic",
+    }, argv.items.items);
+}
+
+test "qemu AArch64 Secure Boot argv uses the secure AAVMF pflash shape" {
+    const allocator = std.testing.allocator;
+    var argv = try buildQemuArgv(allocator, .{
+        .qemu_path = "qemu-system-aarch64",
+        .qemu_data_dir = null,
+        .architecture = .aarch64,
+        .image_path = "disk.qcow2",
+        .image_format = .qcow2,
+        .ovmf_code_path = "AAVMF_CODE.secboot.fd",
+        .ovmf_vars_path = "disk.secboot.vars.fd",
+        .accel = .kvm,
+        .secure_boot = true,
+    });
+    defer argv.deinit(allocator);
+
+    try expectArgv(&.{
+        "qemu-system-aarch64",
+        "-M",
+        "virt,accel=kvm",
+        "-cpu",
+        "host",
+        "-m",
+        "2G",
+        "-smp",
+        "2",
+        "-drive",
+        "if=pflash,unit=0,format=raw,readonly=on,file=AAVMF_CODE.secboot.fd",
+        "-drive",
+        "if=pflash,unit=1,format=raw,file=disk.secboot.vars.fd",
+        "-drive",
+        "file=disk.qcow2,format=qcow2,if=virtio",
+        "-nic",
+        "user,model=virtio-net-pci",
+        "-no-reboot",
+        "-nographic",
     }, argv.items.items);
 }
 
@@ -2551,6 +4115,21 @@ test "qemu release download spec remains pinned to the validated Azure Linux rel
         "cataggar/zvmi/AzureLinux-4.0-aarch64.qcow2@AzureLinux-4.0-20260723",
         known_images[1].release_spec,
     );
+    try std.testing.expectEqualStrings(
+        "44992c857178e95b3a3d2c2c1c2008791d3e5a704f845f4500cc6e86a0baadc6",
+        known_images[2].image_sha256,
+    );
+    try std.testing.expectEqualStrings(
+        "ff294c8655ea80f890a41a7c6dc545d997da498dc5f5f03fd3aee8dea81b0f65",
+        known_images[3].image_sha256,
+    );
+    for (known_images) |known| {
+        try std.testing.expectEqualStrings(
+            release_certificate_sha256,
+            known.certificate_sha256,
+        );
+        _ = try zvmi.artifact_pipeline.parseSha256(known.image_sha256);
+    }
 }
 
 test "qemu known image download argv is exact" {

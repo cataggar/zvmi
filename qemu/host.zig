@@ -532,8 +532,22 @@ pub fn materializeFirmwareFile(
     destination_path: []const u8,
     options: MaterializeOptions,
 ) !void {
+    _ = try materializeFirmwareFileCreated(
+        io,
+        source,
+        destination_path,
+        options,
+    );
+}
+
+pub fn materializeFirmwareFileCreated(
+    io: Io,
+    source: FirmwareSource,
+    destination_path: []const u8,
+    options: MaterializeOptions,
+) !bool {
     if (options.max_output_size == 0) return error.FirmwareTooLarge;
-    if (try destinationState(io, destination_path) == .valid) return;
+    if (try destinationState(io, destination_path) == .valid) return false;
 
     const source_path_stat = try Io.Dir.cwd().statFile(io, source.path, .{
         .follow_symlinks = false,
@@ -583,12 +597,11 @@ pub fn materializeFirmwareFile(
         error.PathAlreadyExists => {
             if (try destinationState(io, destination_path) != .valid)
                 return error.FirmwareDestinationInvalid;
-            return;
+            return false;
         },
         else => return err,
     };
-    if (try destinationState(io, destination_path) != .valid)
-        return error.FirmwareDestinationInvalid;
+    return true;
 }
 
 fn copyRawFirmware(
@@ -1073,6 +1086,40 @@ test "invalid compressed firmware publishes nothing" {
         ),
     );
     try std.testing.expect(!try pathAccessible(io, destination, .{ .read = true }));
+}
+
+test "firmware materialization reports whether it published the destination" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "source.fd",
+        .data = "firmware",
+    });
+
+    const source = try tmp.dir.realPathFileAlloc(io, "source.fd", allocator);
+    defer allocator.free(source);
+    var root_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const destination = try std.fs.path.join(
+        allocator,
+        &.{ root_buf[0..root_len], "destination.fd" },
+    );
+    defer allocator.free(destination);
+
+    try std.testing.expect(try materializeFirmwareFileCreated(
+        io,
+        .{ .path = source, .encoding = .raw },
+        destination,
+        .{},
+    ));
+    try std.testing.expect(!try materializeFirmwareFileCreated(
+        io,
+        .{ .path = source, .encoding = .raw },
+        destination,
+        .{},
+    ));
 }
 
 test "truncated and CRC-invalid compressed firmware publish nothing" {
