@@ -15,13 +15,19 @@ const atomic_output = @import("../atomic_output.zig");
 
 const GuestArchitecture = qemu_host.GuestArchitecture;
 
+const ProvisioningMedia = enum {
+    cdrom,
+    virtio_block,
+};
+
 const KnownImage = struct {
     alias: []const u8,
     disk_name: []const u8,
     release_spec: []const u8,
     architecture: GuestArchitecture,
     image_sha256: []const u8,
-    certificate_sha256: []const u8,
+    certificate_sha256: ?[]const u8,
+    provisioning_media: ProvisioningMedia = .cdrom,
 };
 
 const release_certificate_sha256 =
@@ -60,6 +66,24 @@ const known_images = [_]KnownImage{
         .image_sha256 = "ff294c8655ea80f890a41a7c6dc545d997da498dc5f5f03fd3aee8dea81b0f65",
         .certificate_sha256 = release_certificate_sha256,
     },
+    .{
+        .alias = "FreeBSD-15.1-x86_64",
+        .disk_name = "FreeBSD-15.1-x86_64.qcow2",
+        .release_spec = "cataggar/zvmi/FreeBSD-15.1-x86_64.qcow2@FreeBSD-15.1-20260724",
+        .architecture = .x86_64,
+        .image_sha256 = "28908a347c0eaafda5dbf28fb0208d68f29d0f9165b2454f0cd14fe371b7f58e",
+        .certificate_sha256 = null,
+        .provisioning_media = .virtio_block,
+    },
+    .{
+        .alias = "FreeBSD-15.1-aarch64",
+        .disk_name = "FreeBSD-15.1-aarch64.qcow2",
+        .release_spec = "cataggar/zvmi/FreeBSD-15.1-aarch64.qcow2@FreeBSD-15.1-20260724",
+        .architecture = .aarch64,
+        .image_sha256 = "28f2138af20c4ede674f18922b216ad673816882e6270414f2bae5c6feff4b1e",
+        .certificate_sha256 = null,
+        .provisioning_media = .virtio_block,
+    },
 };
 
 const default_image_name = known_images[0].disk_name;
@@ -84,6 +108,9 @@ const help_text =
     \\  AzureLinux
     \\  AzureLinux-4.0-x86_64
     \\  AzureLinux-4.0-aarch64
+    \\  FreeBSD
+    \\  FreeBSD-15.1-x86_64
+    \\  FreeBSD-15.1-aarch64
     \\
     \\A known alias downloads its missing .qcow2 with ghr. An explicit disk
     \\path must already exist. Missing .code.fd and .vars.fd bundle files are
@@ -91,12 +118,14 @@ const help_text =
     \\
     \\Options:
     \\  --snapshot          Discard guest disk and UEFI variable changes on exit.
-    \\  --architecture <a> Guest architecture: auto, x86_64 (default), or aarch64.
+    \\  --architecture <a>  Guest architecture: auto, x86_64 (default), or aarch64.
+    \\  --arch <a>          Alias for --architecture.
     \\  --admin-username <n> Provision this administrator account (requires a key).
     \\  --ssh-public-key <p> Read this public key for administrator provisioning.
     \\  --ssh-port <port>   Forward localhost TCP port to guest SSH (default 2222).
     \\  --xorriso <path>    Explicit xorriso executable for provisioning media.
-    \\  --accel <name>      Accelerator: auto (default), whpx, kvm, hvf, or tcg.
+    \\  --accel <name>      Accelerator: auto (default), whpx, kvm, hvf, or tcg;
+    \\                      auto uses TCG when host and guest architectures differ.
     \\  --qemu <path>       Explicit architecture-specific QEMU executable.
     \\  --firmware-code <p> Explicit read-only UEFI code firmware (OVMF alias).
     \\  --firmware-vars <p> Explicit UEFI variables template (OVMF alias).
@@ -201,6 +230,7 @@ const ResolvedImage = struct {
     release_spec: ?[]const u8,
     expected_image_sha256: ?zvmi.artifact_pipeline.Digest,
     expected_certificate_sha256: ?zvmi.artifact_pipeline.Digest,
+    provisioning_media: ProvisioningMedia,
     download_allowed: bool,
 
     fn deinit(self: *ResolvedImage, allocator: std.mem.Allocator) void {
@@ -230,6 +260,7 @@ const LaunchPlan = struct {
     ovmf_vars_path: []const u8,
     accel: Accel,
     seed_iso_path: ?[]const u8 = null,
+    provisioning_media: ProvisioningMedia = .cdrom,
     ssh_port: ?u16 = null,
     provisioned: bool = false,
     secure_boot: bool = false,
@@ -654,6 +685,7 @@ fn runVm(
         .ovmf_vars_path = vm_state.vars_path,
         .accel = accel,
         .seed_iso_path = if (seed) |seed_state| seed_state.iso_path else null,
+        .provisioning_media = image.provisioning_media,
         .ssh_port = options.ssh_port,
         .provisioned = seed != null,
         .secure_boot = options.secure_boot,
@@ -734,7 +766,9 @@ fn parseArgs(args: []const []const u8) ParseResult {
             options.secure_boot_certificate_sha256 =
                 zvmi.artifact_pipeline.parseSha256(args[i]) catch
                     return parseFailure(.invalid_secure_boot_sha256, args[i]);
-        } else if (std.mem.eql(u8, arg, "--architecture")) {
+        } else if (std.mem.eql(u8, arg, "--architecture") or
+            std.mem.eql(u8, arg, "--arch"))
+        {
             i += 1;
             if (i >= args.len) return parseFailure(.missing_value, arg);
             options.architecture_request = ArchitectureRequest.parse(args[i]) orelse
@@ -902,6 +936,13 @@ fn resolveImageAlloc(
             std.fs.path.dirname(argument),
             true,
         );
+    if (std.mem.eql(u8, basename, "FreeBSD"))
+        return resolvedKnownImageAlloc(
+            allocator,
+            freebsdImage(options.architecture_request),
+            std.fs.path.dirname(argument),
+            true,
+        );
     for (known_images) |known| {
         if (known.alias.len != 0 and std.mem.eql(u8, basename, known.alias))
             return resolvedKnownImageAlloc(
@@ -920,7 +961,11 @@ fn resolveImageAlloc(
                 known.architecture,
                 known.release_spec,
                 try zvmi.artifact_pipeline.parseSha256(known.image_sha256),
-                try zvmi.artifact_pipeline.parseSha256(known.certificate_sha256),
+                if (known.certificate_sha256) |sha256|
+                    try zvmi.artifact_pipeline.parseSha256(sha256)
+                else
+                    null,
+                known.provisioning_media,
                 false,
             );
     }
@@ -932,6 +977,7 @@ fn resolveImageAlloc(
         null,
         null,
         null,
+        .cdrom,
         false,
     );
 }
@@ -979,9 +1025,29 @@ fn resolvedKnownImageAlloc(
         known.architecture,
         known.release_spec,
         try zvmi.artifact_pipeline.parseSha256(known.image_sha256),
-        try zvmi.artifact_pipeline.parseSha256(known.certificate_sha256),
+        if (known.certificate_sha256) |sha256|
+            try zvmi.artifact_pipeline.parseSha256(sha256)
+        else
+            null,
+        known.provisioning_media,
         download_allowed,
     );
+}
+
+fn freebsdImage(request: ArchitectureRequest) KnownImage {
+    const architecture: GuestArchitecture = switch (request) {
+        .x86_64 => .x86_64,
+        .aarch64 => .aarch64,
+        .auto => if (builtin.cpu.arch == .aarch64) .aarch64 else .x86_64,
+    };
+    for (known_images) |known| {
+        if (known.architecture == architecture and
+            std.mem.startsWith(u8, known.alias, "FreeBSD-"))
+        {
+            return known;
+        }
+    }
+    unreachable;
 }
 
 fn resolvedDiskImageAlloc(
@@ -991,6 +1057,7 @@ fn resolvedDiskImageAlloc(
     release_spec: ?[]const u8,
     expected_image_sha256: ?zvmi.artifact_pipeline.Digest,
     expected_certificate_sha256: ?zvmi.artifact_pipeline.Digest,
+    provisioning_media: ProvisioningMedia,
     download_allowed: bool,
 ) !ResolvedImage {
     const owned_disk_path = try allocator.dupe(u8, disk_path);
@@ -1020,6 +1087,7 @@ fn resolvedDiskImageAlloc(
         .release_spec = release_spec,
         .expected_image_sha256 = expected_image_sha256,
         .expected_certificate_sha256 = expected_certificate_sha256,
+        .provisioning_media = provisioning_media,
         .download_allowed = download_allowed,
     };
 }
@@ -2143,7 +2211,9 @@ fn temporaryDirectoryAlloc(
         allocator.free(path);
     }
 
-    return std.process.currentPathAlloc(io, allocator);
+    const current_path = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(current_path);
+    return allocator.dupe(u8, current_path);
 }
 
 fn childExitCode(term: std.process.Child.Term) ?u8 {
@@ -2151,6 +2221,34 @@ fn childExitCode(term: std.process.Child.Term) ?u8 {
         .exited => |code| code,
         else => null,
     };
+}
+
+fn qemuExecutableRuns(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+) !bool {
+    const result = std.process.run(allocator, io, .{
+        .argv = &.{ path, "--version" },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+        .timeout = .{ .duration = .{
+            .raw = .fromSeconds(10),
+            .clock = .awake,
+        } },
+    }) catch |err| switch (err) {
+        error.FileNotFound,
+        error.InvalidExe,
+        error.AccessDenied,
+        error.PermissionDenied,
+        error.StreamTooLong,
+        error.Timeout,
+        => return false,
+        else => return err,
+    };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    return childExitCode(result.term) == 0;
 }
 
 fn resolveQemuAlloc(
@@ -2163,6 +2261,8 @@ fn resolveQemuAlloc(
     if (options.qemu_path) |explicit_qemu| {
         if (!try qemu_host.pathAccessible(io, explicit_qemu, .{ .execute = true }))
             return error.ExplicitQemuNotExecutable;
+        if (!try qemuExecutableRuns(allocator, io, explicit_qemu))
+            return error.ExplicitQemuNotRunnable;
 
         const binary_path = try allocator.dupe(u8, explicit_qemu);
         errdefer allocator.free(binary_path);
@@ -2181,10 +2281,22 @@ fn resolveQemuAlloc(
         };
     }
 
-    if (try findGhrQemuAlloc(allocator, io, options, architecture)) |resolved| return resolved;
+    var packaged_qemu_failed = false;
+    if (try findGhrQemuAlloc(allocator, io, options, architecture)) |found| {
+        var resolved = found;
+        const runs = qemuExecutableRuns(allocator, io, resolved.binary_path) catch |err| {
+            resolved.deinit(allocator);
+            return err;
+        };
+        if (runs) return resolved;
+        resolved.deinit(allocator);
+        packaged_qemu_failed = true;
+    }
 
-    return (try findSystemQemuAlloc(allocator, io, environ, options, architecture)) orelse
-        return error.QemuNotFound;
+    if (try findSystemQemuAlloc(allocator, io, environ, options, architecture)) |resolved|
+        return resolved;
+    if (packaged_qemu_failed) return error.PackagedQemuNotRunnable;
+    return error.QemuNotFound;
 }
 
 fn findSystemQemuAlloc(
@@ -2209,27 +2321,39 @@ fn findSystemQemuInPathValueAlloc(
     options: Options,
     architecture: qemu_host.GuestArchitecture,
 ) !?ResolvedQemu {
-    const system_qemu = try qemu_host.findExecutableInPathValueAlloc(
-        allocator,
-        io,
-        path_value,
-        qemu_host.qemuSystemName(architecture),
-    ) orelse return null;
-    errdefer allocator.free(system_qemu);
+    const name = qemu_host.qemuSystemName(architecture);
+    var directories = std.mem.splitScalar(u8, path_value, std.fs.path.delimiter);
+    while (directories.next()) |directory| {
+        const candidate = if (directory.len == 0)
+            try allocator.dupe(u8, name)
+        else
+            try std.fs.path.join(allocator, &.{ directory, name });
+        errdefer allocator.free(candidate);
 
-    const firmware = (try qemu_host.findFirmwareSourcePairAlloc(allocator, io, .{
-        .architecture = architecture,
-        .secure_boot = options.secure_boot,
-        .explicit_code_path = options.ovmf_code_path,
-        .explicit_vars_path = options.ovmf_vars_path,
-        .qemu_path = system_qemu,
-    })) orelse return error.FirmwareNotFound;
+        if (!try qemu_host.pathAccessible(io, candidate, .{ .execute = true }) or
+            !try qemuExecutableRuns(allocator, io, candidate))
+        {
+            allocator.free(candidate);
+            continue;
+        }
 
-    return .{
-        .binary_path = system_qemu,
-        .data_dir = null,
-        .firmware = firmware,
-    };
+        const firmware = (try qemu_host.findFirmwareSourcePairAlloc(allocator, io, .{
+            .architecture = architecture,
+            .secure_boot = options.secure_boot,
+            .explicit_code_path = options.ovmf_code_path,
+            .explicit_vars_path = options.ovmf_vars_path,
+            .qemu_path = candidate,
+        })) orelse {
+            allocator.free(candidate);
+            continue;
+        };
+        return .{
+            .binary_path = candidate,
+            .data_dir = null,
+            .firmware = firmware,
+        };
+    }
+    return null;
 }
 
 fn findGhrQemuAlloc(
@@ -2404,7 +2528,9 @@ fn ensureImage(
     if (std.fs.path.dirname(image.disk_path)) |parent|
         try std.Io.Dir.cwd().createDirPath(io, parent);
 
-    const argv = ghrDownloadArgv(image);
+    const digest = image.expected_image_sha256 orelse return error.MissingExpectedImageDigest;
+    const digest_hex = std.fmt.bytesToHex(digest, .lower);
+    const argv = ghrDownloadArgv(image, &digest_hex);
     var child = std.process.spawn(io, .{
         .argv = &argv,
         .stdin = .ignore,
@@ -2424,11 +2550,13 @@ fn ensureImage(
         return error.DownloadMissingOutput;
 }
 
-fn ghrDownloadArgv(image: ResolvedImage) [5][]const u8 {
-    return [5][]const u8{
+fn ghrDownloadArgv(image: ResolvedImage, digest_hex: []const u8) [7][]const u8 {
+    return [7][]const u8{
         "ghr",
         "download",
         image.release_spec.?,
+        "--sha256",
+        digest_hex,
         "--output",
         image.disk_path,
     };
@@ -2669,6 +2797,15 @@ fn printQemuResolutionError(
             "qemu: configured QEMU executable is not accessible: '{s}'\n",
             .{options.qemu_path.?},
         ),
+        error.ExplicitQemuNotRunnable => std.debug.print(
+            "qemu: configured QEMU executable cannot run on this host: '{s}'\n",
+            .{options.qemu_path.?},
+        ),
+        error.PackagedQemuNotRunnable => std.debug.print(
+            "qemu: the installed cataggar/qemu emulator cannot run on this host\n" ++
+                "update it with: ghr install cataggar/qemu@v11.0.91-z.15\n",
+            .{},
+        ),
         error.IncompleteFirmwareOverride => std.debug.print(
             "qemu: --ovmf-code and --ovmf-vars must be provided together\n",
             .{},
@@ -2858,16 +2995,28 @@ fn buildQemuArgv(
         .{ plan.image_path, qemuFormatName(plan.image_format) },
     );
     if (plan.seed_iso_path) |seed_iso_path| {
-        try result.append(allocator, "-device");
-        try result.append(allocator, "virtio-scsi-pci,id=scsi0");
-        try result.append(allocator, "-drive");
-        try result.appendFmt(
-            allocator,
-            "file={s},if=none,id=seed,media=cdrom,readonly=on,format=raw",
-            .{seed_iso_path},
-        );
-        try result.append(allocator, "-device");
-        try result.append(allocator, "scsi-cd,drive=seed,bus=scsi0.0");
+        switch (plan.provisioning_media) {
+            .cdrom => {
+                try result.append(allocator, "-device");
+                try result.append(allocator, "virtio-scsi-pci,id=scsi0");
+                try result.append(allocator, "-drive");
+                try result.appendFmt(
+                    allocator,
+                    "file={s},if=none,id=seed,media=cdrom,readonly=on,format=raw",
+                    .{seed_iso_path},
+                );
+                try result.append(allocator, "-device");
+                try result.append(allocator, "scsi-cd,drive=seed,bus=scsi0.0");
+            },
+            .virtio_block => {
+                try result.append(allocator, "-drive");
+                try result.appendFmt(
+                    allocator,
+                    "file={s},format=raw,if=virtio,readonly=on",
+                    .{seed_iso_path},
+                );
+            },
+        }
     }
     try result.append(allocator, "-nic");
     if (plan.ssh_port) |ssh_port| {
@@ -2924,6 +3073,69 @@ test "qemu parser defaults to the release image" {
     try std.testing.expect(!parsed.options.image_was_explicit);
 }
 
+test "qemu temporary directory fallback has exact allocation ownership" {
+    const path = try temporaryDirectoryAlloc(
+        std.testing.allocator,
+        std.testing.io,
+        .empty,
+    );
+    defer std.testing.allocator.free(path);
+    try std.testing.expect(path.len > 0);
+}
+
+test "qemu executable preflight reports process success and failure" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    for ([_]struct { name: []const u8, exit_code: u8 }{
+        .{ .name = "qemu-ok", .exit_code = 0 },
+        .{ .name = "qemu-fail", .exit_code = 1 },
+    }) |script| {
+        var file = try tmp.dir.createFile(io, script.name, .{
+            .permissions = .executable_file,
+        });
+        const contents = try std.fmt.allocPrint(
+            allocator,
+            "#!/bin/sh\nexit {d}\n",
+            .{script.exit_code},
+        );
+        defer allocator.free(contents);
+        try file.writeStreamingAll(io, contents);
+        file.close(io);
+
+        const path = try tmp.dir.realPathFileAlloc(io, script.name, allocator);
+        defer allocator.free(path);
+        try std.testing.expectEqual(
+            script.exit_code == 0,
+            try qemuExecutableRuns(allocator, io, path),
+        );
+    }
+
+    var invalid_file = try tmp.dir.createFile(io, "qemu-invalid", .{
+        .permissions = .executable_file,
+    });
+    invalid_file.close(io);
+    const invalid_path = try tmp.dir.realPathFileAlloc(io, "qemu-invalid", allocator);
+    defer allocator.free(invalid_path);
+    try std.testing.expect(!try qemuExecutableRuns(allocator, io, invalid_path));
+
+    var noisy_file = try tmp.dir.createFile(io, "qemu-noisy", .{
+        .permissions = .executable_file,
+    });
+    try noisy_file.writeStreamingAll(
+        io,
+        "#!/bin/sh\nwhile :; do printf xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done\n",
+    );
+    noisy_file.close(io);
+    const noisy_path = try tmp.dir.realPathFileAlloc(io, "qemu-noisy", allocator);
+    defer allocator.free(noisy_path);
+    try std.testing.expect(!try qemuExecutableRuns(allocator, io, noisy_path));
+}
+
 test "qemu parser accepts every option and passthrough arguments" {
     const parsed = parseArgs(&.{
         "custom.qcow2",
@@ -2952,9 +3164,9 @@ test "qemu parser accepts every option and passthrough arguments" {
     try expectArgv(&.{ "-d", "guest_errors" }, options.extra_qemu_args);
 }
 
-test "qemu parser accepts architecture and defaults the provisioning port" {
+test "qemu parser accepts architecture aliases and defaults the provisioning port" {
     const parsed = parseArgs(&.{
-        "--architecture",
+        "--arch",
         "aarch64",
         "--admin-username",
         "azure_user",
@@ -2965,6 +3177,13 @@ test "qemu parser accepts architecture and defaults the provisioning port" {
     try std.testing.expectEqual(ArchitectureRequest.aarch64, options.architecture_request);
     try std.testing.expect(options.architecture_was_explicit);
     try std.testing.expectEqual(@as(?u16, 2222), options.ssh_port);
+
+    const compatibility = parseArgs(&.{ "--architecture", "x86_64" }).options;
+    try std.testing.expectEqual(
+        ArchitectureRequest.x86_64,
+        compatibility.architecture_request,
+    );
+    try std.testing.expect(compatibility.architecture_was_explicit);
 }
 
 test "qemu parser validates Secure Boot trust options" {
@@ -3107,6 +3326,38 @@ test "qemu resolves known aliases and explicit image paths" {
     try std.testing.expect(short_alias.expected_certificate_sha256 != null);
     try std.testing.expect(short_alias.download_allowed);
 
+    var freebsd_x86 = try resolveImageAlloc(allocator, .{
+        .image_path = "FreeBSD",
+        .image_was_explicit = true,
+        .architecture_request = .x86_64,
+        .architecture_was_explicit = true,
+    });
+    defer freebsd_x86.deinit(allocator);
+    try std.testing.expectEqualStrings(
+        "FreeBSD-15.1-x86_64.qcow2",
+        freebsd_x86.disk_path,
+    );
+    try std.testing.expectEqual(GuestArchitecture.x86_64, freebsd_x86.architecture);
+    try std.testing.expect(freebsd_x86.expected_image_sha256 != null);
+    try std.testing.expect(freebsd_x86.expected_certificate_sha256 == null);
+    try std.testing.expect(freebsd_x86.download_allowed);
+
+    var freebsd_arm = try resolveImageAlloc(allocator, .{
+        .image_path = "images/FreeBSD",
+        .image_was_explicit = true,
+        .architecture_request = .aarch64,
+        .architecture_was_explicit = true,
+    });
+    defer freebsd_arm.deinit(allocator);
+    try std.testing.expectEqualStrings(
+        "images/FreeBSD-15.1-aarch64.qcow2",
+        freebsd_arm.disk_path,
+    );
+    try std.testing.expectEqual(GuestArchitecture.aarch64, freebsd_arm.architecture);
+    try std.testing.expect(freebsd_arm.expected_image_sha256 != null);
+    try std.testing.expect(freebsd_arm.expected_certificate_sha256 == null);
+    try std.testing.expect(freebsd_arm.download_allowed);
+
     var prefixed = try resolveImageAlloc(allocator, .{
         .image_path = "images/AzureLinux-4.0-aarch64",
         .image_was_explicit = true,
@@ -3149,6 +3400,32 @@ test "qemu resolves known aliases and explicit image paths" {
     try std.testing.expect(core.expected_image_sha256 != null);
     try std.testing.expect(core.expected_certificate_sha256 != null);
     try std.testing.expect(!core.download_allowed);
+}
+
+test "qemu FreeBSD alias selects x86 and TCG on an ARM host" {
+    const allocator = std.testing.allocator;
+    const options = parseArgs(&.{
+        "FreeBSD",
+        "--arch",
+        "x86_64",
+        "--admin-username",
+        "g",
+        "--ssh-public-key",
+        "id.pub",
+        "--ssh-port",
+        "2223",
+    }).options;
+
+    var image = try resolveImageAlloc(allocator, options);
+    defer image.deinit(allocator);
+    try std.testing.expectEqualStrings("FreeBSD-15.1-x86_64.qcow2", image.disk_path);
+    try std.testing.expectEqual(GuestArchitecture.x86_64, image.architecture);
+    try std.testing.expectEqual(ProvisioningMedia.virtio_block, image.provisioning_media);
+    try std.testing.expectEqual(@as(?u16, 2223), options.ssh_port);
+    try std.testing.expectEqual(Accel.tcg, resolveAccel(options.accel, .{
+        .os_tag = .macos,
+        .cpu_arch = .aarch64,
+    }, image.architecture));
 }
 
 test "qemu image selection keeps the implicit x86 default downloadable" {
@@ -3215,6 +3492,11 @@ test "qemu auto accelerator follows host capabilities" {
     try std.testing.expectEqual(Accel.tcg, resolveAccel(.auto, .{
         .os_tag = .macos,
         .cpu_arch = .aarch64,
+    }, .x86_64));
+    try std.testing.expectEqual(Accel.tcg, resolveAccel(.auto, .{
+        .os_tag = .linux,
+        .cpu_arch = .aarch64,
+        .kvm_available = true,
     }, .x86_64));
     try std.testing.expectEqual(Accel.hvf, resolveAccel(.auto, .{
         .os_tag = .macos,
@@ -4016,6 +4298,47 @@ test "qemu AArch64 provisioning argv uses virt, SCSI CD, and host forwarding" {
     }, argv.items.items);
 }
 
+test "qemu FreeBSD provisioning argv uses a read-only VirtIO block seed" {
+    const allocator = std.testing.allocator;
+    var argv = try buildQemuArgv(allocator, .{
+        .qemu_path = "qemu-system-x86_64",
+        .qemu_data_dir = null,
+        .architecture = .x86_64,
+        .image_path = "FreeBSD-15.1-x86_64.qcow2",
+        .image_format = .qcow2,
+        .ovmf_code_path = "FreeBSD-15.1-x86_64.code.fd",
+        .ovmf_vars_path = "FreeBSD-15.1-x86_64.vars.fd",
+        .accel = .tcg,
+        .seed_iso_path = "seed.iso",
+        .provisioning_media = .virtio_block,
+        .ssh_port = 2223,
+        .provisioned = true,
+    });
+    defer argv.deinit(allocator);
+    try expectArgv(&.{
+        "qemu-system-x86_64",
+        "-M",
+        "q35,accel=tcg",
+        "-cpu",
+        "Nehalem-v1",
+        "-m",
+        "2G",
+        "-smp",
+        "2",
+        "-drive",
+        "if=pflash,unit=0,format=raw,readonly=on,file=FreeBSD-15.1-x86_64.code.fd",
+        "-drive",
+        "if=pflash,unit=1,format=raw,file=FreeBSD-15.1-x86_64.vars.fd",
+        "-drive",
+        "file=FreeBSD-15.1-x86_64.qcow2,format=qcow2,if=virtio",
+        "-drive",
+        "file=seed.iso,format=raw,if=virtio,readonly=on",
+        "-nic",
+        "user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:2223-:22",
+        "-nographic",
+    }, argv.items.items);
+}
+
 test "qemu AArch64 launch argv uses virt and max for TCG" {
     const allocator = std.testing.allocator;
     var argv = try buildQemuArgv(allocator, .{
@@ -4102,7 +4425,7 @@ test "qemu-img snapshot overlay argv is explicit" {
     }, &argv);
 }
 
-test "qemu release download spec remains pinned to the validated Azure Linux release" {
+test "qemu release download specs remain pinned to validated releases" {
     try std.testing.expectEqualStrings(
         "cataggar/zvmi/AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260723",
         default_image_spec,
@@ -4123,11 +4446,21 @@ test "qemu release download spec remains pinned to the validated Azure Linux rel
         "ff294c8655ea80f890a41a7c6dc545d997da498dc5f5f03fd3aee8dea81b0f65",
         known_images[3].image_sha256,
     );
-    for (known_images) |known| {
+    try std.testing.expectEqualStrings(
+        "cataggar/zvmi/FreeBSD-15.1-x86_64.qcow2@FreeBSD-15.1-20260724",
+        known_images[4].release_spec,
+    );
+    try std.testing.expectEqualStrings(
+        "cataggar/zvmi/FreeBSD-15.1-aarch64.qcow2@FreeBSD-15.1-20260724",
+        known_images[5].release_spec,
+    );
+    for (known_images[0..4]) |known| {
         try std.testing.expectEqualStrings(
             release_certificate_sha256,
-            known.certificate_sha256,
+            known.certificate_sha256.?,
         );
+    }
+    for (known_images) |known| {
         _ = try zvmi.artifact_pipeline.parseSha256(known.image_sha256);
     }
 }
@@ -4139,11 +4472,14 @@ test "qemu known image download argv is exact" {
         .image_was_explicit = true,
     });
     defer image.deinit(allocator);
-    const argv = ghrDownloadArgv(image);
+    const digest_hex = std.fmt.bytesToHex(image.expected_image_sha256.?, .lower);
+    const argv = ghrDownloadArgv(image, &digest_hex);
     try expectArgv(&.{
         "ghr",
         "download",
         "cataggar/zvmi/AzureLinux-4.0-aarch64.qcow2@AzureLinux-4.0-20260723",
+        "--sha256",
+        "590c6eddbbbc952ff21c8d9a026ae16e10f22ad71e940dc87c10e5e8016ef544",
         "--output",
         "images/AzureLinux-4.0-aarch64.qcow2",
     }, &argv);
@@ -4318,6 +4654,8 @@ test "qemu ignores a ghr package whose recorded binary is missing" {
 }
 
 test "qemu explicit paths bypass package and system discovery" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -4325,6 +4663,7 @@ test "qemu explicit paths bypass package and system discovery" {
 
     const qemu_name = qemu_host.executableName("qemu-system-x86_64");
     var qemu_file = try tmp.dir.createFile(io, qemu_name, .{ .permissions = .executable_file });
+    try qemu_file.writeStreamingAll(io, "#!/bin/sh\nexit 0\n");
     qemu_file.close(io);
     try tmp.dir.writeFile(io, .{ .sub_path = "code.fd", .data = "code" });
     try tmp.dir.writeFile(io, .{ .sub_path = "vars.fd", .data = "vars" });
@@ -4349,31 +4688,57 @@ test "qemu explicit paths bypass package and system discovery" {
     try std.testing.expectEqualStrings(vars_path, resolved.firmware.vars.path);
 }
 
-test "qemu resolves system QEMU and adjacent firmware from PATH" {
+test "qemu skips an invalid PATH emulator and resolves the next QEMU" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDir(io, "share", .default_dir);
+    try tmp.dir.createDir(io, "broken", .default_dir);
+    try tmp.dir.createDirPath(io, "working/share");
     const qemu_name = qemu_host.executableName("qemu-system-x86_64");
-    var qemu_file = try tmp.dir.createFile(io, qemu_name, .{ .permissions = .executable_file });
+    const broken_qemu_path = try std.fs.path.join(allocator, &.{ "broken", qemu_name });
+    defer allocator.free(broken_qemu_path);
+    const working_qemu_path = try std.fs.path.join(allocator, &.{ "working", qemu_name });
+    defer allocator.free(working_qemu_path);
+    var broken_qemu = try tmp.dir.createFile(
+        io,
+        broken_qemu_path,
+        .{ .permissions = .executable_file },
+    );
+    broken_qemu.close(io);
+    var qemu_file = try tmp.dir.createFile(
+        io,
+        working_qemu_path,
+        .{ .permissions = .executable_file },
+    );
+    try qemu_file.writeStreamingAll(io, "#!/bin/sh\nexit 0\n");
     qemu_file.close(io);
     try tmp.dir.writeFile(io, .{
-        .sub_path = "share/edk2-x86_64-code.fd",
+        .sub_path = "working/share/edk2-x86_64-code.fd",
         .data = "code",
     });
     try tmp.dir.writeFile(io, .{
-        .sub_path = "share/edk2-i386-vars.fd",
+        .sub_path = "working/share/edk2-i386-vars.fd",
         .data = "vars",
     });
 
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPath(io, &path_buf);
+    const broken_path = try tmp.dir.realPathFileAlloc(io, "broken", allocator);
+    defer allocator.free(broken_path);
+    const working_path = try tmp.dir.realPathFileAlloc(io, "working", allocator);
+    defer allocator.free(working_path);
+    const path_value = try std.fmt.allocPrint(
+        allocator,
+        "{s}{c}{s}",
+        .{ broken_path, std.fs.path.delimiter, working_path },
+    );
+    defer allocator.free(path_value);
     var resolved = (try findSystemQemuInPathValueAlloc(
         allocator,
         io,
-        path_buf[0..path_len],
+        path_value,
         .{},
         .x86_64,
     )).?;

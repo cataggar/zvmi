@@ -1,6 +1,9 @@
 # QEMU
 
-Use `zvmi qemu` to acquire and boot cataloged Azure Linux images with architecture-matched QEMU and firmware. See [Azure Linux images](azure-linux.md) for the full/core image comparison and release security model.
+Use `zvmi qemu` to acquire and boot cataloged Azure Linux and FreeBSD images
+with architecture-matched QEMU and firmware. See
+[Azure Linux images](azure-linux.md) for the full/core image comparison and
+release security model.
 
 ## Booting the release image with QEMU
 
@@ -15,6 +18,7 @@ Then run the command from the directory where the VM disk should live:
 ```text
 zvmi qemu AzureLinux
 zvmi qemu AzureLinux-4.0-x86_64
+zvmi qemu FreeBSD --arch x86_64
 ```
 
 If `AzureLinux-4.0-x86_64.qcow2` is absent, `zvmi` runs the verified ghr
@@ -26,7 +30,18 @@ then from a system QEMU/UEFI installation. Directory-prefixed aliases such as
 `zvmi qemu images/AzureLinux-4.0-x86_64` place the downloaded disk and
 firmware under that directory.
 
-The published images use the signed direct UKI boot path described in
+`FreeBSD` selects the pinned FreeBSD 15.1 release asset for the requested
+architecture. For example, an ARM64 host runs the x86_64 image through TCG:
+
+```text
+zvmi qemu FreeBSD --arch x86_64
+```
+
+When administrator provisioning is requested, cataloged FreeBSD images receive
+the NoCloud seed as a read-only VirtIO block device, matching their release
+acceptance configuration.
+
+The published Azure Linux images use the signed direct UKI boot path described in
 [Azure Linux images](azure-linux.md). Secure Boot is opt-in:
 
 ```text
@@ -58,10 +73,12 @@ rejected without `--secure-boot`, and extra QEMU arguments are rejected in
 Secure Boot mode so they cannot replace the machine or firmware contract.
 
 `--architecture x86_64|aarch64` selects q35/OVMF or virt/AAVMF respectively;
-`--architecture auto` requires an unambiguous architecture-bearing GPT
+`--arch` is its shorter alias. `--architecture auto` requires an unambiguous
+architecture-bearing GPT
 root/USR GUID or UKI PE header. `AzureLinux` remains the short alias for the
-x86_64 Azure Linux image, while exact catalog aliases select their
-corresponding architecture.
+x86_64 Azure Linux image. `FreeBSD` selects its architecture-specific catalog
+image from `--arch`, while exact catalog aliases select their corresponding
+architecture.
 
 Inside a full image, equivalent manual checks are `mokutil --sb-state`, `mokutil --db`, `mokutil --dbx`, `cat /sys/kernel/security/lockdown`, and `sudo dmesg | grep -Ei 'secure boot|lockdown|module verification'`. Release acceptance parses the EFI variables directly so the core image does not need `mokutil`.
 
@@ -111,9 +128,9 @@ overlay and creates temporary UEFI variables directly from the pristine
 firmware source, not from persistent `.vars.fd` or `.secboot.vars.fd` state.
 Secure Boot snapshots enroll the same verified leaf into that temporary
 template. `zvmi` removes both when QEMU exits. The automatic accelerator is
-WHPX for x86_64 Windows, HVF for
-same-architecture macOS guests, KVM for same-architecture Linux guests when
-`/dev/kvm` is available, and TCG otherwise. Override it when needed:
+WHPX for x86_64 Windows, HVF for same-architecture macOS guests, KVM for
+same-architecture Linux guests when `/dev/kvm` is available, and TCG for
+cross-architecture or otherwise unaccelerated guests. Override it when needed:
 
 ```text
 zvmi qemu AzureLinux --accel tcg
@@ -121,8 +138,8 @@ zvmi qemu AzureLinux --accel tcg
 
 An explicit image path must already exist. Without an architecture option it
 keeps the x86_64 default; exact Azure Linux catalog filenames select their
-corresponding architecture, and `aarch64` or `auto` can be used for other
-Arm64 images:
+corresponding architecture, `FreeBSD` selects the requested catalog
+architecture, and `aarch64` or `auto` can be used for other Arm64 images:
 
 ```text
 zvmi qemu ./AzureLinux-4.0-x86_64.qcow2
