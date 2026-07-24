@@ -37,6 +37,13 @@ const Architecture = enum {
         };
     }
 
+    fn cpuArg(self: Architecture) []const u8 {
+        return switch (self) {
+            .aarch64 => "max",
+            .x86_64 => "qemu64",
+        };
+    }
+
     fn qemuName(self: Architecture) []const u8 {
         return qemu_host.qemuSystemName(self.guestArchitecture());
     }
@@ -818,7 +825,7 @@ test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
                 "-machine",
                 architecture.machineArg(),
                 "-cpu",
-                "max",
+                architecture.cpuArg(),
                 "-smp",
                 "2",
                 "-m",
