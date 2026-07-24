@@ -1,6 +1,10 @@
 //! `zvmi azure derive --input-sha256 <hex> <input.qcow2> <output.vhd>`
-//! `zvmi azure fixup --generation 1|2 <file>`
+//! `zvmi azure fixup [--generation 1|2] <file>`
 //! `zvmi azure deprovision [--user <username>] <file>`
+//!
+//! Fixed VHD inputs are updated in place. Other supported image formats are
+//! converted to a sibling fixed VHD named `<input-basename>.vhd`.
+//! Generation 2 is the default; pass `--generation 1` for legacy BIOS images.
 
 const std = @import("std");
 const zvmi = @import("zvmi");
@@ -14,7 +18,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
 }
 
 const usage = "usage: zvmi azure derive --input-sha256 <hex> [--expected-virtual-size <size>] [--max-input-size <size>] [--max-virtual-size <size>] [--max-output-size <size>] <input.qcow2> <output.vhd>\n" ++
-    "       zvmi azure fixup --generation 1|2 <file>\n" ++
+    "       zvmi azure fixup [--generation 1|2] <file>\n" ++
     "       zvmi azure deprovision [--user <username>] <file>";
 
 fn runDerive(gpa: std.mem.Allocator, io: std.Io, rest: []const []const u8) u8 {
@@ -114,7 +118,8 @@ fn parseSizeArgument(
 }
 
 fn runFixup(gpa: std.mem.Allocator, io: std.Io, rest: []const []const u8) u8 {
-    var generation: ?zvmi.azure.Generation = null;
+    const fixup_usage = "usage: zvmi azure fixup [--generation 1|2] <file>";
+    var generation: zvmi.azure.Generation = .gen2;
     var path: ?[]const u8 = null;
 
     var i: usize = 0;
@@ -137,33 +142,112 @@ fn runFixup(gpa: std.mem.Allocator, io: std.Io, rest: []const []const u8) u8 {
         }
     }
 
-    const gen = generation orelse return fail("azure fixup: --generation 1|2 is required", .{});
-    const file_path = path orelse return fail("usage: zvmi azure fixup --generation 1|2 <file>", .{});
+    const input_path = path orelse return fail(fixup_usage, .{});
 
-    var img = zvmi.Image.openPath(io, file_path) catch |err|
-        return fail("azure fixup: failed to open '{s}': {s}", .{ file_path, @errorName(err) });
-    defer img.close(io);
+    var src = zvmi.Image.openPath(io, input_path) catch |err|
+        return fail("azure fixup: failed to open '{s}': {s}", .{ input_path, @errorName(err) });
+    defer src.close(io);
 
-    const report = zvmi.azure.checkPartitionStyle(img, io, gpa, gen) catch |err|
-        return fail("azure fixup: failed to check partition style: {s}", .{@errorName(err)});
-    const gen_name: []const u8 = if (gen == .gen1) "Gen1" else "Gen2";
-    if (!report.ok) {
-        std.debug.print("Partition style check FAILED for {s}: {s}\n", .{ gen_name, report.message });
-        return 2;
+    if (src.format == .vhd) {
+        return finishFixup(&src, io, gpa, generation, input_path).exit_code;
     }
 
-    const align_result = zvmi.azure.alignFixedVhd(&img, io) catch |err| {
-        if (err == error.GptRelocationRequired) {
+    const src_format = src.format;
+    const src_virtual_size = src.virtual_size;
+    const output_path = derivedVhdPath(gpa, input_path) catch |err|
+        return fail("azure fixup: failed to derive output path: {s}", .{@errorName(err)});
+    defer gpa.free(output_path);
+
+    const initial_vhd_size = if (src_virtual_size % 512 == 0)
+        src_virtual_size
+    else
+        zvmi.azure.alignSizeToMibChecked(src_virtual_size) catch |err|
+            return fail("azure fixup: failed to align source size: {s}", .{@errorName(err)});
+
+    var dst = zvmi.Image.createExclusive(io, output_path, .vhd, initial_vhd_size, .{
+        .vhd_subformat = .fixed,
+    }) catch |err| {
+        if (err == error.PathAlreadyExists) {
             return fail(
-                "azure fixup: GPT growth requires transactional relocation; use 'zvmi azure derive --input-sha256 <hex> <input.qcow2> <output.vhd>'",
-                .{},
+                "azure fixup: output '{s}' already exists; refusing to overwrite it",
+                .{output_path},
             );
         }
-        return fail(
-            "azure fixup: {s} (Azure managed-disk upload requires a *fixed* .vhd; convert first with " ++
-                "'zvmi convert -O vhd -o subformat=fixed <src> {s}')",
-            .{ @errorName(err), file_path },
+        return fail("azure fixup: failed to create '{s}': {s}", .{ output_path, @errorName(err) });
+    };
+    var keep_output = false;
+    defer {
+        dst.close(io);
+        if (!keep_output) {
+            std.Io.Dir.cwd().deleteFile(io, output_path) catch |err| {
+                std.debug.print(
+                    "azure fixup: failed to remove incomplete output '{s}': {s}\n",
+                    .{ output_path, @errorName(err) },
+                );
+            };
+        }
+    }
+
+    zvmi.copyAll(io, src, &dst, gpa) catch |err|
+        return fail("azure fixup: conversion failed: {s}", .{@errorName(err)});
+
+    const outcome = finishFixup(&dst, io, gpa, generation, output_path);
+    keep_output = outcome.fixup_succeeded;
+    if (keep_output) {
+        std.debug.print(
+            "Converted '{s}' ({s}) to fixed VHD '{s}'.\n",
+            .{ input_path, src_format.displayName(), output_path },
         );
+        if (initial_vhd_size != src_virtual_size) {
+            std.debug.print(
+                "Padded virtual size from {d} to {d} bytes for sector alignment.\n",
+                .{ src_virtual_size, initial_vhd_size },
+            );
+        }
+    }
+    return outcome.exit_code;
+}
+
+const FixupOutcome = struct {
+    exit_code: u8,
+    fixup_succeeded: bool,
+};
+
+fn finishFixup(
+    img: *zvmi.Image,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    generation: zvmi.azure.Generation,
+    file_path: []const u8,
+) FixupOutcome {
+    const report = zvmi.azure.checkPartitionStyle(img.*, io, allocator, generation) catch |err| return .{
+        .exit_code = fail("azure fixup: failed to check partition style: {s}", .{@errorName(err)}),
+        .fixup_succeeded = false,
+    };
+    const gen_name: []const u8 = if (generation == .gen1) "Gen1" else "Gen2";
+    if (!report.ok) {
+        std.debug.print("Partition style check FAILED for {s}: {s}\n", .{ gen_name, report.message });
+        return .{ .exit_code = 2, .fixup_succeeded = false };
+    }
+
+    const align_result = zvmi.azure.alignFixedVhd(img, io) catch |err| {
+        if (err == error.GptRelocationRequired) {
+            return .{
+                .exit_code = fail(
+                    "azure fixup: GPT growth requires transactional relocation; use 'zvmi azure derive --input-sha256 <hex> <input.qcow2> <output.vhd>'",
+                    .{},
+                ),
+                .fixup_succeeded = false,
+            };
+        }
+        return .{
+            .exit_code = fail(
+                "azure fixup: {s} (Azure managed-disk upload requires a *fixed* .vhd; convert first with " ++
+                    "'zvmi convert -O vhd -o subformat=fixed <src> {s}')",
+                .{ @errorName(err), file_path },
+            ),
+            .fixup_succeeded = false,
+        };
     };
     if (align_result.was_resized) {
         std.debug.print("Padded virtual size from {d} to {d} bytes (1 MiB alignment).\n", .{ align_result.old_size, align_result.new_size });
@@ -172,7 +256,16 @@ fn runFixup(gpa: std.mem.Allocator, io: std.Io, rest: []const []const u8) u8 {
     }
 
     std.debug.print("Partition style OK for {s}: {s}\n", .{ gen_name, report.message });
-    return 0;
+    return .{ .exit_code = 0, .fixup_succeeded = true };
+}
+
+fn derivedVhdPath(allocator: std.mem.Allocator, input_path: []const u8) std.mem.Allocator.Error![]u8 {
+    const extension = std.fs.path.extension(input_path);
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}.vhd",
+        .{input_path[0 .. input_path.len - extension.len]},
+    );
 }
 
 fn runDeprovision(gpa: std.mem.Allocator, io: std.Io, rest: []const []const u8) u8 {
@@ -216,4 +309,60 @@ fn runDeprovision(gpa: std.mem.Allocator, io: std.Io, rest: []const []const u8) 
 fn fail(comptime format: []const u8, args: anytype) u8 {
     std.debug.print(format ++ "\n", args);
     return 1;
+}
+
+test "derivedVhdPath replaces the input extension" {
+    const allocator = std.testing.allocator;
+
+    const qcow2_path = try derivedVhdPath(allocator, "images/disk.test.qcow2");
+    defer allocator.free(qcow2_path);
+    try std.testing.expectEqualStrings("images/disk.test.vhd", qcow2_path);
+
+    const extensionless_path = try derivedVhdPath(allocator, "images/disk");
+    defer allocator.free(extensionless_path);
+    try std.testing.expectEqualStrings("images/disk.vhd", extensionless_path);
+}
+
+test "azure fixup defaults to Gen2 when converting qcow2 to fixed VHD" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const src_path = "test-azure-fixup-convert.qcow2";
+    const dst_path = "test-azure-fixup-convert.vhd";
+    defer std.Io.Dir.cwd().deleteFile(io, src_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, dst_path) catch {};
+
+    const src_size: u64 = 8 * 1024 * 1024;
+    var src = try zvmi.Image.create(io, src_path, .qcow2, src_size, .{});
+    const specs = [_]zvmi.gpt.PartitionSpec{
+        .{
+            .type_guid = zvmi.guid.esp,
+            .unique_guid = zvmi.guid.parse("88888888-8888-8888-8888-888888888888"),
+            .size_sectors = 2048,
+        },
+    };
+    var placements: [specs.len]zvmi.gpt.Placement = undefined;
+    try zvmi.gpt.writeGpt(
+        &src,
+        io,
+        zvmi.guid.parse("99999999-9999-9999-9999-999999999999"),
+        &specs,
+        &placements,
+    );
+    try src.pwrite(io, "qcow2 payload", 2 * 1024 * 1024);
+    src.close(io);
+
+    try std.testing.expectEqual(
+        @as(u8, 0),
+        run(allocator, io, &.{ "fixup", src_path }),
+    );
+
+    var converted = try zvmi.Image.openPath(io, dst_path);
+    defer converted.close(io);
+    try std.testing.expectEqual(zvmi.Format.vhd, converted.format);
+    try std.testing.expect(converted.dynamic == null);
+    try std.testing.expectEqual(src_size, converted.virtual_size);
+
+    var payload: [13]u8 = undefined;
+    _ = try converted.pread(io, &payload, 2 * 1024 * 1024);
+    try std.testing.expectEqualSlices(u8, "qcow2 payload", &payload);
 }

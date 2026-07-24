@@ -27,17 +27,19 @@ zvmi resize disk.vhd +4G
 zvmi check disk.vhd
 zvmi map disk.vhd
 zvmi azure derive --input-sha256 <hex> input.qcow2 output.vhd  # transactional aligned Gen2 VHD + GPT relocation
-zvmi azure fixup --generation 1|2 disk.vhd  # checks MBR/GPT; refuses unsafe GPT growth
+zvmi azure fixup disk.vhd                     # Gen2 default; fixed VHD is padded and checked in place
+zvmi azure fixup disk.qcow2                   # converts to disk.vhd, then pads and checks for Gen2
+zvmi azure fixup --generation 1 legacy.vhd   # explicit legacy BIOS/MBR validation
 zvmi azure deprovision disk.vhd                    # generalize: reset hostname/SSH host keys/machine-id/DHCP state
 zvmi azure deprovision --user azureuser disk.vhd   # also removes that user account + its home directory
 zvmi cosi disk.img -o disk.cosi              # tar + metadata.json + per-partition raw.zst
-zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G -o output.vhd
-zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G -o output.raw -O raw
-zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G -o output.vhdx -O vhdx
-zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G -o output.qcow2 -O qcow2
-zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 384M --skip-iso-rootfs -o output-minimal.raw -O raw
-zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G --verity -o output.vhd
-zvmi build-image --iso azurelinux.iso --container ./oci-layout --generation 2 --size 4G --boot-mode uki --esp-size 512M -o output-uki.vhd
+zvmi build-image --iso azurelinux.iso --container ./oci-layout --size 4G -o output.vhd  # Gen2 default
+zvmi build-image --iso azurelinux.iso --container ./oci-layout --size 4G -o output.raw -O raw
+zvmi build-image --iso azurelinux.iso --container ./oci-layout --size 4G -o output.vhdx -O vhdx
+zvmi build-image --iso azurelinux.iso --container ./oci-layout --size 4G -o output.qcow2 -O qcow2
+zvmi build-image --iso azurelinux.iso --container ./oci-layout --size 384M --skip-iso-rootfs -o output-minimal.raw -O raw
+zvmi build-image --iso azurelinux.iso --container ./oci-layout --size 4G --verity -o output.vhd
+zvmi build-image --iso azurelinux.iso --container ./oci-layout --size 4G --boot-mode uki --esp-size 512M -o output-uki.vhd
 zvmi qemu AzureLinux
 zvmi qemu AzureLinux --snapshot
 ```
