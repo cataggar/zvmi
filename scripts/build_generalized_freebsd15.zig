@@ -102,6 +102,14 @@ const Architecture = enum {
             },
         };
     }
+
+    fn cpuArg(self: Architecture, accel: Accel) []const u8 {
+        if (accel == .kvm) return "host";
+        return switch (self) {
+            .aarch64 => "max",
+            .x86_64 => "qemu64",
+        };
+    }
 };
 
 const Accel = enum {
@@ -736,7 +744,7 @@ fn runGuestCustomization(
 ) !void {
     const accel = try resolveAccel(io, args.accel, args.architecture);
     const machine = args.architecture.machineArg(accel);
-    const cpu = if (accel == .kvm) "host" else "max";
+    const cpu = args.architecture.cpuArg(accel);
     const escaped_code = try escapeQemuDriveValue(allocator, uefi_code_path);
     defer allocator.free(escaped_code);
     const escaped_vars = try escapeQemuDriveValue(allocator, vars_path);
@@ -1158,6 +1166,14 @@ test "FreeBSD builder selects pinned x86_64 defaults" {
     try std.testing.expectEqualStrings(x86_64_profile.output, args.output);
     try std.testing.expectEqualStrings(x86_64_profile.work_dir, args.work_dir);
     try std.testing.expectEqualStrings("qemu-system-x86_64", args.qemu_path);
+    try std.testing.expectEqualStrings(
+        "qemu64",
+        args.architecture.cpuArg(.tcg),
+    );
+    try std.testing.expectEqualStrings(
+        "host",
+        args.architecture.cpuArg(.kvm),
+    );
 }
 
 test "FreeBSD builder parses explicit source and tool paths" {
